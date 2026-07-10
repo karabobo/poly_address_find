@@ -11,8 +11,14 @@ def test_lock_timeout_is_visible_failure(tmp_path: Path):
         pytest.skip("flock command is required for run_locked integration test")
     lock = tmp_path / "writer.lock"
     script = Path("deploy/scripts/run_locked.sh").resolve()
-    holder = subprocess.Popen(["flock", str(lock), "sleep", "5"])
+    holder = subprocess.Popen(
+        ["flock", str(lock), "sh", "-c", "printf 'ready\\n'; sleep 5"],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
     try:
+        assert holder.stdout is not None
+        assert holder.stdout.readline().strip() == "ready"
         env = os.environ.copy()
         env.update(
             {
