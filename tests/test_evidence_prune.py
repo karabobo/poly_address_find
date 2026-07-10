@@ -1,6 +1,10 @@
 from pm_robot.config import RobotSettings
 from pm_robot.models import CandidateAddress, CandidateStage, ScoreBreakdown, WalletFeatures
-from pm_robot.ops import build_wallet_registry, prune_low_value_evidence
+from pm_robot.ops import (
+    _prune_wallet_evidence_batch,
+    build_wallet_registry,
+    prune_low_value_evidence,
+)
 from pm_robot.storage.db import connect, run_migrations
 from pm_robot.storage.repository import (
     enqueue_pipeline_job,
@@ -133,6 +137,31 @@ def test_prune_evidence_dry_run_and_execute_low_value_only(tmp_path):
             (low,),
         ).fetchone()
         assert rebuilt["registry_status"] == "archived_raw_pruned"
+    finally:
+        conn.close()
+
+
+def test_execute_prune_counts_sqlite_changes_without_precount_scan(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    wallet = "0x" + "9" * 40
+    statements: list[str] = []
+    try:
+        run_migrations(conn)
+        _seed_candidate(conn, wallet, materialized=True)
+        conn.set_trace_callback(statements.append)
+
+        deleted = _prune_wallet_evidence_batch(
+            conn,
+            [wallet],
+            keep_recent_activity=0,
+            dry_run=False,
+        )
+
+        assert deleted["wallet_activity"] == 5
+        assert not any(
+            "SELECT COUNT(*)" in statement.upper()
+            for statement in statements
+        )
     finally:
         conn.close()
 

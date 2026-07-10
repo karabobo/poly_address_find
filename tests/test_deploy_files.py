@@ -85,6 +85,19 @@ def test_deploy_files_exist():
         assert Path(item).exists(), item
 
 
+def test_nas_retention_prune_is_bounded_and_staggered():
+    env = Path("deploy/nas/env.example").read_text(encoding="utf-8")
+    loop = Path("deploy/nas/maintenance-loop.sh").read_text(encoding="utf-8")
+
+    assert "PM_ROBOT_MAINTENANCE_START_DELAY=300" in env
+    assert 'START_DELAY="${PM_ROBOT_MAINTENANCE_START_DELAY:-300}"' in loop
+    assert 'sleep "$START_DELAY"' in loop
+    assert "PM_ROBOT_RETENTION_PRUNE_BATCHES=1" in env
+    assert "PM_ROBOT_RETENTION_PRUNE_LIMIT=5" in env
+    assert 'PRUNE_BATCHES="${PM_ROBOT_RETENTION_PRUNE_BATCHES:-1}"' in loop
+    assert 'PRUNE_LIMIT="${PM_ROBOT_RETENTION_PRUNE_LIMIT:-5}"' in loop
+
+
 def test_canonical_docs_describe_current_research_pipeline_only():
     architecture = Path("docs/research_pipeline_architecture.md").read_text(encoding="utf-8")
     probe = Path("docs/github_activity_probe.md").read_text(encoding="utf-8")

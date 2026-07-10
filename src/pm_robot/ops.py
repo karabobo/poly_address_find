@@ -968,7 +968,8 @@ def prune_low_value_evidence(
         if not dry_run:
             _mark_wallet_registry_pruned(conn, wallets)
             _cancel_wallet_evidence_backfill(conn, wallets)
-            conn.execute("PRAGMA optimize")
+            # Planner statistics are a low-frequency maintenance concern. Running
+            # optimize here turns every bounded prune into a large index scan.
             if vacuum:
                 conn.execute("VACUUM")
             conn.commit()
@@ -1971,9 +1972,12 @@ def _prune_wallet_evidence_batch(
     for table, count_sql, delete_sql in specs:
         if table not in tables:
             continue
-        deleted[table] = int(conn.execute(count_sql).fetchone()[0])
-        if deleted[table] and not dry_run:
-            conn.execute(delete_sql)
+        if dry_run:
+            deleted[table] = int(conn.execute(count_sql).fetchone()[0])
+            continue
+        changes_before = conn.total_changes
+        conn.execute(delete_sql)
+        deleted[table] = conn.total_changes - changes_before
     conn.execute("DROP TABLE IF EXISTS temp_prune_keep_activity")
     conn.execute("DROP TABLE IF EXISTS temp_prune_wallets")
     return deleted

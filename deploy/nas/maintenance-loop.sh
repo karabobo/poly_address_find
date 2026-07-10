@@ -2,6 +2,7 @@
 set -eu
 
 INTERVAL="${PM_ROBOT_MAINTENANCE_INTERVAL:-3600}"
+START_DELAY="${PM_ROBOT_MAINTENANCE_START_DELAY:-300}"
 WAL_CHECKPOINT="${PM_ROBOT_MAINTENANCE_WAL_CHECKPOINT:-none}"
 STALE_INGEST_RUN_SECONDS="${PM_ROBOT_MAINTENANCE_STALE_INGEST_RUN_SECONDS:-21600}"
 FAILED_JOB_COOLDOWN_SECONDS="${PM_ROBOT_MAINTENANCE_FAILED_JOB_COOLDOWN_SECONDS:-21600}"
@@ -21,6 +22,11 @@ runtime_heartbeat() {
     --status "$status" \
     --error "$error" >/dev/null 2>&1 || true
 }
+
+if [ "$START_DELAY" -gt 0 ]; then
+  echo "$(date -Iseconds) maintenance loop: initial delay ${START_DELAY}s"
+  sleep "$START_DELAY"
+fi
 
 while true; do
   echo "$(date -Iseconds) maintenance loop: start"
