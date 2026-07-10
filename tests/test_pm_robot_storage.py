@@ -11,7 +11,7 @@ import pytest
 from pm_robot.config import load_policy
 from pm_robot.models import CandidateAddress, CandidateStage, ScoreBreakdown, WalletFeatures
 from pm_robot.research.scoring import score_candidate
-from pm_robot.storage.db import connect, run_migrations
+from pm_robot.storage.db import connect, retry_sqlite_locked, run_migrations
 from pm_robot.storage.repository import (
     SOURCE_EVENT_UPSERT_SOURCE,
     activity_coverage,
@@ -46,6 +46,30 @@ def test_current_schema_check_does_not_wait_for_database_write_lock(tmp_path):
     finally:
         locker.rollback()
         locker.close()
+        conn.close()
+
+
+def test_exhausted_sqlite_lock_retries_roll_back_final_attempt(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    try:
+        conn.execute("CREATE TABLE test_rows (value INTEGER)")
+        conn.commit()
+
+        def write_then_lock() -> None:
+            conn.execute("INSERT INTO test_rows(value) VALUES (1)")
+            raise sqlite3.OperationalError("database is locked")
+
+        with pytest.raises(sqlite3.OperationalError, match="database is locked"):
+            retry_sqlite_locked(
+                write_then_lock,
+                rollback=conn.rollback,
+                attempts=2,
+                sleep_seconds=0,
+            )
+
+        assert conn.in_transaction is False
+        assert conn.execute("SELECT COUNT(*) FROM test_rows").fetchone()[0] == 0
+    finally:
         conn.close()
 
 

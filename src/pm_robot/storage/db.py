@@ -47,13 +47,15 @@ def retry_sqlite_locked(
         try:
             return operation()
         except sqlite3.OperationalError as exc:
-            if not is_sqlite_locked_error(exc) or attempt >= max_attempts - 1:
+            if not is_sqlite_locked_error(exc):
                 raise
             if rollback is not None:
                 try:
                     rollback()
                 except sqlite3.Error:
                     pass
+            if attempt >= max_attempts - 1:
+                raise
             time.sleep(max(0.0, sleep_seconds) * (attempt + 1))
     raise RuntimeError("unreachable sqlite retry state")
 
