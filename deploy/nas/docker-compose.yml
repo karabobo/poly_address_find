@@ -18,7 +18,7 @@ services:
       PM_ROBOT_PROXY_TUNNEL_LOG_PATH: /logs/vps-http-proxy-tunnel.log
     volumes:
       - ./ssh:/ssh:ro
-      - ./logs:/logs
+      - ${PM_ROBOT_STORAGE_ROOT:-.}/logs:/logs
 
   web:
     build:
@@ -47,10 +47,10 @@ services:
       - ./app/src:/app/src:ro
       - ./app/deploy:/app/deploy:ro
       - ./app/scripts:/app/scripts:ro
-      - ./data:/app/data
-      - ./logs:/app/logs
-      - ./backups:/app/backups
-      - ./reports:/app/reports
+      - ${PM_ROBOT_STORAGE_ROOT:-.}/data:/app/data
+      - ${PM_ROBOT_STORAGE_ROOT:-.}/logs:/app/logs
+      - ${PM_ROBOT_STORAGE_ROOT:-.}/backups:/app/backups
+      - ${PM_ROBOT_STORAGE_ROOT:-.}/reports:/app/reports
       - ./config:/app/config:ro
 
   research-control:
@@ -70,10 +70,10 @@ services:
       - ./app/src:/app/src:ro
       - ./app/deploy:/app/deploy:ro
       - ./app/scripts:/app/scripts:ro
-      - ./data:/app/data
-      - ./logs:/app/logs
-      - ./backups:/app/backups
-      - ./reports:/app/reports
+      - ${PM_ROBOT_STORAGE_ROOT:-.}/data:/app/data
+      - ${PM_ROBOT_STORAGE_ROOT:-.}/logs:/app/logs
+      - ${PM_ROBOT_STORAGE_ROOT:-.}/backups:/app/backups
+      - ${PM_ROBOT_STORAGE_ROOT:-.}/reports:/app/reports
       - ./config:/app/config:ro
 
   discovery-loop:
@@ -95,10 +95,10 @@ services:
       - ./app/src:/app/src:ro
       - ./app/deploy:/app/deploy:ro
       - ./app/scripts:/app/scripts:ro
-      - ./data:/app/data
-      - ./logs:/app/logs
-      - ./backups:/app/backups
-      - ./reports:/app/reports
+      - ${PM_ROBOT_STORAGE_ROOT:-.}/data:/app/data
+      - ${PM_ROBOT_STORAGE_ROOT:-.}/logs:/app/logs
+      - ${PM_ROBOT_STORAGE_ROOT:-.}/backups:/app/backups
+      - ${PM_ROBOT_STORAGE_ROOT:-.}/reports:/app/reports
       - ./config:/app/config:ro
 
   rtds-discovery:
@@ -120,10 +120,10 @@ services:
       - ./app/src:/app/src:ro
       - ./app/deploy:/app/deploy:ro
       - ./app/scripts:/app/scripts:ro
-      - ./data:/app/data
-      - ./logs:/app/logs
-      - ./backups:/app/backups
-      - ./reports:/app/reports
+      - ${PM_ROBOT_STORAGE_ROOT:-.}/data:/app/data
+      - ${PM_ROBOT_STORAGE_ROOT:-.}/logs:/app/logs
+      - ${PM_ROBOT_STORAGE_ROOT:-.}/backups:/app/backups
+      - ${PM_ROBOT_STORAGE_ROOT:-.}/reports:/app/reports
       - ./config:/app/config:ro
 
   pipeline-worker-0:
@@ -148,10 +148,10 @@ services:
       - ./app/src:/app/src:ro
       - ./app/deploy:/app/deploy:ro
       - ./app/scripts:/app/scripts:ro
-      - ./data:/app/data
-      - ./logs:/app/logs
-      - ./backups:/app/backups
-      - ./reports:/app/reports
+      - ${PM_ROBOT_STORAGE_ROOT:-.}/data:/app/data
+      - ${PM_ROBOT_STORAGE_ROOT:-.}/logs:/app/logs
+      - ${PM_ROBOT_STORAGE_ROOT:-.}/backups:/app/backups
+      - ${PM_ROBOT_STORAGE_ROOT:-.}/reports:/app/reports
       - ./config:/app/config:ro
 
   pipeline-worker-1:
@@ -176,10 +176,10 @@ services:
       - ./app/src:/app/src:ro
       - ./app/deploy:/app/deploy:ro
       - ./app/scripts:/app/scripts:ro
-      - ./data:/app/data
-      - ./logs:/app/logs
-      - ./backups:/app/backups
-      - ./reports:/app/reports
+      - ${PM_ROBOT_STORAGE_ROOT:-.}/data:/app/data
+      - ${PM_ROBOT_STORAGE_ROOT:-.}/logs:/app/logs
+      - ${PM_ROBOT_STORAGE_ROOT:-.}/backups:/app/backups
+      - ${PM_ROBOT_STORAGE_ROOT:-.}/reports:/app/reports
       - ./config:/app/config:ro
 
   pipeline-worker-2:
@@ -204,10 +204,10 @@ services:
       - ./app/src:/app/src:ro
       - ./app/deploy:/app/deploy:ro
       - ./app/scripts:/app/scripts:ro
-      - ./data:/app/data
-      - ./logs:/app/logs
-      - ./backups:/app/backups
-      - ./reports:/app/reports
+      - ${PM_ROBOT_STORAGE_ROOT:-.}/data:/app/data
+      - ${PM_ROBOT_STORAGE_ROOT:-.}/logs:/app/logs
+      - ${PM_ROBOT_STORAGE_ROOT:-.}/backups:/app/backups
+      - ${PM_ROBOT_STORAGE_ROOT:-.}/reports:/app/reports
       - ./config:/app/config:ro
 
   copyability-worker-0:
@@ -232,10 +232,10 @@ services:
       - ./app/src:/app/src:ro
       - ./app/deploy:/app/deploy:ro
       - ./app/scripts:/app/scripts:ro
-      - ./data:/app/data
-      - ./logs:/app/logs
-      - ./backups:/app/backups
-      - ./reports:/app/reports
+      - ${PM_ROBOT_STORAGE_ROOT:-.}/data:/app/data
+      - ${PM_ROBOT_STORAGE_ROOT:-.}/logs:/app/logs
+      - ${PM_ROBOT_STORAGE_ROOT:-.}/backups:/app/backups
+      - ${PM_ROBOT_STORAGE_ROOT:-.}/reports:/app/reports
       - ./config:/app/config:ro
 
   copyability-worker-1:
@@ -261,10 +261,10 @@ services:
       - ./app/src:/app/src:ro
       - ./app/deploy:/app/deploy:ro
       - ./app/scripts:/app/scripts:ro
-      - ./data:/app/data
-      - ./logs:/app/logs
-      - ./backups:/app/backups
-      - ./reports:/app/reports
+      - ${PM_ROBOT_STORAGE_ROOT:-.}/data:/app/data
+      - ${PM_ROBOT_STORAGE_ROOT:-.}/logs:/app/logs
+      - ${PM_ROBOT_STORAGE_ROOT:-.}/backups:/app/backups
+      - ${PM_ROBOT_STORAGE_ROOT:-.}/reports:/app/reports
       - ./config:/app/config:ro
 
   paper-observer-loop:
@@ -286,10 +286,10 @@ services:
       - ./app/src:/app/src:ro
       - ./app/deploy:/app/deploy:ro
       - ./app/scripts:/app/scripts:ro
-      - ./data:/app/data
-      - ./logs:/app/logs
-      - ./backups:/app/backups
-      - ./reports:/app/reports
+      - ${PM_ROBOT_STORAGE_ROOT:-.}/data:/app/data
+      - ${PM_ROBOT_STORAGE_ROOT:-.}/logs:/app/logs
+      - ${PM_ROBOT_STORAGE_ROOT:-.}/backups:/app/backups
+      - ${PM_ROBOT_STORAGE_ROOT:-.}/reports:/app/reports
       - ./config:/app/config:ro
 
   maintenance-loop:
@@ -309,10 +309,10 @@ services:
       - ./app/src:/app/src:ro
       - ./app/deploy:/app/deploy:ro
       - ./app/scripts:/app/scripts:ro
-      - ./data:/app/data
-      - ./logs:/app/logs
-      - ./backups:/app/backups
-      - ./reports:/app/reports
+      - ${PM_ROBOT_STORAGE_ROOT:-.}/data:/app/data
+      - ${PM_ROBOT_STORAGE_ROOT:-.}/logs:/app/logs
+      - ${PM_ROBOT_STORAGE_ROOT:-.}/backups:/app/backups
+      - ${PM_ROBOT_STORAGE_ROOT:-.}/reports:/app/reports
       - ./config:/app/config:ro
 
   backup-loop:
@@ -332,10 +332,10 @@ services:
       - ./app/src:/app/src:ro
       - ./app/deploy:/app/deploy:ro
       - ./app/scripts:/app/scripts:ro
-      - ./data:/app/data
-      - ./logs:/app/logs
-      - ./backups:/app/backups
-      - ./reports:/app/reports
+      - ${PM_ROBOT_STORAGE_ROOT:-.}/data:/app/data
+      - ${PM_ROBOT_STORAGE_ROOT:-.}/logs:/app/logs
+      - ${PM_ROBOT_STORAGE_ROOT:-.}/backups:/app/backups
+      - ${PM_ROBOT_STORAGE_ROOT:-.}/reports:/app/reports
       - ./config:/app/config:ro
 
   task:
@@ -358,10 +358,10 @@ services:
       - ./app/src:/app/src:ro
       - ./app/deploy:/app/deploy:ro
       - ./app/scripts:/app/scripts:ro
-      - ./data:/app/data
-      - ./logs:/app/logs
-      - ./backups:/app/backups
-      - ./reports:/app/reports
+      - ${PM_ROBOT_STORAGE_ROOT:-.}/data:/app/data
+      - ${PM_ROBOT_STORAGE_ROOT:-.}/logs:/app/logs
+      - ${PM_ROBOT_STORAGE_ROOT:-.}/backups:/app/backups
+      - ${PM_ROBOT_STORAGE_ROOT:-.}/reports:/app/reports
       - ./config:/app/config:ro
     command:
       - status

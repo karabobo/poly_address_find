@@ -507,6 +507,11 @@ def main() -> int:
 
     backup_cmd = sub.add_parser("backup", help="Create a SQLite backup")
     backup_cmd.add_argument("--db", dest="command_db", default=None, help="SQLite database path")
+    backup_cmd.add_argument(
+        "--full-check",
+        action="store_true",
+        help="Run a full SQLite quick_check after the fast structural verification",
+    )
 
     backup_dump_cmd = sub.add_parser("backup-sql-dump", help="Stream a consistent SQL dump to stdout")
     backup_dump_cmd.add_argument("--db", dest="command_db", default=None, help="SQLite database path")
@@ -1358,7 +1363,7 @@ def main() -> int:
         print(json.dumps(status(settings), ensure_ascii=False, indent=2))
         return 0
     if args.command == "backup":
-        out = backup_database(settings)
+        out = backup_database(settings, full_check=args.full_check)
         print(f"backup written to {out}")
         return 0
     if args.command == "backup-sql-dump":

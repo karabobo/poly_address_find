@@ -8,6 +8,7 @@ import os
 import shutil
 import sqlite3
 import time
+from urllib.parse import quote
 from pathlib import Path
 from typing import Any, BinaryIO
 
@@ -334,7 +335,67 @@ def write_health(settings: RobotSettings, output_path: Path | None = None) -> di
     return data
 
 
-def backup_database(settings: RobotSettings) -> Path:
+def verify_backup_database(path: Path, *, full_check: bool = False) -> dict[str, Any]:
+    """Verify backup structure quickly, with an optional full SQLite scan."""
+    resolved = path.resolve()
+    uri = f"file:{quote(str(resolved), safe='/')}?mode=ro&immutable=1"
+    conn = sqlite3.connect(uri, uri=True, timeout=5)
+    try:
+        page_size = int(conn.execute("PRAGMA page_size").fetchone()[0])
+        page_count = int(conn.execute("PRAGMA page_count").fetchone()[0])
+        tables = {
+            str(row[0])
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        required_tables = {
+            "schema_migrations",
+            "candidate_wallets",
+            "wallet_processing_state",
+            "pipeline_jobs",
+            "wallet_activity",
+            "leader_scores",
+        }
+        missing_tables = sorted(required_tables - tables)
+        migration_count = (
+            int(conn.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0])
+            if "schema_migrations" in tables
+            else 0
+        )
+        expected_size = page_size * page_count
+        actual_size = resolved.stat().st_size
+        if page_size <= 0 or page_count <= 0 or actual_size != expected_size:
+            raise RuntimeError(
+                "backup page layout check failed: "
+                f"page_size={page_size} page_count={page_count} "
+                f"expected_size={expected_size} actual_size={actual_size}"
+            )
+        if missing_tables or migration_count <= 0:
+            raise RuntimeError(
+                "backup schema check failed: "
+                f"missing_tables={missing_tables} migration_count={migration_count}"
+            )
+        quick_check = "not_run"
+        if full_check:
+            check = conn.execute("PRAGMA quick_check").fetchone()
+            quick_check = str(check[0]).lower() if check else "missing_result"
+            if quick_check != "ok":
+                raise RuntimeError(f"backup integrity check failed: {check}")
+        return {
+            "page_size": page_size,
+            "page_count": page_count,
+            "file_size": actual_size,
+            "table_count": len(tables),
+            "migration_count": migration_count,
+            "full_check": bool(full_check),
+            "quick_check": quick_check,
+        }
+    finally:
+        conn.close()
+
+
+def backup_database(settings: RobotSettings, *, full_check: bool = False) -> Path:
     settings.backup_dir.mkdir(parents=True, exist_ok=True)
     if not settings.db_path.exists():
         raise FileNotFoundError(settings.db_path)
@@ -349,17 +410,14 @@ def backup_database(settings: RobotSettings) -> Path:
             dst = sqlite3.connect(partial)
             try:
                 src.backup(dst)
-                check = dst.execute("PRAGMA quick_check").fetchone()
-                if check is None or str(check[0]).lower() != "ok":
-                    raise RuntimeError(f"backup integrity check failed: {check}")
             finally:
                 dst.close()
         finally:
             src.close()
+        verify_backup_database(partial, full_check=full_check)
         partial.replace(out)
     except Exception:
         partial.unlink(missing_ok=True)
-        out.unlink(missing_ok=True)
         raise
     if not out.exists():
         raise RuntimeError("backup file was not created")

@@ -3,6 +3,30 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="${PM_ROBOT_NAS_ROOT:-$SCRIPT_DIR}"
+
+env_file_value() {
+  local name="$1"
+  local value=""
+  if [[ -f "$ROOT/.env" ]]; then
+    value="$(awk -v key="$name" 'index($0, key "=") == 1 {sub(/^[^=]*=/, ""); print; exit}' "$ROOT/.env")"
+  fi
+  value="${value#\"}"
+  value="${value%\"}"
+  value="${value#\'}"
+  value="${value%\'}"
+  printf '%s' "$value"
+}
+
+storage_setting="${PM_ROBOT_STORAGE_ROOT:-$(env_file_value PM_ROBOT_STORAGE_ROOT)}"
+if [[ -z "$storage_setting" || "$storage_setting" == "." ]]; then
+  STORAGE_ROOT="$ROOT"
+elif [[ "$storage_setting" == /* ]]; then
+  STORAGE_ROOT="$storage_setting"
+else
+  STORAGE_ROOT="$ROOT/$storage_setting"
+fi
+DATA_DIR="$STORAGE_ROOT/data"
+REPORTS_DIR="$STORAGE_ROOT/reports"
 DOCKER="${DOCKER:-/usr/local/bin/docker}"
 DOCKER_SUDO="${PM_ROBOT_DOCKER_SUDO:-auto}"
 DOCKER_RUNNER_READY=0
@@ -82,6 +106,7 @@ execution_preflight() {
   fi
   PYTHONPATH="$ROOT/app/src" \
     PM_ROBOT_RUNTIME_ROOT="$ROOT" \
+    PM_ROBOT_STORAGE_ROOT_PATH="$STORAGE_ROOT" \
     PM_ROBOT_EXECUTION_SERVICES="$EXECUTION_SERVICES" \
     PM_ROBOT_EXECUTION_COMPOSE_PS_JSON="$execution_ps_json" \
     PM_ROBOT_EXECUTION_COMPOSE_PS_ERROR="$execution_ps_error" \
@@ -110,6 +135,7 @@ runtime_status() {
   fi
   PYTHONPATH="$ROOT/app/src" \
     PM_ROBOT_RUNTIME_ROOT="$ROOT" \
+    PM_ROBOT_STORAGE_ROOT_PATH="$STORAGE_ROOT" \
     PM_ROBOT_EXPECTED_SERVICES="$RESEARCH_SERVICES" \
     PM_ROBOT_COMPOSE_PS_JSON="$service_ps_json" \
     PM_ROBOT_COMPOSE_PS_ERROR="$service_ps_error" \
@@ -127,7 +153,8 @@ from pm_robot.orchestration.pipeline_audit import address_quality_report
 from pm_robot.web import _runtime_build_info, dashboard_data
 
 root = Path(os.environ["PM_ROBOT_RUNTIME_ROOT"])
-db_path = root / "data" / "pm_robot.sqlite"
+storage_root = Path(os.environ["PM_ROBOT_STORAGE_ROOT_PATH"])
+db_path = storage_root / "data" / "pm_robot.sqlite"
 settings = RobotSettings(db_path=db_path, execution_mode="research")
 source = _runtime_build_info()
 try:
@@ -459,8 +486,8 @@ def _deployment_status(
 
 
 def paper_handoff_file_report(root):
-    json_path = root / "reports" / "paper_handoff.json"
-    csv_path = root / "reports" / "paper_handoff.csv"
+    json_path = storage_root / "reports" / "paper_handoff.json"
+    csv_path = storage_root / "reports" / "paper_handoff.csv"
     now = int(time.time())
     base = {
         "json_path": str(json_path),
@@ -502,7 +529,7 @@ def paper_handoff_file_report(root):
 
 
 def paper_observer_file_report(root):
-    json_path = root / "reports" / "paper_observer_preview.json"
+    json_path = storage_root / "reports" / "paper_observer_preview.json"
     now = int(time.time())
     base = {
         "json_path": str(json_path),
@@ -544,7 +571,7 @@ def paper_observer_file_report(root):
 
 
 def paper_observer_evaluation_file_report(root):
-    json_path = root / "reports" / "paper_observer_evaluation.json"
+    json_path = storage_root / "reports" / "paper_observer_evaluation.json"
     now = int(time.time())
     base = {
         "json_path": str(json_path),
@@ -722,7 +749,7 @@ host_copyability_drain_once() {
   worker_id="manual-host-drain-$(date +%s)"
   PYTHONPATH="$ROOT/app/src" python3 -m pm_robot.cli \
     --env "$ROOT/.env" \
-    --db "$ROOT/data/pm_robot.sqlite" \
+    --db "$DATA_DIR/pm_robot.sqlite" \
     copyability-worker \
     --shard-index 0 \
     --shard-count 1 \
@@ -738,7 +765,7 @@ host_materialize_once() {
   limit="$(bounded_positive_int "${1:-50}" 50 500)"
   PYTHONPATH="$ROOT/app/src" python3 -m pm_robot.cli \
     --env "$ROOT/.env" \
-    --db "$ROOT/data/pm_robot.sqlite" \
+    --db "$DATA_DIR/pm_robot.sqlite" \
     materialize-features \
     --limit "$limit"
 }
@@ -748,12 +775,12 @@ host_score_once() {
   PM_ROBOT_POLICY_PATH="$ROOT/config/leader_scoring_policy.json" \
     PYTHONPATH="$ROOT/app/src" python3 -m pm_robot.cli \
     --env "$ROOT/.env" \
-    --db "$ROOT/data/pm_robot.sqlite" \
+    --db "$DATA_DIR/pm_robot.sqlite" \
     build-review \
     --incremental \
     --limit "$limit" \
     --no-import-csv \
-    --out "$ROOT/reports/manual_incremental_review.csv"
+    --out "$REPORTS_DIR/manual_incremental_review.csv"
 }
 
 host_policy_rescore_once() {
@@ -771,10 +798,11 @@ host_policy_rescore_once() {
 }
 
 copyability_queue_counts() {
-  python3 - <<'PY'
+  PM_ROBOT_HOST_DB_PATH="$DATA_DIR/pm_robot.sqlite" python3 - <<'PY'
+import os
 import sqlite3
 
-conn = sqlite3.connect("data/pm_robot.sqlite")
+conn = sqlite3.connect(os.environ["PM_ROBOT_HOST_DB_PATH"])
 queued, running = conn.execute(
     """
     SELECT
@@ -789,10 +817,11 @@ PY
 }
 
 pipeline_running_job_counts() {
-  python3 - <<'PY'
+  PM_ROBOT_HOST_DB_PATH="$DATA_DIR/pm_robot.sqlite" python3 - <<'PY'
+import os
 import sqlite3
 
-conn = sqlite3.connect("data/pm_robot.sqlite")
+conn = sqlite3.connect(os.environ["PM_ROBOT_HOST_DB_PATH"])
 row = conn.execute(
     """
     SELECT
@@ -1080,10 +1109,11 @@ case "$cmd" in
     compose up -d --no-deps --no-recreate copyability-worker-0 copyability-worker-1
     deadline=$(( $(date +%s) + timeout_seconds ))
     while [[ "$(date +%s)" -lt "$deadline" ]]; do
-      running_count="$(python3 - <<'PY'
+      running_count="$(PM_ROBOT_HOST_DB_PATH="$DATA_DIR/pm_robot.sqlite" python3 - <<'PY'
+import os
 import sqlite3
 
-conn = sqlite3.connect("data/pm_robot.sqlite")
+conn = sqlite3.connect(os.environ["PM_ROBOT_HOST_DB_PATH"])
 print(conn.execute(
     "SELECT COUNT(*) FROM pipeline_jobs WHERE job_type = ? AND status = ?",
     ("copyability_evidence", "running"),

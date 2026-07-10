@@ -3,12 +3,15 @@ import sqlite3
 from io import BytesIO
 from pathlib import Path
 
+import pytest
+
 from pm_robot.config import RobotSettings
 from pm_robot.ops import (
     backup_database,
     dump_database_sql,
     next_backup_delay_seconds,
     storage_report,
+    verify_backup_database,
 )
 from pm_robot.storage.db import connect, initialize_database, run_migrations
 
@@ -37,6 +40,9 @@ def test_backup_database_creates_verified_restoreable_sqlite(tmp_path):
     finally:
         restored.close()
     assert (settings.backup_dir / "pm_robot-latest.sqlite").exists()
+    verification = verify_backup_database(backup)
+    assert verification["full_check"] is False
+    assert verification["quick_check"] == "not_run"
 
 
 def test_dump_database_sql_stream_is_restoreable(tmp_path):
@@ -204,9 +210,65 @@ def test_backup_database_promotes_verified_partial_atomically(tmp_path):
         execution_mode="research",
     )
     initialize_database(settings.db_path)
+    conn = connect(settings.db_path)
+    try:
+        run_migrations(conn)
+    finally:
+        conn.close()
 
     backup = backup_database(settings)
 
     assert backup.exists()
     assert not list(settings.backup_dir.glob("*.partial"))
     assert (settings.backup_dir / "pm_robot-latest.sqlite").exists()
+
+
+def test_backup_database_supports_optional_full_integrity_scan(tmp_path):
+    settings = RobotSettings(
+        db_path=tmp_path / "data" / "robot.sqlite",
+        backup_dir=tmp_path / "backups",
+        execution_mode="research",
+    )
+    initialize_database(settings.db_path)
+    conn = connect(settings.db_path)
+    try:
+        run_migrations(conn)
+    finally:
+        conn.close()
+
+    backup = backup_database(settings, full_check=True)
+    verification = verify_backup_database(backup, full_check=True)
+
+    assert verification["full_check"] is True
+    assert verification["quick_check"] == "ok"
+
+
+def test_failed_same_second_backup_preserves_previous_verified_file(
+    tmp_path, monkeypatch
+):
+    settings = RobotSettings(
+        db_path=tmp_path / "data" / "robot.sqlite",
+        backup_dir=tmp_path / "backups",
+        execution_mode="research",
+    )
+    initialize_database(settings.db_path)
+    conn = connect(settings.db_path)
+    try:
+        run_migrations(conn)
+    finally:
+        conn.close()
+    monkeypatch.setattr(
+        "pm_robot.ops.time.strftime",
+        lambda *_args, **_kwargs: "20260711-000000",
+    )
+    first = backup_database(settings)
+
+    def fail_verification(*_args, **_kwargs):
+        raise RuntimeError("verification failed")
+
+    monkeypatch.setattr("pm_robot.ops.verify_backup_database", fail_verification)
+    with pytest.raises(RuntimeError, match="verification failed"):
+        backup_database(settings)
+
+    assert first.exists()
+    assert first.stat().st_size > 0

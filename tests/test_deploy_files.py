@@ -1033,3 +1033,24 @@ def test_nas_research_stack_runs_verified_daily_backups():
     assert "python -m pm_robot.cli --env /app/.env backup" in loop
     assert "loop_backup" in loop
     assert "runtime-heartbeat" in loop
+
+
+def test_nas_persistent_storage_can_live_outside_application_root():
+    compose = Path("deploy/nas/docker-compose.yml").read_text(encoding="utf-8")
+    execution = Path("deploy/nas/docker-compose.execution.yml").read_text(
+        encoding="utf-8"
+    )
+    env = Path("deploy/nas/env.example").read_text(encoding="utf-8")
+    helper = Path("deploy/nas/pmrobot-nas.sh").read_text(encoding="utf-8")
+
+    for container_path in ("data", "logs", "backups", "reports"):
+        mount = f"${{PM_ROBOT_STORAGE_ROOT:-.}}/{container_path}:/app/{container_path}"
+        assert mount in compose
+        assert mount in execution
+    assert "${PM_ROBOT_STORAGE_ROOT:-.}/logs:/logs" in compose
+    assert "PM_ROBOT_STORAGE_ROOT=" in env
+    assert 'storage_setting="${PM_ROBOT_STORAGE_ROOT:-' in helper
+    assert 'DATA_DIR="$STORAGE_ROOT/data"' in helper
+    assert 'REPORTS_DIR="$STORAGE_ROOT/reports"' in helper
+    assert helper.count('PM_ROBOT_STORAGE_ROOT_PATH="$STORAGE_ROOT"') >= 2
+    assert '$ROOT/data/pm_robot.sqlite' not in helper

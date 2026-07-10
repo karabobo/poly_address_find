@@ -13,10 +13,10 @@ x-pm-robot-execution-app: &pm_robot_execution_app
     - ./app/src:/app/src:ro
     - ./app/deploy:/app/deploy:ro
     - ./app/scripts:/app/scripts:ro
-    - ./data:/app/data
-    - ./logs:/app/logs
-    - ./backups:/app/backups
-    - ./reports:/app/reports
+    - ${PM_ROBOT_STORAGE_ROOT:-.}/data:/app/data
+    - ${PM_ROBOT_STORAGE_ROOT:-.}/logs:/app/logs
+    - ${PM_ROBOT_STORAGE_ROOT:-.}/backups:/app/backups
+    - ${PM_ROBOT_STORAGE_ROOT:-.}/reports:/app/reports
     - ./config:/app/config:ro
 
 services:
