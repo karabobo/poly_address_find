@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import time
 
+import pm_robot.web as web_module
 from pm_robot.config import RobotSettings
 from pm_robot.storage.db import connect, run_migrations
 from pm_robot.web import (
@@ -35,6 +36,26 @@ from pm_robot.web import (
 
 def _settings(tmp_path):
     return RobotSettings(db_path=tmp_path / "pm_robot.sqlite", execution_mode="research")
+
+
+def test_web_console_binds_before_starting_dashboard_prewarm(tmp_path, monkeypatch):
+    settings = _settings(tmp_path)
+    settings.db_path.touch()
+    events = []
+
+    class FakeServer:
+        def __init__(self, address, handler):
+            events.append(("bind", address, handler))
+
+        def serve_forever(self):
+            events.append(("serve",))
+
+    monkeypatch.setattr(web_module, "ThreadingHTTPServer", FakeServer)
+    monkeypatch.setattr(web_module, "_start_dashboard_cache_prewarm", lambda _settings: events.append(("prewarm",)))
+
+    web_module.run_web_console(web_module.WebConsoleConfig(settings=settings, host="127.0.0.1", port=8787))
+
+    assert [event[0] for event in events] == ["bind", "prewarm", "serve"]
 
 
 def _insert_l3_evidence(conn, wallet: str, *, updated_at: int) -> None:

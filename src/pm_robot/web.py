@@ -171,8 +171,8 @@ class WebConsoleConfig:
 def run_web_console(config: WebConsoleConfig) -> None:
     conn = connect_readonly(config.settings.db_path)
     conn.close()
-    _prewarm_dashboard_cache(config.settings)
     server = ThreadingHTTPServer((config.host, config.port), _handler_factory(config))
+    _start_dashboard_cache_prewarm(config.settings)
     print(f"pm-robot web console listening on http://{config.host}:{config.port}")
     server.serve_forever()
 
@@ -310,6 +310,17 @@ def _prewarm_dashboard_cache(settings: RobotSettings) -> None:
         _dashboard_data_cached(settings, force_refresh=True)
     except Exception as exc:  # pragma: no cover - startup should continue if diagnostics fail.
         print(f"pm-robot web dashboard cache prewarm skipped: {type(exc).__name__}: {exc}")
+
+
+def _start_dashboard_cache_prewarm(settings: RobotSettings) -> None:
+    """Warm expensive dashboard queries without delaying the listening socket."""
+
+    threading.Thread(
+        target=_prewarm_dashboard_cache,
+        args=(settings,),
+        name="pm-robot-dashboard-prewarm",
+        daemon=True,
+    ).start()
 
 
 def _start_dashboard_cache_refresh(
