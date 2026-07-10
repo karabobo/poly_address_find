@@ -1,3 +1,4 @@
+from pm_robot.clients.http import HttpClientError
 from pm_robot.models import CandidateAddress, WalletFeatures
 from pm_robot.orchestration.trade_role_ingestor import (
     TRADE_SAMPLE_LIMIT,
@@ -21,6 +22,20 @@ class FakeTradeClient:
     def wallet_trades(self, wallet, *, limit, taker_only, offset=0):
         assert limit == TRADE_SAMPLE_LIMIT
         return self.taker_trades if taker_only else self.all_trades
+
+
+class RateLimitedTradeClient:
+    def __init__(self):
+        self.calls = 0
+
+    def wallet_trades(self, wallet, *, limit, taker_only, offset=0):
+        self.calls += 1
+        raise HttpClientError(
+            "shared cooldown",
+            status_code=429,
+            error_type="upstream_cooldown",
+            retry_after_seconds=60.0,
+        )
 
 
 def _trades(count: int, *, prefix: str = "trade") -> list[dict]:
@@ -106,6 +121,31 @@ def test_trade_role_evidence_can_screen_wallet(tmp_path):
         assert refreshed.extra["maker_fraction_source"].startswith(
             "polymarket_data_api_trades"
         )
+    finally:
+        conn.close()
+
+
+def test_trade_role_ingestor_stops_batch_without_recording_wallet_error(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    wallets = ["0x" + "3" * 40, "0x" + "4" * 40]
+    client = RateLimitedTradeClient()
+    try:
+        run_migrations(conn)
+        for wallet in wallets:
+            _seed(conn, wallet)
+
+        summary = ingest_trade_role_evidence(
+            conn,
+            limit=2,
+            client=client,
+            now=10_000,
+        )
+
+        assert summary.status == "partial"
+        assert summary.wallets_attempted == 1
+        assert summary.wallets_succeeded == 0
+        assert client.calls == 1
+        assert conn.execute("SELECT COUNT(*) FROM wallet_trade_role_evidence").fetchone()[0] == 0
     finally:
         conn.close()
 

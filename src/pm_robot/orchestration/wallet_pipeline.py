@@ -18,6 +18,10 @@ from pm_robot.orchestration.evidence_backfill import (
     _fetch_activity_history,
     summarize_wallet_evidence,
 )
+from pm_robot.orchestration.retry_policy import (
+    is_upstream_scheduling_error,
+    upstream_aware_retry_at,
+)
 from pm_robot.pipeline_terms import (
     DEFAULT_EVIDENCE_JOB_STAGE,
     EvidenceJobStage,
@@ -363,11 +367,17 @@ def run_wallet_pipeline_worker(
                 conn.rollback()
                 error = f"{wallet}: {exc}"
             except Exception as exc:
-                failed += 1
                 status = "partial"
                 conn.rollback()
+                scheduler_deferred = is_upstream_scheduling_error(exc)
+                if not scheduler_deferred:
+                    failed += 1
                 now = int(time.time())
-                retry_at = now + min(21_600, 900 * int(job["attempts"] or 1))
+                retry_at = upstream_aware_retry_at(
+                    exc,
+                    now=now,
+                    attempts=int(job["attempts"] or 1),
+                )
                 error = f"{wallet}: {exc}"
                 retry_sqlite_locked(
                     lambda: _retry_claimed_pipeline_job(
@@ -376,12 +386,15 @@ def run_wallet_pipeline_worker(
                         worker_id=worker_id,
                         error=str(exc),
                         next_attempt_at=retry_at,
+                        count_attempt=not scheduler_deferred,
                         now=now,
                     ),
                     rollback=conn.rollback,
                     attempts=LOCK_RETRY_ATTEMPTS,
                     sleep_seconds=LOCK_RETRY_SLEEP_SECONDS,
                 )
+                if scheduler_deferred:
+                    break
         return WalletPipelineWorkerSummary(
             run_id=run_id,
             shard_index=shard_index,
@@ -437,6 +450,7 @@ def _retry_claimed_pipeline_job(
     worker_id: str,
     error: str,
     next_attempt_at: int,
+    count_attempt: bool,
     now: int,
 ) -> bool:
     retried = retry_pipeline_job(
@@ -445,6 +459,7 @@ def _retry_claimed_pipeline_job(
         worker_id=worker_id,
         error=error,
         next_attempt_at=next_attempt_at,
+        count_attempt=count_attempt,
         now=now,
     )
     if retried:

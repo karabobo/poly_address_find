@@ -274,6 +274,7 @@ def test_dashboard_data_reads_research_summaries(tmp_path):
     assert data["storage_maintenance"]["safe_command"] == "./pmrobot-nas.sh wal-truncate-window"
     assert data["storage_maintenance"]["idle_window_command"] == "./pmrobot-nas.sh wal-truncate-when-idle 7200 900 30"
     assert data["ops_health"]["address_quality"]["invalid_address_rows"] == 0
+    assert data["ops_health"]["upstream_request_budget"]["active_cooldowns"] == 0
     assert data["top_review_candidates"][0]["address"] == "0xabc0000000000000000000000000000000000001"
     assert data["top_review_candidates"][0]["leader_score"] == 55.5
     assert data["top_review_candidates"][0]["blocker_label"] == "历史证据偏薄"
@@ -2295,6 +2296,8 @@ def test_dashboard_ops_health_reports_stale_and_active_pipeline_jobs(tmp_path):
     assert "来源质量摘要" in html
     assert "观察/Paper" in html
     assert "队列吞吐" in html
+    assert "上游 API 调度" in html
+    assert "上游冷却" in html
     assert "过期 running 样本" in html
 
 

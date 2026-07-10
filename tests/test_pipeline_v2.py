@@ -2,6 +2,7 @@ import json
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier
 
+from pm_robot.clients.http import HttpClientError
 from pm_robot.models import CandidateAddress, CandidateStage
 from pm_robot.orchestration.copyability_evidence import JOB_TYPE as COPYABILITY_JOB_TYPE
 from pm_robot.orchestration.evidence_backfill import summarize_wallet_evidence
@@ -183,6 +184,55 @@ def test_pipeline_job_completion_rejects_stale_lease_owner(tmp_path):
         conn.close()
 
 
+def test_pipeline_scheduler_deferral_does_not_consume_failure_attempt(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    wallet = "0x" + "9" * 40
+    try:
+        run_migrations(conn)
+        assert enqueue_pipeline_job(
+            conn,
+            job_type=WALLET_EVIDENCE_JOB_TYPE,
+            wallet=wallet,
+            subject_key=DEFAULT_EVIDENCE_JOB_STAGE,
+            tier=EvidenceTier.L1_LIGHT.value,
+            shard=0,
+            max_attempts=3,
+            now=10_000,
+        )
+        conn.commit()
+        job = claim_pipeline_job(
+            conn,
+            job_type=WALLET_EVIDENCE_JOB_TYPE,
+            shard=0,
+            worker_id="worker-rate-limit",
+            lease_seconds=60,
+            now=10_001,
+        )
+        assert job is not None
+        assert job["attempts"] == 1
+
+        assert retry_pipeline_job(
+            conn,
+            job_id=int(job["job_id"]),
+            worker_id="worker-rate-limit",
+            error="shared upstream cooldown",
+            next_attempt_at=10_050,
+            count_attempt=False,
+            now=10_002,
+        )
+        row = conn.execute(
+            "SELECT status, attempts, next_attempt_at FROM pipeline_jobs WHERE job_id = ?",
+            (job["job_id"],),
+        ).fetchone()
+        assert dict(row) == {
+            "status": "queued",
+            "attempts": 0,
+            "next_attempt_at": 10_050,
+        }
+    finally:
+        conn.close()
+
+
 def test_concurrent_pipeline_claims_assign_one_job_once(tmp_path):
     db_path = tmp_path / "robot.sqlite"
     conn = connect(db_path)
@@ -272,6 +322,23 @@ class FakePipelineClient:
         return self.positions_by_wallet.get(wallet, [])
 
 
+class RateLimitedPipelineClient:
+    def __init__(self):
+        self.activity_calls = 0
+
+    def activity(self, wallet, *, limit, offset):
+        self.activity_calls += 1
+        raise HttpClientError(
+            "shared cooldown",
+            status_code=429,
+            error_type="upstream_cooldown",
+            retry_after_seconds=60.0,
+        )
+
+    def positions(self, wallet, *, size_threshold=0.0):
+        raise AssertionError("positions should not run after activity cooldown")
+
+
 def _seed_light_pending_state(conn, wallet: str, *, priority: int = 50, now: int = 30_000) -> None:
     upsert_candidate(conn, CandidateAddress(address=wallet, sources="polymarket_trades_global"))
     conn.execute(
@@ -286,6 +353,48 @@ def _seed_light_pending_state(conn, wallet: str, *, priority: int = 50, now: int
         """,
         (wallet, priority, now),
     )
+
+
+def test_wallet_pipeline_stops_batch_and_preserves_attempts_on_shared_cooldown(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    wallets = ["0x" + "a" * 40, "0x" + "b" * 40]
+    client = RateLimitedPipelineClient()
+    try:
+        run_migrations(conn)
+        for wallet in wallets:
+            _seed_light_pending_state(conn, wallet)
+        conn.commit()
+        plan = plan_wallet_pipeline_jobs(
+            conn,
+            light_limit=2,
+            medium_limit=0,
+            deep_limit=0,
+            shard_count=1,
+            now=40_000,
+        )
+
+        summary = run_wallet_pipeline_worker(
+            conn,
+            shard_index=0,
+            shard_count=1,
+            limit=2,
+            sleep_seconds=0,
+            client=client,
+        )
+        rows = conn.execute(
+            "SELECT status, attempts FROM pipeline_jobs ORDER BY job_id"
+        ).fetchall()
+
+        assert plan.jobs_enqueued == 2
+        assert summary.jobs_attempted == 1
+        assert summary.jobs_failed == 0
+        assert client.activity_calls == 1
+        assert [dict(row) for row in rows] == [
+            {"status": "queued", "attempts": 0},
+            {"status": "queued", "attempts": 0},
+        ]
+    finally:
+        conn.close()
 
 
 def test_wallet_pipeline_tier_thresholds():

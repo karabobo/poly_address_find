@@ -8,10 +8,12 @@ from dataclasses import dataclass
 from dataclasses import replace
 from pathlib import Path
 
+from pm_robot.clients.http import HttpClientError
 from pm_robot.clients.polymarket_public import PublicPolymarketClient
 from pm_robot.execution.paper_broker import PAPER_MAX_PRICE, PAPER_MIN_PRICE, PaperBroker
 from pm_robot.execution.paper_quote import simulate_buy_quote
 from pm_robot.models import TradeSignal
+from pm_robot.orchestration.retry_policy import is_upstream_scheduling_error
 from pm_robot.pipeline_terms import PAPER_ELIGIBLE_CANDIDATE_STAGES, PROVISIONAL_CANDIDATE_STAGES
 from pm_robot.risk.eligibility import paper_eligibility_status
 from pm_robot.storage.repository import persist_paper_signal_evaluations
@@ -153,7 +155,7 @@ def evaluate_paper_observer(
         include_review_min_score=None,
     )
     broker = PaperBroker(ledger_path=None, conn=None, max_stake_usd=safe_max_stake_usd)
-    client = client or PublicPolymarketClient()
+    client = client or PublicPolymarketClient(conn=conn)
     evaluations: list[dict[str, object]] = []
     for row in rows:
         evaluations.append(
@@ -238,13 +240,12 @@ def run_paper(
                 quote_source=quote.source,
                 quote_json=quote.raw_json,
             )
+        except HttpClientError as exc:
+            if is_upstream_scheduling_error(exc):
+                raise
+            signal = _signal_with_quote_error(signal, exc, quote_started=quote_started)
         except Exception as exc:
-            signal = replace(
-                signal,
-                quote_snapshot_at=int(time.time()),
-                quote_latency_ms=int((time.monotonic() - quote_started) * 1000),
-                quote_source=f"quote_error:{type(exc).__name__}",
-            )
+            signal = _signal_with_quote_error(signal, exc, quote_started=quote_started)
         decision = broker.evaluate(signal)
         broker.submit(signal, decision)
         if not decision.accepted:
@@ -280,14 +281,14 @@ def _evaluate_observation_row(
             quote_source=quote.source,
             quote_json=quote.raw_json,
         )
+    except HttpClientError as exc:
+        if is_upstream_scheduling_error(exc):
+            raise
+        quote_error = f"{type(exc).__name__}: {str(exc)[:180]}"
+        signal = _signal_with_quote_error(signal, exc, quote_started=quote_started)
     except Exception as exc:
         quote_error = f"{type(exc).__name__}: {str(exc)[:180]}"
-        signal = replace(
-            signal,
-            quote_snapshot_at=int(time.time()),
-            quote_latency_ms=int((time.monotonic() - quote_started) * 1000),
-            quote_source=f"quote_error:{type(exc).__name__}",
-        )
+        signal = _signal_with_quote_error(signal, exc, quote_started=quote_started)
     decision = broker.evaluate(signal)
     signal_age_sec = max(0, generated_at - signal.detected_at)
     signal_fresh = max_actionable_signal_age_sec <= 0 or signal_age_sec <= max_actionable_signal_age_sec
@@ -320,6 +321,20 @@ def _evaluate_observation_row(
         "slippage_bps": decision.slippage_bps if decision.accepted else None,
         "observer_action": "external_paper_evaluate_no_order",
     }
+
+
+def _signal_with_quote_error(
+    signal: TradeSignal,
+    error: BaseException,
+    *,
+    quote_started: float,
+) -> TradeSignal:
+    return replace(
+        signal,
+        quote_snapshot_at=int(time.time()),
+        quote_latency_ms=int((time.monotonic() - quote_started) * 1000),
+        quote_source=f"quote_error:{type(error).__name__}",
+    )
 
 
 def _actionability_reason(*, accepted: bool, signal_fresh: bool, decision_reason: str) -> str:

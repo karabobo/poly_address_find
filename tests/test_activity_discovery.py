@@ -20,6 +20,23 @@ class ForbiddenGlobalActivityClient:
         raise HttpClientError("forbidden", status_code=403, error_type="cloudflare_or_forbidden")
 
 
+class PartialRateLimitedActivityClient:
+    def __init__(self, first_page):
+        self.first_page = first_page
+        self.calls = 0
+
+    def recent_trades(self, *, limit, offset, min_cash_usdc=0.0):
+        self.calls += 1
+        if offset == 0:
+            return self.first_page
+        raise HttpClientError(
+            "shared cooldown",
+            status_code=429,
+            error_type="upstream_cooldown",
+            retry_after_seconds=60.0,
+        )
+
+
 def _activity(wallet: str, tx: str, usdc: float, market: str = "market-1") -> dict:
     return {
         "proxyWallet": wallet,
@@ -238,5 +255,31 @@ def test_discover_activity_candidates_reports_limited_when_global_activity_forbi
         assert summary.status == "limited"
         assert summary.candidates_inserted_or_updated == 0
         assert "cloudflare_or_forbidden" in summary.error
+    finally:
+        conn.close()
+
+
+def test_discovery_persists_successful_pages_before_shared_cooldown(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    wallet = "0x" + "9" * 40
+    client = PartialRateLimitedActivityClient([_activity(wallet, "0xpartial", 150)])
+    try:
+        run_migrations(conn)
+        summary = discover_activity_candidates(
+            conn,
+            pages=2,
+            page_limit=1,
+            sleep_seconds=0,
+            client=client,
+        )
+
+        assert summary.status == "partial"
+        assert summary.pages_succeeded == 1
+        assert summary.promoted_wallets == 1
+        assert client.calls == 2
+        assert conn.execute(
+            "SELECT COUNT(*) FROM candidate_wallets WHERE address = ?",
+            (wallet,),
+        ).fetchone()[0] == 1
     finally:
         conn.close()

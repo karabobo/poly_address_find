@@ -7,7 +7,9 @@ import sqlite3
 import time
 from dataclasses import dataclass
 
+from pm_robot.clients.http import HttpClientError
 from pm_robot.clients.polymarket_public import PublicPolymarketClient
+from pm_robot.orchestration.retry_policy import is_upstream_scheduling_error
 
 
 TRADE_SAMPLE_LIMIT = 10_000
@@ -34,10 +36,12 @@ def ingest_trade_role_evidence(
     client = client or PublicPolymarketClient(conn=conn)
     fetched_at = now or int(time.time())
     wallets = _targets(conn, limit)
+    attempted = 0
     succeeded = 0
     screened = 0
     error = ""
     for wallet in wallets:
+        attempted += 1
         try:
             all_trades = client.wallet_trades(
                 wallet,
@@ -76,17 +80,25 @@ def ingest_trade_role_evidence(
                 status=status,
                 fetched_at=fetched_at,
             )
+            conn.commit()
             succeeded += 1
             screened += int(status == "screened")
+        except HttpClientError as exc:
+            if is_upstream_scheduling_error(exc):
+                error = f"{wallet}: {exc}"
+                break
+            error = f"{wallet}: {exc}"
+            _persist_error(conn, wallet, str(exc), fetched_at)
+            conn.commit()
         except Exception as exc:
             error = f"{wallet}: {exc}"
             _persist_error(conn, wallet, str(exc), fetched_at)
-    conn.commit()
+            conn.commit()
     return TradeRoleIngestSummary(
-        wallets_attempted=len(wallets),
+        wallets_attempted=attempted,
         wallets_succeeded=succeeded,
         wallets_screened=screened,
-        status="ok" if succeeded == len(wallets) else "partial",
+        status="ok" if succeeded == attempted == len(wallets) else "partial",
         error=error,
     )
 

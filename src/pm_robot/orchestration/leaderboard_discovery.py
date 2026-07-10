@@ -7,8 +7,10 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
+from pm_robot.clients.http import HttpClientError
 from pm_robot.clients.polymarket_public import PublicPolymarketClient
 from pm_robot.models import CandidateAddress, WalletFeatures
+from pm_robot.orchestration.retry_policy import is_upstream_scheduling_error
 from pm_robot.storage.repository import get_wallet_features, upsert_candidate, upsert_wallet_feature
 
 
@@ -51,12 +53,19 @@ def discover_leaderboard_candidates(
     succeeded = 0
     seen: dict[str, dict[str, Any]] = {}
     error = ""
+    scheduler_deferred = False
     for metric in metrics:
         for window in windows:
             attempted += 1
             try:
                 rows = client.leaderboard(metric, window=window)
                 succeeded += 1
+            except HttpClientError as exc:
+                error = f"{metric}:{window}: {exc}"
+                if is_upstream_scheduling_error(exc):
+                    scheduler_deferred = True
+                    break
+                continue
             except Exception as exc:
                 error = f"{metric}:{window}: {exc}"
                 continue
@@ -78,12 +87,14 @@ def discover_leaderboard_candidates(
                 }
                 if not item.get("name"):
                     item["name"] = _display_name(row)
+        if scheduler_deferred:
+            break
 
     v1_attempted = 0
     v1_succeeded = 0
     normalized_limit = min(max(int(v1_limit or DEFAULT_V1_LIMIT), 1), DEFAULT_V1_LIMIT)
     normalized_pages = max(int(v1_pages or 0), 0)
-    for category in categories:
+    for category in (() if scheduler_deferred else categories):
         normalized_category = category.strip().upper()
         if not normalized_category:
             continue
@@ -106,6 +117,12 @@ def discover_leaderboard_candidates(
                             offset=page * normalized_limit,
                         )
                         v1_succeeded += 1
+                    except HttpClientError as exc:
+                        error = f"v1:{normalized_category}:{normalized_period}:{normalized_order_by}:{page}: {exc}"
+                        if is_upstream_scheduling_error(exc):
+                            scheduler_deferred = True
+                            break
+                        continue
                     except Exception as exc:
                         error = f"v1:{normalized_category}:{normalized_period}:{normalized_order_by}:{page}: {exc}"
                         continue
@@ -136,6 +153,12 @@ def discover_leaderboard_candidates(
                         }
                         if not item.get("name"):
                             item["name"] = _display_name(row)
+                if scheduler_deferred:
+                    break
+            if scheduler_deferred:
+                break
+        if scheduler_deferred:
+            break
 
     existing = get_wallet_features(conn)
     candidate_count = 0
@@ -149,6 +172,10 @@ def discover_leaderboard_candidates(
             upsert_wallet_feature(conn, feature)
             feature_count += 1
     conn.commit()
+    if scheduler_deferred:
+        status = "partial" if succeeded or v1_succeeded else "limited"
+    else:
+        status = "ok" if succeeded or v1_succeeded else "failed"
     return LeaderboardDiscoverySummary(
         snapshots_attempted=attempted,
         snapshots_succeeded=succeeded,
@@ -157,7 +184,7 @@ def discover_leaderboard_candidates(
         candidates_seen=len(seen),
         candidates_inserted_or_updated=candidate_count,
         features_updated=feature_count,
-        status="ok" if succeeded or v1_succeeded else "failed",
+        status=status,
         error=error,
     )
 

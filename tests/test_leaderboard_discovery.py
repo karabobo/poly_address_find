@@ -1,3 +1,4 @@
+from pm_robot.clients.http import HttpClientError
 from pm_robot.orchestration.leaderboard_discovery import discover_leaderboard_candidates
 from pm_robot.storage.db import connect, run_migrations
 from pm_robot.storage.repository import get_wallet_features
@@ -36,6 +37,23 @@ class FakeLeaderboardClient:
                 }
             ]
         return []
+
+
+class RateLimitedLeaderboardClient:
+    def __init__(self):
+        self.calls = 0
+
+    def leaderboard(self, metric, *, window):
+        self.calls += 1
+        raise HttpClientError(
+            "shared cooldown",
+            status_code=429,
+            error_type="upstream_cooldown",
+            retry_after_seconds=60.0,
+        )
+
+    def trader_leaderboard(self, **kwargs):
+        raise AssertionError("v1 discovery should not run during shared cooldown")
 
 
 def test_discover_leaderboard_candidates_imports_official_v1_category_rankings(tmp_path):
@@ -81,5 +99,29 @@ def test_discover_leaderboard_candidates_imports_official_v1_category_rankings(t
             ("OVERALL", "MONTH", "PNL", 50, 0),
             ("OVERALL", "MONTH", "VOL", 50, 0),
         ]
+    finally:
+        conn.close()
+
+
+def test_leaderboard_discovery_stops_batch_on_shared_cooldown(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    client = RateLimitedLeaderboardClient()
+    try:
+        run_migrations(conn)
+        summary = discover_leaderboard_candidates(
+            conn,
+            metrics=("profit", "volume"),
+            windows=("1d", "7d"),
+            categories=("OVERALL",),
+            time_periods=("MONTH",),
+            order_bys=("PNL",),
+            v1_pages=1,
+            client=client,
+        )
+
+        assert summary.status == "limited"
+        assert summary.snapshots_attempted == 1
+        assert summary.v1_snapshots_attempted == 0
+        assert client.calls == 1
     finally:
         conn.close()

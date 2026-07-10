@@ -90,6 +90,15 @@ default `up`, `restart`, `runtime-ensure`, or watchdog commands.
 - Workers renew leases around long work and can only complete or retry jobs they still own.
 - Maintenance requeues expired leases and stale runtime records.
 - Planner backpressure limits queued/running wallet evidence jobs.
+- Public Polymarket HTTP clients reserve global and endpoint request slots atomically through the shared
+  `api_rate_limit_state` table, while retaining the existing per-process limiter.
+- HTTP `429 Retry-After` cooldowns are shared across containers. Short waits are handled in the HTTP client;
+  waits longer than 30 seconds return to the queue scheduler so workers do not hold leases while sleeping.
+- Upstream cooldown and coordination deferrals do not consume a wallet job's failure-attempt budget, and the
+  worker stops the current batch instead of churning through more wallets during the same cooldown. Run
+  summaries count only wallets actually attempted and do not classify scheduler deferrals as job failures.
+- Shared limiter lock contention defers the caller instead of allowing an uncoordinated request. The
+  coordination transaction uses a short timeout and never contains network I/O or sleep.
 - Daily online SQLite backups are integrity-checked; the dashboard warns when no backup exists or the latest
   backup is older than the configured freshness window.
 - `paper_candidate` and `live_eligible` are research states, never implicit permission to place real orders.
@@ -97,6 +106,5 @@ default `up`, `restart`, `runtime-ensure`, or watchdog commands.
 ## Current Follow-Up Work
 
 - Verify proxy reachability and logical loop liveness from the NAS runtime, not only container presence.
-- Show failed queue samples and per-wallet job history in the web console.
-- Add a shared cross-container upstream API budget and cooldown for rate-limit responses.
+- Measure shared request-budget write latency under the real NAS worker count before increasing concurrency.
 - Validate the complete Compose stack and backup schedule on the NAS after network access is restored.

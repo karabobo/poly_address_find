@@ -706,6 +706,7 @@ def retry_evidence_backfill_job(
     error: str,
     next_attempt_at: int,
     failed: bool = False,
+    count_attempt: bool = True,
     now: int | None = None,
 ) -> None:
     ts = now or int(time.time())
@@ -717,10 +718,18 @@ def retry_evidence_backfill_job(
             lease_until = 0,
             next_attempt_at = ?,
             last_error = ?,
+            attempts = CASE WHEN ? THEN attempts ELSE MAX(0, attempts - 1) END,
             updated_at = ?
         WHERE job_id = ?
         """,
-        ("failed" if failed else "queued", next_attempt_at, error[:1000], ts, job_id),
+        (
+            "failed" if failed else "queued",
+            next_attempt_at,
+            error[:1000],
+            1 if count_attempt else 0,
+            ts,
+            job_id,
+        ),
     )
 
 
@@ -1362,16 +1371,21 @@ def retry_pipeline_job(
     worker_id: str,
     error: str,
     next_attempt_at: int,
+    count_attempt: bool = True,
     now: int | None = None,
 ) -> bool:
     """Release a failed job only when the caller still owns its lease."""
     ts = now or int(time.time())
     row = conn.execute("SELECT attempts, max_attempts FROM pipeline_jobs WHERE job_id = ?", (job_id,)).fetchone()
-    failed = bool(row and int(row["attempts"] or 0) >= int(row["max_attempts"] or 3))
+    attempts = int(row["attempts"] or 0) if row else 0
+    if not count_attempt:
+        attempts = max(0, attempts - 1)
+    failed = bool(row and attempts >= int(row["max_attempts"] or 3))
     params: tuple[Any, ...] = (
         "failed" if failed else "queued",
         next_attempt_at,
         error[:1000],
+        1 if count_attempt else 0,
         ts,
         job_id,
         worker_id,
@@ -1384,6 +1398,7 @@ def retry_pipeline_job(
             lease_until = 0,
             next_attempt_at = ?,
             last_error = ?,
+            attempts = CASE WHEN ? THEN attempts ELSE MAX(0, attempts - 1) END,
             updated_at = ?
         WHERE job_id = ?
           AND status = 'running'

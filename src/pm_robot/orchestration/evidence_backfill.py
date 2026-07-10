@@ -11,6 +11,10 @@ from statistics import median
 from typing import Any
 
 from pm_robot.clients.polymarket_public import PublicPolymarketClient
+from pm_robot.orchestration.retry_policy import (
+    is_upstream_scheduling_error,
+    upstream_aware_retry_at,
+)
 from pm_robot.pipeline_terms import (
     DEFAULT_EVIDENCE_JOB_STAGE,
     EvidenceJobStage,
@@ -256,7 +260,7 @@ def run_queued_evidence_backfill_worker(
         raise ValueError("shard_count must be positive")
     if shard_index < 0 or shard_index >= shard_count:
         raise ValueError("shard_index must be in [0, shard_count)")
-    client = client or PublicPolymarketClient()
+    client = client or PublicPolymarketClient(conn=conn)
     worker_id = worker_id or f"evidence-worker-{shard_index}-{int(time.time())}"
     run_id = start_ingest_run(conn, f"evidence_backfill_worker_{shard_index}")
     attempted = 0
@@ -337,21 +341,30 @@ def run_queued_evidence_backfill_worker(
                 conn.commit()
                 succeeded += 1
             except Exception as exc:
-                failed += 1
                 status = "partial"
                 attempts = int(job["attempts"] or 1)
+                scheduler_deferred = is_upstream_scheduling_error(exc)
+                if not scheduler_deferred:
+                    failed += 1
                 now = int(time.time())
-                retry_at = now + min(21_600, 900 * attempts)
+                retry_at = upstream_aware_retry_at(
+                    exc,
+                    now=now,
+                    attempts=attempts,
+                )
                 error = f"{wallet}: {exc}"
                 retry_evidence_backfill_job(
                     conn,
                     job_id=int(job["job_id"]),
                     error=str(exc),
                     next_attempt_at=retry_at,
-                    failed=attempts >= max_attempts,
+                    failed=not scheduler_deferred and attempts >= max_attempts,
+                    count_attempt=not scheduler_deferred,
                     now=now,
                 )
                 conn.commit()
+                if scheduler_deferred:
+                    break
         return QueuedBackfillWorkerSummary(
             run_id=run_id,
             shard_index=shard_index,
@@ -416,6 +429,7 @@ def run_evidence_backfill(
         medium_limit=medium_limit,
         deep_limit=deep_limit,
     )
+    attempted = 0
     succeeded = 0
     activity_events_written = 0
     positions_written = 0
@@ -425,6 +439,7 @@ def run_evidence_backfill(
     error = ""
     try:
         for idx, target in enumerate(targets):
+            attempted += 1
             if idx > 0 and sleep_seconds > 0:
                 time.sleep(sleep_seconds)
             wallet = str(target["wallet"])
@@ -485,8 +500,14 @@ def run_evidence_backfill(
                 stage_updates[next_stage] = stage_updates.get(next_stage, 0) + 1
             except Exception as exc:
                 status = "partial"
+                scheduler_deferred = is_upstream_scheduling_error(exc)
                 now = int(time.time())
-                retry_at = now + min(21_600, 1_800 * (int(target["error_count"] or 0) + 1))
+                retry_at = upstream_aware_retry_at(
+                    exc,
+                    now=now,
+                    attempts=int(target["error_count"] or 0) + 1,
+                    base_delay_seconds=1_800,
+                )
                 error = f"{wallet}: {exc}"
                 update_evidence_backfill_budget(
                     conn,
@@ -494,15 +515,18 @@ def run_evidence_backfill(
                     stage=str(target["stage"]),
                     target_depth=target_depth,
                     current_depth=int(target["activity_count"] or 0),
-                    error=str(exc),
+                    stop_reason="upstream_scheduler_deferred" if scheduler_deferred else "",
+                    error="" if scheduler_deferred else str(exc),
                     next_attempt_at=retry_at,
                     now=now,
                 )
                 conn.commit()
+                if scheduler_deferred:
+                    break
         return EvidenceBackfillSummary(
             run_id=run_id,
             seeded=seeded,
-            wallets_attempted=len(targets),
+            wallets_attempted=attempted,
             wallets_succeeded=succeeded,
             activity_events_written=activity_events_written,
             positions_written=positions_written,
@@ -517,7 +541,7 @@ def run_evidence_backfill(
         return EvidenceBackfillSummary(
             run_id=run_id,
             seeded=seeded,
-            wallets_attempted=len(targets),
+            wallets_attempted=attempted,
             wallets_succeeded=succeeded,
             activity_events_written=activity_events_written,
             positions_written=positions_written,
@@ -531,7 +555,7 @@ def run_evidence_backfill(
             conn,
             run_id,
             status=status,
-            wallets_attempted=len(targets),
+            wallets_attempted=attempted,
             wallets_succeeded=succeeded,
             rows_written=activity_events_written + positions_written,
             error=error,

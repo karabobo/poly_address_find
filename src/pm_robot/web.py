@@ -47,6 +47,7 @@ from pm_robot.pipeline_terms import (
     EvidenceTier,
     PipelineJobType,
 )
+from pm_robot.storage.api_rate_limit import api_rate_limit_summary
 from pm_robot.storage.db import connect_readonly
 from pm_robot.storage.repository import evidence_backfill_summary
 
@@ -3645,6 +3646,11 @@ def _ops_health_summary(conn: sqlite3.Connection, settings: RobotSettings) -> di
     address_quality = _address_quality_fast_report(conn)
     pipeline_backlog = _pending_evidence_backlog_summary(conn)
     runtime_loops = _runtime_loop_summary(conn, now=now)
+    upstream_request_budget = (
+        api_rate_limit_summary(conn, now=now)
+        if _table_exists(conn, "api_rate_limit_state")
+        else {"scope_count": 0, "active_cooldowns": 0, "total_cooldowns": 0, "rows": []}
+    )
     job_status = _rows(
         conn,
         """
@@ -3739,6 +3745,7 @@ def _ops_health_summary(conn: sqlite3.Connection, settings: RobotSettings) -> di
         "address_quality": address_quality,
         "runtime": _runtime_build_info(),
         "runtime_loops": runtime_loops,
+        "upstream_request_budget": upstream_request_budget,
         "storage": storage,
         "pipeline_backlog": pipeline_backlog,
         "job_status": job_status,
@@ -7694,6 +7701,7 @@ def _ops_health_panel(values: dict[str, Any]) -> str:
     address_quality = values.get("address_quality") or {}
     runtime = values.get("runtime") or {}
     runtime_loops = values.get("runtime_loops") or {}
+    upstream_request_budget = values.get("upstream_request_budget") or {}
     pipeline_backlog = values.get("pipeline_backlog") or {}
     health = str(values.get("health") or "ok")
     invalid_address_rows = int(address_quality.get("invalid_address_rows") or 0)
@@ -7724,6 +7732,12 @@ def _ops_health_panel(values: dict[str, Any]) -> str:
         ("WAL", _fmt_bytes(int(storage.get("wal_bytes") or 0)), "写入日志", "warn" if int(storage.get("wal_bytes") or 0) >= 1_000_000_000 else "ok"),
         ("地址质量", _fmt_int(invalid_address_rows), "非标准钱包地址", "warn" if invalid_address_rows else "ok"),
         ("过期队列", _fmt_int(values.get("stale_running_count")), "running lease 已过期", "warn" if int(values.get("stale_running_count") or 0) else "ok"),
+        (
+            "上游冷却",
+            _fmt_int(upstream_request_budget.get("active_cooldowns")),
+            f"{_fmt_int(upstream_request_budget.get('scope_count'))} 个共享预算",
+            "warn" if int(upstream_request_budget.get("active_cooldowns") or 0) else "ok",
+        ),
         ("高优先级漏派", _fmt_int(high_priority_backlog), f"priority <= {priority_threshold}", "warn" if high_priority_backlog else "ok"),
         ("待派 backlog", _fmt_int(pending_backlog), "未进入活动队列", "ok"),
         ("可用空间", _fmt_bytes(int(storage.get("free_disk_bytes") or 0)), "NAS 数据卷", "ok"),
@@ -7771,6 +7785,21 @@ def _ops_health_panel(values: dict[str, Any]) -> str:
                 "latest_completed_at",
             ],
             ["队列", "排队", "运行", "近1h完成", "近24h完成", "估算/小时", "粗略剩余", "最近完成"],
+        ),
+        '<h3 class="subhead">上游 API 调度</h3>'
+        + _simple_table(
+            upstream_request_budget.get("rows") or [],
+            [
+                "scope",
+                "state",
+                "rate",
+                "cooldown_remaining_seconds",
+                "total_permits",
+                "total_cooldowns",
+                "last_status_code",
+                "updated_at",
+            ],
+            ["预算", "状态", "速率", "冷却秒", "许可", "冷却次数", "最近状态码", "更新"],
         ),
     ]
     if values.get("stale_running_samples"):

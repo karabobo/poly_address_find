@@ -1,5 +1,6 @@
 import json
 
+from pm_robot.clients.http import HttpClientError
 from pm_robot.models import CandidateAddress, CandidateStage
 from pm_robot.orchestration.activity_ingestor import _fetch_wallet_activity, ingest_activity
 from pm_robot.storage.db import connect, run_migrations
@@ -14,6 +15,20 @@ class FakeActivityClient:
     def activity(self, wallet, *, limit, offset):
         self.calls.append((wallet, limit, offset))
         return self.pages.get(offset, [])
+
+
+class RateLimitedActivityClient:
+    def __init__(self):
+        self.calls = 0
+
+    def activity(self, wallet, *, limit, offset):
+        self.calls += 1
+        raise HttpClientError(
+            "shared cooldown",
+            status_code=429,
+            error_type="upstream_cooldown",
+            retry_after_seconds=60.0,
+        )
 
 
 def _event(ts: int, tx: str) -> dict:
@@ -133,5 +148,39 @@ def test_ingest_activity_marks_general_poll_source(tmp_path):
         assert summary.status == "ok"
         assert summary.events_written == 1
         assert json.loads(raw)["source"] == "wallet_activity_poll"
+    finally:
+        conn.close()
+
+
+def test_activity_ingestor_stops_wallet_batch_on_shared_cooldown(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    client = RateLimitedActivityClient()
+    try:
+        run_migrations(conn)
+        for suffix in ("d", "e"):
+            upsert_candidate(
+                conn,
+                CandidateAddress(address="0x" + suffix * 40, sources="test"),
+            )
+        conn.commit()
+
+        summary = ingest_activity(
+            conn,
+            wallet_limit=2,
+            page_limit=10,
+            max_events_per_wallet=10,
+            sleep_seconds=0,
+            client=client,
+        )
+
+        assert summary.status == "partial"
+        assert summary.wallets_attempted == 1
+        assert summary.wallets_succeeded == 0
+        assert client.calls == 1
+        run = conn.execute(
+            "SELECT wallets_attempted FROM ingest_runs WHERE run_id = ?",
+            (summary.run_id,),
+        ).fetchone()
+        assert run["wallets_attempted"] == 1
     finally:
         conn.close()

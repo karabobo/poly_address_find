@@ -1,5 +1,6 @@
 from dataclasses import replace
 
+from pm_robot.clients.http import HttpClientError
 from pm_robot.execution.paper_broker import PaperBroker
 from pm_robot.execution.paper_portfolio import settle_paper_portfolio
 from pm_robot.models import CandidateAddress
@@ -52,6 +53,20 @@ class ClosedGammaClient(FakeGammaClient):
         return market
 
 
+class RateLimitedGammaClient:
+    def __init__(self):
+        self.calls = 0
+
+    def market_by_slug(self, slug):
+        self.calls += 1
+        raise HttpClientError(
+            "shared cooldown",
+            status_code=429,
+            error_type="upstream_cooldown",
+            retry_after_seconds=60.0,
+        )
+
+
 def test_gamma_market_ingestor_caches_referenced_slug(tmp_path):
     conn = connect(tmp_path / "robot.sqlite")
     wallet = "0x" + "8" * 40
@@ -87,6 +102,56 @@ def test_gamma_market_ingestor_caches_referenced_slug(tmp_path):
         assert summary.rows_written == 1
         assert cache["referenced_market_slugs"] == 1
         assert cache["cached_markets"] == 1
+    finally:
+        conn.close()
+
+
+def test_gamma_ingestor_stops_market_batch_on_shared_cooldown(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    wallet = "0x" + "9" * 40
+    client = RateLimitedGammaClient()
+    try:
+        run_migrations(conn)
+        upsert_candidate(conn, CandidateAddress(address=wallet, sources="test"))
+        persist_wallet_activity(
+            conn,
+            wallet,
+            [
+                {
+                    "timestamp": 1_000 + idx,
+                    "conditionId": f"condition-{idx}",
+                    "eventSlug": f"event-{idx}",
+                    "slug": f"market-{idx}",
+                    "asset": f"asset-{idx}",
+                    "outcome": "YES",
+                    "type": "TRADE",
+                    "side": "BUY",
+                    "price": 0.5,
+                    "size": 10,
+                    "usdcSize": 5,
+                    "transactionHash": f"0xhash-{idx}",
+                }
+                for idx in range(2)
+            ],
+            ingested_at=2_000,
+        )
+
+        summary = ingest_gamma_markets(
+            conn,
+            limit=2,
+            sleep_seconds=0,
+            client=client,
+        )
+
+        assert summary.status == "partial"
+        assert summary.markets_attempted == 1
+        assert summary.markets_succeeded == 0
+        assert client.calls == 1
+        run = conn.execute(
+            "SELECT wallets_attempted FROM ingest_runs WHERE run_id = ?",
+            (summary.run_id,),
+        ).fetchone()
+        assert run["wallets_attempted"] == 1
     finally:
         conn.close()
 

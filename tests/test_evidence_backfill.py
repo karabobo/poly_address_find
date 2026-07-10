@@ -1,3 +1,6 @@
+import time
+
+from pm_robot.clients.http import HttpClientError
 from pm_robot.models import CandidateAddress, CandidateStage, ScoreBreakdown
 from pm_robot.orchestration.evidence_backfill import (
     plan_queued_evidence_backfill,
@@ -26,6 +29,19 @@ class FakeEvidenceClient:
     def positions(self, wallet, *, size_threshold=0.0):
         self.position_calls.append((wallet, size_threshold))
         return self.positions_by_wallet.get(wallet, [])
+
+
+class RateLimitedEvidenceClient:
+    def activity(self, wallet, *, limit, offset):
+        raise HttpClientError(
+            "shared cooldown",
+            status_code=429,
+            error_type="upstream_cooldown",
+            retry_after_seconds=60.0,
+        )
+
+    def positions(self, wallet, *, size_threshold=0.0):
+        raise AssertionError("positions should not run after activity cooldown")
 
 
 def _event(wallet: str, idx: int, *, market: str) -> dict:
@@ -110,6 +126,37 @@ def test_evidence_backfill_pauses_fast_market_specialist(tmp_path):
         assert budget["stage"] == "paused_fast_market_specialist"
         assert budget["stop_reason"] == "fast_market_specialist"
         assert evidence["fast_market_share"] == 1.0
+    finally:
+        conn.close()
+
+
+def test_direct_evidence_backfill_reports_actual_attempts_on_shared_cooldown(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    try:
+        run_migrations(conn)
+        for suffix in ("6", "7"):
+            wallet = "0x" + suffix * 40
+            upsert_candidate(conn, CandidateAddress(address=wallet, sources="test"))
+            seed_evidence_backfill_budget(conn, wallet, source="test", priority=20)
+        conn.commit()
+
+        summary = run_evidence_backfill(
+            conn,
+            light_limit=2,
+            medium_limit=0,
+            deep_limit=0,
+            sleep_seconds=0,
+            client=RateLimitedEvidenceClient(),
+        )
+
+        assert summary.status == "partial"
+        assert summary.wallets_attempted == 1
+        assert summary.wallets_succeeded == 0
+        run = conn.execute(
+            "SELECT wallets_attempted FROM ingest_runs WHERE run_id = ?",
+            (summary.run_id,),
+        ).fetchone()
+        assert run["wallets_attempted"] == 1
     finally:
         conn.close()
 
@@ -229,5 +276,43 @@ def test_queued_evidence_backfill_plans_and_processes_shards(tmp_path):
         assert sum(summary.positions_written for summary in summaries) == 2
         assert after["statuses"] == [{"status": "done", "count": 2}]
         assert {budget["stage"] for budget in budgets} == {"medium_pending"}
+    finally:
+        conn.close()
+
+
+def test_legacy_evidence_queue_deferral_does_not_consume_attempt(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    wallet = "0x" + "8" * 40
+    try:
+        run_migrations(conn)
+        upsert_candidate(conn, CandidateAddress(address=wallet, sources="test"))
+        seed_evidence_backfill_budget(conn, wallet, source="test", priority=20)
+        conn.commit()
+        plan_queued_evidence_backfill(
+            conn,
+            light_limit=1,
+            medium_limit=0,
+            deep_limit=0,
+            shard_count=1,
+            now=int(time.time()),
+        )
+
+        summary = run_queued_evidence_backfill_worker(
+            conn,
+            shard_index=0,
+            shard_count=1,
+            limit=1,
+            sleep_seconds=0,
+            client=RateLimitedEvidenceClient(),
+        )
+        job = conn.execute(
+            "SELECT status, attempts, next_attempt_at FROM evidence_backfill_jobs WHERE wallet = ?",
+            (wallet,),
+        ).fetchone()
+
+        assert summary.jobs_failed == 0
+        assert job["status"] == "queued"
+        assert job["attempts"] == 0
+        assert job["next_attempt_at"] > int(time.time())
     finally:
         conn.close()

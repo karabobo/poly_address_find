@@ -13,6 +13,7 @@ from typing import Any, BinaryIO
 
 from pm_robot.config import RobotSettings
 from pm_robot.risk.eligibility import winner_library_eligibility_status
+from pm_robot.storage.api_rate_limit import api_rate_limit_summary
 from pm_robot.storage.db import connect, connect_readonly, is_sqlite_locked_error, run_migrations
 from pm_robot.storage.repository import api_request_summary
 
@@ -197,6 +198,8 @@ def health_check(settings: RobotSettings) -> dict[str, Any]:
             result["production_readiness"] = _production_readiness(conn, tables)
             if "api_request_log" in tables:
                 result["api_requests_1h"] = api_request_summary(conn, since_seconds=3600)
+            if "api_rate_limit_state" in tables:
+                result["upstream_request_budget"] = api_rate_limit_summary(conn)
             result["storage"] = storage_report(settings)
         finally:
             conn.close()

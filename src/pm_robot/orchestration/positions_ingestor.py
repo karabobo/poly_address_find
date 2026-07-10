@@ -6,7 +6,9 @@ import sqlite3
 import time
 from dataclasses import dataclass
 
+from pm_robot.clients.http import HttpClientError
 from pm_robot.clients.polymarket_public import PublicPolymarketClient
+from pm_robot.orchestration.retry_policy import is_upstream_scheduling_error
 from pm_robot.storage.repository import (
     finish_ingest_run,
     list_ingest_targets,
@@ -36,12 +38,14 @@ def ingest_positions(
     client = client or PublicPolymarketClient(conn=conn)
     run_id = start_ingest_run(conn, "positions")
     wallets = list_ingest_targets(conn, limit=limit)
+    attempted = 0
     succeeded = 0
     rows_written = 0
     error = ""
     status = "ok"
     try:
         for idx, wallet in enumerate(wallets):
+            attempted += 1
             if idx > 0 and sleep_seconds > 0:
                 time.sleep(sleep_seconds)
             try:
@@ -54,20 +58,25 @@ def ingest_positions(
                     captured_at=captured_at,
                 )
                 succeeded += 1
+            except HttpClientError as exc:
+                error = f"{wallet}: {exc}"
+                if is_upstream_scheduling_error(exc):
+                    status = "partial"
+                    break
             except Exception as exc:
                 # Keep running; a single bad wallet/API response should not stop the batch.
                 error = f"{wallet}: {exc}"
-        return IngestSummary(run_id, len(wallets), succeeded, rows_written, status, error)
+        return IngestSummary(run_id, attempted, succeeded, rows_written, status, error)
     except Exception as exc:
         status = "failed"
         error = str(exc)
-        return IngestSummary(run_id, len(wallets), succeeded, rows_written, status, error)
+        return IngestSummary(run_id, attempted, succeeded, rows_written, status, error)
     finally:
         finish_ingest_run(
             conn,
             run_id,
             status=status,
-            wallets_attempted=len(wallets),
+            wallets_attempted=attempted,
             wallets_succeeded=succeeded,
             rows_written=rows_written,
             error=error,

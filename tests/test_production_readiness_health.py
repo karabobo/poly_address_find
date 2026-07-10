@@ -21,5 +21,7 @@ def test_health_reports_business_closure_separately_from_operational_health(tmp_
     result = health_check(settings)
 
     assert result["ok"] is True
+    assert result["upstream_request_budget"]["scope_count"] == 0
+    assert result["upstream_request_budget"]["active_cooldowns"] == 0
     assert result["production_readiness"]["closed"] is False
     assert "no_active_published_leaders" in result["production_readiness"]["blockers"]

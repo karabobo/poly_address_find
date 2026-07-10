@@ -59,6 +59,7 @@ def discover_activity_candidates(
     events_seen = 0
     wallets: dict[str, dict[str, Any]] = {}
     error = ""
+    fetch_status = ""
 
     for page in range(max(pages, 0)):
         attempted += 1
@@ -72,23 +73,17 @@ def discover_activity_candidates(
             )
         except HttpClientError as exc:
             error = f"recent_trades:{exc.error_type}:{exc.status_code or ''}:{exc}"
-            status = "limited" if exc.status_code in {400, 403, 429, 503} else "partial" if succeeded else "failed"
-            return _summary(attempted, succeeded, events_seen, wallets, 0, 0, 0, 0, status, error, output_path="")
+            if succeeded:
+                fetch_status = "partial"
+            elif exc.status_code in {400, 403, 429, 503}:
+                fetch_status = "limited"
+            else:
+                fetch_status = "failed"
+            break
         except Exception as exc:
             error = f"recent_trades:{exc}"
-            return _summary(
-                attempted,
-                succeeded,
-                events_seen,
-                wallets,
-                0,
-                0,
-                0,
-                0,
-                "partial" if succeeded else "failed",
-                error,
-                output_path="",
-            )
+            fetch_status = "partial" if succeeded else "failed"
+            break
         succeeded += 1
         if not rows:
             break
@@ -128,7 +123,7 @@ def discover_activity_candidates(
         result["features"],
         result["observed"],
         result["promoted"],
-        "ok" if succeeded else "failed",
+        fetch_status or ("ok" if succeeded else "failed"),
         error,
         output_path=str(output_path or ""),
     )

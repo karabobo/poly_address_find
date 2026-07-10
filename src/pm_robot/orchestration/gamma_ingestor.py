@@ -6,7 +6,9 @@ import sqlite3
 import time
 from dataclasses import dataclass
 
+from pm_robot.clients.http import HttpClientError
 from pm_robot.clients.polymarket_public import PublicPolymarketClient
+from pm_robot.orchestration.retry_policy import is_upstream_scheduling_error
 from pm_robot.storage.repository import (
     finish_ingest_run,
     list_gamma_market_backfill_targets,
@@ -43,6 +45,7 @@ def ingest_gamma_markets(
     client = client or PublicPolymarketClient(conn=conn)
     run_id = start_ingest_run(conn, "gamma_markets")
     slugs = list_gamma_market_backfill_targets(conn, limit=limit, paper_only=paper_only)
+    attempted = 0
     succeeded = 0
     failures_cached = 0
     rows_written = 0
@@ -52,6 +55,7 @@ def ingest_gamma_markets(
     status = "ok"
     try:
         for idx, slug in enumerate(slugs):
+            attempted += 1
             if idx > 0 and sleep_seconds > 0:
                 time.sleep(sleep_seconds)
             try:
@@ -78,6 +82,20 @@ def ingest_gamma_markets(
                     closed_slugs.add(slug)
                 succeeded += 1
                 rows_written += 1
+            except HttpClientError as exc:
+                error = f"{slug}: {exc}"
+                if is_upstream_scheduling_error(exc):
+                    status = "partial"
+                    break
+                if _should_cache_failure(exc):
+                    upsert_gamma_market_failure(
+                        conn,
+                        market_slug=slug,
+                        error=str(exc),
+                        fetched_at=int(time.time()),
+                        ttl_seconds=failure_ttl_seconds,
+                    )
+                    failures_cached += 1
             except Exception as exc:
                 error = f"{slug}: {exc}"
                 if _should_cache_failure(exc):
@@ -96,7 +114,7 @@ def ingest_gamma_markets(
         )
         return GammaIngestSummary(
             run_id,
-            len(slugs),
+            attempted,
             succeeded,
             failures_cached,
             rows_written,
@@ -109,7 +127,7 @@ def ingest_gamma_markets(
         error = str(exc)
         return GammaIngestSummary(
             run_id,
-            len(slugs),
+            attempted,
             succeeded,
             failures_cached,
             rows_written,
@@ -122,7 +140,7 @@ def ingest_gamma_markets(
             conn,
             run_id,
             status=status,
-            wallets_attempted=len(slugs),
+            wallets_attempted=attempted,
             wallets_succeeded=succeeded,
             rows_written=rows_written,
             error=error,

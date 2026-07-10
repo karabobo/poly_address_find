@@ -2,6 +2,9 @@ import time
 import json
 import sys
 
+import pytest
+
+from pm_robot.clients.http import HttpClientError
 from pm_robot.cli import main
 from pm_robot.models import CandidateAddress, CandidateStage, WalletFeatures
 from pm_robot.orchestration.paper_runner import evaluate_paper_observer, preview_paper_observer, run_paper
@@ -18,6 +21,20 @@ class StaticBookClient:
 
 
 BOOK_CLIENT = StaticBookClient()
+
+
+class RateLimitedBookClient:
+    def __init__(self):
+        self.calls = 0
+
+    def book(self, token_id: str) -> dict:
+        self.calls += 1
+        raise HttpClientError(
+            "shared cooldown",
+            status_code=429,
+            error_type="upstream_cooldown",
+            retry_after_seconds=60.0,
+        )
 
 
 def _candidate_address(suffix: str) -> str:
@@ -117,6 +134,44 @@ def test_paper_runner_ignores_unapproved_candidate(tmp_path):
         assert summary.signals_seen == 0
         assert summary.orders_recorded == 0
         assert count == 0
+    finally:
+        conn.close()
+
+
+def test_paper_runner_propagates_upstream_cooldown_without_writing_order(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    client = RateLimitedBookClient()
+    try:
+        run_migrations(conn)
+        address = _candidate_address("6")
+        upsert_candidate(conn, CandidateAddress(address=address, sources="test"))
+        _seed_paper_eligibility(conn, address)
+
+        with pytest.raises(HttpClientError) as captured:
+            run_paper(conn, ledger_path=None, limit=10, client=client)
+
+        assert captured.value.status_code == 429
+        assert client.calls == 1
+        assert conn.execute("SELECT COUNT(*) FROM paper_orders").fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+def test_paper_observer_propagates_upstream_cooldown_without_persisting(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    client = RateLimitedBookClient()
+    try:
+        run_migrations(conn)
+        address = _candidate_address("7")
+        upsert_candidate(conn, CandidateAddress(address=address, sources="test"))
+        _seed_paper_eligibility(conn, address, stage=CandidateStage.PAPER_APPROVED)
+
+        with pytest.raises(HttpClientError) as captured:
+            evaluate_paper_observer(conn, limit=10, persist=True, client=client)
+
+        assert captured.value.status_code == 429
+        assert client.calls == 1
+        assert conn.execute("SELECT COUNT(*) FROM paper_signal_evaluations").fetchone()[0] == 0
     finally:
         conn.close()
 
@@ -476,7 +531,10 @@ def test_paper_observer_evaluate_cli_exports_json_without_writing_orders(tmp_pat
         conn.close()
 
     out = tmp_path / "paper_observer_evaluation.json"
-    monkeypatch.setattr("pm_robot.orchestration.paper_runner.PublicPolymarketClient", lambda: BOOK_CLIENT)
+    monkeypatch.setattr(
+        "pm_robot.orchestration.paper_runner.PublicPolymarketClient",
+        lambda **kwargs: BOOK_CLIENT,
+    )
     monkeypatch.setattr(
         sys,
         "argv",
@@ -526,7 +584,10 @@ def test_paper_observer_evaluate_cli_can_persist_without_writing_orders(tmp_path
         conn.close()
 
     out = tmp_path / "paper_observer_evaluation.json"
-    monkeypatch.setattr("pm_robot.orchestration.paper_runner.PublicPolymarketClient", lambda: BOOK_CLIENT)
+    monkeypatch.setattr(
+        "pm_robot.orchestration.paper_runner.PublicPolymarketClient",
+        lambda **kwargs: BOOK_CLIENT,
+    )
     monkeypatch.setattr(
         sys,
         "argv",

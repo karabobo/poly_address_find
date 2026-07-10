@@ -6,23 +6,41 @@ import json
 import sqlite3
 import time
 from dataclasses import dataclass, field
+from datetime import timezone
+from email.utils import parsedate_to_datetime
 from threading import Lock
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
+from pm_robot.storage.api_rate_limit import (
+    RateLimitScope,
+    SharedApiRateLimiter,
+    SharedRateLimitDeferred,
+    SharedRateLimitUnavailable,
+    writable_sqlite_main_database_path,
+)
 from pm_robot.storage.repository import log_api_request
 
 
 USER_AGENT = "pm-robot/0.1"
+MAX_RETRY_AFTER_SECONDS = 3_600.0
 
 
 class HttpClientError(RuntimeError):
-    def __init__(self, message: str, *, status_code: int | None = None, error_type: str = "http_error"):
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        error_type: str = "http_error",
+        retry_after_seconds: float | None = None,
+    ):
         super().__init__(message)
         self.status_code = status_code
         self.error_type = error_type
+        self.retry_after_seconds = retry_after_seconds
 
 
 @dataclass
@@ -64,7 +82,15 @@ class RateLimitedHttpClient:
     conn: sqlite3.Connection | None = None
     base_kind: dict[str, str] = field(default_factory=dict)
     limits: dict[tuple[str, str], tuple[int, float]] = field(default_factory=lambda: DEFAULT_LIMITS.copy())
+    shared_limiter: SharedApiRateLimiter | None = None
     _buckets: dict[tuple[str, str], TokenBucket] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.shared_limiter is not None or self.conn is None:
+            return
+        db_path = writable_sqlite_main_database_path(self.conn)
+        if db_path is not None:
+            self.shared_limiter = SharedApiRateLimiter(db_path)
 
     def get_json(self, base_url: str, path: str, params: dict[str, Any] | None = None) -> Any:
         self._wait_for_slot(base_url, path)
@@ -90,7 +116,23 @@ class RateLimitedHttpClient:
             except HTTPError as exc:
                 status_code = int(exc.code)
                 error_type = _http_error_type(status_code)
-                last_error = HttpClientError(str(exc), status_code=status_code, error_type=error_type)
+                retry_after_seconds = None
+                if status_code == 429:
+                    retry_after_seconds = _retry_after_seconds(exc.headers)
+                    if retry_after_seconds is None:
+                        retry_after_seconds = min(60.0, max(2.0, 2.0 ** (attempt + 1)))
+                    self._record_shared_cooldown(
+                        base_url,
+                        path,
+                        retry_after_seconds=retry_after_seconds,
+                        status_code=status_code,
+                    )
+                last_error = HttpClientError(
+                    str(exc),
+                    status_code=status_code,
+                    error_type=error_type,
+                    retry_after_seconds=retry_after_seconds,
+                )
             except URLError as exc:
                 error_type = "url_error"
                 last_error = HttpClientError(str(exc), error_type=error_type)
@@ -108,19 +150,68 @@ class RateLimitedHttpClient:
             self._log(base_url, path, status_code, started, attempt, error_type, False)
             if attempt >= self.max_retries or not _retryable(error_type, status_code):
                 break
-            time.sleep(min(8.0, 2.0**attempt))
+            if status_code == 429 and last_error is not None:
+                retry_after = float(last_error.retry_after_seconds or 0)
+                if retry_after > 30.0:
+                    break
+                time.sleep(max(0.0, retry_after))
+            else:
+                time.sleep(min(8.0, 2.0**attempt))
             self._wait_for_slot(base_url, path)
             attempt += 1
         raise last_error or HttpClientError("request failed")
 
     def _wait_for_slot(self, base_url: str, path: str) -> None:
-        kind = self.base_kind.get(base_url, _infer_base_kind(base_url))
-        for key in ((kind, "*"), (kind, path)):
-            limit = self.limits.get(key)
-            if not limit:
-                continue
+        scopes = self._rate_limit_scopes(base_url, path)
+        for scope in scopes:
+            limit = (scope.capacity, scope.window_seconds)
+            kind, endpoint = scope.name.split(":", 1)
+            key = (kind, endpoint)
             bucket = self._buckets.setdefault(key, TokenBucket(limit[0], limit[1]))
             bucket.wait()
+        if self.shared_limiter is not None:
+            try:
+                self.shared_limiter.wait(scopes)
+            except SharedRateLimitDeferred as exc:
+                raise HttpClientError(
+                    "shared upstream request budget is cooling down",
+                    status_code=429,
+                    error_type="upstream_cooldown",
+                    retry_after_seconds=exc.retry_after_seconds,
+                ) from exc
+            except SharedRateLimitUnavailable as exc:
+                raise HttpClientError(
+                    "shared upstream request budget is unavailable",
+                    status_code=429,
+                    error_type="rate_limit_coordination_unavailable",
+                    retry_after_seconds=exc.retry_after_seconds,
+                ) from exc
+
+    def _rate_limit_scopes(self, base_url: str, path: str) -> list[RateLimitScope]:
+        kind = self.base_kind.get(base_url, _infer_base_kind(base_url))
+        scopes = []
+        for key in ((kind, "*"), (kind, path)):
+            limit = self.limits.get(key)
+            if limit:
+                scopes.append(RateLimitScope(f"{key[0]}:{key[1]}", limit[0], limit[1]))
+        return scopes
+
+    def _record_shared_cooldown(
+        self,
+        base_url: str,
+        path: str,
+        *,
+        retry_after_seconds: float,
+        status_code: int,
+    ) -> None:
+        if self.shared_limiter is None:
+            return
+        self.shared_limiter.record_cooldown(
+            self._rate_limit_scopes(base_url, path),
+            retry_after_seconds=retry_after_seconds,
+            status_code=status_code,
+            reason="http_429",
+        )
 
     def _log(
         self,
@@ -181,3 +272,26 @@ def _retryable(error_type: str, status_code: int | None) -> bool:
     if error_type in {"rate_limited", "cloudflare_or_forbidden", "server_error", "timeout", "url_error", "cloudflare_or_html"}:
         return True
     return bool(status_code and status_code >= 500)
+
+
+def _retry_after_seconds(headers: Any, *, now: float | None = None) -> float | None:
+    if headers is None:
+        return None
+    try:
+        value = str(headers.get("Retry-After") or "").strip()
+    except (AttributeError, TypeError):
+        return None
+    if not value:
+        return None
+    try:
+        return min(MAX_RETRY_AFTER_SECONDS, max(0.0, float(value)))
+    except ValueError:
+        pass
+    try:
+        retry_at = parsedate_to_datetime(value)
+        if retry_at.tzinfo is None:
+            retry_at = retry_at.replace(tzinfo=timezone.utc)
+        current = time.time() if now is None else float(now)
+        return min(MAX_RETRY_AFTER_SECONDS, max(0.0, retry_at.timestamp() - current))
+    except (TypeError, ValueError, OverflowError):
+        return None
