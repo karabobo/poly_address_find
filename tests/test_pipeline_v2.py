@@ -1,5 +1,6 @@
 import ast
 import json
+import sqlite3
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -8,6 +9,7 @@ from threading import Barrier
 from pm_robot.clients.http import HttpClientError
 from pm_robot.models import CandidateAddress, CandidateStage
 import pm_robot.orchestration.wallet_pipeline as wallet_pipeline
+import pm_robot.storage.repository as repository
 from pm_robot.orchestration.copyability_evidence import JOB_TYPE as COPYABILITY_JOB_TYPE
 from pm_robot.orchestration.evidence_backfill import summarize_wallet_evidence
 from pm_robot.orchestration.wallet_pipeline import (
@@ -1764,6 +1766,43 @@ def test_materialize_wallet_processing_state_from_existing_activity(tmp_path):
         assert result["wallets_materialized"] == 1
         assert state_row["discovery_tier"] == "l1_light"
         assert state_row["next_action"] == "medium_pending"
+    finally:
+        conn.close()
+
+
+def test_materialize_wallet_processing_state_retries_locked_batch(tmp_path, monkeypatch):
+    conn = connect(tmp_path / "robot.sqlite")
+    wallet = "0x" + "9" * 40
+    real_upsert = repository.upsert_wallet_evidence_summary
+    calls = 0
+
+    def locked_once(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise sqlite3.OperationalError("database is locked")
+        return real_upsert(*args, **kwargs)
+
+    try:
+        run_migrations(conn)
+        upsert_candidate(conn, CandidateAddress(address=wallet, sources="polymarket_trades_global"))
+        conn.commit()
+        monkeypatch.setattr(repository, "upsert_wallet_evidence_summary", locked_once)
+        monkeypatch.setattr("pm_robot.storage.db.time.sleep", lambda _seconds: None)
+
+        result = materialize_wallet_processing_state(
+            conn,
+            limit=10,
+            source="test_materialize",
+            commit_every=5,
+        )
+
+        assert result["wallets_materialized"] == 1
+        assert calls == 2
+        assert conn.execute(
+            "SELECT 1 FROM wallet_processing_state WHERE wallet = ?",
+            (wallet,),
+        ).fetchone()
     finally:
         conn.close()
 

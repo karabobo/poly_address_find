@@ -1172,21 +1172,33 @@ def materialize_wallet_processing_state(
         sql += " LIMIT ?"
         params = (limit,)
     rows = conn.execute(sql, params).fetchall()
+    wallets = [str(row["address"]).lower() for row in rows]
+    batch_size = max(1, commit_every) if commit_every > 0 else max(1, len(wallets))
     materialized = 0
-    for row in rows:
-        wallet = str(row["address"]).lower()
-        evidence = summarize_wallet_evidence(conn, wallet)
-        upsert_wallet_evidence_summary(
-            conn,
-            wallet,
-            evidence,
-            source_artifacts=[f"sqlite://wallet_activity/{wallet}"],
-        )
-        sync_wallet_processing_state(conn, wallet, evidence, source=source)
-        materialized += 1
-        if commit_every > 0 and materialized % commit_every == 0:
+
+    for offset in range(0, len(wallets), batch_size):
+        batch = wallets[offset : offset + batch_size]
+
+        def materialize_batch() -> int:
+            for wallet in batch:
+                evidence = summarize_wallet_evidence(conn, wallet)
+                upsert_wallet_evidence_summary(
+                    conn,
+                    wallet,
+                    evidence,
+                    source_artifacts=[f"sqlite://wallet_activity/{wallet}"],
+                )
+                sync_wallet_processing_state(conn, wallet, evidence, source=source)
             conn.commit()
-    conn.commit()
+            return len(batch)
+
+        materialized += retry_sqlite_locked(
+            materialize_batch,
+            rollback=conn.rollback,
+            attempts=4,
+            sleep_seconds=2.0,
+        )
+
     summary = wallet_processing_state_summary(conn)
     summary["wallets_seen"] = len(rows)
     summary["wallets_materialized"] = materialized
