@@ -1,7 +1,5 @@
-import json
-
 from pm_robot.models import CandidateAddress, CandidateStage, ScoreBreakdown, WalletFeatures
-from pm_robot.orchestration.eligibility_repair import plan_eligibility_repair_jobs
+from pm_robot.orchestration.eligibility_repair import prepare_eligibility_repairs
 from pm_robot.storage.db import connect, run_migrations
 from pm_robot.storage.repository import persist_score, persist_wallet_activity, upsert_candidate, upsert_wallet_feature
 
@@ -42,7 +40,7 @@ def _score(conn, wallet: str, *, score: float = 70.0, stage: CandidateStage = Ca
     )
 
 
-def test_eligibility_repair_routes_thin_review_wallet_to_wallet_pipeline(tmp_path):
+def test_eligibility_repair_prepares_thin_review_wallet_for_wallet_planner(tmp_path):
     conn = connect(tmp_path / "robot.sqlite")
     wallet = "0x" + "1" * 40
     try:
@@ -51,31 +49,27 @@ def test_eligibility_repair_routes_thin_review_wallet_to_wallet_pipeline(tmp_pat
         _score(conn, wallet, score=72)
         conn.commit()
 
-        summary = plan_eligibility_repair_jobs(conn, limit=10, shard_count=1, now=50_000)
+        summary = prepare_eligibility_repairs(conn, limit=10, now=50_000)
         budget = conn.execute("SELECT * FROM evidence_backfill_budget WHERE wallet = ?", (wallet,)).fetchone()
         job = conn.execute(
             "SELECT * FROM pipeline_jobs WHERE wallet = ? AND job_type = 'wallet_evidence_backfill'",
             (wallet,),
         ).fetchone()
-        input_json = json.loads(job["input_json"])
-
         assert summary.wallets_seen == 1
         assert summary.wallets_ineligible == 1
         assert summary.evidence_budgets_seeded == 1
-        assert summary.wallet_pipeline_jobs_enqueued == 1
-        assert summary.copyability_jobs_enqueued == 0
+        assert summary.wallet_repairs_prepared == 1
+        assert summary.copyability_repairs_ready == 0
         assert summary.reason_counts["insufficient_trade_events"] == 1
         assert summary.action_counts["wallet_evidence_backfill"] == 1
         assert budget["source"] == "eligibility_repair"
         assert budget["target_depth"] == 200
-        assert job["status"] == "queued"
-        assert input_json["source"] == "eligibility_repair"
-        assert "insufficient_trade_events" in input_json["eligibility_reasons"]
+        assert job is None
     finally:
         conn.close()
 
 
-def test_eligibility_repair_routes_copyability_blocker_to_copyability_queue(tmp_path):
+def test_eligibility_repair_leaves_copyability_admission_to_copyability_planner(tmp_path):
     conn = connect(tmp_path / "robot.sqlite")
     wallet = "0x" + "2" * 40
     try:
@@ -95,7 +89,7 @@ def test_eligibility_repair_routes_copyability_blocker_to_copyability_queue(tmp_
         persist_wallet_activity(conn, wallet, _trade_events(wallet, 120), ingested_at=20_000)
         conn.commit()
 
-        summary = plan_eligibility_repair_jobs(conn, limit=10, shard_count=1, now=50_000)
+        summary = prepare_eligibility_repairs(conn, limit=10, now=50_000)
         wallet_job = conn.execute(
             "SELECT * FROM pipeline_jobs WHERE wallet = ? AND job_type = 'wallet_evidence_backfill'",
             (wallet,),
@@ -104,18 +98,14 @@ def test_eligibility_repair_routes_copyability_blocker_to_copyability_queue(tmp_
             "SELECT * FROM pipeline_jobs WHERE wallet = ? AND job_type = 'copyability_evidence'",
             (wallet,),
         ).fetchone()
-        input_json = json.loads(copy_job["input_json"])
-
         assert summary.wallets_seen == 1
         assert summary.wallets_ineligible == 1
-        assert summary.wallet_pipeline_jobs_enqueued == 0
-        assert summary.copyability_jobs_enqueued == 1
+        assert summary.wallet_repairs_prepared == 0
+        assert summary.copyability_repairs_ready == 1
         assert summary.reason_counts["missing_copyability_evidence"] == 1
         assert summary.action_counts["copyability_evidence"] == 1
         assert wallet_job is None
-        assert copy_job["status"] == "queued"
-        assert input_json["source"] == "eligibility_repair"
-        assert "missing_copyability_evidence" in input_json["eligibility_reasons"]
+        assert copy_job is None
     finally:
         conn.close()
 
@@ -152,7 +142,7 @@ def test_eligibility_repair_does_not_queue_paper_eligible_wallet(tmp_path):
         )
         conn.commit()
 
-        summary = plan_eligibility_repair_jobs(conn, limit=10, shard_count=1, now=50_000)
+        summary = prepare_eligibility_repairs(conn, limit=10, now=50_000)
         jobs = conn.execute("SELECT * FROM pipeline_jobs WHERE wallet = ?", (wallet,)).fetchall()
 
         assert summary.wallets_seen == 1

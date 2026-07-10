@@ -1,76 +1,67 @@
-"""Route eligibility blockers into existing evidence queues.
+"""Prepare eligibility blockers for the canonical evidence planners.
 
 The paper/publish gates intentionally fail closed.  This planner keeps the
-pipeline smooth by turning actionable paper-eligibility blockers into queued
-repair work instead of letting promising wallets sit behind a static filter.
+pipeline smooth by turning actionable paper-eligibility blockers into evidence
+budgets and planner-ready repair signals. It never writes pipeline jobs.
 """
 
 from __future__ import annotations
 
-import hashlib
-import json
 import sqlite3
 import time
 from dataclasses import dataclass
 from typing import Any
 
-from pm_robot.orchestration.copyability_evidence import JOB_TYPE as COPYABILITY_JOB_TYPE
-from pm_robot.orchestration.copyability_evidence import SUBJECT_KEY as COPYABILITY_SUBJECT_KEY
-from pm_robot.orchestration.copyability_evidence import TIER as COPYABILITY_TIER
 from pm_robot.orchestration.evidence_backfill import LIGHT_DEPTH
-from pm_robot.orchestration.wallet_pipeline import JOB_TYPE as WALLET_PIPELINE_JOB_TYPE
-from pm_robot.pipeline_terms import DEFAULT_EVIDENCE_JOB_STAGE, REVIEW_FUNNEL_CANDIDATE_STAGES
+from pm_robot.pipeline_terms import PipelineJobType, REVIEW_FUNNEL_CANDIDATE_STAGES
 from pm_robot.risk.eligibility import paper_eligibility_status
-from pm_robot.storage.repository import enqueue_pipeline_job, seed_evidence_backfill_budget
+from pm_robot.storage.repository import seed_evidence_backfill_budget
 
 
 REPAIR_SOURCE = "eligibility_repair"
 REPAIR_STAGES = REVIEW_FUNNEL_CANDIDATE_STAGES
-ACTION_WALLET_EVIDENCE = WALLET_PIPELINE_JOB_TYPE
-ACTION_COPYABILITY = COPYABILITY_JOB_TYPE
+ACTION_WALLET_EVIDENCE = PipelineJobType.WALLET_EVIDENCE_BACKFILL.value
+ACTION_COPYABILITY = PipelineJobType.COPYABILITY_EVIDENCE.value
 ACTION_FEATURE_MATERIALIZE = "feature_materialize_recommended"
 ACTION_SOURCE_REVIEW = "source_provenance_review"
 
 
 @dataclass(frozen=True)
-class EligibilityRepairPlanSummary:
+class EligibilityRepairPreparationSummary:
     wallets_seen: int
     wallets_ineligible: int
     evidence_budgets_seeded: int
-    wallet_pipeline_jobs_enqueued: int
-    copyability_jobs_enqueued: int
+    wallet_repairs_prepared: int
+    copyability_repairs_ready: int
     reason_counts: dict[str, int]
     action_counts: dict[str, int]
-    shard_count: int
     dry_run: bool
     status: str
 
 
-def plan_eligibility_repair_jobs(
+def prepare_eligibility_repairs(
     conn: sqlite3.Connection,
     *,
     limit: int = 100,
     min_score: float = 40.0,
-    shard_count: int = 3,
     min_copyability_activity_events: int = 25,
     now: int | None = None,
     dry_run: bool = False,
-) -> EligibilityRepairPlanSummary:
-    """Queue evidence work for wallets blocked by paper eligibility.
+) -> EligibilityRepairPreparationSummary:
+    """Prepare evidence work for wallets blocked by paper eligibility.
 
     Watchlist/review wallets still do not bypass paper gates; instead, high
-    scoring provisional wallets get priority repair jobs.  The planner is
-    idempotent through the underlying pipeline job uniqueness constraints.
+    scoring provisional wallets receive an evidence budget or become eligible
+    for the dedicated copyability planner. Queue admission remains owned by the
+    canonical wallet and copyability planners.
     """
 
-    if shard_count <= 0:
-        raise ValueError("shard_count must be positive")
     ts = now or int(time.time())
     rows = _candidate_rows(conn, limit=limit, min_score=min_score)
     ineligible = 0
     evidence_budgets_seeded = 0
-    wallet_jobs = 0
-    copyability_jobs = 0
+    wallet_repairs = 0
+    copyability_repairs = 0
     reason_counts: dict[str, int] = {}
     action_counts: dict[str, int] = {}
 
@@ -91,6 +82,7 @@ def plan_eligibility_repair_jobs(
         if dry_run:
             continue
         if ACTION_WALLET_EVIDENCE in actions:
+            wallet_repairs += 1
             evidence_budgets_seeded += int(
                 _seed_wallet_evidence_budget(
                     conn,
@@ -100,61 +92,18 @@ def plan_eligibility_repair_jobs(
                     now=ts,
                 )
             )
-            wallet_jobs += int(
-                enqueue_pipeline_job(
-                    conn,
-                    job_type=WALLET_PIPELINE_JOB_TYPE,
-                    wallet=wallet,
-                    subject_key=DEFAULT_EVIDENCE_JOB_STAGE,
-                    tier="eligibility_repair",
-                    priority=_priority(float(row["leader_score"] or 0.0)),
-                    shard=_wallet_shard(wallet, shard_count),
-                    input_data={
-                        "source": REPAIR_SOURCE,
-                        "stage": DEFAULT_EVIDENCE_JOB_STAGE,
-                        "target_depth": LIGHT_DEPTH,
-                        "eligibility_reasons": list(reasons),
-                        "leader_score": float(row["leader_score"] or 0.0),
-                        "planned_at": ts,
-                    },
-                    max_attempts=3,
-                    next_attempt_at=0,
-                    now=ts,
-                )
-            )
         if ACTION_COPYABILITY in actions:
-            copyability_jobs += int(
-                enqueue_pipeline_job(
-                    conn,
-                    job_type=COPYABILITY_JOB_TYPE,
-                    wallet=wallet,
-                    subject_key=COPYABILITY_SUBJECT_KEY,
-                    tier=COPYABILITY_TIER,
-                    priority=_priority(float(row["leader_score"] or 0.0)),
-                    shard=_wallet_shard(wallet, shard_count),
-                    input_data={
-                        "source": REPAIR_SOURCE,
-                        "eligibility_reasons": list(reasons),
-                        "leader_score": float(row["leader_score"] or 0.0),
-                        "activity_count": int(row["trade_events"] or 0),
-                        "planned_at": ts,
-                    },
-                    max_attempts=3,
-                    next_attempt_at=0,
-                    now=ts,
-                )
-            )
+            copyability_repairs += 1
     if not dry_run:
         conn.commit()
-    return EligibilityRepairPlanSummary(
+    return EligibilityRepairPreparationSummary(
         wallets_seen=len(rows),
         wallets_ineligible=ineligible,
         evidence_budgets_seeded=evidence_budgets_seeded,
-        wallet_pipeline_jobs_enqueued=wallet_jobs,
-        copyability_jobs_enqueued=copyability_jobs,
+        wallet_repairs_prepared=wallet_repairs,
+        copyability_repairs_ready=copyability_repairs,
         reason_counts=dict(sorted(reason_counts.items())),
         action_counts=dict(sorted(action_counts.items())),
-        shard_count=shard_count,
         dry_run=dry_run,
         status="ok",
     )
@@ -278,11 +227,6 @@ def _priority(score: float) -> int:
     if score >= 50:
         return 8
     return 12
-
-
-def _wallet_shard(wallet: str, shard_count: int) -> int:
-    digest = hashlib.sha1(wallet.lower().encode("utf-8")).hexdigest()
-    return int(digest[:12], 16) % shard_count
 
 
 def _increment_counts(counts: dict[str, int], keys: tuple[str, ...]) -> None:

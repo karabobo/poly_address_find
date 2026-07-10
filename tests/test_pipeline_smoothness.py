@@ -1,8 +1,16 @@
 from pm_robot.models import CandidateAddress, CandidateStage, ScoreBreakdown, WalletFeatures
-from pm_robot.orchestration.eligibility_repair import plan_eligibility_repair_jobs
+from pm_robot.orchestration.copyability_evidence import plan_copyability_evidence_jobs
+from pm_robot.orchestration.eligibility_repair import prepare_eligibility_repairs
 from pm_robot.orchestration.pipeline_smoothness import pipeline_smoothness_report
+from pm_robot.orchestration.wallet_pipeline import plan_wallet_pipeline_jobs
 from pm_robot.storage.db import connect, run_migrations
-from pm_robot.storage.repository import persist_score, persist_wallet_activity, upsert_candidate, upsert_wallet_feature
+from pm_robot.storage.repository import (
+    materialize_wallet_processing_state,
+    persist_score,
+    persist_wallet_activity,
+    upsert_candidate,
+    upsert_wallet_feature,
+)
 
 
 def _trade_events(wallet: str, count: int) -> list[dict]:
@@ -81,7 +89,18 @@ def test_pipeline_smoothness_reports_eligibility_blockers_and_backlog(tmp_path):
         _insert_l3_evidence(conn, paper_ready)
         conn.commit()
 
-        plan_eligibility_repair_jobs(conn, limit=10, shard_count=1, now=50_000)
+        prepare_eligibility_repairs(conn, limit=10, now=50_000)
+        materialize_wallet_processing_state(conn, limit=2)
+        plan_wallet_pipeline_jobs(conn, shard_count=1, now=50_000)
+        plan_copyability_evidence_jobs(
+            conn,
+            limit=10,
+            max_active_jobs=10,
+            min_score=40,
+            min_activity_events=25,
+            shard_count=1,
+            now=50_000,
+        )
         report = pipeline_smoothness_report(conn, top=10, now=50_100)
 
         assert report["ok"] is True
@@ -94,17 +113,17 @@ def test_pipeline_smoothness_reports_eligibility_blockers_and_backlog(tmp_path):
         assert report["eligibility"]["action_counts"]["wallet_evidence_backfill"] == 1
         assert report["eligibility"]["action_counts"]["copyability_evidence"] == 1
         assert report["queues"]["wallet_pipeline"]["statuses"] == [
-            {"job_type": "wallet_evidence_backfill", "status": "queued", "count": 1}
+            {"job_type": "wallet_evidence_backfill", "status": "queued", "count": 2}
         ]
         assert report["queues"]["copyability"]["statuses"] == [
-            {"job_type": "copyability_evidence", "status": "queued", "count": 1}
+            {"job_type": "copyability_evidence", "status": "queued", "count": 2}
         ]
         stuck = {item["wallet"]: item for item in report["top_stuck_wallets"]}
         assert stuck[thin]["wallet_pipeline_status"] == "queued"
         assert stuck[copy_blocked]["copyability_status"] == "queued"
         assert paper_ready not in stuck
-        assert any("wallet-pipeline" in step for step in report["next_steps"])
-        assert any("copyability" in step for step in report["next_steps"])
+        assert any("wallet-pipeline-plan/worker" in step for step in report["next_steps"])
+        assert any("copyability-plan/worker" in step for step in report["next_steps"])
     finally:
         conn.close()
 

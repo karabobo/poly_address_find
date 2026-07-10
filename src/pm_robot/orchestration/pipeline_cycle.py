@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from pm_robot.orchestration.copyability_evidence import plan_copyability_evidence_jobs
-from pm_robot.orchestration.eligibility_repair import plan_eligibility_repair_jobs
+from pm_robot.orchestration.eligibility_repair import prepare_eligibility_repairs
 from pm_robot.orchestration.feature_materializer import materialize_wallet_features
 from pm_robot.orchestration.pipeline_smoothness import pipeline_smoothness_report
 from pm_robot.orchestration.review_pipeline import score_database
@@ -55,11 +55,10 @@ def run_pipeline_cycle(conn: sqlite3.Connection, options: PipelineCycleOptions) 
         min_copyability_activity_events=options.copyability_min_activity_events,
     )
 
-    eligibility_preview = plan_eligibility_repair_jobs(
+    eligibility_preview = prepare_eligibility_repairs(
         conn,
         limit=options.repair_limit,
         min_score=options.min_score,
-        shard_count=options.shard_count,
         min_copyability_activity_events=options.copyability_min_activity_events,
         dry_run=True,
     )
@@ -83,6 +82,16 @@ def run_pipeline_cycle(conn: sqlite3.Connection, options: PipelineCycleOptions) 
             "recommended_command": "pipeline-cycle --execute-plan",
         }
 
+    repair = prepare_eligibility_repairs(
+        conn,
+        limit=options.repair_limit,
+        min_score=options.min_score,
+        min_copyability_activity_events=options.copyability_min_activity_events,
+        dry_run=False,
+    )
+    steps.append(_step("eligibility_repair_prepare", "executed", repair.__dict__))
+
+    # Repair budgets must become processing state before the canonical planner runs.
     state = materialize_wallet_processing_state(conn, limit=options.state_limit)
     steps.append(_step("wallet_pipeline_state_materialize", "executed", state))
 
@@ -93,16 +102,6 @@ def run_pipeline_cycle(conn: sqlite3.Connection, options: PipelineCycleOptions) 
         min_copyability_activity_events=options.copyability_min_activity_events,
     )
     steps.append(_step("pipeline_smoothness_after_state", "observed", _compact_smoothness(after_state)))
-
-    repair = plan_eligibility_repair_jobs(
-        conn,
-        limit=options.repair_limit,
-        min_score=options.min_score,
-        shard_count=options.shard_count,
-        min_copyability_activity_events=options.copyability_min_activity_events,
-        dry_run=False,
-    )
-    steps.append(_step("eligibility_repair_plan", "executed", repair.__dict__))
 
     wallet_plan = plan_wallet_pipeline_jobs(
         conn,

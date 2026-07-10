@@ -42,7 +42,7 @@ from pm_robot.orchestration.evidence_backfill import (
     run_evidence_backfill,
     run_queued_evidence_backfill_worker,
 )
-from pm_robot.orchestration.eligibility_repair import plan_eligibility_repair_jobs
+from pm_robot.orchestration.eligibility_repair import prepare_eligibility_repairs
 from pm_robot.orchestration.feature_materializer import materialize_wallet_features
 from pm_robot.orchestration.gamma_ingestor import ingest_gamma_markets
 from pm_robot.orchestration.leaderboard_discovery import discover_leaderboard_candidates
@@ -353,12 +353,11 @@ def main() -> int:
 
     eligibility_repair_cmd = sub.add_parser(
         "eligibility-repair-plan",
-        help="Queue evidence/copyability repair jobs for wallets blocked by paper eligibility",
+        help="Prepare evidence/copyability repairs for the canonical queue planners",
     )
     eligibility_repair_cmd.add_argument("--db", dest="command_db", default=None, help="SQLite database path")
     eligibility_repair_cmd.add_argument("--limit", type=int, default=100)
     eligibility_repair_cmd.add_argument("--min-score", type=float, default=40.0)
-    eligibility_repair_cmd.add_argument("--shard-count", type=int, default=3)
     eligibility_repair_cmd.add_argument("--min-copyability-activity-events", type=int, default=25)
     eligibility_repair_cmd.add_argument("--dry-run", action="store_true")
 
@@ -1098,11 +1097,10 @@ def main() -> int:
         conn = connect(db_path)
         try:
             run_migrations(conn)
-            summary = plan_eligibility_repair_jobs(
+            summary = prepare_eligibility_repairs(
                 conn,
                 limit=args.limit,
                 min_score=args.min_score,
-                shard_count=args.shard_count,
                 min_copyability_activity_events=args.min_copyability_activity_events,
                 dry_run=args.dry_run,
             )

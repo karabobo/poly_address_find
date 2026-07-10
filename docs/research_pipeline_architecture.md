@@ -52,6 +52,9 @@ The NAS wallet pipeline has one control-plane owner: `wallet-pipeline-planner-lo
 candidate inputs; scoring only materializes features and writes review results. Neither loop enqueues wallet
 evidence jobs. The control loop materializes only wallets with changed candidate metadata, evidence budgets, or
 activity watermarks. Copyability retains its own planner because it is a separate evidence lane and job type.
+Eligibility repair only prepares evidence budgets and planner-ready actions; it never writes `pipeline_jobs`.
+`pipeline-cycle` therefore prepares repairs before state materialization, then delegates admission to the same
+wallet and copyability planners used by the NAS loops.
 The optional systemd deployment follows the same ownership rule through `pm-robot-evidence-planner.service`;
 its scoring service does not materialize wallet state or enqueue evidence jobs.
 

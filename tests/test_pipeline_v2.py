@@ -1,6 +1,8 @@
+import ast
 import json
 import time
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from threading import Barrier
 
 from pm_robot.clients.http import HttpClientError
@@ -825,6 +827,29 @@ def test_pipeline_terms_are_canonical_and_compatible():
         CandidateStage.PAPER_CANDIDATE.value,
         CandidateStage.NEEDS_REVIEW.value,
     )
+
+
+def test_pipeline_job_enqueue_calls_have_only_canonical_planner_owners():
+    owners: set[str] = set()
+    raw_sql_owners: set[str] = set()
+    orchestration_dir = Path(__file__).resolve().parents[1] / "src/pm_robot/orchestration"
+    for path in orchestration_dir.glob("*.py"):
+        source = path.read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        if any(
+            isinstance(node, ast.Call)
+            and (
+                (isinstance(node.func, ast.Name) and node.func.id == "enqueue_pipeline_job")
+                or (isinstance(node.func, ast.Attribute) and node.func.attr == "enqueue_pipeline_job")
+            )
+            for node in ast.walk(tree)
+        ):
+            owners.add(path.name)
+        if "insert into pipeline_jobs" in " ".join(source.lower().split()):
+            raw_sql_owners.add(path.name)
+
+    assert owners == {"copyability_evidence.py", "wallet_pipeline.py"}
+    assert raw_sql_owners == set()
 
 
 def test_wallet_evidence_summary_and_state_are_idempotent(tmp_path):

@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 from pm_robot.models import CandidateAddress, CandidateStage, ScoreBreakdown, WalletFeatures
@@ -71,7 +72,7 @@ def test_pipeline_cycle_dry_run_is_read_only(tmp_path):
         conn.close()
 
 
-def test_pipeline_cycle_execute_queues_repair_without_workers_or_duplicate_light_job(tmp_path):
+def test_pipeline_cycle_routes_repairs_through_canonical_planners(tmp_path):
     conn = connect(tmp_path / "robot.sqlite")
     thin = "0x" + "2" * 40
     copy_blocked = "0x" + "3" * 40
@@ -119,7 +120,12 @@ def test_pipeline_cycle_execute_queues_repair_without_workers_or_duplicate_light
             "SELECT * FROM pipeline_jobs WHERE wallet = ? AND job_type = 'copyability_evidence'",
             (copy_blocked,),
         ).fetchall()
+        all_job_sources = [
+            json.loads(row["input_json"]).get("source")
+            for row in conn.execute("SELECT input_json FROM pipeline_jobs").fetchall()
+        ]
         runs = conn.execute("SELECT * FROM ingest_runs").fetchall()
+        steps = {step["name"]: step for step in report["steps"]}
 
         assert report["ok"] is True
         assert report["dry_run"] is False
@@ -127,8 +133,13 @@ def test_pipeline_cycle_execute_queues_repair_without_workers_or_duplicate_light
         assert report["safety"]["runs_network_workers"] is False
         assert len(thin_jobs) == 1
         assert thin_jobs[0]["subject_key"] == "light_pending"
-        assert thin_jobs[0]["tier"] == "eligibility_repair"
+        assert thin_jobs[0]["tier"] == "l0_discovered"
+        assert json.loads(thin_jobs[0]["input_json"])["source"] == "wallet_processing_state"
         assert len(copyability_jobs) == 1
+        assert json.loads(copyability_jobs[0]["input_json"])["source"] == "copyability_planner"
+        assert "eligibility_repair" not in all_job_sources
+        assert steps["eligibility_repair_prepare"]["data"]["wallet_repairs_prepared"] == 1
+        assert steps["eligibility_repair_prepare"]["data"]["copyability_repairs_ready"] == 1
         assert runs == []
         assert report["after"]["queues"]["wallet_pipeline"]["statuses"]
         assert report["after"]["queues"]["copyability"]["statuses"] == [

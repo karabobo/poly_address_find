@@ -218,7 +218,7 @@ def _next_steps(eligibility: dict[str, Any], queues: dict[str, Any]) -> list[str
     if int(action_counts.get(ACTION_WALLET_EVIDENCE, 0)) > 0:
         steps.append("run eligibility-repair-plan, then wallet-pipeline-plan/worker for thin activity evidence")
     if int(action_counts.get(ACTION_COPYABILITY, 0)) > 0:
-        steps.append("run eligibility-repair-plan, then copyability-worker for copyability blockers")
+        steps.append("run eligibility-repair-plan, then copyability-plan/worker for copyability blockers")
     if int(action_counts.get(ACTION_FEATURE_MATERIALIZE, 0)) > 0:
         steps.append("run materialize-features and ingest-trade-roles for hygiene/maker blockers")
     if int(action_counts.get(ACTION_SOURCE_REVIEW, 0)) > 0:

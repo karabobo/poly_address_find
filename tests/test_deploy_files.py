@@ -96,6 +96,7 @@ def test_canonical_docs_describe_current_research_pipeline_only():
     assert "pipeline_jobs[job_type=wallet_evidence_backfill]" in architecture
     assert "Copyability is a separate evidence lane" in architecture
     assert "one control-plane owner" in architecture
+    assert "never writes `pipeline_jobs`" in architecture
     assert "There is no L4" in architecture
     assert "does not submit real orders" in architecture
     assert "manual supplemental discovery probe, not a runtime" in probe
