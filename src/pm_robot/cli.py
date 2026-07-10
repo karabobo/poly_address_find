@@ -437,6 +437,14 @@ def main() -> int:
         action="store_true",
         help="Skip repeated smoothness reports in a frequent production control loop",
     )
+    cycle_cmd.add_argument(
+        "--busy-timeout-seconds",
+        type=float,
+        default=120.0,
+        help="SQLite lock wait per write attempt; frequent control loops should use a small value",
+    )
+    cycle_cmd.add_argument("--planner-lock-attempts", type=int, default=8)
+    cycle_cmd.add_argument("--planner-lock-sleep-seconds", type=float, default=3.0)
 
     prioritize_backfill_cmd = sub.add_parser("prioritize-backfill", help="Promote scored review wallets into the evidence backfill queue")
     prioritize_backfill_cmd.add_argument("--db", dest="command_db", default=None, help="SQLite database path")
@@ -666,6 +674,12 @@ def main() -> int:
     maintenance_cmd.add_argument("--scores-days", type=int, default=30)
     maintenance_cmd.add_argument("--review-events-days", type=int, default=30)
     maintenance_cmd.add_argument("--ingest-runs-days", type=int, default=30)
+    maintenance_cmd.add_argument(
+        "--runtime-heartbeat-days",
+        type=int,
+        default=30,
+        help="Retention for loop_* heartbeats even when full cleanup is skipped",
+    )
     maintenance_cmd.add_argument("--keep-backups", type=int, default=2)
     maintenance_cmd.add_argument("--dry-run", action="store_true")
     maintenance_cmd.add_argument("--vacuum", action="store_true")
@@ -1175,6 +1189,8 @@ def main() -> int:
     if args.command == "pipeline-cycle":
         conn = connect(db_path)
         try:
+            busy_timeout_ms = max(0, int(float(args.busy_timeout_seconds) * 1000))
+            conn.execute(f"PRAGMA busy_timeout = {busy_timeout_ms}")
             run_migrations(conn)
             heartbeat_prefix = str(args.heartbeat_prefix or "").strip()
 
@@ -1189,7 +1205,10 @@ def main() -> int:
                         conn,
                         f"{heartbeat_prefix}_{step['name']}",
                         status=heartbeat_status,
+                        rows_written=_pipeline_cycle_step_rows_written(step),
                         error=str(data.get("error") or ""),
+                        started_at=int(step.get("started_at") or 0) or None,
+                        finished_at=int(step.get("finished_at") or 0) or None,
                     )
                 except Exception:
                     conn.rollback()
@@ -1215,6 +1234,8 @@ def main() -> int:
                     copyability_min_activity_events=args.copyability_min_activity_events,
                     copyability_shard_count=args.copyability_shard_count,
                     copyability_rescan_seconds=args.copyability_rescan_seconds,
+                    planner_lock_attempts=max(1, args.planner_lock_attempts),
+                    planner_lock_sleep_seconds=max(0.0, args.planner_lock_sleep_seconds),
                     feature_limit=args.feature_limit,
                     feature_min_activity_events=args.feature_min_activity_events,
                     score_limit=args.score_limit,
@@ -1510,6 +1531,7 @@ def main() -> int:
             scores_days=args.scores_days,
             review_events_days=args.review_events_days,
             ingest_runs_days=args.ingest_runs_days,
+            runtime_heartbeat_days=args.runtime_heartbeat_days,
             keep_backups=args.keep_backups,
             dry_run=args.dry_run,
             vacuum=args.vacuum,
@@ -1565,6 +1587,23 @@ def _source_event_mode_arg(value: str) -> str:
     if value == "upsert-source":
         return "upsert_source"
     return value
+
+
+def _pipeline_cycle_step_rows_written(step: dict) -> int:
+    data = step.get("data") if isinstance(step.get("data"), dict) else {}
+    result_keys = {
+        "eligibility_repair_prepare": "evidence_budgets_seeded",
+        "wallet_pipeline_state_materialize": "wallets_materialized",
+        "wallet_pipeline_plan": "jobs_enqueued",
+        "copyability_plan": "jobs_enqueued",
+        "materialize_features": "wallets_updated",
+        "incremental_score": "scores_written",
+    }
+    key = result_keys.get(str(step.get("name") or ""), "")
+    try:
+        return max(0, int(data.get(key) or 0)) if key else 0
+    except (TypeError, ValueError):
+        return 0
 
 
 def _env_int(name: str, default: int) -> int:

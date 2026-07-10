@@ -2377,6 +2377,22 @@ def test_dashboard_ops_health_reports_runtime_loop_freshness(tmp_path):
                 ("loop_discovery_leaderboard", now - 180, now - 170, "ok", 5, ""),
                 ("loop_research_control", now - 7_200, now - 7_100, "ok", 12, ""),
                 ("loop_maintenance", now - 60, now - 50, "failed", 0, "checkpoint failed"),
+                (
+                    "loop_research_control_step_wallet_pipeline_plan",
+                    now - 80,
+                    now - 65,
+                    "failed",
+                    0,
+                    "database is locked",
+                ),
+                (
+                    "loop_research_control_step_incremental_score",
+                    now - 50,
+                    now - 45,
+                    "ok",
+                    3,
+                    "",
+                ),
             ],
         )
         conn.commit()
@@ -2386,6 +2402,8 @@ def test_dashboard_ops_health_reports_runtime_loop_freshness(tmp_path):
     data = dashboard_data(settings)
     loops = data["ops_health"]["runtime_loops"]
     by_key = {row["loop_key"]: row for row in loops["rows"]}
+    phases = data["ops_health"]["research_control_steps"]
+    by_step = {row["step_key"]: row for row in phases["rows"]}
     html = _render_dashboard(settings)
 
     assert data["ops_health"]["health"] == "attention"
@@ -2397,10 +2415,32 @@ def test_dashboard_ops_health_reports_runtime_loop_freshness(tmp_path):
     assert by_key["research_control"]["state"] == "stale"
     assert by_key["maintenance"]["state"] == "error"
     assert by_key["discovery_activity"]["state"] == "no_data"
+    assert phases["has_data"] is True
+    assert phases["attention_count"] == 1
+    assert by_step["wallet_pipeline_plan"]["state"] == "error"
+    assert by_step["wallet_pipeline_plan"]["duration_label"] == "15 秒"
+    assert by_step["wallet_pipeline_plan"]["error"] == "database is locked"
+    assert by_step["incremental_score"]["state"] == "ok"
+    assert by_step["incremental_score"]["rows_written"] == 3
     assert "常驻循环新鲜度" in html
+    assert "研究控制阶段" in html
+    assert "钱包队列规划" in html
+    assert "增量评分" in html
     assert "摘要/错误" in html
     assert "研究控制循环" in html
     assert "checkpoint failed" in html
+    assert "database is locked" in html
+
+
+def test_dashboard_ops_health_hides_research_control_steps_without_phase_heartbeats(tmp_path):
+    settings = _settings(tmp_path)
+    _seed(settings)
+
+    data = dashboard_data(settings)
+    html = _render_dashboard(settings)
+
+    assert data["ops_health"]["research_control_steps"]["has_data"] is False
+    assert "研究控制阶段" not in html
 
 
 def test_dashboard_ops_health_distinguishes_normal_backlog_from_high_priority_gap(tmp_path):

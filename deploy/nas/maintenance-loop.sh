@@ -6,6 +6,7 @@ WAL_CHECKPOINT="${PM_ROBOT_MAINTENANCE_WAL_CHECKPOINT:-none}"
 STALE_INGEST_RUN_SECONDS="${PM_ROBOT_MAINTENANCE_STALE_INGEST_RUN_SECONDS:-21600}"
 FAILED_JOB_COOLDOWN_SECONDS="${PM_ROBOT_MAINTENANCE_FAILED_JOB_COOLDOWN_SECONDS:-21600}"
 KEEP_BACKUPS="${PM_ROBOT_MAINTENANCE_KEEP_BACKUPS:-14}"
+RUNTIME_HEARTBEAT_DAYS="${PM_ROBOT_MAINTENANCE_RUNTIME_HEARTBEAT_DAYS:-30}"
 
 runtime_heartbeat() {
   name="$1"
@@ -25,6 +26,7 @@ while true; do
       --failed-job-cooldown-seconds "$FAILED_JOB_COOLDOWN_SECONDS" \
       --reset-stale-ingest-runs \
       --stale-ingest-run-seconds "$STALE_INGEST_RUN_SECONDS" \
+      --runtime-heartbeat-days "$RUNTIME_HEARTBEAT_DAYS" \
       --keep-backups "$KEEP_BACKUPS" \
       --wal-checkpoint "$WAL_CHECKPOINT"; then
     echo "$(date -Iseconds) maintenance loop: ok"

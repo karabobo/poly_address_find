@@ -148,6 +148,16 @@ _RUNTIME_LOOP_SPECS = (
     RuntimeLoopSpec("rtds_discovery", "RTDS 实时发现", "loop_rtds_discovery", 900),
 )
 
+_RESEARCH_CONTROL_STEP_SPECS = (
+    ("eligibility_repair_prepare", "资格修复"),
+    ("wallet_pipeline_state_materialize", "钱包状态物化"),
+    ("wallet_pipeline_plan", "钱包队列规划"),
+    ("copyability_plan", "Copyability 规划"),
+    ("materialize_features", "特征物化"),
+    ("incremental_score", "增量评分"),
+)
+_RESEARCH_CONTROL_STEP_PREFIX = "loop_research_control_step_"
+
 
 @dataclass(frozen=True)
 class WebConsoleConfig:
@@ -3659,6 +3669,7 @@ def _ops_health_summary(conn: sqlite3.Connection, settings: RobotSettings) -> di
     address_quality = _address_quality_fast_report(conn)
     pipeline_backlog = _pending_evidence_backlog_summary(conn)
     runtime_loops = _runtime_loop_summary(conn, now=now)
+    research_control_steps = _research_control_step_summary(conn, now=now)
     upstream_request_budget = (
         api_rate_limit_summary(conn, now=now)
         if _table_exists(conn, "api_rate_limit_state")
@@ -3740,6 +3751,9 @@ def _ops_health_summary(conn: sqlite3.Connection, settings: RobotSettings) -> di
     elif high_priority_backlog:
         health = "attention"
         note = "高优先级钱包等待补证据但未进入活动队列，需要重新规划或检查 worker。"
+    elif int(research_control_steps.get("attention_count") or 0):
+        health = "attention"
+        note = "研究控制阶段最近有失败、部分完成或超时，请查看具体阶段。"
     elif int(runtime_loops.get("attention_count") or 0):
         health = "attention"
         note = "常驻循环有失败、部分完成或超时，需要查看运行循环新鲜度。"
@@ -3758,6 +3772,7 @@ def _ops_health_summary(conn: sqlite3.Connection, settings: RobotSettings) -> di
         "address_quality": address_quality,
         "runtime": _runtime_build_info(),
         "runtime_loops": runtime_loops,
+        "research_control_steps": research_control_steps,
         "upstream_request_budget": upstream_request_budget,
         "storage": storage,
         "pipeline_backlog": pipeline_backlog,
@@ -3835,6 +3850,85 @@ def _latest_runtime_loop_run(conn: sqlite3.Connection, spec: RuntimeLoopSpec) ->
         (spec.ingest_pattern,),
     )
     return rows[0] if rows else None
+
+
+def _research_control_step_summary(conn: sqlite3.Connection, *, now: int) -> dict[str, Any]:
+    expected = {f"{_RESEARCH_CONTROL_STEP_PREFIX}{key}": (key, label) for key, label in _RESEARCH_CONTROL_STEP_SPECS}
+    placeholders = ",".join("?" for _ in expected)
+    latest_rows = _rows(
+        conn,
+        f"""
+        WITH ranked AS (
+            SELECT
+                ingest_type,
+                status,
+                started_at,
+                finished_at,
+                rows_written,
+                error,
+                ROW_NUMBER() OVER (
+                    PARTITION BY ingest_type
+                    ORDER BY COALESCE(finished_at, started_at) DESC, run_id DESC
+                ) AS row_num
+            FROM ingest_runs
+            WHERE ingest_type IN ({placeholders})
+        )
+        SELECT ingest_type, status, started_at, finished_at, rows_written, error
+        FROM ranked
+        WHERE row_num = 1
+        """,
+        tuple(expected),
+    )
+    latest_by_type = {str(row["ingest_type"]): row for row in latest_rows}
+    rows: list[dict[str, Any]] = []
+    attention_states = {"error", "partial", "interrupted", "stale", "stale_running"}
+    for step_key, label in _RESEARCH_CONTROL_STEP_SPECS:
+        ingest_type = f"{_RESEARCH_CONTROL_STEP_PREFIX}{step_key}"
+        latest = latest_by_type.get(ingest_type)
+        if not latest:
+            rows.append(
+                {
+                    "step_key": step_key,
+                    "step": label,
+                    "state": "no_data",
+                    "state_label": "无记录",
+                    "last_status": "",
+                    "duration_label": "",
+                    "age_label": "",
+                    "last_at": 0,
+                    "rows_written": 0,
+                    "error": "",
+                }
+            )
+            continue
+        status = str(latest.get("status") or "")
+        started_at = int(latest.get("started_at") or 0)
+        finished_at = int(latest.get("finished_at") or started_at)
+        last_at = finished_at or started_at
+        age_seconds = max(0, now - last_at) if last_at else 0
+        state = _runtime_loop_state(status, age_seconds=age_seconds, max_age_seconds=1_800)
+        rows.append(
+            {
+                "step_key": step_key,
+                "step": label,
+                "state": state,
+                "state_label": _runtime_loop_state_label(state),
+                "last_status": status,
+                "duration_label": _short_duration_label(max(0, finished_at - started_at)),
+                "age_label": _age_label(age_seconds) if last_at else "",
+                "last_at": last_at,
+                "rows_written": int(latest.get("rows_written") or 0),
+                "error": _short_error(str(latest.get("error") or "")),
+            }
+        )
+    attention_count = sum(1 for row in rows if row["state"] in attention_states)
+    has_data = any(row["state"] != "no_data" for row in rows)
+    return {
+        "state": "attention" if attention_count else "ok",
+        "has_data": has_data,
+        "attention_count": attention_count,
+        "rows": rows,
+    }
 
 
 def _runtime_loop_state(last_status: str, *, age_seconds: int, max_age_seconds: int) -> str:
@@ -7833,6 +7927,7 @@ def _ops_health_panel(values: dict[str, Any]) -> str:
     address_quality = values.get("address_quality") or {}
     runtime = values.get("runtime") or {}
     runtime_loops = values.get("runtime_loops") or {}
+    research_control_steps = values.get("research_control_steps") or {}
     upstream_request_budget = values.get("upstream_request_budget") or {}
     pipeline_backlog = values.get("pipeline_backlog") or {}
     health = str(values.get("health") or "ok")
@@ -7934,6 +8029,25 @@ def _ops_health_panel(values: dict[str, Any]) -> str:
             ["预算", "状态", "速率", "冷却秒", "许可", "冷却次数", "最近状态码", "更新"],
         ),
     ]
+    if research_control_steps.get("has_data"):
+        body.insert(
+            5,
+            '<h3 class="subhead">研究控制阶段</h3>'
+            + _simple_table(
+                research_control_steps.get("rows") or [],
+                [
+                    "step",
+                    "state_label",
+                    "last_status",
+                    "duration_label",
+                    "age_label",
+                    "last_at",
+                    "rows_written",
+                    "error",
+                ],
+                ["阶段", "状态", "最近结果", "耗时", "多久前", "最近时间", "处理", "摘要/错误"],
+            ),
+        )
     if values.get("stale_running_samples"):
         body.append(
             '<h3 class="subhead">过期 running 样本</h3>'
@@ -8128,6 +8242,18 @@ def _duration_label(seconds: Any) -> str:
         return _fmt_duration_hours(float(seconds) / 3600) or "刚刚"
     except (TypeError, ValueError):
         return str(seconds)
+
+
+def _short_duration_label(seconds: Any) -> str:
+    try:
+        value = max(0.0, float(seconds))
+    except (TypeError, ValueError):
+        return str(seconds or "")
+    if value < 1:
+        return "<1 秒"
+    if value < 60:
+        return f"{int(round(value))} 秒"
+    return _duration_label(value)
 
 
 def _fmt_pct(value: Any) -> str:

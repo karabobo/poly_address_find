@@ -262,6 +262,9 @@ def test_nas_research_control_runs_ordered_cycle_with_sharded_workers():
     assert "--continue-on-error" in control
     assert "--heartbeat-prefix loop_research_control_step" in control
     assert "--no-diagnostics" in control
+    assert '--busy-timeout-seconds "$BUSY_TIMEOUT_SECONDS"' in control
+    assert '--planner-lock-attempts "$PLANNER_LOCK_ATTEMPTS"' in control
+    assert '--planner-lock-sleep-seconds "$PLANNER_LOCK_SLEEP_SECONDS"' in control
     assert "--state-stale-only" in control
     assert '--wallet-max-active-jobs "$WALLET_MAX_ACTIVE_JOBS"' in control
     assert '--copyability-max-active-jobs "$COPYABILITY_MAX_ACTIVE_JOBS"' in control
@@ -862,6 +865,9 @@ def test_nas_research_control_runs_planning_features_and_scoring_in_one_cycle():
     assert "research-control-restart" in helper
     assert "score-up" in helper
     assert "PM_ROBOT_RESEARCH_CONTROL_INTERVAL=300" in env
+    assert "PM_ROBOT_RESEARCH_BUSY_TIMEOUT_SECONDS=5" in env
+    assert "PM_ROBOT_RESEARCH_PLANNER_LOCK_ATTEMPTS=2" in env
+    assert "PM_ROBOT_RESEARCH_PLANNER_LOCK_SLEEP_SECONDS=1" in env
     assert "PM_ROBOT_SCORE_FEATURE_LIMIT=80" in env
     assert "PM_ROBOT_SCORE_LIMIT=300" in env
     assert "PM_ROBOT_PAPER_ACTIVITY_WALLET_LIMIT=10" in env
@@ -961,15 +967,18 @@ def test_nas_maintenance_loop_runs_lightweight_storage_and_queue_repair():
     assert "PM_ROBOT_MAINTENANCE_WAL_CHECKPOINT=none" in env
     assert "PM_ROBOT_MAINTENANCE_STALE_INGEST_RUN_SECONDS=21600" in env
     assert "PM_ROBOT_MAINTENANCE_FAILED_JOB_COOLDOWN_SECONDS=21600" in env
+    assert "PM_ROBOT_MAINTENANCE_RUNTIME_HEARTBEAT_DAYS=30" in env
     assert "--skip-cleanup" in loop
     assert "--reset-stale-jobs" in loop
     assert "--failed-job-cooldown-seconds \"$FAILED_JOB_COOLDOWN_SECONDS\"" in loop
     assert "--reset-stale-ingest-runs" in loop
     assert "--stale-ingest-run-seconds \"$STALE_INGEST_RUN_SECONDS\"" in loop
+    assert "--runtime-heartbeat-days \"$RUNTIME_HEARTBEAT_DAYS\"" in loop
     assert "--wal-checkpoint \"$WAL_CHECKPOINT\"" in loop
     assert "PM_ROBOT_MAINTENANCE_WAL_CHECKPOINT:-none" in loop
     assert "PM_ROBOT_MAINTENANCE_STALE_INGEST_RUN_SECONDS:-21600" in loop
     assert "PM_ROBOT_MAINTENANCE_FAILED_JOB_COOLDOWN_SECONDS:-21600" in loop
+    assert "PM_ROBOT_MAINTENANCE_RUNTIME_HEARTBEAT_DAYS:-30" in loop
     assert "--reset-stale-jobs" in systemd_service
     assert "--failed-job-cooldown-seconds 21600" in systemd_service
     assert "--reset-stale-ingest-runs" in systemd_service

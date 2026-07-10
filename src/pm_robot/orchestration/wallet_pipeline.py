@@ -99,6 +99,8 @@ def plan_wallet_pipeline_jobs(
     deep_limit: int = DEFAULT_PIPELINE_STAGE_WEIGHTS[EvidenceJobStage.DEEP_PENDING.value],
     shard_count: int = 3,
     max_active_jobs: int = 240,
+    lock_retry_attempts: int = LOCK_RETRY_ATTEMPTS,
+    lock_retry_sleep_seconds: float = LOCK_RETRY_SLEEP_SECONDS,
     now: int | None = None,
 ) -> WalletPipelinePlanSummary:
     if shard_count <= 0:
@@ -106,6 +108,14 @@ def plan_wallet_pipeline_jobs(
 
     def _plan_once() -> WalletPipelinePlanSummary:
         conn.commit()
+        ts = now or int(time.time())
+        prefetched_targets = _prefetch_pipeline_targets(
+            conn,
+            light_limit=light_limit,
+            medium_limit=medium_limit,
+            deep_limit=deep_limit,
+            now=ts,
+        )
         conn.execute("BEGIN IMMEDIATE")
         try:
             summary = _plan_wallet_pipeline_jobs_once(
@@ -115,7 +125,8 @@ def plan_wallet_pipeline_jobs(
                 deep_limit=deep_limit,
                 shard_count=shard_count,
                 max_active_jobs=max_active_jobs,
-                now=now,
+                now=ts,
+                prefetched_targets=prefetched_targets,
             )
             conn.commit()
             return summary
@@ -126,8 +137,8 @@ def plan_wallet_pipeline_jobs(
     return retry_sqlite_locked(
         _plan_once,
         rollback=conn.rollback,
-        attempts=LOCK_RETRY_ATTEMPTS,
-        sleep_seconds=LOCK_RETRY_SLEEP_SECONDS,
+        attempts=lock_retry_attempts,
+        sleep_seconds=lock_retry_sleep_seconds,
     )
 
 
@@ -139,9 +150,10 @@ def _plan_wallet_pipeline_jobs_once(
     deep_limit: int,
     shard_count: int,
     max_active_jobs: int,
-    now: int | None,
+    now: int,
+    prefetched_targets: dict[str, list[dict[str, Any]]],
 ) -> WalletPipelinePlanSummary:
-    ts = now or int(time.time())
+    ts = now
     active_jobs = _active_wallet_pipeline_jobs(conn)
     if max_active_jobs > 0 and active_jobs >= max_active_jobs:
         return WalletPipelinePlanSummary(
@@ -166,6 +178,7 @@ def _plan_wallet_pipeline_jobs_once(
         deep_limit=deep_limit,
         max_targets=available_slots,
         now=ts,
+        prefetched_targets=prefetched_targets,
     )
     enqueued = 0
     for target in targets:
@@ -721,17 +734,29 @@ def _select_pipeline_targets(
     deep_limit: int,
     max_targets: int | None,
     now: int,
+    prefetched_targets: dict[str, list[dict[str, Any]]] | None = None,
 ) -> list[dict[str, Any]]:
     stage_limits = (
         (DEFAULT_EVIDENCE_JOB_STAGE, light_limit),
         (EvidenceJobStage.MEDIUM_PENDING.value, medium_limit),
         (EvidenceJobStage.DEEP_PENDING.value, deep_limit),
     )
-    targets_by_stage = {
-        evidence_job_stage: _targets_for_action(conn, evidence_job_stage, limit, now)
-        for evidence_job_stage, limit in stage_limits
-        if limit > 0
-    }
+    targets_by_stage = (
+        _prefetch_pipeline_targets(
+            conn,
+            light_limit=light_limit,
+            medium_limit=medium_limit,
+            deep_limit=deep_limit,
+            now=now,
+        )
+        if prefetched_targets is None
+        else {
+            evidence_job_stage: list(prefetched_targets.get(evidence_job_stage, ()))
+            for evidence_job_stage, limit in stage_limits
+            if limit > 0
+        }
+    )
+    targets_by_stage = _revalidate_pipeline_targets(conn, targets_by_stage, now=now)
     target_count = sum(len(stage_targets) for stage_targets in targets_by_stage.values())
     selection_limit = target_count if max_targets is None else min(max_targets, target_count)
     if selection_limit <= 0:
@@ -789,6 +814,108 @@ def _select_pipeline_targets(
         active_by_stage[evidence_job_stage] = active_by_stage.get(evidence_job_stage, 0) + 1
     _persist_wallet_pipeline_scheduler_state(conn, scheduler_state, now=now)
     return selected
+
+
+def _prefetch_pipeline_targets(
+    conn: sqlite3.Connection,
+    *,
+    light_limit: int,
+    medium_limit: int,
+    deep_limit: int,
+    now: int,
+) -> dict[str, list[dict[str, Any]]]:
+    """Read planner candidates before the short queue-admission write transaction."""
+
+    stage_limits = (
+        (DEFAULT_EVIDENCE_JOB_STAGE, light_limit),
+        (EvidenceJobStage.MEDIUM_PENDING.value, medium_limit),
+        (EvidenceJobStage.DEEP_PENDING.value, deep_limit),
+    )
+    return {
+        evidence_job_stage: _targets_for_action(conn, evidence_job_stage, limit, now)
+        for evidence_job_stage, limit in stage_limits
+        if limit > 0
+    }
+
+
+def _revalidate_pipeline_targets(
+    conn: sqlite3.Connection,
+    targets_by_stage: dict[str, list[dict[str, Any]]],
+    *,
+    now: int,
+) -> dict[str, list[dict[str, Any]]]:
+    """Recheck mutable eligibility and dedupe state while queue capacity is reserved."""
+
+    targets = [target for stage_targets in targets_by_stage.values() for target in stage_targets]
+    wallets = sorted({str(target["wallet"]).lower() for target in targets})
+    if not wallets:
+        return targets_by_stage
+    placeholders = ", ".join("?" for _wallet in wallets)
+    state_rows = conn.execute(
+        f"""
+        SELECT
+            wps.wallet,
+            wps.discovery_tier,
+            wps.evidence_status,
+            wps.next_action,
+            wps.next_action_at,
+            cw.candidate_stage
+        FROM wallet_processing_state wps
+        JOIN candidate_wallets cw
+          ON cw.address = wps.wallet
+        WHERE wps.wallet IN ({placeholders})
+        """,
+        tuple(wallets),
+    ).fetchall()
+    current_state = {str(row["wallet"]).lower(): row for row in state_rows}
+    job_rows = conn.execute(
+        f"""
+        SELECT wallet, subject_key, tier, status, next_attempt_at
+        FROM pipeline_jobs
+        WHERE job_type = ?
+          AND wallet IN ({placeholders})
+        """,
+        (JOB_TYPE, *wallets),
+    ).fetchall()
+    jobs_by_wallet: dict[str, list[sqlite3.Row]] = {}
+    for row in job_rows:
+        jobs_by_wallet.setdefault(str(row["wallet"]).lower(), []).append(row)
+
+    validated: dict[str, list[dict[str, Any]]] = {}
+    blocked_stages = {"rejected", "blocked_hygiene", "blocked_copyability"}
+    for evidence_job_stage, stage_targets in targets_by_stage.items():
+        valid_targets: list[dict[str, Any]] = []
+        for target in stage_targets:
+            wallet = str(target["wallet"]).lower()
+            state = current_state.get(wallet)
+            job_scope = str(target.get("discovery_tier") or "")
+            if (
+                state is None
+                or str(state["next_action"] or "") != evidence_job_stage
+                or int(state["next_action_at"] or 0) > now
+                or str(state["evidence_status"] or "") in {"paused", "summary_ready"}
+                or str(state["candidate_stage"] or "") in blocked_stages
+                or str(state["discovery_tier"] or "") != job_scope
+            ):
+                continue
+            conflict = False
+            for job in jobs_by_wallet.get(wallet, ()):
+                if str(job["subject_key"] or "") != evidence_job_stage:
+                    continue
+                status = str(job["status"] or "")
+                exact_scope = str(job["tier"] or "") == job_scope
+                if status in {"queued", "running"}:
+                    conflict = True
+                elif status == "failed" and exact_scope and int(job["next_attempt_at"] or 0) > now:
+                    conflict = True
+                elif status == "done" and exact_scope:
+                    conflict = True
+                if conflict:
+                    break
+            if not conflict:
+                valid_targets.append(target)
+        validated[evidence_job_stage] = valid_targets
+    return validated
 
 
 def _active_wallet_pipeline_jobs_by_stage(conn: sqlite3.Connection) -> dict[str, int]:

@@ -9,6 +9,7 @@ from pm_robot.storage.repository import (
     materialize_wallet_processing_state,
     persist_score,
     persist_wallet_activity,
+    record_runtime_heartbeat,
     upsert_candidate,
     upsert_wallet_feature,
 )
@@ -217,6 +218,8 @@ def test_pipeline_cycle_isolates_failed_phase_and_continues_committed_work(tmp_p
                 include_diagnostics=False,
                 wallet_shard_count=1,
                 copyability_shard_count=1,
+                planner_lock_attempts=2,
+                planner_lock_sleep_seconds=0.0,
                 feature_limit=0,
                 run_scoring=True,
                 policy_path=Path("config/leader_scoring_policy.json"),
@@ -243,5 +246,65 @@ def test_pipeline_cycle_isolates_failed_phase_and_continues_committed_work(tmp_p
             "materialize_features",
             "incremental_score",
         ]
+        assert all(int(step["finished_at"]) >= int(step["started_at"]) for step in reported_steps)
+        assert all(float(step["duration_ms"]) >= 0 for step in reported_steps)
+    finally:
+        conn.close()
+
+
+def test_pipeline_cycle_phase_heartbeats_preserve_failure_and_recovery(tmp_path, monkeypatch):
+    conn = connect(tmp_path / "robot.sqlite")
+    wallet = "0x" + "6" * 40
+
+    def report_step(step: dict) -> None:
+        data = step.get("data") if isinstance(step.get("data"), dict) else {}
+        record_runtime_heartbeat(
+            conn,
+            f"loop_research_control_step_{step['name']}",
+            status="failed" if step.get("status") == "failed" else "ok",
+            error=str(data.get("error") or ""),
+            started_at=int(step.get("started_at") or 0) or None,
+            finished_at=int(step.get("finished_at") or 0) or None,
+        )
+
+    options = PipelineCycleOptions(
+        execute_plan=True,
+        continue_on_error=True,
+        include_diagnostics=False,
+        wallet_shard_count=1,
+        copyability_shard_count=1,
+        planner_lock_attempts=1,
+        planner_lock_sleep_seconds=0.0,
+        feature_limit=0,
+        run_scoring=False,
+        policy_path=Path("config/leader_scoring_policy.json"),
+    )
+    try:
+        run_migrations(conn)
+        upsert_candidate(conn, CandidateAddress(address=wallet, sources="test_source"))
+        conn.commit()
+
+        with monkeypatch.context() as patcher:
+            patcher.setattr(
+                "pm_robot.orchestration.pipeline_cycle.plan_wallet_pipeline_jobs",
+                lambda *args, **kwargs: (_ for _ in ()).throw(sqlite3.OperationalError("database is locked")),
+            )
+            first = run_pipeline_cycle(conn, options, step_reporter=report_step)
+
+        second = run_pipeline_cycle(conn, options, step_reporter=report_step)
+        rows = conn.execute(
+            """
+            SELECT status, started_at, finished_at, error
+            FROM ingest_runs
+            WHERE ingest_type = 'loop_research_control_step_wallet_pipeline_plan'
+            ORDER BY run_id DESC
+            """
+        ).fetchall()
+
+        assert first["partial"] is True
+        assert second["ok"] is True
+        assert [row["status"] for row in rows] == ["ok", "failed"]
+        assert rows[1]["error"] == "database is locked"
+        assert all(int(row["finished_at"]) >= int(row["started_at"]) for row in rows)
     finally:
         conn.close()

@@ -7,6 +7,7 @@ from threading import Barrier
 
 from pm_robot.clients.http import HttpClientError
 from pm_robot.models import CandidateAddress, CandidateStage
+import pm_robot.orchestration.wallet_pipeline as wallet_pipeline
 from pm_robot.orchestration.copyability_evidence import JOB_TYPE as COPYABILITY_JOB_TYPE
 from pm_robot.orchestration.evidence_backfill import summarize_wallet_evidence
 from pm_robot.orchestration.wallet_pipeline import (
@@ -1627,6 +1628,39 @@ def test_concurrent_wallet_planners_do_not_oversubscribe_queue_capacity(tmp_path
     assert sum(summary.jobs_enqueued for summary in summaries) == 1
     assert sum(1 for summary in summaries if summary.throttled) == 1
     assert active_jobs == 1
+
+
+def test_wallet_planner_prefetches_candidates_before_write_transaction(tmp_path, monkeypatch):
+    conn = connect(tmp_path / "robot.sqlite")
+    wallet = "0x" + "d" * 40
+    observed_transactions: list[bool] = []
+    real_targets_for_action = wallet_pipeline._targets_for_action
+
+    def observing_targets(conn_arg, evidence_job_stage, limit, now):
+        observed_transactions.append(conn_arg.in_transaction)
+        return real_targets_for_action(conn_arg, evidence_job_stage, limit, now)
+
+    try:
+        run_migrations(conn)
+        _seed_light_pending_state(conn, wallet, priority=10)
+        conn.commit()
+        monkeypatch.setattr(wallet_pipeline, "_targets_for_action", observing_targets)
+
+        summary = plan_wallet_pipeline_jobs(
+            conn,
+            light_limit=1,
+            medium_limit=0,
+            deep_limit=0,
+            shard_count=1,
+            max_active_jobs=10,
+            now=40_000,
+        )
+
+        assert summary.jobs_enqueued == 1
+        assert observed_transactions == [False]
+        assert conn.in_transaction is False
+    finally:
+        conn.close()
 
 
 def test_wallet_processing_state_is_evidence_tier_source_of_truth(tmp_path):

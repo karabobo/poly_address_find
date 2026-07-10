@@ -23,6 +23,7 @@ from pm_robot.pipeline_terms import (
     EvidenceTier,
     PAPER_ELIGIBLE_CANDIDATE_STAGES,
 )
+from pm_robot.storage.db import retry_sqlite_locked
 
 
 SOURCE_EVENT_APPEND = "append"
@@ -1663,21 +1664,34 @@ def record_runtime_heartbeat(
     rows_written: int = 0,
     error: str = "",
     now: int | None = None,
+    started_at: int | None = None,
+    finished_at: int | None = None,
 ) -> int:
     """Record a finished loop heartbeat without claiming ownership of worker runs."""
 
     ts = int(time.time()) if now is None else int(now)
-    cur = conn.execute(
-        """
-        INSERT INTO ingest_runs(
-            ingest_type, started_at, finished_at, status,
-            wallets_attempted, wallets_succeeded, rows_written, error
-        ) VALUES (?, ?, ?, ?, 0, 0, ?, ?)
-        """,
-        (ingest_type, ts, ts, status, int(rows_written), error[:1000]),
+    started_ts = ts if started_at is None else int(started_at)
+    finished_ts = ts if finished_at is None else int(finished_at)
+    finished_ts = max(started_ts, finished_ts)
+    def write_heartbeat() -> int:
+        cur = conn.execute(
+            """
+            INSERT INTO ingest_runs(
+                ingest_type, started_at, finished_at, status,
+                wallets_attempted, wallets_succeeded, rows_written, error
+            ) VALUES (?, ?, ?, ?, 0, 0, ?, ?)
+            """,
+            (ingest_type, started_ts, finished_ts, status, int(rows_written), error[:1000]),
+        )
+        conn.commit()
+        return int(cur.lastrowid)
+
+    return retry_sqlite_locked(
+        write_heartbeat,
+        rollback=conn.rollback,
+        attempts=2,
+        sleep_seconds=0.5,
     )
-    conn.commit()
-    return int(cur.lastrowid)
 
 
 def finish_ingest_run(

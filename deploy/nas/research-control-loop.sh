@@ -22,6 +22,9 @@ FEATURE_MIN_ACTIVITY_EVENTS="${PM_ROBOT_SCORE_MIN_ACTIVITY_EVENTS:-25}"
 SCORE_LIMIT="${PM_ROBOT_SCORE_LIMIT:-300}"
 POLICY_PATH="${PM_ROBOT_POLICY_PATH:-/app/config/leader_scoring_policy.json}"
 PAPER_HANDOFF_LIMIT="${PM_ROBOT_PAPER_HANDOFF_LIMIT:-250}"
+BUSY_TIMEOUT_SECONDS="${PM_ROBOT_RESEARCH_BUSY_TIMEOUT_SECONDS:-5}"
+PLANNER_LOCK_ATTEMPTS="${PM_ROBOT_RESEARCH_PLANNER_LOCK_ATTEMPTS:-2}"
+PLANNER_LOCK_SLEEP_SECONDS="${PM_ROBOT_RESEARCH_PLANNER_LOCK_SLEEP_SECONDS:-1}"
 
 runtime_heartbeat() {
   name="$1"
@@ -40,6 +43,9 @@ while true; do
       --continue-on-error \
       --heartbeat-prefix loop_research_control_step \
       --no-diagnostics \
+      --busy-timeout-seconds "$BUSY_TIMEOUT_SECONDS" \
+      --planner-lock-attempts "$PLANNER_LOCK_ATTEMPTS" \
+      --planner-lock-sleep-seconds "$PLANNER_LOCK_SLEEP_SECONDS" \
       --min-score "$MIN_SCORE" \
       --state-limit "$STATE_LIMIT" \
       --state-stale-only \

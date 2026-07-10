@@ -1,4 +1,5 @@
 import json
+import time
 
 import pytest
 
@@ -84,6 +85,61 @@ def test_maintenance_skip_cleanup_avoids_cleanup_scan(tmp_path, monkeypatch):
 
     assert result["cleanup_skipped"] is True
     assert result["deleted"] == {}
+
+
+def test_maintenance_skip_cleanup_prunes_only_old_runtime_heartbeats(tmp_path):
+    settings = _settings(tmp_path)
+    initialize_database(settings.db_path)
+    now = int(time.time())
+    old = now - 31 * 86_400
+    conn = connect(settings.db_path)
+    try:
+        run_migrations(conn)
+        conn.executemany(
+            """
+            INSERT INTO ingest_runs(
+                ingest_type, started_at, finished_at, status,
+                wallets_attempted, wallets_succeeded, rows_written, error
+            ) VALUES (?, ?, ?, 'ok', 0, 0, 0, '')
+            """,
+            [
+                ("loop_research_control_step_wallet_pipeline_plan", old, old + 1),
+                ("loopX_worker", old, old + 1),
+                ("loopback_worker", old, old + 1),
+                ("wallet_pipeline_worker_0", old, old + 1),
+                ("loop_recent", now - 60, now - 50),
+            ],
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    dry_run = maintenance(
+        settings,
+        skip_cleanup=True,
+        dry_run=True,
+        runtime_heartbeat_days=30,
+    )
+    assert dry_run["runtime_heartbeat_cleanup"]["matched"] == 1
+    assert dry_run["runtime_heartbeat_cleanup"]["deleted"] == 0
+
+    result = maintenance(settings, skip_cleanup=True, runtime_heartbeat_days=30)
+    assert result["runtime_heartbeat_cleanup"]["deleted"] == 1
+
+    conn = connect(settings.db_path)
+    try:
+        remaining = {
+            str(row[0])
+            for row in conn.execute("SELECT ingest_type FROM ingest_runs ORDER BY ingest_type").fetchall()
+        }
+    finally:
+        conn.close()
+    assert remaining == {
+        "loopX_worker",
+        "loop_recent",
+        "loopback_worker",
+        "wallet_pipeline_worker_0",
+    }
 
 
 def test_maintenance_rejects_unknown_wal_checkpoint_mode(tmp_path):

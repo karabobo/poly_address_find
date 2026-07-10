@@ -991,11 +991,17 @@ def test_copyability_planner_fills_only_remaining_active_queue_slots(tmp_path):
 def test_copyability_planner_checks_capacity_inside_write_transaction(tmp_path, monkeypatch):
     conn = connect(tmp_path / "robot.sqlite")
     observed_transactions: list[bool] = []
+    observed_selection_transactions: list[bool] = []
     real_active_count = copyability_evidence._active_copyability_job_count
+    real_select_targets = copyability_evidence._select_copyability_targets
 
     def observing_active_count(conn_arg):
         observed_transactions.append(conn_arg.in_transaction)
         return real_active_count(conn_arg)
+
+    def observing_select_targets(conn_arg, **kwargs):
+        observed_selection_transactions.append(conn_arg.in_transaction)
+        return real_select_targets(conn_arg, **kwargs)
 
     try:
         run_migrations(conn)
@@ -1003,6 +1009,11 @@ def test_copyability_planner_checks_capacity_inside_write_transaction(tmp_path, 
             copyability_evidence,
             "_active_copyability_job_count",
             observing_active_count,
+        )
+        monkeypatch.setattr(
+            copyability_evidence,
+            "_select_copyability_targets",
+            observing_select_targets,
         )
 
         summary = plan_copyability_evidence_jobs(
@@ -1014,8 +1025,91 @@ def test_copyability_planner_checks_capacity_inside_write_transaction(tmp_path, 
         )
 
         assert summary.status == "ok"
+        assert observed_selection_transactions == [False]
         assert observed_transactions == [True]
         assert conn.in_transaction is False
+    finally:
+        conn.close()
+
+
+def test_copyability_planner_revalidates_latest_score_before_enqueue(tmp_path, monkeypatch):
+    conn = connect(tmp_path / "robot.sqlite")
+    wallet = "0x" + "e" * 40
+    real_select_targets = copyability_evidence._select_copyability_targets
+    selection_calls = 0
+
+    def lower_score_after_prefetch(conn_arg, **kwargs):
+        nonlocal selection_calls
+        rows = real_select_targets(conn_arg, **kwargs)
+        selection_calls += 1
+        if selection_calls == 1:
+            conn_arg.execute(
+                """
+                INSERT INTO leader_scores(
+                    address, leader_score, review_stage, review_reason,
+                    components_json, penalties_json, policy_version, scored_at
+                ) VALUES (?, 10, 'needs_manual_review', 'score_dropped', '{}', '{}', 'test', 11000)
+                """,
+                (wallet,),
+            )
+            conn_arg.commit()
+        return rows
+
+    try:
+        run_migrations(conn)
+        upsert_candidate(conn, CandidateAddress(address=wallet, sources="test"))
+        conn.execute(
+            "UPDATE candidate_wallets SET candidate_stage = 'needs_manual_review' WHERE address = ?",
+            (wallet,),
+        )
+        conn.execute(
+            """
+            INSERT INTO leader_scores(
+                address, leader_score, review_stage, review_reason,
+                components_json, penalties_json, policy_version, scored_at
+            ) VALUES (?, 70, 'needs_manual_review', 'watchlist_score', '{}', '{}', 'test', 10000)
+            """,
+            (wallet,),
+        )
+        conn.execute(
+            """
+            INSERT INTO wallet_processing_state(
+                wallet, discovery_tier, evidence_status, evidence_depth,
+                evidence_confidence, priority, current_stage, next_action,
+                next_action_at, activity_count, non_fast_trade_count,
+                distinct_markets, updated_at
+            ) VALUES (?, 'l1_light', 'queued', 100, 0.7, 10,
+                'light_done', 'medium_pending', 0, 100, 80, 4, 10000)
+            """,
+            (wallet,),
+        )
+        conn.commit()
+        monkeypatch.setattr(
+            copyability_evidence,
+            "_select_copyability_targets",
+            lower_score_after_prefetch,
+        )
+
+        summary = plan_copyability_evidence_jobs(
+            conn,
+            limit=10,
+            max_active_jobs=10,
+            min_score=40,
+            min_activity_events=25,
+            shard_count=1,
+            now=12_000,
+        )
+        queued = int(
+            conn.execute(
+                "SELECT COUNT(*) FROM pipeline_jobs WHERE job_type = ? AND wallet = ?",
+                (JOB_TYPE, wallet),
+            ).fetchone()[0]
+        )
+
+        assert selection_calls == 2
+        assert summary.targets_seen == 0
+        assert summary.jobs_enqueued == 0
+        assert queued == 0
     finally:
         conn.close()
 

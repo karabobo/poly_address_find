@@ -1,5 +1,8 @@
 import json
+import sqlite3
 from pathlib import Path
+
+import pytest
 
 from pm_robot.config import load_policy
 from pm_robot.models import CandidateAddress, CandidateStage, ScoreBreakdown, WalletFeatures
@@ -16,6 +19,7 @@ from pm_robot.storage.repository import (
     list_candidates,
     persist_wallet_activity,
     persist_wallet_positions,
+    record_runtime_heartbeat,
     persist_score,
     rebuild_wallet_episodes,
     seed_evidence_backfill_budget,
@@ -23,6 +27,39 @@ from pm_robot.storage.repository import (
     upsert_gamma_market_cache,
     upsert_wallet_feature,
 )
+
+
+def test_runtime_heartbeat_lock_failure_cannot_rollback_committed_wallet_data(tmp_path):
+    db_path = tmp_path / "robot.sqlite"
+    conn = connect(db_path)
+    locker = sqlite3.connect(db_path, timeout=0)
+    wallet = "0x" + "f" * 40
+    try:
+        run_migrations(conn)
+        upsert_candidate(conn, CandidateAddress(address=wallet, sources="test"))
+        conn.commit()
+        conn.execute("PRAGMA busy_timeout = 1")
+        locker.execute("BEGIN IMMEDIATE")
+
+        with pytest.raises(sqlite3.OperationalError, match="database is locked"):
+            record_runtime_heartbeat(conn, "loop_research_control_step_wallet_pipeline_plan")
+
+        candidate_count = int(
+            conn.execute("SELECT COUNT(*) FROM candidate_wallets WHERE address = ?", (wallet,)).fetchone()[0]
+        )
+        heartbeat_count = int(
+            conn.execute(
+                "SELECT COUNT(*) FROM ingest_runs WHERE ingest_type = ?",
+                ("loop_research_control_step_wallet_pipeline_plan",),
+            ).fetchone()[0]
+        )
+
+        assert candidate_count == 1
+        assert heartbeat_count == 0
+    finally:
+        locker.rollback()
+        locker.close()
+        conn.close()
 
 
 def test_sqlite_candidate_feature_score_roundtrip(tmp_path):

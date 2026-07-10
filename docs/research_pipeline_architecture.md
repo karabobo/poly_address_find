@@ -57,6 +57,13 @@ phases continue against the latest committed data. Paper handoff export runs aft
 partial cycles, so planner contention cannot make an otherwise valid handoff stale.
 The frequent control loop skips full smoothness diagnostics; those scans remain available through the explicit
 audit/report commands instead of being repeated during every scheduling pass.
+The NAS control loop uses a short SQLite busy timeout and a bounded planner retry budget. Lock contention therefore
+fails one isolated phase and yields to the next control pass instead of blocking workers for minutes. Every phase
+records its own start time, finish time, result count, and error; the system-health panel shows the latest six phase
+heartbeats only after phase data exists.
+Wallet and copyability planners run candidate selection and copyability priority calculation before opening their
+short queue-admission write transaction. Under the write lock they recheck mutable eligibility, exact-scope dedupe,
+retry cooldown, and active-queue capacity before enqueueing.
 Eligibility repair only prepares evidence budgets and planner-ready actions; it never writes `pipeline_jobs`.
 Queue admission remains delegated to the canonical wallet and copyability planners, and unchanged repair budgets
 are not rewritten on every control pass.
@@ -106,6 +113,8 @@ default `up`, `restart`, `runtime-ensure`, or watchdog commands.
 - Queue claims use SQLite write serialization and leases.
 - Workers renew leases around long work and can only complete or retry jobs they still own.
 - Maintenance requeues expired leases and stale runtime records.
+- Lightweight maintenance retains `loop_*` runtime heartbeats for 30 days by default even when broad database
+  cleanup is skipped. It does not delete worker audit runs or wallet evidence in that path.
 - Maintenance marks expired or queued jobs failed once their attempt budget is exhausted, so unclaimable jobs
   cannot occupy planner queue capacity indefinitely. Failed jobs respect `next_attempt_at`; after the cooldown,
   planners may reopen them with a fresh attempt budget while retaining the previous error for diagnosis.

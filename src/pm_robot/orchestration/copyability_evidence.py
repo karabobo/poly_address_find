@@ -93,6 +93,8 @@ def plan_copyability_evidence_jobs(
     min_activity_events: int = 25,
     shard_count: int = 3,
     rescan_seconds: int = 21_600,
+    lock_retry_attempts: int = LOCK_RETRY_ATTEMPTS,
+    lock_retry_sleep_seconds: float = LOCK_RETRY_SLEEP_SECONDS,
     now: int | None = None,
 ) -> CopyabilityPlanSummary:
     if shard_count <= 0:
@@ -100,6 +102,17 @@ def plan_copyability_evidence_jobs(
 
     def _plan_once() -> CopyabilityPlanSummary:
         conn.commit()
+        ts = now or int(time.time())
+        batch_limit = max(0, int(limit))
+        prefetched_targets = _select_copyability_targets(
+            conn,
+            limit=batch_limit,
+            min_score=min_score,
+            min_activity_events=min_activity_events,
+            rescan_seconds=rescan_seconds,
+            now=ts,
+        )
+        priority_updates = _copyability_priority_updates(conn)
         conn.execute("BEGIN IMMEDIATE")
         try:
             summary = _plan_copyability_evidence_jobs_once(
@@ -110,7 +123,9 @@ def plan_copyability_evidence_jobs(
                 min_activity_events=min_activity_events,
                 shard_count=shard_count,
                 rescan_seconds=rescan_seconds,
-                now=now,
+                now=ts,
+                prefetched_targets=prefetched_targets,
+                priority_updates=priority_updates,
             )
             conn.commit()
             return summary
@@ -121,8 +136,8 @@ def plan_copyability_evidence_jobs(
     return retry_sqlite_locked(
         _plan_once,
         rollback=conn.rollback,
-        attempts=LOCK_RETRY_ATTEMPTS,
-        sleep_seconds=LOCK_RETRY_SLEEP_SECONDS,
+        attempts=lock_retry_attempts,
+        sleep_seconds=lock_retry_sleep_seconds,
     )
 
 
@@ -135,11 +150,13 @@ def _plan_copyability_evidence_jobs_once(
     min_activity_events: int,
     shard_count: int,
     rescan_seconds: int,
-    now: int | None,
+    now: int,
+    prefetched_targets: list[sqlite3.Row],
+    priority_updates: list[tuple[int, int]],
 ) -> CopyabilityPlanSummary:
     """Reserve copyability queue capacity and enqueue work under one write lock."""
 
-    ts = now or int(time.time())
+    ts = now
     active_jobs = _active_copyability_job_count(conn)
     batch_limit = max(0, int(limit))
     waterline_slots = (
@@ -161,14 +178,14 @@ def _plan_copyability_evidence_jobs_once(
             throttled=True,
             reason="active_queue_waterline",
         )
-    targets = _select_copyability_targets(
+    targets = _revalidate_copyability_targets(
         conn,
-        limit=available_slots,
+        prefetched_targets,
         min_score=min_score,
         min_activity_events=min_activity_events,
         rescan_seconds=rescan_seconds,
         now=ts,
-    )
+    )[:available_slots]
     enqueued = 0
     for target in targets:
         wallet = str(target["address"]).lower()
@@ -201,7 +218,7 @@ def _plan_copyability_evidence_jobs_once(
             next_attempt_at=0,
             now=ts,
         ) else 0
-    reprioritized = _reprioritize_queued_copyability_jobs(conn, now=ts)
+    reprioritized = _apply_copyability_priority_updates(conn, priority_updates, now=ts)
     return CopyabilityPlanSummary(
         targets_seen=len(targets),
         jobs_enqueued=enqueued,
@@ -686,16 +703,25 @@ def _select_copyability_targets(
     min_activity_events: int,
     rescan_seconds: int,
     now: int,
+    addresses: tuple[str, ...] = (),
 ) -> list[sqlite3.Row]:
     stale_before = now - max(0, int(rescan_seconds))
+    normalized_addresses = tuple(dict.fromkeys(address.lower() for address in addresses if address))
+    latest_address_filter = ""
+    candidate_address_filter = ""
+    if normalized_addresses:
+        placeholders = ", ".join("?" for _address in normalized_addresses)
+        latest_address_filter = f"WHERE address IN ({placeholders})"
+        candidate_address_filter = f"AND cw.address IN ({placeholders})"
     return conn.execute(
-        """
+        f"""
         WITH latest AS (
             SELECT ls.*
             FROM leader_scores ls
             JOIN (
                 SELECT address, MAX(score_id) AS max_id
                 FROM leader_scores
+                {latest_address_filter}
                 GROUP BY address
             ) latest_id
               ON latest_id.address = ls.address
@@ -752,6 +778,7 @@ def _select_copyability_targets(
              AND pj.tier = ?
              AND pj.subject_key = ?
             WHERE cw.candidate_stage NOT IN ('rejected', 'blocked_hygiene', 'blocked_copyability')
+              {candidate_address_filter}
               AND (
                     cw.candidate_stage IN (
                         'needs_manual_review',
@@ -923,9 +950,11 @@ def _select_copyability_targets(
         LIMIT ?
         """,
         (
+            *normalized_addresses,
             JOB_TYPE,
             TIER,
             SUBJECT_KEY,
+            *normalized_addresses,
             int(min_activity_events),
             float(min_score),
             LIGHT_NO_SIGNAL_DEEP_RESCAN_MIN_SCORE,
@@ -935,6 +964,37 @@ def _select_copyability_targets(
             int(limit),
         ),
     ).fetchall()
+
+
+def _revalidate_copyability_targets(
+    conn: sqlite3.Connection,
+    targets: list[sqlite3.Row],
+    *,
+    min_score: float,
+    min_activity_events: int,
+    rescan_seconds: int,
+    now: int,
+) -> list[sqlite3.Row]:
+    """Re-run eligibility for the small prefetched set while queue slots are reserved."""
+
+    wallets = sorted({str(target["address"]).lower() for target in targets})
+    if not wallets:
+        return []
+    current_targets = _select_copyability_targets(
+        conn,
+        limit=len(wallets),
+        min_score=min_score,
+        min_activity_events=min_activity_events,
+        rescan_seconds=rescan_seconds,
+        now=now,
+        addresses=tuple(wallets),
+    )
+    current_by_wallet = {str(row["address"]).lower(): row for row in current_targets}
+    return [
+        current_by_wallet[wallet]
+        for target in targets
+        if (wallet := str(target["address"]).lower()) in current_by_wallet
+    ]
 
 
 def _active_copyability_job_count(conn: sqlite3.Connection) -> int:
@@ -1001,7 +1061,9 @@ def _normalize_single_shard_jobs(conn: sqlite3.Connection, *, now: int) -> None:
     conn.commit()
 
 
-def _reprioritize_queued_copyability_jobs(conn: sqlite3.Connection, *, now: int) -> int:
+def _copyability_priority_updates(conn: sqlite3.Connection) -> list[tuple[int, int]]:
+    """Calculate queued-job priority changes before opening the write transaction."""
+
     rows = conn.execute(
         """
         WITH queued_jobs AS (
@@ -1074,22 +1136,35 @@ def _reprioritize_queued_copyability_jobs(conn: sqlite3.Connection, *, now: int)
         """,
         (JOB_TYPE,),
     ).fetchall()
-    changed = 0
+    updates: list[tuple[int, int]] = []
     for row in rows:
         priority = _target_priority(row)
         if int(row["priority"] or 0) == priority:
             continue
-        conn.execute(
+        updates.append((int(row["job_id"]), priority))
+    return updates
+
+
+def _apply_copyability_priority_updates(
+    conn: sqlite3.Connection,
+    updates: list[tuple[int, int]],
+    *,
+    now: int,
+) -> int:
+    changed = 0
+    for job_id, priority in updates:
+        cur = conn.execute(
             """
             UPDATE pipeline_jobs
             SET priority = ?,
                 updated_at = ?
             WHERE job_id = ?
               AND status = 'queued'
+              AND priority != ?
             """,
-            (priority, now, int(row["job_id"])),
+            (priority, now, job_id, priority),
         )
-        changed += 1
+        changed += max(0, int(cur.rowcount))
     return changed
 
 

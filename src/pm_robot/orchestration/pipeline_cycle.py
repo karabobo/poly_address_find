@@ -9,6 +9,7 @@ systemd/compose actions.
 from __future__ import annotations
 
 import sqlite3
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -41,6 +42,8 @@ class PipelineCycleOptions:
     copyability_min_activity_events: int = 25
     copyability_shard_count: int = 1
     copyability_rescan_seconds: int = 21_600
+    planner_lock_attempts: int = 8
+    planner_lock_sleep_seconds: float = 3.0
     feature_limit: int = 10
     feature_min_activity_events: int = 25
     score_limit: int = 0
@@ -162,6 +165,8 @@ def run_pipeline_cycle(
             deep_limit=options.wallet_deep_limit,
             shard_count=options.wallet_shard_count,
             max_active_jobs=options.wallet_max_active_jobs,
+            lock_retry_attempts=options.planner_lock_attempts,
+            lock_retry_sleep_seconds=options.planner_lock_sleep_seconds,
         ),
         continue_on_error=options.continue_on_error,
         step_reporter=step_reporter,
@@ -179,6 +184,8 @@ def run_pipeline_cycle(
             min_activity_events=options.copyability_min_activity_events,
             shard_count=options.copyability_shard_count,
             rescan_seconds=options.copyability_rescan_seconds,
+            lock_retry_attempts=options.planner_lock_attempts,
+            lock_retry_sleep_seconds=options.planner_lock_sleep_seconds,
         ),
         continue_on_error=options.continue_on_error,
         step_reporter=step_reporter,
@@ -273,6 +280,8 @@ def _dry_run_steps(options: PipelineCycleOptions) -> list[dict[str, Any]]:
                 "deep_limit": options.wallet_deep_limit,
                 "shard_count": options.wallet_shard_count,
                 "max_active_jobs": options.wallet_max_active_jobs,
+                "lock_retry_attempts": options.planner_lock_attempts,
+                "lock_retry_sleep_seconds": options.planner_lock_sleep_seconds,
             },
         ),
         _step(
@@ -285,6 +294,8 @@ def _dry_run_steps(options: PipelineCycleOptions) -> list[dict[str, Any]]:
                 "min_activity_events": options.copyability_min_activity_events,
                 "shard_count": options.copyability_shard_count,
                 "rescan_seconds": options.copyability_rescan_seconds,
+                "lock_retry_attempts": options.planner_lock_attempts,
+                "lock_retry_sleep_seconds": options.planner_lock_sleep_seconds,
             },
         ),
         _step(
@@ -319,8 +330,23 @@ def _compact_smoothness(report: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _step(name: str, status: str, data: dict[str, Any]) -> dict[str, Any]:
-    return {"name": name, "status": status, "data": data}
+def _step(
+    name: str,
+    status: str,
+    data: dict[str, Any],
+    *,
+    started_at: float | None = None,
+    finished_at: float | None = None,
+    duration_ms: float | None = None,
+) -> dict[str, Any]:
+    step: dict[str, Any] = {"name": name, "status": status, "data": data}
+    if started_at is not None:
+        step["started_at"] = int(started_at)
+    if finished_at is not None:
+        step["finished_at"] = int(finished_at)
+    if duration_ms is not None:
+        step["duration_ms"] = round(max(0.0, duration_ms), 3)
+    return step
 
 
 def _run_isolated_step(
@@ -335,25 +361,56 @@ def _run_isolated_step(
 ) -> Any | None:
     """Run one committed phase; a failed phase cannot poison later phases."""
 
+    started_at = time.time()
+    started_clock = time.perf_counter()
     try:
         result = operation()
     except Exception as exc:
+        finished_at = time.time()
         conn.rollback()
-        failed = _failed_step(name, exc)
+        failed = _failed_step(
+            name,
+            exc,
+            started_at=started_at,
+            finished_at=finished_at,
+            duration_ms=(time.perf_counter() - started_clock) * 1000,
+        )
         _append_step(steps, failed, step_reporter=step_reporter)
         if not continue_on_error:
             raise
         return None
+    finished_at = time.time()
     data = result if isinstance(result, dict) else result.__dict__
-    _append_step(steps, _step(name, status, data), step_reporter=step_reporter)
+    _append_step(
+        steps,
+        _step(
+            name,
+            status,
+            data,
+            started_at=started_at,
+            finished_at=finished_at,
+            duration_ms=(time.perf_counter() - started_clock) * 1000,
+        ),
+        step_reporter=step_reporter,
+    )
     return result
 
 
-def _failed_step(name: str, exc: Exception) -> dict[str, Any]:
+def _failed_step(
+    name: str,
+    exc: Exception,
+    *,
+    started_at: float | None = None,
+    finished_at: float | None = None,
+    duration_ms: float | None = None,
+) -> dict[str, Any]:
     return _step(
         name,
         "failed",
         {"error_type": type(exc).__name__, "error": str(exc)[:1000]},
+        started_at=started_at,
+        finished_at=finished_at,
+        duration_ms=duration_ms,
     )
 
 

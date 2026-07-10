@@ -405,6 +405,7 @@ def maintenance(
     scores_days: int = 30,
     review_events_days: int = 30,
     ingest_runs_days: int = 30,
+    runtime_heartbeat_days: int = 30,
     keep_backups: int = 2,
     dry_run: bool = False,
     vacuum: bool = False,
@@ -423,6 +424,11 @@ def maintenance(
     try:
         if skip_cleanup:
             deleted: dict[str, int] = {}
+            runtime_heartbeat_cleanup = _cleanup_runtime_heartbeats(
+                conn,
+                days=runtime_heartbeat_days,
+                dry_run=dry_run,
+            )
         else:
             run_migrations(conn)
             deleted = _cleanup_database(
@@ -432,6 +438,11 @@ def maintenance(
                 scores_days=scores_days,
                 review_events_days=review_events_days,
                 ingest_runs_days=ingest_runs_days,
+                dry_run=dry_run,
+            )
+            runtime_heartbeat_cleanup = _cleanup_runtime_heartbeats(
+                conn,
+                days=runtime_heartbeat_days,
                 dry_run=dry_run,
             )
         if not dry_run:
@@ -475,10 +486,55 @@ def maintenance(
         "duplicate_running_jobs": duplicate_running_jobs,
         "exhausted_queued_jobs": exhausted_queued_jobs,
         "stale_ingest_runs": stale_ingest_runs,
+        "runtime_heartbeat_cleanup": runtime_heartbeat_cleanup,
         "deleted": deleted,
         "backup_cleanup": backup_cleanup,
         "storage_before": storage_before,
         "storage": storage_report(settings),
+    }
+
+
+def _cleanup_runtime_heartbeats(
+    conn: sqlite3.Connection,
+    *,
+    days: int,
+    dry_run: bool,
+) -> dict[str, Any]:
+    """Bound loop heartbeat retention without scanning business evidence tables."""
+
+    table_exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'ingest_runs'"
+    ).fetchone()
+    retention_days = max(0, int(days))
+    if not table_exists:
+        return {
+            "available": False,
+            "executed": False,
+            "days": retention_days,
+            "matched": 0,
+            "deleted": 0,
+        }
+    cutoff = int(time.time()) - retention_days * DAY_SECONDS
+    matched = int(
+        conn.execute(
+            "SELECT COUNT(*) FROM ingest_runs WHERE ingest_type GLOB 'loop_*' AND started_at < ?",
+            (cutoff,),
+        ).fetchone()[0]
+    )
+    deleted = 0
+    if not dry_run and matched:
+        cur = conn.execute(
+            "DELETE FROM ingest_runs WHERE ingest_type GLOB 'loop_*' AND started_at < ?",
+            (cutoff,),
+        )
+        deleted = max(0, int(cur.rowcount))
+        conn.commit()
+    return {
+        "available": True,
+        "executed": not dry_run,
+        "days": retention_days,
+        "matched": matched,
+        "deleted": deleted,
     }
 
 
