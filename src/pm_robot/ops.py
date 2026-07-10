@@ -340,11 +340,13 @@ def backup_database(settings: RobotSettings) -> Path:
         raise FileNotFoundError(settings.db_path)
     ts = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
     out = settings.backup_dir / f"pm_robot-{ts}.sqlite"
+    partial = out.with_suffix(f"{out.suffix}.partial")
+    partial.unlink(missing_ok=True)
     # SQLite backup API is safer than raw copy with WAL; fallback copy is unnecessary.
     try:
         src = sqlite3.connect(settings.db_path)
         try:
-            dst = sqlite3.connect(out)
+            dst = sqlite3.connect(partial)
             try:
                 src.backup(dst)
                 check = dst.execute("PRAGMA quick_check").fetchone()
@@ -354,7 +356,9 @@ def backup_database(settings: RobotSettings) -> Path:
                 dst.close()
         finally:
             src.close()
+        partial.replace(out)
     except Exception:
+        partial.unlink(missing_ok=True)
         out.unlink(missing_ok=True)
         raise
     if not out.exists():
@@ -370,6 +374,35 @@ def backup_database(settings: RobotSettings) -> Path:
     except OSError:
         pass
     return out
+
+
+def next_backup_delay_seconds(
+    backup_dir: Path,
+    *,
+    interval_seconds: int,
+    start_delay_seconds: int,
+    now: float | None = None,
+) -> int:
+    """Return the restart delay without postponing an already-due backup."""
+    interval = max(0, int(interval_seconds))
+    start_delay = max(0, int(start_delay_seconds))
+    latest = backup_dir / "pm_robot-latest.sqlite"
+    try:
+        latest_mtime = latest.stat().st_mtime
+    except FileNotFoundError:
+        # Timestamped files without the verified marker may be interrupted backups.
+        has_unverified_artifact = (
+            latest.is_symlink()
+            or any(
+                path.name != latest.name
+                for path in backup_dir.glob("pm_robot-*.sqlite")
+            )
+            or any(backup_dir.glob("pm_robot-*.sqlite.partial"))
+        )
+        return 0 if has_unverified_artifact else start_delay
+    current_time = time.time() if now is None else float(now)
+    age = max(0, int(current_time - latest_mtime))
+    return max(0, interval - age)
 
 
 def dump_database_sql(settings: RobotSettings, output: BinaryIO) -> None:

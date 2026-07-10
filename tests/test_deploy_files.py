@@ -1026,6 +1026,10 @@ def test_nas_research_stack_runs_verified_daily_backups():
     assert "PM_ROBOT_MAINTENANCE_KEEP_BACKUPS=14" in env
     assert "PM_ROBOT_BACKUP_INTERVAL:-86400" in loop
     assert "PM_ROBOT_BACKUP_START_DELAY:-600" in loop
+    assert 'BACKUP_DIR="${PM_ROBOT_BACKUP_DIR:-/app/backups}"' in loop
+    assert "next_backup_delay_seconds" in loop
+    assert "schedule calculation failed; backing up now" in loop
+    assert "runtime_heartbeat ok 0" in loop
     assert "python -m pm_robot.cli --env /app/.env backup" in loop
     assert "loop_backup" in loop
     assert "runtime-heartbeat" in loop
