@@ -287,6 +287,11 @@ def main() -> int:
     wallet_pipeline_cmd.add_argument("--materialize", action="store_true", help="Refresh summaries before printing")
     wallet_pipeline_cmd.add_argument("--limit", type=int, default=0, help="Wallets to materialize; 0 means all")
     wallet_pipeline_cmd.add_argument("--commit-every", type=int, default=100, help="Commit every N wallets while materializing")
+    wallet_pipeline_cmd.add_argument(
+        "--stale-only",
+        action="store_true",
+        help="Materialize only wallets whose candidate, budget, or activity watermark changed",
+    )
 
     wallet_pipeline_plan_cmd = sub.add_parser("wallet-pipeline-plan", help="Plan v2 wallet evidence jobs from pipeline state")
     wallet_pipeline_plan_cmd.add_argument("--db", dest="command_db", default=None, help="SQLite database path")
@@ -971,6 +976,7 @@ def main() -> int:
                     conn,
                     limit=args.limit,
                     commit_every=args.commit_every,
+                    stale_only=args.stale_only,
                 )
                 if args.materialize
                 else wallet_processing_state_summary(conn)

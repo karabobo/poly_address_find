@@ -372,6 +372,29 @@ def api_rate_limit_summary(
     }
 
 
+def api_rate_limit_cooldown_wait(
+    conn: sqlite3.Connection,
+    scope_names: Iterable[str],
+    *,
+    now: float | None = None,
+) -> float:
+    """Return the longest active cooldown for the requested shared scopes."""
+    names = sorted({str(name).strip() for name in scope_names if str(name).strip()})
+    if not names:
+        return 0.0
+    current = time.time() if now is None else float(now)
+    placeholders = ",".join("?" for _ in names)
+    row = conn.execute(
+        f"""
+        SELECT MAX(cooldown_until) AS cooldown_until
+        FROM api_rate_limit_state
+        WHERE scope IN ({placeholders})
+        """,
+        tuple(names),
+    ).fetchone()
+    return max(0.0, float(row["cooldown_until"] or 0) - current)
+
+
 def _normalize_scopes(scopes: Iterable[RateLimitScope]) -> list[RateLimitScope]:
     by_name: dict[str, RateLimitScope] = {}
     for scope in scopes:

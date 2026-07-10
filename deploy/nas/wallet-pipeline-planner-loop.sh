@@ -1,7 +1,9 @@
 #!/usr/bin/env sh
 set -eu
 
-INTERVAL="${PM_ROBOT_PIPELINE_PLANNER_INTERVAL:-900}"
+INTERVAL="${PM_ROBOT_PIPELINE_PLANNER_INTERVAL:-120}"
+STATE_LIMIT="${PM_ROBOT_PIPELINE_STATE_LIMIT:-250}"
+STATE_COMMIT_EVERY="${PM_ROBOT_PIPELINE_STATE_COMMIT_EVERY:-50}"
 LIGHT_LIMIT="${PM_ROBOT_PIPELINE_PLANNER_LIGHT_LIMIT:-30}"
 MEDIUM_LIMIT="${PM_ROBOT_PIPELINE_PLANNER_MEDIUM_LIMIT:-20}"
 DEEP_LIMIT="${PM_ROBOT_PIPELINE_PLANNER_DEEP_LIMIT:-5}"
@@ -19,18 +21,32 @@ runtime_heartbeat() {
 }
 
 while true; do
-  echo "$(date -Iseconds) wallet pipeline planner: start"
-  if python -m pm_robot.cli --env /app/.env wallet-pipeline-plan \
-      --light-limit "$LIGHT_LIMIT" \
-      --medium-limit "$MEDIUM_LIMIT" \
-      --deep-limit "$DEEP_LIMIT" \
-      --shard-count "$SHARD_COUNT" \
-      --max-active-jobs "$MAX_ACTIVE_JOBS"; then
-    echo "$(date -Iseconds) wallet pipeline planner: ok"
-    runtime_heartbeat loop_wallet_pipeline_planner ok
+  echo "$(date -Iseconds) wallet pipeline control: materialize state start"
+  if python -m pm_robot.cli --env /app/.env wallet-pipeline-state \
+      --materialize \
+      --stale-only \
+      --limit "$STATE_LIMIT" \
+      --commit-every "$STATE_COMMIT_EVERY"; then
+    echo "$(date -Iseconds) wallet pipeline control: materialize state ok"
+    runtime_heartbeat loop_wallet_pipeline_state ok
+
+    echo "$(date -Iseconds) wallet pipeline control: plan jobs start"
+    if python -m pm_robot.cli --env /app/.env wallet-pipeline-plan \
+        --light-limit "$LIGHT_LIMIT" \
+        --medium-limit "$MEDIUM_LIMIT" \
+        --deep-limit "$DEEP_LIMIT" \
+        --shard-count "$SHARD_COUNT" \
+        --max-active-jobs "$MAX_ACTIVE_JOBS"; then
+      echo "$(date -Iseconds) wallet pipeline control: plan jobs ok"
+      runtime_heartbeat loop_wallet_pipeline_planner ok
+    else
+      echo "$(date -Iseconds) wallet pipeline control: plan jobs failed" >&2
+      runtime_heartbeat loop_wallet_pipeline_planner failed "wallet-pipeline-plan failed"
+    fi
   else
-    echo "$(date -Iseconds) wallet pipeline planner: failed" >&2
-    runtime_heartbeat loop_wallet_pipeline_planner failed "wallet-pipeline-plan failed"
+    echo "$(date -Iseconds) wallet pipeline control: materialize state failed" >&2
+    runtime_heartbeat loop_wallet_pipeline_state failed "wallet-pipeline-state failed"
+    runtime_heartbeat loop_wallet_pipeline_planner failed "wallet-pipeline-state prerequisite failed"
   fi
   sleep "$INTERVAL"
 done

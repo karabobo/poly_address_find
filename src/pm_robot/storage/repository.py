@@ -1129,6 +1129,7 @@ def materialize_wallet_processing_state(
     limit: int = 0,
     source: str = "materialize_wallet_processing_state",
     commit_every: int = 100,
+    stale_only: bool = False,
 ) -> dict[str, Any]:
     from pm_robot.orchestration.evidence_backfill import summarize_wallet_evidence
 
@@ -1139,7 +1140,26 @@ def materialize_wallet_processing_state(
           ON ebb.wallet = cw.address
         LEFT JOIN wallet_processing_state wps
           ON wps.wallet = cw.address
+        LEFT JOIN wallet_activity_watermarks waw
+          ON waw.address = cw.address
         WHERE cw.candidate_stage NOT IN ('rejected', 'blocked_hygiene', 'blocked_copyability')
+    """
+    if stale_only:
+        sql += """
+          AND (
+              wps.wallet IS NULL
+              OR COALESCE(cw.updated_at, 0) > COALESCE(wps.updated_at, 0)
+              OR COALESCE(ebb.updated_at, 0) > COALESCE(wps.updated_at, 0)
+              OR COALESCE(waw.updated_at, 0) > COALESCE(wps.updated_at, 0)
+              OR COALESCE(waw.newest_timestamp, 0) != COALESCE(wps.newest_activity_ts, 0)
+              OR COALESCE(waw.newest_activity_key, '') != COALESCE(wps.newest_activity_key, '')
+              OR COALESCE(ebb.stage, '') != COALESCE(wps.current_stage, '')
+              OR COALESCE(ebb.priority, 100) != COALESCE(wps.priority, 100)
+              OR COALESCE(ebb.next_attempt_at, 0) != COALESCE(wps.next_action_at, 0)
+              OR COALESCE(ebb.current_depth, 0) > COALESCE(wps.evidence_depth, 0)
+          )
+        """
+    sql += """
         ORDER BY
             CASE WHEN wps.wallet IS NULL THEN 0 ELSE 1 END ASC,
             COALESCE(ebb.priority, 100) ASC,

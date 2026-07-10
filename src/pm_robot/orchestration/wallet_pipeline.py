@@ -28,6 +28,7 @@ from pm_robot.pipeline_terms import (
     PENDING_EVIDENCE_JOB_STAGES,
     PipelineJobType,
 )
+from pm_robot.storage.api_rate_limit import api_rate_limit_cooldown_wait
 from pm_robot.storage.db import is_sqlite_locked_error, retry_sqlite_locked
 from pm_robot.storage.repository import (
     PipelineJobLeaseLost,
@@ -51,6 +52,8 @@ from pm_robot.storage.repository import (
 JOB_TYPE = PipelineJobType.WALLET_EVIDENCE_BACKFILL.value
 LOCK_RETRY_ATTEMPTS = 8
 LOCK_RETRY_SLEEP_SECONDS = 3.0
+UPSTREAM_COOLDOWN_BLOCK_SECONDS = 30.0
+WALLET_EVIDENCE_API_SCOPES = ("data:*", "data:/activity", "data:/positions")
 
 
 @dataclass(frozen=True)
@@ -217,6 +220,14 @@ def run_wallet_pipeline_worker(
     error = ""
     try:
         for idx in range(max(0, limit)):
+            cooldown_wait = api_rate_limit_cooldown_wait(
+                conn,
+                WALLET_EVIDENCE_API_SCOPES,
+            )
+            if cooldown_wait > UPSTREAM_COOLDOWN_BLOCK_SECONDS:
+                status = "partial"
+                error = f"shared upstream cooldown active for {int(cooldown_wait + 0.999)}s"
+                break
             if idx > 0 and sleep_seconds > 0:
                 time.sleep(sleep_seconds)
             job = retry_sqlite_locked(

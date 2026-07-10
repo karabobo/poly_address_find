@@ -95,6 +95,7 @@ def test_canonical_docs_describe_current_research_pipeline_only():
     assert "wallet_processing_state (L0-L3 evidence truth)" in architecture
     assert "pipeline_jobs[job_type=wallet_evidence_backfill]" in architecture
     assert "Copyability is a separate evidence lane" in architecture
+    assert "one control-plane owner" in architecture
     assert "There is no L4" in architecture
     assert "does not submit real orders" in architecture
     assert "manual supplemental discovery probe, not a runtime" in probe
@@ -140,10 +141,13 @@ def test_systemd_evidence_services_use_v2_wallet_pipeline():
     score = Path("deploy/systemd/pm-robot-score.service").read_text(encoding="utf-8")
     legacy = Path("deploy/systemd/pm-robot-evidence-backfill.service").read_text(encoding="utf-8")
 
+    assert "wallet-pipeline-state" in planner
+    assert "--stale-only" in planner
     assert "wallet-pipeline-plan" in planner
     assert "wallet-pipeline-worker" in worker
     assert "--max-active-jobs 240" in planner
-    assert "--max-active-jobs 240" in score
+    assert "wallet-pipeline-state" not in score
+    assert "wallet-pipeline-plan" not in score
     assert "paper-handoff-export" in score
     assert "/opt/pm-robot/reports/paper_handoff.json" in score
     assert "ingest-activity --paper-stage-only" in score
@@ -155,6 +159,16 @@ def test_systemd_evidence_services_use_v2_wallet_pipeline():
     assert "legacy evidence-backfill is disabled" in legacy
     assert "evidence-backfill-plan" not in planner
     assert "evidence-backfill-worker" not in worker
+
+
+def test_systemd_wallet_pipeline_control_plane_has_one_owner():
+    owners = []
+    for path in Path("deploy/systemd").glob("*.service"):
+        text = path.read_text(encoding="utf-8")
+        if "wallet-pipeline-plan" in text:
+            owners.append(path.name)
+
+    assert owners == ["pm-robot-evidence-planner.service"]
 
 
 def test_health_check_is_low_frequency_and_not_writer_locked():
@@ -227,10 +241,18 @@ def test_nas_wallet_pipeline_runs_as_sharded_compose_services():
     assert "pipeline-audit" in helper
     assert "runtime-status" in helper
     assert "PM_ROBOT_PIPELINE_WORKER_LIMIT=6" in env
+    assert "PM_ROBOT_PIPELINE_WORKER_INTERVAL=60" in env
+    assert "PM_ROBOT_PIPELINE_PLANNER_INTERVAL=120" in env
+    assert "PM_ROBOT_PIPELINE_STATE_LIMIT=250" in env
+    assert "PM_ROBOT_PIPELINE_STATE_COMMIT_EVERY=50" in env
     assert "PM_ROBOT_PIPELINE_PLANNER_MAX_ACTIVE_JOBS=240" in env
+    assert "wallet-pipeline-state" in planner
+    assert "--stale-only" in planner
+    assert "loop_wallet_pipeline_state" in planner
     assert "wallet-pipeline-plan" in planner
     assert "--max-active-jobs \"$MAX_ACTIVE_JOBS\"" in planner
     assert "wallet-pipeline-worker" in worker
+    assert "PM_ROBOT_PIPELINE_WORKER_INTERVAL:-60" in worker
     assert "sleep \"$INTERVAL\"" in planner
     assert "sleep \"$INTERVAL\"" in worker
 
@@ -725,7 +747,7 @@ def test_ubuntu_vm_doc_keeps_docker_compose_and_research_boundary():
 
 
 @pytest.mark.skipif(not Path("deploy/nas/README.md").exists(), reason="README files are intentionally excluded")
-def test_nas_discovery_loop_runs_high_quality_sources():
+def test_nas_discovery_loop_runs_high_quality_sources_without_queue_planning():
     compose = Path("deploy/nas/docker-compose.yml").read_text(encoding="utf-8")
     env = Path("deploy/nas/env.example").read_text(encoding="utf-8")
     loop = Path("deploy/nas/discovery-loop.sh").read_text(encoding="utf-8")
@@ -743,9 +765,8 @@ def test_nas_discovery_loop_runs_high_quality_sources():
     assert "--v1-pages" in loop
     assert "discover-activity" in loop
     assert "--min-trade-filter-usdc" in loop
-    assert "wallet-pipeline-state" in loop
-    assert "wallet-pipeline-plan" in loop
-    assert "--max-active-jobs \"$PIPELINE_MAX_ACTIVE_JOBS\"" in loop
+    assert "wallet-pipeline-state" not in loop
+    assert "wallet-pipeline-plan" not in loop
     assert "sleep \"$INTERVAL\"" in loop
     assert "rtds-discovery:" in compose
     assert "container_name: pm-robot-rtds-discovery" in compose
@@ -764,7 +785,7 @@ def test_nas_discovery_loop_runs_high_quality_sources():
     assert "RTDS rows for all other wallets are not bulk-saved" in readme
 
 
-def test_nas_scoring_loop_runs_materialize_score_and_v2_pipeline_plan():
+def test_nas_scoring_loop_runs_materialize_score_without_queue_planning():
     compose = Path("deploy/nas/docker-compose.yml").read_text(encoding="utf-8")
     env = Path("deploy/nas/env.example").read_text(encoding="utf-8")
     loop = Path("deploy/nas/score-loop.sh").read_text(encoding="utf-8")
@@ -778,7 +799,6 @@ def test_nas_scoring_loop_runs_materialize_score_and_v2_pipeline_plan():
     assert "PM_ROBOT_SCORE_FULL_INTERVAL=300" in env
     assert "PM_ROBOT_SCORE_FEATURE_LIMIT=80" in env
     assert "PM_ROBOT_SCORE_LIMIT=300" in env
-    assert "PM_ROBOT_SCORE_STATE_LIMIT=120" in env
     assert "PM_ROBOT_PAPER_ACTIVITY_WALLET_LIMIT=10" in env
     assert "PM_ROBOT_PAPER_OBSERVER_MAX_SIGNAL_AGE_SEC=21600" in env
     assert "PM_ROBOT_PAPER_OBSERVER_MAX_ACTIONABLE_SIGNAL_AGE_SEC=300" in env
@@ -798,10 +818,24 @@ def test_nas_scoring_loop_runs_materialize_score_and_v2_pipeline_plan():
     assert "loop_score_paper_observer_preview" not in loop
     assert "loop_score_paper_observer_evaluation" not in loop
     assert "prioritize-backfill" not in loop
-    assert "wallet-pipeline-state" in loop
-    assert "wallet-pipeline-plan" in loop
-    assert "--max-active-jobs \"$PIPELINE_MAX_ACTIVE_JOBS\"" in loop
+    assert "wallet-pipeline-state" not in loop
+    assert "wallet-pipeline-plan" not in loop
     assert "sleep \"$INTERVAL\"" in loop
+
+
+def test_nas_wallet_pipeline_control_plane_has_one_owner():
+    planner = Path("deploy/nas/wallet-pipeline-planner-loop.sh").read_text(encoding="utf-8")
+    discovery = Path("deploy/nas/discovery-loop.sh").read_text(encoding="utf-8")
+    scoring = Path("deploy/nas/score-loop.sh").read_text(encoding="utf-8")
+
+    state_command = "python -m pm_robot.cli --env /app/.env wallet-pipeline-state"
+    plan_command = "python -m pm_robot.cli --env /app/.env wallet-pipeline-plan"
+    assert planner.count(state_command) == 1
+    assert planner.count(plan_command) == 1
+    assert "wallet-pipeline-state" not in discovery
+    assert "wallet-pipeline-plan" not in discovery
+    assert "wallet-pipeline-state" not in scoring
+    assert "wallet-pipeline-plan" not in scoring
 
 
 @pytest.mark.skipif(not Path("deploy/nas/README.md").exists(), reason="README files are intentionally excluded")

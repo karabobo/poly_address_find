@@ -1,4 +1,5 @@
 import json
+import time
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier
 
@@ -393,6 +394,96 @@ def test_wallet_pipeline_stops_batch_and_preserves_attempts_on_shared_cooldown(t
             {"status": "queued", "attempts": 0},
             {"status": "queued", "attempts": 0},
         ]
+    finally:
+        conn.close()
+
+
+def test_wallet_pipeline_does_not_claim_job_during_existing_shared_cooldown(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    wallet = "0x" + "c" * 40
+    try:
+        run_migrations(conn)
+        _seed_light_pending_state(conn, wallet)
+        conn.execute(
+            """
+            INSERT INTO api_rate_limit_state(
+                scope, capacity, window_seconds, cooldown_until, updated_at
+            ) VALUES ('data:*', 50, 10, ?, ?)
+            """,
+            (time.time() + 60, time.time()),
+        )
+        conn.commit()
+        plan_wallet_pipeline_jobs(
+            conn,
+            light_limit=1,
+            medium_limit=0,
+            deep_limit=0,
+            shard_count=1,
+        )
+
+        summary = run_wallet_pipeline_worker(
+            conn,
+            shard_index=0,
+            shard_count=1,
+            limit=1,
+            sleep_seconds=0,
+            client=RateLimitedPipelineClient(),
+        )
+        job = conn.execute(
+            "SELECT status, attempts, lease_owner FROM pipeline_jobs WHERE wallet = ?",
+            (wallet,),
+        ).fetchone()
+
+        assert summary.status == "partial"
+        assert summary.jobs_attempted == 0
+        assert summary.jobs_failed == 0
+        assert "shared upstream cooldown active" in summary.error
+        assert dict(job) == {"status": "queued", "attempts": 0, "lease_owner": None}
+    finally:
+        conn.close()
+
+
+def test_wallet_pipeline_state_stale_only_materializes_changed_wallets(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    changed_wallet = "0x" + "d" * 40
+    unchanged_wallet = "0x" + "e" * 40
+    try:
+        run_migrations(conn)
+        for wallet in (changed_wallet, unchanged_wallet):
+            upsert_candidate(conn, CandidateAddress(address=wallet, sources="test"))
+        conn.commit()
+        materialize_wallet_processing_state(conn)
+        conn.execute("UPDATE candidate_wallets SET updated_at = 1000")
+        conn.execute("UPDATE wallet_processing_state SET updated_at = 1000")
+        conn.execute(
+            "UPDATE candidate_wallets SET updated_at = 1001 WHERE address = ?",
+            (changed_wallet,),
+        )
+        conn.commit()
+
+        summary = materialize_wallet_processing_state(conn, stale_only=True)
+
+        assert summary["wallets_seen"] == 1
+        assert summary["wallets_materialized"] == 1
+        changed = conn.execute(
+            "SELECT updated_at FROM wallet_processing_state WHERE wallet = ?",
+            (changed_wallet,),
+        ).fetchone()
+        unchanged = conn.execute(
+            "SELECT updated_at FROM wallet_processing_state WHERE wallet = ?",
+            (unchanged_wallet,),
+        ).fetchone()
+        assert changed["updated_at"] > 1001
+        assert unchanged["updated_at"] == 1000
+
+        persist_wallet_activity(
+            conn,
+            changed_wallet,
+            [_event(changed_wallet, 1, market="same-second-watermark")],
+            ingested_at=int(changed["updated_at"]),
+        )
+        same_second = materialize_wallet_processing_state(conn, stale_only=True)
+        assert same_second["wallets_materialized"] == 1
     finally:
         conn.close()
 

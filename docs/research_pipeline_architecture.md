@@ -47,6 +47,14 @@ promising scored wallet
 The historical database column `wallet_processing_state.discovery_tier` is called `evidence_tier` in code.
 `pipeline_jobs.tier` is a job scope/dedupe field, not the wallet's real evidence tier.
 
+The NAS wallet pipeline has one control-plane owner: `wallet-pipeline-planner-loop.sh` materializes
+`wallet_processing_state` and then plans `wallet_evidence_backfill` jobs. Discovery only writes observation and
+candidate inputs; scoring only materializes features and writes review results. Neither loop enqueues wallet
+evidence jobs. The control loop materializes only wallets with changed candidate metadata, evidence budgets, or
+activity watermarks. Copyability retains its own planner because it is a separate evidence lane and job type.
+The optional systemd deployment follows the same ownership rule through `pm-robot-evidence-planner.service`;
+its scoring service does not materialize wallet state or enqueue evidence jobs.
+
 ## Evidence Tiers
 
 - `l0_discovered`: candidate registered, no useful history yet.
@@ -76,7 +84,7 @@ The default Compose stack runs:
 
 - proxy tunnel and web console;
 - polling and RTDS discovery;
-- evidence planner and sharded wallet workers;
+- one evidence control loop for state materialization and job planning, plus sharded wallet workers;
 - copyability planner and workers;
 - scoring and paper-observer loops;
 - maintenance and verified SQLite backup loops.

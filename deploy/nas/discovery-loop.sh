@@ -17,14 +17,6 @@ ACTIVITY_MIN_TRADE_FILTER_USDC="${PM_ROBOT_DISCOVERY_ACTIVITY_MIN_TRADE_FILTER_U
 ACTIVITY_MAX_CANDIDATES="${PM_ROBOT_DISCOVERY_ACTIVITY_MAX_CANDIDATES:-150}"
 ACTIVITY_SLEEP="${PM_ROBOT_DISCOVERY_ACTIVITY_SLEEP:-0.05}"
 
-STATE_LIMIT="${PM_ROBOT_DISCOVERY_STATE_LIMIT:-250}"
-STATE_COMMIT_EVERY="${PM_ROBOT_DISCOVERY_STATE_COMMIT_EVERY:-50}"
-PIPELINE_SHARD_COUNT="${PM_ROBOT_PIPELINE_SHARD_COUNT:-3}"
-PIPELINE_LIGHT_LIMIT="${PM_ROBOT_DISCOVERY_PIPELINE_LIGHT_LIMIT:-30}"
-PIPELINE_MEDIUM_LIMIT="${PM_ROBOT_DISCOVERY_PIPELINE_MEDIUM_LIMIT:-10}"
-PIPELINE_DEEP_LIMIT="${PM_ROBOT_DISCOVERY_PIPELINE_DEEP_LIMIT:-0}"
-PIPELINE_MAX_ACTIVE_JOBS="${PM_ROBOT_PIPELINE_PLANNER_MAX_ACTIVE_JOBS:-240}"
-
 runtime_heartbeat() {
   name="$1"
   status="${2:-ok}"
@@ -66,32 +58,6 @@ while true; do
   else
     echo "$(date -Iseconds) discovery loop: whale activity discovery failed" >&2
     runtime_heartbeat loop_discovery_activity failed "discover-activity failed"
-  fi
-
-  echo "$(date -Iseconds) discovery loop: materialize new wallet state start"
-  if python -m pm_robot.cli --env /app/.env wallet-pipeline-state \
-      --materialize \
-      --limit "$STATE_LIMIT" \
-      --commit-every "$STATE_COMMIT_EVERY"; then
-    echo "$(date -Iseconds) discovery loop: materialize new wallet state ok"
-    runtime_heartbeat loop_discovery_state ok
-  else
-    echo "$(date -Iseconds) discovery loop: materialize new wallet state failed" >&2
-    runtime_heartbeat loop_discovery_state failed "wallet-pipeline-state failed"
-  fi
-
-  echo "$(date -Iseconds) discovery loop: plan new wallet jobs start"
-  if python -m pm_robot.cli --env /app/.env wallet-pipeline-plan \
-      --light-limit "$PIPELINE_LIGHT_LIMIT" \
-      --medium-limit "$PIPELINE_MEDIUM_LIMIT" \
-      --deep-limit "$PIPELINE_DEEP_LIMIT" \
-      --shard-count "$PIPELINE_SHARD_COUNT" \
-      --max-active-jobs "$PIPELINE_MAX_ACTIVE_JOBS"; then
-    echo "$(date -Iseconds) discovery loop: plan new wallet jobs ok"
-    runtime_heartbeat loop_wallet_pipeline_planner ok
-  else
-    echo "$(date -Iseconds) discovery loop: plan new wallet jobs failed" >&2
-    runtime_heartbeat loop_wallet_pipeline_planner failed "wallet-pipeline-plan failed from discovery loop"
   fi
 
   sleep "$INTERVAL"

@@ -6,13 +6,6 @@ FULL_SCORE_INTERVAL="${PM_ROBOT_SCORE_FULL_INTERVAL:-300}"
 FEATURE_LIMIT="${PM_ROBOT_SCORE_FEATURE_LIMIT:-80}"
 SCORE_LIMIT="${PM_ROBOT_SCORE_LIMIT:-300}"
 MIN_ACTIVITY_EVENTS="${PM_ROBOT_SCORE_MIN_ACTIVITY_EVENTS:-25}"
-STATE_LIMIT="${PM_ROBOT_SCORE_STATE_LIMIT:-${PM_ROBOT_SCORE_PRIORITY_STATE_LIMIT:-120}}"
-STATE_COMMIT_EVERY="${PM_ROBOT_SCORE_STATE_COMMIT_EVERY:-${PM_ROBOT_SCORE_PRIORITY_STATE_COMMIT_EVERY:-40}}"
-PIPELINE_SHARD_COUNT="${PM_ROBOT_PIPELINE_SHARD_COUNT:-3}"
-PIPELINE_LIGHT_LIMIT="${PM_ROBOT_PIPELINE_PLANNER_LIGHT_LIMIT:-30}"
-PIPELINE_MEDIUM_LIMIT="${PM_ROBOT_PIPELINE_PLANNER_MEDIUM_LIMIT:-20}"
-PIPELINE_DEEP_LIMIT="${PM_ROBOT_PIPELINE_PLANNER_DEEP_LIMIT:-5}"
-PIPELINE_MAX_ACTIVE_JOBS="${PM_ROBOT_PIPELINE_PLANNER_MAX_ACTIVE_JOBS:-240}"
 LAST_FULL_SCORE=0
 
 runtime_heartbeat() {
@@ -47,30 +40,6 @@ while true; do
       LAST_FULL_SCORE="$(date +%s)"
       echo "$(date -Iseconds) score loop: incremental build review ok"
       runtime_heartbeat loop_score_review ok
-
-      echo "$(date -Iseconds) score loop: sync wallet pipeline state start"
-      if python -m pm_robot.cli --env /app/.env wallet-pipeline-state \
-          --materialize \
-          --limit "$STATE_LIMIT" \
-          --commit-every "$STATE_COMMIT_EVERY"; then
-        echo "$(date -Iseconds) score loop: sync wallet pipeline state ok"
-        echo "$(date -Iseconds) score loop: plan wallet pipeline jobs start"
-        if python -m pm_robot.cli --env /app/.env wallet-pipeline-plan \
-            --light-limit "$PIPELINE_LIGHT_LIMIT" \
-            --medium-limit "$PIPELINE_MEDIUM_LIMIT" \
-            --deep-limit "$PIPELINE_DEEP_LIMIT" \
-            --shard-count "$PIPELINE_SHARD_COUNT" \
-            --max-active-jobs "$PIPELINE_MAX_ACTIVE_JOBS"; then
-          echo "$(date -Iseconds) score loop: plan wallet pipeline jobs ok"
-          runtime_heartbeat loop_score_state_plan ok
-        else
-          echo "$(date -Iseconds) score loop: plan wallet pipeline jobs failed" >&2
-          runtime_heartbeat loop_score_state_plan failed "wallet-pipeline-plan failed from score loop"
-        fi
-      else
-        echo "$(date -Iseconds) score loop: sync wallet pipeline state failed" >&2
-        runtime_heartbeat loop_score_state_plan failed "wallet-pipeline-state failed from score loop"
-      fi
 
       echo "$(date -Iseconds) score loop: export paper handoff start"
       if python -m pm_robot.cli --env /app/.env paper-handoff-export \
