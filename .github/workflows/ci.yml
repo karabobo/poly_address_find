@@ -39,4 +39,23 @@ jobs:
         run: python -m compileall -q src tests
 
       - name: Run test suite
-        run: python -m pytest
+        shell: bash
+        run: |
+          set -o pipefail
+          python -m pytest 2>&1 | tee "$RUNNER_TEMP/pytest.log"
+
+      - name: Publish test failure summary
+        if: failure()
+        env:
+          PYTEST_LOG: ${{ runner.temp }}/pytest.log
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+
+          log_path = Path(os.environ["PYTEST_LOG"])
+          lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+          summary = "\n".join(lines[-80:])[-7000:]
+          escaped = summary.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+          print(f"::error file=.github/workflows/ci.yml,title=pytest failure::{escaped}")
+          PY
