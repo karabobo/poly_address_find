@@ -15,8 +15,6 @@ rsync -a --delete \
   --exclude '.venv' \
   --exclude '.env' \
   --exclude '.env.*' \
-  --exclude 'nautilus-trading' \
-  --exclude 'polywhale' \
   --exclude 'data/pm_robot.sqlite' \
   --exclude 'data/pm_robot.sqlite-wal' \
   --exclude 'data/pm_robot.sqlite-shm' \

@@ -26,6 +26,7 @@ from pm_robot.pipeline_terms import (
 )
 from pm_robot.storage.db import is_sqlite_locked_error, retry_sqlite_locked
 from pm_robot.storage.repository import (
+    PipelineJobLeaseLost,
     claim_pipeline_job,
     complete_pipeline_job,
     finish_ingest_run,
@@ -34,6 +35,7 @@ from pm_robot.storage.repository import (
     persist_wallet_positions,
     pipeline_job_summary,
     rebuild_wallet_episodes,
+    renew_pipeline_job_lease,
     retry_pipeline_job,
     start_ingest_run,
     sync_wallet_processing_state,
@@ -246,6 +248,12 @@ def run_wallet_pipeline_worker(
                             priority=int(job["priority"] or 100),
                             now=now,
                         )
+                        _require_pipeline_job_lease(
+                            conn,
+                            job_id=int(job["job_id"]),
+                            worker_id=worker_id,
+                            lease_seconds=lease_seconds,
+                        )
                         events = _fetch_activity_history(
                             client,
                             wallet,
@@ -253,17 +261,38 @@ def run_wallet_pipeline_worker(
                             max_events=target_depth,
                             sleep_seconds=sleep_seconds,
                         )
+                        _require_pipeline_job_lease(
+                            conn,
+                            job_id=int(job["job_id"]),
+                            worker_id=worker_id,
+                            lease_seconds=lease_seconds,
+                        )
+                        positions = client.positions(wallet, size_threshold=0.0)
+                        _require_pipeline_job_lease(
+                            conn,
+                            job_id=int(job["job_id"]),
+                            worker_id=worker_id,
+                            lease_seconds=lease_seconds,
+                        )
                         job_activity_events_written = persist_wallet_activity(
                             conn,
                             wallet,
                             events,
                             ingested_at=now,
                             source="wallet_pipeline",
+                            commit=False,
                         )
-                        job_episodes_rebuilt = rebuild_wallet_episodes(conn, wallet)
-                        positions = client.positions(wallet, size_threshold=0.0)
+                        job_episodes_rebuilt = rebuild_wallet_episodes(
+                            conn,
+                            wallet,
+                            commit=False,
+                        )
                         job_positions_written = persist_wallet_positions(
-                            conn, wallet, positions, captured_at=now
+                            conn,
+                            wallet,
+                            positions,
+                            captured_at=now,
+                            commit=False,
                         )
                         evidence = summarize_wallet_evidence(conn, wallet)
                         next_stage, next_depth, stop_reason, next_attempt_at = _classify_next_step(
@@ -297,9 +326,10 @@ def run_wallet_pipeline_worker(
                             source="wallet_pipeline_worker",
                             now=now,
                         )
-                        complete_pipeline_job(
+                        completed = complete_pipeline_job(
                             conn,
                             job_id=int(job["job_id"]),
+                            worker_id=worker_id,
                             output_data={
                                 "wallet": wallet,
                                 "stage": stage,
@@ -311,6 +341,10 @@ def run_wallet_pipeline_worker(
                             },
                             now=now,
                         )
+                        if not completed:
+                            raise PipelineJobLeaseLost(
+                                "wallet pipeline job lease was lost before completion"
+                            )
                         conn.commit()
                         activity_events_written += job_activity_events_written
                         positions_written += job_positions_written
@@ -323,9 +357,15 @@ def run_wallet_pipeline_worker(
                             raise
                         conn.rollback()
                         time.sleep(LOCK_RETRY_SLEEP_SECONDS * (write_attempt + 1))
+            except PipelineJobLeaseLost as exc:
+                failed += 1
+                status = "partial"
+                conn.rollback()
+                error = f"{wallet}: {exc}"
             except Exception as exc:
                 failed += 1
                 status = "partial"
+                conn.rollback()
                 now = int(time.time())
                 retry_at = now + min(21_600, 900 * int(job["attempts"] or 1))
                 error = f"{wallet}: {exc}"
@@ -333,6 +373,7 @@ def run_wallet_pipeline_worker(
                     lambda: _retry_claimed_pipeline_job(
                         conn,
                         job_id=int(job["job_id"]),
+                        worker_id=worker_id,
                         error=str(exc),
                         next_attempt_at=retry_at,
                         now=now,
@@ -393,17 +434,43 @@ def _retry_claimed_pipeline_job(
     conn: sqlite3.Connection,
     *,
     job_id: int,
+    worker_id: str,
     error: str,
     next_attempt_at: int,
     now: int,
-) -> None:
-    retry_pipeline_job(
+) -> bool:
+    retried = retry_pipeline_job(
         conn,
         job_id=job_id,
+        worker_id=worker_id,
         error=error,
         next_attempt_at=next_attempt_at,
         now=now,
     )
+    if retried:
+        conn.commit()
+    else:
+        conn.rollback()
+    return retried
+
+
+def _require_pipeline_job_lease(
+    conn: sqlite3.Connection,
+    *,
+    job_id: int,
+    worker_id: str,
+    lease_seconds: int,
+) -> None:
+    """Renew a claimed job around network I/O and release SQLite write locks."""
+    renewed = renew_pipeline_job_lease(
+        conn,
+        job_id=job_id,
+        worker_id=worker_id,
+        lease_seconds=lease_seconds,
+    )
+    if not renewed:
+        conn.rollback()
+        raise PipelineJobLeaseLost("wallet pipeline job lease was lost")
     conn.commit()
 
 

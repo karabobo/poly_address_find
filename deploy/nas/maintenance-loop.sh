@@ -4,6 +4,7 @@ set -eu
 INTERVAL="${PM_ROBOT_MAINTENANCE_INTERVAL:-3600}"
 WAL_CHECKPOINT="${PM_ROBOT_MAINTENANCE_WAL_CHECKPOINT:-none}"
 STALE_INGEST_RUN_SECONDS="${PM_ROBOT_MAINTENANCE_STALE_INGEST_RUN_SECONDS:-21600}"
+KEEP_BACKUPS="${PM_ROBOT_MAINTENANCE_KEEP_BACKUPS:-14}"
 
 runtime_heartbeat() {
   name="$1"
@@ -22,6 +23,7 @@ while true; do
       --reset-stale-jobs \
       --reset-stale-ingest-runs \
       --stale-ingest-run-seconds "$STALE_INGEST_RUN_SECONDS" \
+      --keep-backups "$KEEP_BACKUPS" \
       --wal-checkpoint "$WAL_CHECKPOINT"; then
     echo "$(date -Iseconds) maintenance loop: ok"
     runtime_heartbeat loop_maintenance ok

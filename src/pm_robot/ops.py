@@ -1258,7 +1258,12 @@ def storage_report(settings: RobotSettings) -> dict[str, Any]:
     db_size = _path_size(settings.db_path)
     wal_size = _path_size(settings.db_path.with_name(settings.db_path.name + "-wal"))
     shm_size = _path_size(settings.db_path.with_name(settings.db_path.name + "-shm"))
-    backup_files = sorted(settings.backup_dir.glob("pm_robot-*.sqlite"))
+    # The latest path is a hard link or symlink to a timestamped restore point.
+    backup_files = sorted(
+        path
+        for path in settings.backup_dir.glob("pm_robot-*.sqlite")
+        if path.name != "pm_robot-latest.sqlite"
+    )
     backup_size = sum(_path_size(path) for path in backup_files)
     usage = shutil.disk_usage(settings.db_path.parent if settings.db_path.parent.exists() else Path("."))
     return {

@@ -65,6 +65,7 @@ def materialize_wallet_feature(
     *,
     now: int | None = None,
     refresh_copyability: bool = False,
+    commit: bool = True,
 ) -> bool:
     """Materialize one wallet immediately.
 
@@ -77,25 +78,39 @@ def materialize_wallet_feature(
     ts = now or int(time.time())
     wallet = wallet.lower()
     if refresh_copyability:
-        _write_with_retry(conn, lambda: _clear_copyability_materializer_fields(conn, wallet))
+        _write_with_retry(
+            conn,
+            lambda: _clear_copyability_materializer_fields(conn, wallet),
+            commit=commit,
+        )
     feature = _materialize_wallet(conn, wallet, now=ts)
     if feature is None:
         return False
-    _write_materialized_feature(conn, wallet, feature)
+    _write_materialized_feature(conn, wallet, feature, commit=commit)
     return True
 
 
-def _write_materialized_feature(conn: sqlite3.Connection, wallet: str, feature: WalletFeatures) -> None:
+def _write_materialized_feature(
+    conn: sqlite3.Connection,
+    wallet: str,
+    feature: WalletFeatures,
+    *,
+    commit: bool = True,
+) -> None:
     """Write one materialized wallet feature in its own short transaction."""
 
     def _operation() -> None:
         _clear_materializer_owned_nullable_fields(conn, wallet)
         upsert_wallet_feature(conn, feature)
 
-    _write_with_retry(conn, _operation)
+    _write_with_retry(conn, _operation, commit=commit)
 
 
-def _write_with_retry(conn: sqlite3.Connection, operation) -> None:
+def _write_with_retry(conn: sqlite3.Connection, operation, *, commit: bool = True) -> None:
+    if not commit:
+        operation()
+        return
+
     def _operation() -> None:
         operation()
         conn.commit()

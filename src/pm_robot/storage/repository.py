@@ -1322,15 +1322,21 @@ def renew_pipeline_job_lease(
     return bool(updated)
 
 
+class PipelineJobLeaseLost(RuntimeError):
+    """Raised when a queue worker no longer owns the job it is processing."""
+
+
 def complete_pipeline_job(
     conn: sqlite3.Connection,
     *,
     job_id: int,
+    worker_id: str,
     output_data: dict[str, Any] | None = None,
     now: int | None = None,
-) -> None:
+) -> bool:
+    """Complete a running job only when the caller still owns its lease."""
     ts = now or int(time.time())
-    conn.execute(
+    updated = conn.execute(
         """
         UPDATE pipeline_jobs
         SET status = 'done',
@@ -1341,23 +1347,36 @@ def complete_pipeline_job(
             completed_at = ?,
             updated_at = ?
         WHERE job_id = ?
+          AND status = 'running'
+          AND lease_owner = ?
         """,
-        (_json_dump(output_data or {}), ts, ts, job_id),
-    )
+        (_json_dump(output_data or {}), ts, ts, job_id, worker_id),
+    ).rowcount
+    return bool(updated)
 
 
 def retry_pipeline_job(
     conn: sqlite3.Connection,
     *,
     job_id: int,
+    worker_id: str,
     error: str,
     next_attempt_at: int,
     now: int | None = None,
-) -> None:
+) -> bool:
+    """Release a failed job only when the caller still owns its lease."""
     ts = now or int(time.time())
     row = conn.execute("SELECT attempts, max_attempts FROM pipeline_jobs WHERE job_id = ?", (job_id,)).fetchone()
     failed = bool(row and int(row["attempts"] or 0) >= int(row["max_attempts"] or 3))
-    conn.execute(
+    params: tuple[Any, ...] = (
+        "failed" if failed else "queued",
+        next_attempt_at,
+        error[:1000],
+        ts,
+        job_id,
+        worker_id,
+    )
+    updated = conn.execute(
         """
         UPDATE pipeline_jobs
         SET status = ?,
@@ -1367,9 +1386,12 @@ def retry_pipeline_job(
             last_error = ?,
             updated_at = ?
         WHERE job_id = ?
+          AND status = 'running'
+          AND lease_owner = ?
         """,
-        ("failed" if failed else "queued", next_attempt_at, error[:1000], ts, job_id),
-    )
+        params,
+    ).rowcount
+    return bool(updated)
 
 
 def pipeline_job_summary(conn: sqlite3.Connection, *, job_type: str = "") -> dict[str, Any]:
@@ -1907,6 +1929,7 @@ def persist_wallet_positions(
     positions: list[dict[str, Any]],
     *,
     captured_at: int,
+    commit: bool = True,
 ) -> int:
     address = address.lower()
     rows = []
@@ -1955,7 +1978,8 @@ def persist_wallet_positions(
         (captured_at, captured_at, address),
     )
     _merge_position_feature(conn, address, positions)
-    conn.commit()
+    if commit:
+        conn.commit()
     return len(rows)
 
 
@@ -1966,6 +1990,7 @@ def persist_wallet_activity(
     *,
     ingested_at: int,
     source: str = "",
+    commit: bool = True,
 ) -> int:
     address = address.lower()
     rows = []
@@ -2065,7 +2090,8 @@ def persist_wallet_activity(
         "UPDATE candidate_wallets SET last_ingested_at = ?, updated_at = ? WHERE address = ?",
         (ingested_at, ingested_at, address),
     )
-    conn.commit()
+    if commit:
+        conn.commit()
     return inserted
 
 
@@ -2135,7 +2161,12 @@ def activity_event_key(event: dict[str, Any]) -> str:
     return _activity_key_from_event(event)
 
 
-def rebuild_wallet_episodes(conn: sqlite3.Connection, address: str) -> int:
+def rebuild_wallet_episodes(
+    conn: sqlite3.Connection,
+    address: str,
+    *,
+    commit: bool = True,
+) -> int:
     address = address.lower()
     now = int(time.time())
     rows = conn.execute(
@@ -2213,7 +2244,8 @@ def rebuild_wallet_episodes(conn: sqlite3.Connection, address: str) -> int:
             episode_rows,
         )
     _merge_episode_features(conn, address)
-    conn.commit()
+    if commit:
+        conn.commit()
     return len(episode_rows)
 
 

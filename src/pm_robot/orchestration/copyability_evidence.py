@@ -20,6 +20,7 @@ from pm_robot.research.copy_graph import mine_copy_graph_for_leaders
 from pm_robot.research.scoring import score_candidate
 from pm_robot.storage.db import retry_sqlite_locked
 from pm_robot.storage.repository import (
+    PipelineJobLeaseLost,
     _feature_from_row,
     apply_copyability_no_signal_blocks,
     complete_pipeline_job,
@@ -193,12 +194,17 @@ def run_copyability_evidence_worker(
     error = ""
     try:
         for _ in range(max(0, limit)):
-            job = _claim_copyability_job(
-                conn,
-                shard=shard_index,
-                worker_id=worker_id,
-                lease_seconds=lease_seconds,
-                prefer_scan_mode=prefer_scan_mode,
+            job = retry_sqlite_locked(
+                lambda: _claim_copyability_job(
+                    conn,
+                    shard=shard_index,
+                    worker_id=worker_id,
+                    lease_seconds=lease_seconds,
+                    prefer_scan_mode=prefer_scan_mode,
+                ),
+                rollback=conn.rollback,
+                attempts=LOCK_RETRY_ATTEMPTS,
+                sleep_seconds=LOCK_RETRY_SLEEP_SECONDS,
             )
             if job is None:
                 break
@@ -216,6 +222,12 @@ def run_copyability_evidence_worker(
             )
             try:
                 now = int(time.time())
+                _require_copyability_job_lease(
+                    conn,
+                    job_id=int(job["job_id"]),
+                    worker_id=worker_id,
+                    lease_seconds=lease_seconds,
+                )
                 graph = mine_copy_graph_for_leaders(
                     conn,
                     policy,
@@ -223,29 +235,35 @@ def run_copyability_evidence_worker(
                     max_leader_events=effective_max_leader_events,
                     max_followers_per_event=effective_max_followers_per_event,
                     now=now,
+                    commit=False,
                 )
-                renew_pipeline_job_lease(
+                _require_copyability_job_lease(
                     conn,
                     job_id=int(job["job_id"]),
                     worker_id=worker_id,
                     lease_seconds=lease_seconds,
-                    now=int(time.time()),
+                    commit=False,
                 )
-                conn.commit()
-                backtest = backtest_copy_stream_for_leaders(conn, policy, [wallet], now=now)
-                renew_pipeline_job_lease(
+                backtest = backtest_copy_stream_for_leaders(
+                    conn,
+                    policy,
+                    [wallet],
+                    now=now,
+                    commit=False,
+                )
+                _require_copyability_job_lease(
                     conn,
                     job_id=int(job["job_id"]),
                     worker_id=worker_id,
                     lease_seconds=lease_seconds,
-                    now=int(time.time()),
+                    commit=False,
                 )
-                conn.commit()
                 materialized = materialize_wallet_feature(
                     conn,
                     wallet,
                     now=now,
                     refresh_copyability=True,
+                    commit=False,
                 )
                 scored = (
                     _score_wallet_after_copyability(
@@ -268,17 +286,17 @@ def run_copyability_evidence_worker(
                     else 0
                 )
                 now = int(time.time())
-                renew_pipeline_job_lease(
+                _require_copyability_job_lease(
                     conn,
                     job_id=int(job["job_id"]),
                     worker_id=worker_id,
                     lease_seconds=lease_seconds,
-                    now=now,
+                    commit=False,
                 )
-                conn.commit()
-                complete_pipeline_job(
+                completed = complete_pipeline_job(
                     conn,
                     job_id=int(job["job_id"]),
+                    worker_id=worker_id,
                     output_data={
                         "wallet": wallet,
                         "graph": graph.__dict__,
@@ -292,6 +310,10 @@ def run_copyability_evidence_worker(
                     },
                     now=now,
                 )
+                if not completed:
+                    raise PipelineJobLeaseLost(
+                        "copyability job lease was lost before completion"
+                    )
                 conn.commit()
                 succeeded += 1
                 links_written += graph.links_written
@@ -302,20 +324,30 @@ def run_copyability_evidence_worker(
                 features_materialized += 1 if materialized else 0
                 scores_written += 1 if scored else 0
                 no_signal_blocks += no_signal_blocked
+            except PipelineJobLeaseLost as exc:
+                failed += 1
+                status = "partial"
+                conn.rollback()
+                error = f"{wallet}: {exc}"
             except Exception as exc:
                 failed += 1
                 status = "partial"
+                conn.rollback()
                 now = int(time.time())
                 retry_at = now + min(21_600, 900 * int(job["attempts"] or 1))
                 error = f"{wallet}: {exc}"
-                retry_pipeline_job(
+                retried = retry_pipeline_job(
                     conn,
                     job_id=int(job["job_id"]),
+                    worker_id=worker_id,
                     error=str(exc),
                     next_attempt_at=retry_at,
                     now=now,
                 )
-                conn.commit()
+                if retried:
+                    conn.commit()
+                else:
+                    conn.rollback()
         return CopyabilityWorkerSummary(
             run_id=run_id,
             shard_index=shard_index,
@@ -374,6 +406,29 @@ def run_copyability_evidence_worker(
 
 def copyability_evidence_job_status(conn: sqlite3.Connection) -> dict[str, Any]:
     return pipeline_job_summary(conn, job_type=JOB_TYPE)
+
+
+def _require_copyability_job_lease(
+    conn: sqlite3.Connection,
+    *,
+    job_id: int,
+    worker_id: str,
+    lease_seconds: int,
+    commit: bool = True,
+) -> None:
+    """Renew a claimed copyability job and fail closed when ownership changed."""
+    renewed = renew_pipeline_job_lease(
+        conn,
+        job_id=job_id,
+        worker_id=worker_id,
+        lease_seconds=lease_seconds,
+        now=int(time.time()),
+    )
+    if not renewed:
+        conn.rollback()
+        raise PipelineJobLeaseLost("copyability job lease was lost")
+    if commit:
+        conn.commit()
 
 
 def _score_wallet_after_copyability(

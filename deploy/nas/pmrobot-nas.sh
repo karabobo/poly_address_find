@@ -15,8 +15,9 @@ COPYABILITY_SERVICES="copyability-planner copyability-worker-0 copyability-worke
 SCORE_SERVICES="score-loop"
 PAPER_OBSERVER_SERVICES="paper-observer-loop"
 MAINTENANCE_SERVICES="maintenance-loop"
-APP_SERVICES="web $DISCOVERY_SERVICES $PIPELINE_SERVICES $COPYABILITY_SERVICES $SCORE_SERVICES $PAPER_OBSERVER_SERVICES $MAINTENANCE_SERVICES"
-RESEARCH_SERVICES="$CORE_SERVICES $DISCOVERY_SERVICES $PIPELINE_SERVICES $COPYABILITY_SERVICES $SCORE_SERVICES $PAPER_OBSERVER_SERVICES $MAINTENANCE_SERVICES"
+BACKUP_SERVICES="backup-loop"
+APP_SERVICES="web $DISCOVERY_SERVICES $PIPELINE_SERVICES $COPYABILITY_SERVICES $SCORE_SERVICES $PAPER_OBSERVER_SERVICES $MAINTENANCE_SERVICES $BACKUP_SERVICES"
+RESEARCH_SERVICES="$CORE_SERVICES $DISCOVERY_SERVICES $PIPELINE_SERVICES $COPYABILITY_SERVICES $SCORE_SERVICES $PAPER_OBSERVER_SERVICES $MAINTENANCE_SERVICES $BACKUP_SERVICES"
 EXECUTION_SERVICES="paper-runner-loop paper-settle-loop publish-loop"
 
 resolve_docker_runner() {
@@ -920,7 +921,7 @@ watchdog_enable() {
 
 case "$cmd" in
   up)
-    compose up -d --build $CORE_SERVICES $DISCOVERY_SERVICES $PIPELINE_SERVICES $COPYABILITY_SERVICES $SCORE_SERVICES $PAPER_OBSERVER_SERVICES $MAINTENANCE_SERVICES
+    compose up -d --build $RESEARCH_SERVICES
     ;;
   web-up)
     compose up -d --build $CORE_SERVICES
@@ -965,6 +966,12 @@ case "$cmd" in
   maintenance-down)
     compose stop $MAINTENANCE_SERVICES
     ;;
+  backup-up)
+    compose up -d --build $BACKUP_SERVICES
+    ;;
+  backup-down)
+    compose stop $BACKUP_SERVICES
+    ;;
   execution-up)
     echo "Starting the opt-in execution profile: paper-run, paper-settle, and publish loops."
     echo "This is outside the default NAS research/scoring stack."
@@ -993,8 +1000,8 @@ case "$cmd" in
     compose down
     ;;
   restart)
-    compose up -d --build $CORE_SERVICES $DISCOVERY_SERVICES $PIPELINE_SERVICES $COPYABILITY_SERVICES $SCORE_SERVICES $PAPER_OBSERVER_SERVICES $MAINTENANCE_SERVICES
-    compose restart $CORE_SERVICES $DISCOVERY_SERVICES $PIPELINE_SERVICES $COPYABILITY_SERVICES $SCORE_SERVICES $PAPER_OBSERVER_SERVICES $MAINTENANCE_SERVICES
+    compose up -d --build $RESEARCH_SERVICES
+    compose restart $RESEARCH_SERVICES
     ;;
   app-restart)
     compose up -d --no-deps $APP_SERVICES
@@ -1069,6 +1076,10 @@ PY
     compose up -d --build $MAINTENANCE_SERVICES
     compose restart $MAINTENANCE_SERVICES
     ;;
+  backup-restart)
+    compose up -d --build $BACKUP_SERVICES
+    compose restart $BACKUP_SERVICES
+    ;;
   logs)
     service="${2:-web}"
     compose logs --tail="${1:-200}" -f "$service"
@@ -1113,6 +1124,9 @@ PY
   maintenance)
     compose run --rm task maintenance "$@"
     ;;
+  backup-now)
+    compose run --rm task backup
+    ;;
   pipeline-jobs)
     compose run --rm task wallet-pipeline-jobs "$@"
     ;;
@@ -1126,7 +1140,7 @@ PY
     compose run --rm --entrypoint /bin/sh task
     ;;
   *)
-    echo "Usage: $0 {up|web-up|web-restart|discovery-up|discovery-down|pipeline-up|pipeline-down|copyability-up|copyability-down|score-up|score-down|observer-up|observer-down|maintenance-up|maintenance-down|execution-up|execution-down|execution-restart|execution-status|execution-preflight|execution-logs [tail] [service]|down|restart|app-restart|runtime-ensure|watchdog-once|watchdog-status|watchdog-disable [reason]|watchdog-enable|discovery-restart|pipeline-restart|copyability-restart|copyability-ensure-workers|copyability-restart-when-idle [timeout_seconds] [poll_seconds]|score-restart|observer-restart|maintenance-restart|logs [tail] [service]|status|runtime-status|copyability-drain-once [limit<=5]|materialize-once [limit<=500]|score-once [limit<=500]|policy-rescore-once [score_limit<=500] [optional_feature_limit<=500]|recover-once [copyability_limit<=5] [score_limit<=500] [feature_limit<=500]|wal-truncate-window [checkpoint_timeout_seconds]|wal-truncate-when-idle [wait_timeout_seconds] [checkpoint_timeout_seconds] [poll_seconds]|migrate|health|app-status|maintenance|pipeline-jobs|pipeline-audit|copyability-jobs|shell}" >&2
+    echo "Usage: $0 {up|web-up|web-restart|discovery-up|discovery-down|pipeline-up|pipeline-down|copyability-up|copyability-down|score-up|score-down|observer-up|observer-down|maintenance-up|maintenance-down|backup-up|backup-down|backup-restart|backup-now|execution-up|execution-down|execution-restart|execution-status|execution-preflight|execution-logs [tail] [service]|down|restart|app-restart|runtime-ensure|watchdog-once|watchdog-status|watchdog-disable [reason]|watchdog-enable|discovery-restart|pipeline-restart|copyability-restart|copyability-ensure-workers|copyability-restart-when-idle [timeout_seconds] [poll_seconds]|score-restart|observer-restart|maintenance-restart|logs [tail] [service]|status|runtime-status|copyability-drain-once [limit<=5]|materialize-once [limit<=500]|score-once [limit<=500]|policy-rescore-once [score_limit<=500] [optional_feature_limit<=500]|recover-once [copyability_limit<=5] [score_limit<=500] [feature_limit<=500]|wal-truncate-window [checkpoint_timeout_seconds]|wal-truncate-when-idle [wait_timeout_seconds] [checkpoint_timeout_seconds] [poll_seconds]|migrate|health|app-status|maintenance|pipeline-jobs|pipeline-audit|copyability-jobs|shell}" >&2
     exit 2
     ;;
 esac

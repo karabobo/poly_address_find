@@ -929,7 +929,6 @@ def main() -> int:
                 medium_limit=args.medium_limit,
                 deep_limit=args.deep_limit,
                 shard_count=args.shard_count,
-                max_active_jobs=args.max_active_jobs,
             )
         finally:
             conn.close()
@@ -990,6 +989,7 @@ def main() -> int:
                 medium_limit=args.medium_limit,
                 deep_limit=args.deep_limit,
                 shard_count=args.shard_count,
+                max_active_jobs=args.max_active_jobs,
             )
         finally:
             conn.close()

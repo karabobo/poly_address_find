@@ -78,10 +78,26 @@ def test_deploy_files_exist():
         "deploy/nas/score-loop.sh",
         "deploy/nas/paper-observer-loop.sh",
         "deploy/nas/maintenance-loop.sh",
+        "deploy/nas/backup-loop.sh",
         "deploy/nas/pmrobot-vps-http-proxy.service",
     ]
     for item in required:
         assert Path(item).exists(), item
+
+
+def test_canonical_docs_describe_current_research_pipeline_only():
+    architecture = Path("docs/research_pipeline_architecture.md").read_text(encoding="utf-8")
+    probe = Path("docs/github_activity_probe.md").read_text(encoding="utf-8")
+
+    assert "canonical architecture reference" in architecture
+    assert "research/scoring" in architecture
+    assert "observed_wallets" in architecture
+    assert "wallet_processing_state (L0-L3 evidence truth)" in architecture
+    assert "pipeline_jobs[job_type=wallet_evidence_backfill]" in architecture
+    assert "Copyability is a separate evidence lane" in architecture
+    assert "There is no L4" in architecture
+    assert "does not submit real orders" in architecture
+    assert "manual supplemental discovery probe, not a runtime" in probe
 
 
 def test_github_workflows_do_not_auto_deploy_or_duplicate_discovery():
@@ -302,7 +318,7 @@ def test_nas_runtime_is_research_scoring_only():
     assert "paper_candidate" in readme
     assert "research/scoring only" in helper
     assert "PAPER_OBSERVER_SERVICES=\"paper-observer-loop\"" in helper
-    assert "RESEARCH_SERVICES=\"$CORE_SERVICES $DISCOVERY_SERVICES $PIPELINE_SERVICES $COPYABILITY_SERVICES $SCORE_SERVICES $PAPER_OBSERVER_SERVICES $MAINTENANCE_SERVICES\"" in helper
+    assert "RESEARCH_SERVICES=\"$CORE_SERVICES $DISCOVERY_SERVICES $PIPELINE_SERVICES $COPYABILITY_SERVICES $SCORE_SERVICES $PAPER_OBSERVER_SERVICES $MAINTENANCE_SERVICES $BACKUP_SERVICES\"" in helper
     assert "runtime-ensure" in helper
     assert "compose up -d --no-deps --no-recreate $RESEARCH_SERVICES" in helper
     assert "watchdog-once" in helper
@@ -416,7 +432,7 @@ def test_nas_execution_profile_is_manual_opt_in():
     assert "list[" not in helper
     assert "dict[" not in helper
     assert "up)" in helper
-    assert "compose up -d --build $CORE_SERVICES $DISCOVERY_SERVICES $PIPELINE_SERVICES $COPYABILITY_SERVICES $SCORE_SERVICES $PAPER_OBSERVER_SERVICES $MAINTENANCE_SERVICES" in helper
+    assert "compose up -d --build $RESEARCH_SERVICES" in helper
     assert "execution profile is opt-in" in readme
     assert "not part of the default research/scoring stack" in readme
     assert "execution-preflight" in readme
@@ -699,7 +715,6 @@ def test_ubuntu_vm_doc_keeps_docker_compose_and_research_boundary():
     assert "paper trading loops" in doc
     assert "publish loops" in doc
     assert "live trading or external execution handoff" in doc
-    assert "PolyHermes" in doc
     assert "service monitor `ok`" in doc
     assert "pm-robot-research" in doc
     assert "pm-robot-execution" in doc
@@ -879,3 +894,28 @@ def test_nas_maintenance_loop_runs_lightweight_storage_and_queue_repair():
     assert "explicit WAL shrink path" in readme
     assert "300 second timeout" in readme
     assert "WAL shrinking is" in readme
+
+
+def test_nas_research_stack_runs_verified_daily_backups():
+    compose = Path("deploy/nas/docker-compose.yml").read_text(encoding="utf-8")
+    env = Path("deploy/nas/env.example").read_text(encoding="utf-8")
+    loop = Path("deploy/nas/backup-loop.sh").read_text(encoding="utf-8")
+    helper = Path("deploy/nas/pmrobot-nas.sh").read_text(encoding="utf-8")
+
+    assert "backup-loop:" in compose
+    assert "container_name: pm-robot-backup-loop" in compose
+    assert "backup-loop.sh" in compose
+    assert "BACKUP_SERVICES=\"backup-loop\"" in helper
+    assert "backup-up" in helper
+    assert "backup-down" in helper
+    assert "backup-restart" in helper
+    assert "backup-now" in helper
+    assert "$BACKUP_SERVICES" in helper
+    assert "PM_ROBOT_BACKUP_INTERVAL=86400" in env
+    assert "PM_ROBOT_BACKUP_START_DELAY=600" in env
+    assert "PM_ROBOT_MAINTENANCE_KEEP_BACKUPS=14" in env
+    assert "PM_ROBOT_BACKUP_INTERVAL:-86400" in loop
+    assert "PM_ROBOT_BACKUP_START_DELAY:-600" in loop
+    assert "python -m pm_robot.cli --env /app/.env backup" in loop
+    assert "loop_backup" in loop
+    assert "runtime-heartbeat" in loop

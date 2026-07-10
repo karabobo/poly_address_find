@@ -368,6 +368,29 @@ services:
       - ./reports:/app/reports
       - ./config:/app/config:ro
 
+  backup-loop:
+    build:
+      context: ./app
+      dockerfile: deploy/nas/Dockerfile
+    image: pm-robot:nas
+    container_name: pm-robot-backup-loop
+    restart: unless-stopped
+    env_file:
+      - ./.env
+    working_dir: /app
+    command:
+      - /bin/sh
+      - /app/deploy/nas/backup-loop.sh
+    volumes:
+      - ./app/src:/app/src:ro
+      - ./app/deploy:/app/deploy:ro
+      - ./app/scripts:/app/scripts:ro
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./backups:/app/backups
+      - ./reports:/app/reports
+      - ./config:/app/config:ro
+
   task:
     build:
       context: ./app

@@ -1,8 +1,17 @@
+import json
+
 import pytest
 
 from pm_robot.config import RobotSettings
 from pm_robot.ops import maintenance
+from pm_robot.orchestration.wallet_pipeline import JOB_TYPE as WALLET_EVIDENCE_JOB_TYPE
+from pm_robot.pipeline_terms import DEFAULT_EVIDENCE_JOB_STAGE, EvidenceTier
 from pm_robot.storage.db import connect, initialize_database, run_migrations
+from pm_robot.storage.repository import (
+    claim_pipeline_job,
+    complete_pipeline_job,
+    enqueue_pipeline_job,
+)
 
 
 def _settings(tmp_path):
@@ -133,6 +142,72 @@ def test_maintenance_can_requeue_only_expired_running_pipeline_jobs(tmp_path):
     assert live["status"] == "running"
     assert live["lease_owner"] == "worker"
     assert live["lease_until"] == 4_000_000_000
+
+
+def test_expired_job_is_recovered_and_completed_by_replacement_worker(tmp_path, monkeypatch):
+    settings = _settings(tmp_path)
+    initialize_database(settings.db_path)
+    wallet = "0x" + "9" * 40
+    conn = connect(settings.db_path)
+    try:
+        run_migrations(conn)
+        assert enqueue_pipeline_job(
+            conn,
+            job_type=WALLET_EVIDENCE_JOB_TYPE,
+            wallet=wallet,
+            subject_key=DEFAULT_EVIDENCE_JOB_STAGE,
+            tier=EvidenceTier.L1_LIGHT.value,
+            shard=0,
+            now=1_000,
+        )
+        conn.commit()
+        abandoned = claim_pipeline_job(
+            conn,
+            job_type=WALLET_EVIDENCE_JOB_TYPE,
+            shard=0,
+            worker_id="worker-crashed",
+            lease_seconds=10,
+            now=1_001,
+        )
+        assert abandoned is not None
+    finally:
+        conn.close()
+
+    monkeypatch.setattr("pm_robot.ops.time.time", lambda: 1_012)
+    recovered = maintenance(settings, skip_cleanup=True, reset_stale_jobs=True)
+    assert recovered["stale_jobs"]["total"] == 1
+
+    conn = connect(settings.db_path)
+    try:
+        replacement = claim_pipeline_job(
+            conn,
+            job_type=WALLET_EVIDENCE_JOB_TYPE,
+            shard=0,
+            worker_id="worker-replacement",
+            lease_seconds=60,
+            now=1_013,
+        )
+        assert replacement is not None
+        assert replacement["attempts"] == 2
+        assert complete_pipeline_job(
+            conn,
+            job_id=int(replacement["job_id"]),
+            worker_id="worker-replacement",
+            output_data={"recovered": True},
+            now=1_014,
+        ) is True
+        conn.commit()
+        row = conn.execute(
+            "SELECT status, attempts, lease_owner, output_json FROM pipeline_jobs WHERE job_id = ?",
+            (replacement["job_id"],),
+        ).fetchone()
+    finally:
+        conn.close()
+
+    assert row["status"] == "done"
+    assert row["attempts"] == 2
+    assert row["lease_owner"] is None
+    assert json.loads(row["output_json"]) == {"recovered": True}
 
 
 def test_maintenance_requeues_older_duplicate_running_pipeline_leases(tmp_path):

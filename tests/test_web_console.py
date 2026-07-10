@@ -2439,6 +2439,69 @@ def test_storage_maintenance_summary_marks_large_wal_with_safe_commands(tmp_path
     assert "WAL truncate 会临时停止 research/scoring 服务" in html
 
 
+def test_storage_maintenance_summary_reports_missing_and_fresh_backups(tmp_path):
+    settings = RobotSettings(
+        db_path=tmp_path / "data" / "pm_robot.sqlite",
+        backup_dir=tmp_path / "backups",
+        execution_mode="research",
+    )
+    settings.db_path.parent.mkdir(parents=True)
+    settings.db_path.write_bytes(b"db")
+
+    missing = _storage_maintenance_summary(
+        settings,
+        now=100_000,
+        backup_max_age_seconds=90_000,
+        low_free_disk_bytes=1,
+    )
+    assert missing["state"] == "backup_missing"
+    assert missing["backup_count"] == 0
+    assert missing["backup_fresh"] is False
+
+    settings.backup_dir.mkdir(parents=True)
+    backup = settings.backup_dir / "pm_robot-19700102-000000.sqlite"
+    backup.write_bytes(b"backup")
+    backup.touch()
+    fresh = _storage_maintenance_summary(
+        settings,
+        now=int(backup.stat().st_mtime) + 60,
+        backup_max_age_seconds=90_000,
+        low_free_disk_bytes=1,
+    )
+    html = _storage_maintenance_panel(fresh)
+
+    assert fresh["state"] == "ok"
+    assert fresh["backup_count"] == 1
+    assert fresh["backup_fresh"] is True
+    assert fresh["latest_backup_name"] == backup.name
+    assert "最近备份" in html
+    assert "backup-now" in html
+
+
+def test_storage_maintenance_summary_marks_stale_backup(tmp_path):
+    settings = RobotSettings(
+        db_path=tmp_path / "data" / "pm_robot.sqlite",
+        backup_dir=tmp_path / "backups",
+        execution_mode="research",
+    )
+    settings.db_path.parent.mkdir(parents=True)
+    settings.db_path.write_bytes(b"db")
+    settings.backup_dir.mkdir(parents=True)
+    backup = settings.backup_dir / "pm_robot-19700101-000000.sqlite"
+    backup.write_bytes(b"backup")
+    backup.touch()
+
+    summary = _storage_maintenance_summary(
+        settings,
+        now=int(backup.stat().st_mtime) + 90_001,
+        backup_max_age_seconds=90_000,
+        low_free_disk_bytes=1,
+    )
+    assert summary["state"] == "backup_stale"
+    assert summary["backup_fresh"] is False
+    assert summary["latest_backup_age_seconds"] == 90_001
+
+
 def test_discovery_data_builds_workbench_metrics(tmp_path):
     settings = _settings(tmp_path)
     _seed(settings)

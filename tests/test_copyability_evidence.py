@@ -31,6 +31,95 @@ def test_copyability_worker_default_lease_matches_long_running_graph_refresh():
     assert default == 7_200
 
 
+def test_copyability_worker_rolls_back_when_completion_loses_lease(tmp_path, monkeypatch):
+    conn = connect(tmp_path / "robot.sqlite")
+    wallet = "0x" + "c" * 40
+    try:
+        run_migrations(conn)
+        upsert_candidate(
+            conn,
+            CandidateAddress(address=wallet, sources="test", notes="original"),
+        )
+        conn.execute(
+            """
+            INSERT INTO pipeline_jobs(
+                job_type, wallet, subject_key, tier, priority, shard, status,
+                lease_owner, lease_until, attempts, max_attempts, next_attempt_at,
+                input_json, output_json, last_error, created_at, updated_at
+            ) VALUES (?, ?, 'copyability', 'copyability', 10, 0, 'queued',
+                NULL, 0, 0, 3, 0, '{}', '{}', '', 100, 100)
+            """,
+            (JOB_TYPE, wallet),
+        )
+        conn.commit()
+
+        def fake_graph(
+            conn_arg,
+            policy,
+            leaders,
+            *,
+            max_leader_events,
+            max_followers_per_event,
+            now,
+            commit=True,
+        ):
+            assert commit is False
+            conn_arg.execute(
+                "UPDATE candidate_wallets SET notes = 'stale-write' WHERE address = ?",
+                (wallet,),
+            )
+            return TargetedCopyGraphSummary(1, 0, 0, 0, 0)
+
+        def fake_backtest(conn_arg, policy, leaders, *, now=None, commit=True):
+            assert commit is False
+            return TargetedCopyBacktestSummary(1, 0, 0, 0)
+
+        monkeypatch.setattr(copyability_evidence, "mine_copy_graph_for_leaders", fake_graph)
+        monkeypatch.setattr(copyability_evidence, "backtest_copy_stream_for_leaders", fake_backtest)
+        monkeypatch.setattr(
+            copyability_evidence,
+            "materialize_wallet_feature",
+            lambda *args, **kwargs: True,
+        )
+        monkeypatch.setattr(
+            copyability_evidence,
+            "_score_wallet_after_copyability",
+            lambda *args, **kwargs: False,
+        )
+        monkeypatch.setattr(
+            copyability_evidence,
+            "complete_pipeline_job",
+            lambda *args, **kwargs: False,
+        )
+
+        summary = run_copyability_evidence_worker(
+            conn,
+            shard_index=0,
+            shard_count=1,
+            limit=1,
+            worker_id="copy-lease-loss-worker",
+            policy_path=str(Path("config/leader_scoring_policy.json")),
+        )
+        candidate = conn.execute(
+            "SELECT notes FROM candidate_wallets WHERE address = ?",
+            (wallet,),
+        ).fetchone()
+        job = conn.execute(
+            "SELECT status, lease_owner, output_json FROM pipeline_jobs WHERE wallet = ?",
+            (wallet,),
+        ).fetchone()
+
+        assert summary.status == "partial"
+        assert summary.jobs_failed == 1
+        assert "lease was lost" in summary.error
+        assert candidate["notes"] == "original"
+        assert job["status"] == "running"
+        assert job["lease_owner"] == "copy-lease-loss-worker"
+        assert json.loads(job["output_json"]) == {}
+    finally:
+        conn.close()
+
+
 def test_copyability_worker_run_type_includes_worker_identity():
     first = _copyability_worker_ingest_type(0, "nas-copyability-0-host")
     second = _copyability_worker_ingest_type(0, "nas-copyability-worker-1")
@@ -780,6 +869,7 @@ def test_copyability_worker_uses_per_job_light_scan_bounds(tmp_path, monkeypatch
             max_leader_events,
             max_followers_per_event,
             now,
+            commit=True,
         ):
             captured["max_leader_events"] = max_leader_events
             captured["max_followers_per_event"] = max_followers_per_event
@@ -791,7 +881,7 @@ def test_copyability_worker_uses_per_job_light_scan_bounds(tmp_path, monkeypatch
                 qualified_pairs=0,
             )
 
-        def fake_backtest(conn_arg, policy, leaders, *, now=None):
+        def fake_backtest(conn_arg, policy, leaders, *, now=None, commit=True):
             return TargetedCopyBacktestSummary(
                 leaders_seen=1,
                 trades_written=0,
@@ -866,6 +956,7 @@ def test_copyability_worker_does_not_prefer_light_scan_over_higher_priority_jobs
             max_leader_events,
             max_followers_per_event,
             now,
+            commit=True,
         ):
             captured["wallet"] = leaders[0]
             return TargetedCopyGraphSummary(
@@ -876,7 +967,7 @@ def test_copyability_worker_does_not_prefer_light_scan_over_higher_priority_jobs
                 qualified_pairs=0,
             )
 
-        def fake_backtest(conn_arg, policy, leaders, *, now=None):
+        def fake_backtest(conn_arg, policy, leaders, *, now=None, commit=True):
             return TargetedCopyBacktestSummary(
                 leaders_seen=1,
                 trades_written=0,
@@ -943,6 +1034,7 @@ def test_copyability_worker_can_prefer_light_scan_with_equal_priority(tmp_path, 
             max_leader_events,
             max_followers_per_event,
             now,
+            commit=True,
         ):
             captured["wallet"] = leaders[0]
             return TargetedCopyGraphSummary(
@@ -953,7 +1045,7 @@ def test_copyability_worker_can_prefer_light_scan_with_equal_priority(tmp_path, 
                 qualified_pairs=0,
             )
 
-        def fake_backtest(conn_arg, policy, leaders, *, now=None):
+        def fake_backtest(conn_arg, policy, leaders, *, now=None, commit=True):
             return TargetedCopyBacktestSummary(
                 leaders_seen=1,
                 trades_written=0,
@@ -1052,6 +1144,7 @@ def test_copyability_worker_blocks_completed_deep_scan_with_no_signal(tmp_path, 
             max_leader_events,
             max_followers_per_event,
             now,
+            commit=True,
         ):
             return TargetedCopyGraphSummary(
                 leaders_seen=1,
@@ -1061,7 +1154,7 @@ def test_copyability_worker_blocks_completed_deep_scan_with_no_signal(tmp_path, 
                 qualified_pairs=0,
             )
 
-        def fake_backtest(conn_arg, policy, leaders, *, now=None):
+        def fake_backtest(conn_arg, policy, leaders, *, now=None, commit=True):
             return TargetedCopyBacktestSummary(
                 leaders_seen=1,
                 trades_written=0,

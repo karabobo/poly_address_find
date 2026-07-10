@@ -95,6 +95,7 @@ def mine_copy_graph_for_leaders(
     max_leader_events: int = 3_000,
     max_followers_per_event: int = 200,
     now: int | None = None,
+    commit: bool = True,
 ) -> TargetedCopyGraphSummary:
     """Refresh copy graph evidence for a bounded set of leaders.
 
@@ -136,7 +137,8 @@ def mine_copy_graph_for_leaders(
 
     _delete_for_leaders(conn, "copy_trade_links", "leader_wallet", leader_wallets)
     links_written = _insert_copy_link_rows(conn, link_rows)
-    conn.commit()
+    if commit:
+        conn.commit()
 
     pair_stats = _build_pair_stats_for_leaders(
         conn,
@@ -159,7 +161,8 @@ def mine_copy_graph_for_leaders(
             """,
             pair_stats,
         )
-    conn.commit()
+    if commit:
+        conn.commit()
 
     leader_stats = _build_leader_stats_for_leaders(conn, leader_wallets, ts)
     _delete_for_leaders(conn, "copy_leader_stats", "leader_wallet", leader_wallets)
@@ -176,7 +179,8 @@ def mine_copy_graph_for_leaders(
             leader_stats,
         )
     _merge_leader_features(conn, leader_wallets)
-    conn.commit()
+    if commit:
+        conn.commit()
     return TargetedCopyGraphSummary(
         leaders_seen=len(leader_wallets),
         links_written=links_written,

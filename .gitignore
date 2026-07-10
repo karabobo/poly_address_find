@@ -26,10 +26,6 @@ reports/
 *.sqlite-*
 *.db
 
-PolyHermes/
-nautilus-trading/
-polywhale/
-
 tmp/
 dist/
 build/

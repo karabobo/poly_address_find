@@ -85,6 +85,7 @@ def backtest_copy_stream_for_leaders(
     leaders: list[str],
     *,
     now: int | None = None,
+    commit: bool = True,
 ) -> TargetedCopyBacktestSummary:
     """Backtest copy streams for a bounded set of leaders.
 
@@ -129,7 +130,8 @@ def backtest_copy_stream_for_leaders(
             """,
             trades,
         )
-    conn.commit()
+    if commit:
+        conn.commit()
 
     performance = _build_leader_performance(conn, ts, leaders=leader_wallets)
     conn.execute(
@@ -151,7 +153,8 @@ def backtest_copy_stream_for_leaders(
             performance,
         )
     _merge_copy_stream_features(conn, leader_wallets)
-    conn.commit()
+    if commit:
+        conn.commit()
     return TargetedCopyBacktestSummary(
         leaders_seen=len(leader_wallets),
         trades_written=len(trades),

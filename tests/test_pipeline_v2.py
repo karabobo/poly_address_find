@@ -1,4 +1,6 @@
 import json
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
 
 from pm_robot.models import CandidateAddress, CandidateStage
 from pm_robot.orchestration.copyability_evidence import JOB_TYPE as COPYABILITY_JOB_TYPE
@@ -38,12 +40,201 @@ from pm_robot.storage.repository import (
     persist_wallet_activity,
     pipeline_job_summary,
     renew_pipeline_job_lease,
+    retry_pipeline_job,
     seed_evidence_backfill_budget,
     sync_wallet_processing_state,
     upsert_candidate,
     upsert_wallet_evidence_summary,
     wallet_pipeline_tier,
 )
+
+
+def test_wallet_pipeline_plan_cli_honors_active_job_waterline(tmp_path, monkeypatch, capsys):
+    from pm_robot.cli import main
+
+    db_path = tmp_path / "robot.sqlite"
+    conn = connect(db_path)
+    try:
+        run_migrations(conn)
+        assert enqueue_pipeline_job(
+            conn,
+            job_type=WALLET_EVIDENCE_JOB_TYPE,
+            wallet="0x" + "1" * 40,
+            subject_key=DEFAULT_EVIDENCE_JOB_STAGE,
+            tier=EvidenceTier.L1_LIGHT.value,
+            priority=10,
+            shard=0,
+            now=10_000,
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "pm-robot",
+            "--env",
+            str(tmp_path / "missing.env"),
+            "--db",
+            str(db_path),
+            "wallet-pipeline-plan",
+            "--max-active-jobs",
+            "1",
+        ],
+    )
+
+    assert main() == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["throttled"] is True
+    assert payload["reason"] == "active_queue_waterline"
+    assert payload["active_jobs"] == 1
+    assert payload["max_active_jobs"] == 1
+
+
+def test_legacy_evidence_backfill_plan_cli_does_not_require_wallet_waterline(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    from pm_robot.cli import main
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "pm-robot",
+            "--env",
+            str(tmp_path / "missing.env"),
+            "--db",
+            str(tmp_path / "robot.sqlite"),
+            "evidence-backfill-plan",
+            "--light-limit",
+            "0",
+            "--medium-limit",
+            "0",
+            "--deep-limit",
+            "0",
+        ],
+    )
+
+    assert main() == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "ok"
+
+
+def test_pipeline_job_completion_rejects_stale_lease_owner(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    wallet = "0x" + "2" * 40
+    try:
+        run_migrations(conn)
+        assert enqueue_pipeline_job(
+            conn,
+            job_type=WALLET_EVIDENCE_JOB_TYPE,
+            wallet=wallet,
+            subject_key=DEFAULT_EVIDENCE_JOB_STAGE,
+            tier=EvidenceTier.L1_LIGHT.value,
+            shard=0,
+            now=10_000,
+        )
+        conn.commit()
+        job = claim_pipeline_job(
+            conn,
+            job_type=WALLET_EVIDENCE_JOB_TYPE,
+            shard=0,
+            worker_id="worker-current",
+            lease_seconds=60,
+            now=10_001,
+        )
+        assert job is not None
+
+        assert complete_pipeline_job(
+            conn,
+            job_id=int(job["job_id"]),
+            worker_id="worker-stale",
+            output_data={"ok": False},
+            now=10_010,
+        ) is False
+        row = conn.execute(
+            "SELECT status, lease_owner, output_json FROM pipeline_jobs WHERE job_id = ?",
+            (job["job_id"],),
+        ).fetchone()
+        assert dict(row) == {
+            "status": "running",
+            "lease_owner": "worker-current",
+            "output_json": "{}",
+        }
+        assert retry_pipeline_job(
+            conn,
+            job_id=int(job["job_id"]),
+            worker_id="worker-stale",
+            error="stale worker failure",
+            next_attempt_at=10_020,
+            now=10_010,
+        ) is False
+
+        assert complete_pipeline_job(
+            conn,
+            job_id=int(job["job_id"]),
+            worker_id="worker-current",
+            output_data={"ok": True},
+            now=10_011,
+        ) is True
+    finally:
+        conn.close()
+
+
+def test_concurrent_pipeline_claims_assign_one_job_once(tmp_path):
+    db_path = tmp_path / "robot.sqlite"
+    conn = connect(db_path)
+    try:
+        run_migrations(conn)
+        assert enqueue_pipeline_job(
+            conn,
+            job_type=WALLET_EVIDENCE_JOB_TYPE,
+            wallet="0x" + "3" * 40,
+            subject_key=DEFAULT_EVIDENCE_JOB_STAGE,
+            tier=EvidenceTier.L1_LIGHT.value,
+            shard=0,
+            now=10_000,
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    barrier = Barrier(2)
+
+    def claim(worker_id):
+        worker_conn = connect(db_path)
+        try:
+            barrier.wait()
+            return claim_pipeline_job(
+                worker_conn,
+                job_type=WALLET_EVIDENCE_JOB_TYPE,
+                shard=0,
+                worker_id=worker_id,
+                lease_seconds=60,
+                now=10_001,
+            )
+        finally:
+            worker_conn.close()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        jobs = list(executor.map(claim, ("worker-a", "worker-b")))
+
+    claimed = [job for job in jobs if job is not None]
+    assert len(claimed) == 1
+    assert claimed[0]["attempts"] == 1
+
+    conn = connect(db_path)
+    try:
+        row = conn.execute(
+            "SELECT status, attempts, lease_owner FROM pipeline_jobs"
+        ).fetchone()
+    finally:
+        conn.close()
+    assert row["status"] == "running"
+    assert row["attempts"] == 1
+    assert row["lease_owner"] in {"worker-a", "worker-b"}
 
 
 def _event(wallet: str, idx: int, *, market: str) -> dict:
@@ -290,6 +481,116 @@ def test_wallet_pipeline_plans_and_runs_v2_backfill_job(tmp_path):
         conn.close()
 
 
+def test_wallet_pipeline_rolls_back_partial_evidence_before_retry(tmp_path, monkeypatch):
+    conn = connect(tmp_path / "robot.sqlite")
+    wallet = "0x" + "5" * 40
+    try:
+        run_migrations(conn)
+        upsert_candidate(conn, CandidateAddress(address=wallet, sources="polymarket_trades_global"))
+        materialize_wallet_processing_state(conn, limit=10, source="test_seed")
+        plan_wallet_pipeline_jobs(
+            conn,
+            light_limit=1,
+            medium_limit=0,
+            deep_limit=0,
+            shard_count=1,
+            now=40_000,
+        )
+        client = FakePipelineClient(
+            {wallet: [_event(wallet, idx, market="rollback-market") for idx in range(5)]},
+            {wallet: [{"asset": "asset-open", "size": 10, "marketSlug": "rollback-market"}]},
+        )
+
+        def fail_positions(*args, **kwargs):
+            raise RuntimeError("position persistence failed")
+
+        monkeypatch.setattr(
+            "pm_robot.orchestration.wallet_pipeline.persist_wallet_positions",
+            fail_positions,
+        )
+        summary = run_wallet_pipeline_worker(
+            conn,
+            shard_index=0,
+            shard_count=1,
+            limit=1,
+            page_limit=20,
+            sleep_seconds=0,
+            client=client,
+            worker_id="rollback-worker",
+        )
+        activity_count = conn.execute(
+            "SELECT COUNT(*) FROM wallet_activity WHERE address = ?",
+            (wallet,),
+        ).fetchone()[0]
+        job = conn.execute(
+            "SELECT status, lease_owner, last_error FROM pipeline_jobs WHERE wallet = ?",
+            (wallet,),
+        ).fetchone()
+
+        assert summary.status == "partial"
+        assert summary.jobs_failed == 1
+        assert activity_count == 0
+        assert job["status"] == "queued"
+        assert job["lease_owner"] is None
+        assert "position persistence failed" in job["last_error"]
+    finally:
+        conn.close()
+
+
+def test_wallet_pipeline_rolls_back_when_completion_loses_lease(tmp_path, monkeypatch):
+    conn = connect(tmp_path / "robot.sqlite")
+    wallet = "0x" + "6" * 40
+    try:
+        run_migrations(conn)
+        upsert_candidate(conn, CandidateAddress(address=wallet, sources="polymarket_trades_global"))
+        materialize_wallet_processing_state(conn, limit=10, source="test_seed")
+        plan_wallet_pipeline_jobs(
+            conn,
+            light_limit=1,
+            medium_limit=0,
+            deep_limit=0,
+            shard_count=1,
+            now=40_000,
+        )
+        client = FakePipelineClient(
+            {wallet: [_event(wallet, idx, market="lease-loss-market") for idx in range(5)]},
+            {wallet: [{"asset": "asset-open", "size": 10, "marketSlug": "lease-loss-market"}]},
+        )
+        monkeypatch.setattr(
+            "pm_robot.orchestration.wallet_pipeline.complete_pipeline_job",
+            lambda *args, **kwargs: False,
+        )
+
+        summary = run_wallet_pipeline_worker(
+            conn,
+            shard_index=0,
+            shard_count=1,
+            limit=1,
+            page_limit=20,
+            sleep_seconds=0,
+            client=client,
+            worker_id="lease-loss-worker",
+        )
+        activity_count = conn.execute(
+            "SELECT COUNT(*) FROM wallet_activity WHERE address = ?",
+            (wallet,),
+        ).fetchone()[0]
+        job = conn.execute(
+            "SELECT status, lease_owner, output_json FROM pipeline_jobs WHERE wallet = ?",
+            (wallet,),
+        ).fetchone()
+
+        assert summary.status == "partial"
+        assert summary.jobs_failed == 1
+        assert "lease was lost" in summary.error
+        assert activity_count == 0
+        assert job["status"] == "running"
+        assert job["lease_owner"] == "lease-loss-worker"
+        assert json.loads(job["output_json"]) == {}
+    finally:
+        conn.close()
+
+
 def test_pipeline_job_dedupe_scope_includes_tier(tmp_path):
     conn = connect(tmp_path / "robot.sqlite")
     wallet = "0x" + "5" * 40
@@ -376,7 +677,13 @@ def test_enqueue_pipeline_job_does_not_reopen_completed_job(tmp_path):
             now=10_001,
         )
         assert job is not None
-        complete_pipeline_job(conn, job_id=job["job_id"], output_data={"ok": True}, now=10_010)
+        complete_pipeline_job(
+            conn,
+            job_id=job["job_id"],
+            worker_id="worker-a",
+            output_data={"ok": True},
+            now=10_010,
+        )
         conn.commit()
 
         assert not enqueue_pipeline_job(
@@ -444,7 +751,13 @@ def test_wallet_pipeline_planner_skips_completed_exact_scope_jobs(tmp_path):
             now=30_001,
         )
         assert job is not None
-        complete_pipeline_job(conn, job_id=job["job_id"], output_data={"ok": True}, now=30_010)
+        complete_pipeline_job(
+            conn,
+            job_id=job["job_id"],
+            worker_id="worker-a",
+            output_data={"ok": True},
+            now=30_010,
+        )
         conn.commit()
 
         plan = plan_wallet_pipeline_jobs(
@@ -696,7 +1009,13 @@ def test_pipeline_jobs_claim_complete_and_summarize(tmp_path):
         assert job["wallet"] == wallet
         assert job["attempts"] == 1
 
-        complete_pipeline_job(conn, job_id=job["job_id"], output_data={"ok": True}, now=10_010)
+        complete_pipeline_job(
+            conn,
+            job_id=job["job_id"],
+            worker_id="worker-a",
+            output_data={"ok": True},
+            now=10_010,
+        )
         conn.commit()
         summary = pipeline_job_summary(conn, job_type=legacy_job_type)
 
