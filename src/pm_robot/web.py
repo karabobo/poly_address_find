@@ -39,7 +39,14 @@ from pm_robot.orchestration.pipeline_audit import (
 )
 from pm_robot.orchestration.paper_runner import preview_paper_observer
 from pm_robot.orchestration.evidence_readiness import paper_evidence_ready, paper_evidence_ready_sql
-from pm_robot.pipeline_terms import PAPER_ELIGIBLE_CANDIDATE_STAGES, PipelineJobType
+from pm_robot.models import CandidateStage
+from pm_robot.pipeline_terms import (
+    PAPER_ELIGIBLE_CANDIDATE_STAGES,
+    EvidenceJobStage,
+    EvidenceStatus,
+    EvidenceTier,
+    PipelineJobType,
+)
 from pm_robot.storage.db import connect_readonly
 from pm_robot.storage.repository import evidence_backfill_summary
 
@@ -61,6 +68,54 @@ BACKUP_MAX_AGE_SECONDS = 26 * 3_600
 _DASHBOARD_CACHE_LOCK = threading.Lock()
 _DASHBOARD_CACHE: dict[tuple[str, bool], tuple[float, dict[str, Any]]] = {}
 _DASHBOARD_REFRESHING: set[tuple[str, bool]] = set()
+
+_CANDIDATE_STAGE_LABELS = {
+    CandidateStage.IMPORTED.value: "已导入",
+    CandidateStage.NEEDS_DATA.value: "待补证据",
+    CandidateStage.NEEDS_REVIEW.value: "自动复核中",
+    CandidateStage.PAPER_CANDIDATE.value: "Paper 候选",
+    CandidateStage.PAPER_APPROVED.value: "Paper 已批准",
+    CandidateStage.LIVE_ELIGIBLE.value: "可交接生产",
+    CandidateStage.REJECTED.value: "已拒绝",
+    CandidateStage.BLOCKED_HYGIENE.value: "Hygiene 阻断",
+    CandidateStage.BLOCKED_COPYABILITY.value: "Copyability 阻断",
+}
+_EVIDENCE_TIER_LABELS = {
+    EvidenceTier.L0_DISCOVERED.value: "L0 已发现",
+    EvidenceTier.L1_LIGHT.value: "L1 轻量证据",
+    EvidenceTier.L2_MEDIUM.value: "L2 中量证据",
+    EvidenceTier.L3_DEEP.value: "L3 深度证据",
+}
+_EVIDENCE_STATUS_LABELS = {
+    EvidenceStatus.PENDING.value: "待规划",
+    EvidenceStatus.NEEDS_LIGHT.value: "需要轻量历史",
+    EvidenceStatus.NEEDS_MEDIUM.value: "需要中量历史",
+    EvidenceStatus.NEEDS_DEEP.value: "需要深度历史",
+    EvidenceStatus.QUEUED.value: "已进入队列",
+    EvidenceStatus.SUMMARY_READY.value: "证据摘要就绪",
+    EvidenceStatus.PAUSED.value: "已暂停",
+}
+_EVIDENCE_ACTION_LABELS = {
+    EvidenceJobStage.LIGHT_PENDING.value: "补轻量历史",
+    EvidenceJobStage.LIGHT_DONE.value: "轻量历史完成",
+    EvidenceJobStage.MEDIUM_PENDING.value: "补中量历史",
+    EvidenceJobStage.MEDIUM_DONE.value: "中量历史完成",
+    EvidenceJobStage.DEEP_PENDING.value: "补深度历史",
+    EvidenceJobStage.DEEP_DONE.value: "深度历史完成",
+    "score_wallet": "进入评分",
+    "manual_review_fast_market": "复核快盘风险",
+}
+_PIPELINE_JOB_TYPE_LABELS = {
+    PipelineJobType.WALLET_EVIDENCE_BACKFILL.value: "历史证据",
+    PipelineJobType.COPYABILITY_EVIDENCE.value: "Copyability 证据",
+}
+_JOB_STATUS_LABELS = {
+    "queued": "等待执行",
+    "running": "执行中",
+    "done": "已完成",
+    "failed": "已失败",
+    "cancelled": "已取消",
+}
 
 
 @dataclass(frozen=True)
@@ -2404,6 +2459,140 @@ def _progress_pct(current: Any, target: Any) -> float:
         return 0.0
 
 
+def _wallet_pipeline_diagnostic(
+    candidate: dict[str, Any],
+    processing_state: dict[str, Any],
+    pipeline_jobs: list[dict[str, Any]],
+    *,
+    now: int | None = None,
+) -> dict[str, Any]:
+    """Summarize queue state for operators without mutating pipeline state."""
+    current = int(time.time()) if now is None else int(now)
+    latest_job = pipeline_jobs[0] if pipeline_jobs else {}
+    candidate_stage = str(candidate.get("candidate_stage") or "")
+    evidence_status = str(processing_state.get("evidence_status") or "")
+    evidence_tier = str(processing_state.get("discovery_tier") or "")
+    next_action = str(processing_state.get("next_action") or "")
+    next_action_at = int(processing_state.get("next_action_at") or 0)
+    job_status = str(latest_job.get("status") or "")
+    lease_until = int(latest_job.get("lease_until") or 0)
+    next_attempt_at = int(latest_job.get("next_attempt_at") or 0)
+    latest_error = str(latest_job.get("last_error") or "")
+
+    if not next_action:
+        due_state = "none"
+        due_label = "无待处理动作"
+    elif next_action_at <= 0 or next_action_at <= current:
+        due_state = "due"
+        due_label = "已到调度时间"
+    else:
+        due_state = "scheduled"
+        due_label = f"{_duration_label(next_action_at - current)}后可调度"
+
+    state = "attention"
+    headline = "等待证据管道继续处理"
+    suggested_action = "检查 planner 与对应 worker 的最近心跳。"
+    if job_status == "running" and lease_until and lease_until <= current:
+        state = "critical"
+        headline = "运行租约已经过期"
+        suggested_action = "等待队列回收租约；若持续存在，检查对应 worker 心跳。"
+    elif job_status == "failed":
+        state = "critical"
+        headline = "最近一次证据任务失败"
+        suggested_action = "展开完整错误，修复上游问题后重试对应任务。"
+    elif job_status == "queued" and next_attempt_at > current:
+        headline = "任务正在等待重试窗口"
+        suggested_action = f"预计 {_duration_label(next_attempt_at - current)}后可再次领取。"
+    elif job_status == "queued":
+        headline = "任务已排队等待 worker"
+        suggested_action = "确认对应 worker 有心跳且存在可用并发。"
+    elif job_status == "running":
+        state = "ok"
+        headline = "证据任务正在执行"
+        suggested_action = "无需人工处理；关注租约到期前是否完成或续租。"
+    elif job_status == "done" and next_action and due_state == "due":
+        headline = "上一任务完成，下一动作等待派发"
+        suggested_action = "确认 pipeline planner 正常运行并创建下一层任务。"
+    elif evidence_status == EvidenceStatus.SUMMARY_READY.value:
+        state = "ok"
+        headline = "历史证据摘要已经就绪"
+        suggested_action = "等待评分与自动复核循环消费最新证据。"
+    elif not processing_state:
+        state = "critical"
+        headline = "尚未生成钱包处理状态"
+        suggested_action = "运行状态物化流程，再由 pipeline planner 创建任务。"
+    elif next_action and not latest_job:
+        state = "critical" if due_state == "due" else "attention"
+        headline = "下一动作尚未进入执行队列"
+        suggested_action = "检查 pipeline planner 是否漏派该钱包。"
+
+    if candidate_stage in {
+        CandidateStage.BLOCKED_HYGIENE.value,
+        CandidateStage.BLOCKED_COPYABILITY.value,
+        CandidateStage.REJECTED.value,
+    }:
+        state = "critical"
+        headline = "钱包已被研究风险规则阻断"
+        suggested_action = "先查看最新评分原因和阶段变更，再决定是否重新补证据。"
+    elif candidate_stage == CandidateStage.NEEDS_REVIEW.value and state == "ok":
+        headline = "证据链正常，等待自动复核结论"
+
+    return {
+        "state": state,
+        "headline": headline,
+        "suggested_action": suggested_action,
+        "candidate_stage": candidate_stage,
+        "candidate_stage_label": _CANDIDATE_STAGE_LABELS.get(candidate_stage, candidate_stage),
+        "evidence_status": evidence_status,
+        "evidence_status_label": _EVIDENCE_STATUS_LABELS.get(evidence_status, evidence_status),
+        "evidence_tier": evidence_tier,
+        "evidence_tier_label": _EVIDENCE_TIER_LABELS.get(evidence_tier, evidence_tier),
+        "next_action": next_action,
+        "next_action_label": _EVIDENCE_ACTION_LABELS.get(next_action, next_action),
+        "next_action_at": next_action_at,
+        "due_state": due_state,
+        "due_label": due_label,
+        "latest_job_status": job_status,
+        "latest_job_status_label": _JOB_STATUS_LABELS.get(job_status, job_status),
+        "latest_job_type": str(latest_job.get("job_type") or ""),
+        "latest_error": latest_error,
+        "attempts": int(latest_job.get("attempts") or 0),
+        "max_attempts": int(latest_job.get("max_attempts") or 0),
+    }
+
+
+def _wallet_history_timeline(
+    score_history: list[dict[str, Any]],
+    review_events: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Merge score and stage history for display without changing stored events."""
+    rows = [
+        {
+            "event_type": "score",
+            "event_label": "评分",
+            "stage": row.get("review_stage"),
+            "score": row.get("leader_score"),
+            "reason": row.get("review_reason"),
+            "policy_version": row.get("policy_version"),
+            "occurred_at": row.get("scored_at"),
+        }
+        for row in score_history
+    ]
+    rows.extend(
+        {
+            "event_type": "stage_change",
+            "event_label": "阶段变更",
+            "stage": f'{row.get("from_stage") or "-"} -> {row.get("to_stage") or "-"}',
+            "score": None,
+            "reason": row.get("reason"),
+            "policy_version": "",
+            "occurred_at": row.get("created_at"),
+        }
+        for row in review_events
+    )
+    return sorted(rows, key=lambda row: int(row.get("occurred_at") or 0), reverse=True)
+
+
 def _wallet_detail_data(
     conn: sqlite3.Connection,
     address: str,
@@ -2431,17 +2620,78 @@ def _wallet_detail_data(
         paper_min_score=paper_min_score,
         research_only=research_only,
     )
+    processing_state = _one(
+        conn,
+        "SELECT * FROM wallet_processing_state WHERE wallet = ?",
+        (address,),
+    )
+    pipeline_jobs = _rows(
+        conn,
+        """
+        SELECT
+            job_id,
+            job_type,
+            subject_key AS job_action,
+            tier AS job_scope,
+            status,
+            priority,
+            shard,
+            attempts,
+            max_attempts,
+            lease_owner,
+            lease_until,
+            next_attempt_at,
+            last_error,
+            created_at,
+            updated_at,
+            completed_at
+        FROM pipeline_jobs
+        WHERE wallet = ?
+        ORDER BY updated_at DESC, job_id DESC
+        LIMIT 30
+        """,
+        (address,),
+    )
+    score_history = _rows(
+        conn,
+        """
+        SELECT leader_score, review_stage, review_reason, policy_version, scored_at
+        FROM leader_scores
+        WHERE address = ?
+        ORDER BY scored_at DESC, score_id DESC
+        LIMIT 20
+        """,
+        (address,),
+    )
+    review_events = _rows(
+        conn,
+        """
+        SELECT from_stage, to_stage, reason, created_at
+        FROM review_events
+        WHERE address = ?
+        ORDER BY created_at DESC, event_id DESC
+        LIMIT 20
+        """,
+        (address,),
+    )
+    candidate_data = dict(candidate)
     return {
         "address": address,
         "found": True,
-        "candidate": dict(candidate),
+        "candidate": candidate_data,
         "feature": _json_columns(dict(feature)) if feature else {},
         "latest_score": _json_columns(dict(latest_score)) if latest_score else {},
+        "processing_state": processing_state,
+        "processing_diagnostic": _wallet_pipeline_diagnostic(candidate_data, processing_state, pipeline_jobs),
         "paper_handoff": paper_handoff_rows[0] if paper_handoff_rows else {},
         "paper_quality": _one(conn, "SELECT * FROM paper_wallet_quality WHERE wallet = ?", (address,)),
         "paper_performance": _one(conn, "SELECT * FROM paper_wallet_performance WHERE wallet = ?", (address,)),
         "publish": _one(conn, "SELECT * FROM leader_publish WHERE wallet = ?", (address,)),
         "backfill": _one(conn, "SELECT * FROM evidence_backfill_budget WHERE wallet = ?", (address,)),
+        "pipeline_jobs": pipeline_jobs,
+        "score_history": score_history,
+        "review_events": review_events,
+        "history_timeline": _wallet_history_timeline(score_history, review_events),
         "source_events": _rows(
             conn,
             """
@@ -2596,6 +2846,8 @@ def _render_wallet_detail(settings: RobotSettings, address: str) -> str:
         return _render_page("钱包不存在", _top_nav("wallets") + f'<main class="shell"><h1>钱包不存在</h1><p>{_e(address)}</p></main>')
     candidate = data["candidate"]
     score = data.get("latest_score") or {}
+    processing_state = data.get("processing_state") or {}
+    processing_diagnostic = data.get("processing_diagnostic") or {}
     body = [
         _top_nav("wallets"),
         '<main class="shell">',
@@ -2603,10 +2855,13 @@ def _render_wallet_detail(settings: RobotSettings, address: str) -> str:
         f'<h1 class="address">{_e(address)}</h1>',
         f'<p>{_e(candidate.get("sources", ""))}</p>',
         '</div><a class="button secondary" href="/wallets">返回列表</a></section>',
+        _wallet_processing_diagnostic_panel(processing_diagnostic),
         '<section class="metric-grid">',
-        _metric("候选阶段", candidate.get("candidate_stage", "")),
+        _metric("候选阶段", processing_diagnostic.get("candidate_stage_label", "")),
         _metric("Leader Score", _fmt_num(score.get("leader_score"))),
         _metric("Review Stage", score.get("review_stage", "")),
+        _metric("证据层级", processing_diagnostic.get("evidence_tier_label", "")),
+        _metric("下一动作", processing_diagnostic.get("next_action_label", "")),
         _metric("Paper ROI", _fmt_pct((data.get("paper_quality") or {}).get("total_roi"))),
         "</section>",
         '<section class="grid two">',
@@ -2618,10 +2873,15 @@ def _render_wallet_detail(settings: RobotSettings, address: str) -> str:
         _panel("Paper 质量", _dict_table(data.get("paper_quality") or {})),
         "</section>",
         '<section class="grid two">',
+        _panel("证据处理状态", _wallet_processing_state_table(processing_state)),
         _panel("补历史预算", _dict_table(data.get("backfill") or {})),
-        _panel("发布状态", _dict_table(data.get("publish") or {})),
         "</section>",
+        _panel("任务历史", _pipeline_jobs_table(data.get("pipeline_jobs") or [])),
+        _panel("评分与阶段时间线", _wallet_history_timeline_table(data.get("history_timeline") or [])),
+        '<section class="grid two">',
+        _panel("发布状态", _dict_table(data.get("publish") or {})),
         _panel("Copy Leader", _dict_table(data.get("copy_leader") or {})),
+        "</section>",
         _panel("来源事件", _simple_table(data["source_events"], ["source", "status", "labels", "observed_at", "recorded_at"], ["来源", "状态", "标签", "观察", "记录"])),
         _panel("最近活动", _simple_table(data["recent_activity"], ["timestamp", "type", "side", "market_slug", "outcome", "price", "usdc_size"], ["时间", "类型", "方向", "市场", "结果", "价格", "USDC"])),
         _panel("交易 Episode", _simple_table(data["episodes"], ["market_slug", "outcome", "status", "buy_count", "sell_count", "bought_usdc", "sold_usdc", "realized_pnl_est"], ["市场", "结果", "状态", "买", "卖", "买入", "卖出", "估算PnL"])),
@@ -3158,6 +3418,201 @@ def _simple_table(rows: list[dict[str, Any]], keys: list[str], labels: list[str]
     return _table(labels, "".join(body))
 
 
+def _operator_code(value: Any, labels: dict[str, str]) -> str:
+    code = str(value or "")
+    if not code:
+        return "-"
+    label = labels.get(code, code)
+    raw = f'<small class="mono">{_e(code)}</small>' if label != code else ""
+    return f'<span class="operator-label">{_e(label)}</span>{raw}'
+
+
+def _expandable_error(error: Any) -> str:
+    text = str(error or "")
+    if not text:
+        return ""
+    return (
+        '<details class="job-error-details">'
+        f'<summary>{_e(_short_error(text))}</summary>'
+        f'<div>{_e(text)}</div>'
+        "</details>"
+    )
+
+
+def _wallet_processing_diagnostic_panel(values: dict[str, Any]) -> str:
+    if not values:
+        return ""
+    state = str(values.get("state") or "attention")
+    latest_job = values.get("latest_job_status_label") or "暂无任务"
+    attempts = int(values.get("attempts") or 0)
+    max_attempts = int(values.get("max_attempts") or 0)
+    cards = [
+        (
+            "证据状态",
+            values.get("evidence_status_label") or "未生成",
+            values.get("evidence_tier_label") or "未分层",
+        ),
+        (
+            "候选阶段",
+            values.get("candidate_stage_label") or "未设置",
+            values.get("candidate_stage") or "-",
+        ),
+        (
+            "下一动作",
+            values.get("next_action_label") or "无",
+            values.get("due_label") or "无调度时间",
+        ),
+        (
+            "最近任务",
+            latest_job,
+            f"尝试 {attempts}/{max_attempts}" if max_attempts else f"尝试 {attempts}",
+        ),
+    ]
+    error = _expandable_error(values.get("latest_error"))
+    return (
+        '<section class="wallet-diagnostic">'
+        f'<div class="health-banner {state}"><strong>{_e(values.get("headline") or "")}</strong>'
+        f'<span>{_e(values.get("suggested_action") or "")}</span></div>'
+        '<div class="health-grid">'
+        + "".join(
+            f'<div class="health-card"><span>{_e(label)}</span><strong>{_e(value)}</strong><small>{_e(note)}</small></div>'
+            for label, value, note in cards
+        )
+        + "</div>"
+        + (f'<div class="diagnostic-error"><strong>最新错误</strong>{error}</div>' if error else "")
+        + "</section>"
+    )
+
+
+def _wallet_processing_state_table(values: dict[str, Any]) -> str:
+    if not values:
+        return '<p class="empty">尚未生成钱包处理状态。</p>'
+    rows = [
+        ("证据层级", _operator_code(values.get("discovery_tier"), _EVIDENCE_TIER_LABELS)),
+        ("证据状态", _operator_code(values.get("evidence_status"), _EVIDENCE_STATUS_LABELS)),
+        ("当前任务阶段", _operator_code(values.get("current_stage"), _EVIDENCE_ACTION_LABELS)),
+        ("下一动作", _operator_code(values.get("next_action"), _EVIDENCE_ACTION_LABELS)),
+        ("下一调度时间", _format_cell(values.get("next_action_at"))),
+        ("证据深度", _format_cell(values.get("evidence_depth"))),
+        ("证据置信度", _format_cell(values.get("evidence_confidence"))),
+        (
+            "历史覆盖",
+            f'{_fmt_int(values.get("activity_count"))} 条活动 · '
+            f'{_fmt_int(values.get("distinct_markets"))} 个市场 · '
+            f'{_fmt_int(values.get("non_fast_trade_count"))} 条非快盘',
+        ),
+        ("处理优先级", _format_cell(values.get("priority"))),
+        ("最近轻量回填", _format_cell(values.get("last_light_backfill_at"))),
+        ("最近中量回填", _format_cell(values.get("last_medium_backfill_at"))),
+        ("最近深度回填", _format_cell(values.get("last_deep_backfill_at"))),
+        ("状态更新时间", _format_cell(values.get("updated_at"))),
+    ]
+    body = "".join(f"<tr><th>{_e(label)}</th><td>{value}</td></tr>" for label, value in rows)
+    return f'<div class="table-wrap"><table class="kv"><tbody>{body}</tbody></table></div>'
+
+
+def _stage_history_label(value: Any) -> str:
+    text = str(value or "")
+    if " -> " not in text:
+        return _operator_code(text, _CANDIDATE_STAGE_LABELS)
+    from_stage, to_stage = text.split(" -> ", 1)
+    from_label = _CANDIDATE_STAGE_LABELS.get(from_stage, from_stage)
+    to_label = _CANDIDATE_STAGE_LABELS.get(to_stage, to_stage)
+    return (
+        f'<span class="operator-label">{_e(from_label)} -> {_e(to_label)}</span>'
+        f'<small class="mono">{_e(text)}</small>'
+    )
+
+
+def _wallet_history_timeline_table(rows: list[dict[str, Any]]) -> str:
+    if not rows:
+        return '<p class="empty">暂无评分或阶段变更记录。</p>'
+    body = []
+    for row in rows:
+        score = row.get("score")
+        stage = _stage_history_label(row.get("stage"))
+        stage_score = stage
+        if score is not None:
+            stage_score = f'<strong class="timeline-score">{_e(_fmt_num(score))}</strong>{stage}'
+        body.append(
+            "<tr>"
+            f'<td>{_badge(row.get("event_label"))}</td>'
+            f"<td>{stage_score}</td>"
+            f'<td>{_e(row.get("reason") or "")}</td>'
+            f'<td class="mono">{_e(row.get("policy_version") or "-")}</td>'
+            f'<td>{_fmt_ts(row.get("occurred_at"))}</td>'
+            "</tr>"
+        )
+    return _table(["事件", "阶段 / 分数", "原因", "策略版本", "时间"], "".join(body))
+
+
+def _pipeline_jobs_table(
+    rows: list[dict[str, Any]],
+    *,
+    include_wallet: bool = False,
+) -> str:
+    if not rows:
+        return '<p class="empty">暂无数据。</p>'
+    body = []
+    now = int(time.time())
+    for row in rows:
+        wallet = str(row.get("wallet") or "")
+        wallet_cell = ""
+        if include_wallet:
+            wallet_cell = (
+                f'<td><a class="mono strong-link" href="/wallet/{_e(wallet)}">{_short(wallet)}</a></td>'
+                if wallet
+                else "<td></td>"
+            )
+        error = str(row.get("last_error") or "")
+        status_cell = _operator_code(row.get("status"), _JOB_STATUS_LABELS) + _expandable_error(error)
+        queue_cell = (
+            _operator_code(row.get("job_type"), _PIPELINE_JOB_TYPE_LABELS)
+            + _operator_code(row.get("job_action"), _EVIDENCE_ACTION_LABELS)
+            + f'<small>scope <span class="mono">{_e(row.get("job_scope") or "-")}</span></small>'
+        )
+        attempts_cell = (
+            f'{_fmt_int(row.get("attempts"))}/{_fmt_int(row.get("max_attempts"))}'
+            f'<small>priority {_fmt_int(row.get("priority"))} · shard {_fmt_int(row.get("shard"))}</small>'
+        )
+        next_attempt_at = int(row.get("next_attempt_at") or 0)
+        lease_until = int(row.get("lease_until") or 0)
+        lease_owner = str(row.get("lease_owner") or "")
+        if next_attempt_at:
+            retry_note = (
+                f'{_duration_label(next_attempt_at - now)}后重试'
+                if next_attempt_at > now
+                else "已到重试时间"
+            )
+            retry_line = f'<div>{_fmt_ts(next_attempt_at)}<small>{_e(retry_note)}</small></div>'
+        else:
+            retry_line = '<div class="muted-line">无重试计划</div>'
+        if lease_owner:
+            lease_state = "租约已过期" if lease_until and lease_until <= now else "租约有效"
+            lease_line = (
+                f'<div class="lease-line"><span class="mono">{_e(lease_owner)}</span>'
+                f'<small>{_e(lease_state)} · {_fmt_ts(lease_until) or "无到期时间"}</small></div>'
+            )
+        else:
+            lease_line = '<div class="muted-line">无活动租约</div>'
+        schedule_cell = retry_line + lease_line
+        created_at = int(row.get("created_at") or 0)
+        age = f'{_duration_label(max(0, now - created_at))}前' if created_at else "未知"
+        timing_cell = (
+            f'创建 {_fmt_ts(created_at) or "-"}<small>任务年龄 {age}</small>'
+            f'<small>更新 {_fmt_ts(row.get("updated_at")) or "-"}</small>'
+            f'<small>完成 {_fmt_ts(row.get("completed_at")) if row.get("completed_at") else "-"}</small>'
+        )
+        body.append(
+            "<tr>"
+            + wallet_cell
+            + f"<td>{queue_cell}</td><td>{status_cell}</td>"
+            + f"<td>{schedule_cell}</td><td>{attempts_cell}</td><td>{timing_cell}</td></tr>"
+        )
+    labels = (["钱包"] if include_wallet else []) + ["队列 / 动作", "状态 / 错误", "重试 / 租约", "尝试", "时间"]
+    return _table(labels, "".join(body))
+
+
 def _dict_table(values: dict[str, Any]) -> str:
     if not values:
         return '<p class="empty">暂无数据。</p>'
@@ -3221,8 +3676,40 @@ def _ops_health_summary(conn: sqlite3.Connection, settings: RobotSettings) -> di
         """,
         (now,),
     )
+    stale_count = int(
+        conn.execute(
+            "SELECT COUNT(*) FROM pipeline_jobs WHERE status = 'running' AND lease_until <= ?",
+            (now,),
+        ).fetchone()[0]
+    )
+    failed_samples = _rows(
+        conn,
+        """
+        SELECT
+            job_id,
+            job_type,
+            wallet,
+            subject_key AS job_action,
+            tier AS job_scope,
+            status,
+            priority,
+            shard,
+            attempts,
+            max_attempts,
+            lease_owner,
+            lease_until,
+            next_attempt_at,
+            last_error,
+            created_at,
+            updated_at,
+            completed_at
+        FROM pipeline_jobs
+        WHERE status = 'failed'
+        ORDER BY updated_at DESC, priority ASC, job_id DESC
+        LIMIT 10
+        """,
+    )
     status_totals = {str(row["status"]): int(row["count"] or 0) for row in job_status}
-    stale_count = sum(1 for _ in stale_samples)
     invalid_address_rows = int(address_quality.get("invalid_address_rows") or 0)
     high_priority_backlog = int(pipeline_backlog.get("high_priority_pending_without_active_job") or 0)
     if invalid_address_rows:
@@ -3256,12 +3743,9 @@ def _ops_health_summary(conn: sqlite3.Connection, settings: RobotSettings) -> di
         "pipeline_backlog": pipeline_backlog,
         "job_status": job_status,
         "active_jobs": active_jobs,
+        "failed_job_samples": failed_samples,
         "queue_progress": _queue_progress_rows(conn, now=now),
-        "stale_running_count": _scalar(
-            conn,
-            "SELECT COUNT(*) FROM pipeline_jobs WHERE status = 'running' AND lease_until <= ?",
-            (now,),
-        ),
+        "stale_running_count": stale_count,
         "stale_running_samples": stale_samples,
         "generated_at": now,
     }
@@ -7298,6 +7782,14 @@ def _ops_health_panel(values: dict[str, Any]) -> str:
                 ["队列", "钱包", "动作", "尝试", "lease 到期"],
             )
         )
+    if values.get("failed_job_samples"):
+        body.append(
+            '<h3 class="subhead">失败任务样本</h3>'
+            + _pipeline_jobs_table(
+                values["failed_job_samples"],
+                include_wallet=True,
+            )
+        )
     if pipeline_backlog.get("high_priority_samples"):
         body.append(
             '<h3 class="subhead">高优先级漏派样本</h3>'
@@ -7655,7 +8147,18 @@ p { margin: 6px 0 0; color: var(--muted); }
   background: var(--surface-soft);
 }
 .health-banner.attention { border-left-color: var(--amber); }
+.health-banner.critical { border-left-color: var(--rose); background: #fff7f8; }
 .health-banner span { color: var(--muted); white-space: nowrap; }
+.wallet-diagnostic { margin-bottom: 16px; }
+.diagnostic-error {
+  margin-top: -2px;
+  margin-bottom: 12px;
+  padding: 12px;
+  border: 1px solid #fecdd3;
+  border-radius: 8px;
+  background: #fff7f8;
+}
+.diagnostic-error > strong { display: block; margin-bottom: 6px; color: var(--rose); }
 .health-grid {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -7745,6 +8248,23 @@ tbody tr:hover { background: #fbfcfb; }
 .num { text-align: right; font-variant-numeric: tabular-nums; }
 .numline { font-weight: 800; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .muted-line, td small { display: block; margin-top: 4px; color: var(--muted); font-size: 12px; }
+.operator-label { display: block; font-weight: 700; }
+.timeline-score { display: block; margin-bottom: 3px; font-size: 18px; font-variant-numeric: tabular-nums; }
+.job-error-details { margin-top: 6px; max-width: 520px; }
+.job-error-details summary { color: var(--rose); cursor: pointer; font-size: 12px; font-weight: 700; }
+.job-error-details div {
+  margin-top: 6px;
+  padding: 8px;
+  border: 1px solid #fecdd3;
+  border-radius: 6px;
+  background: #fff7f8;
+  color: #881337;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.lease-line { margin-top: 7px; }
 .priority-cell { min-width: 92px; }
 .priority-cell strong { display: block; margin-bottom: 7px; font-size: 18px; font-variant-numeric: tabular-nums; }
 .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
@@ -7877,7 +8397,7 @@ input {
   .hero-actions { width: 100%; flex-wrap: wrap; }
   .metric-grid, .health-grid, .ops-columns, .grid.two, .grid.three, .filters { grid-template-columns: 1fr; }
   .status-strip { align-items: flex-start; flex-direction: column; }
-  .status-strip span { white-space: normal; }
+  .status-strip span, .health-banner span { white-space: normal; }
   .funnel-grid { grid-template-columns: repeat(2, minmax(140px, 1fr)); }
   .metric { min-height: 80px; }
 }

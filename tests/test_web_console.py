@@ -16,6 +16,7 @@ from pm_robot.web import (
     _runtime_build_info,
     _storage_maintenance_panel,
     _storage_maintenance_summary,
+    _wallet_pipeline_diagnostic,
     dashboard_data,
     discovery_data,
     execution_preflight_data,
@@ -2231,6 +2232,33 @@ def test_dashboard_ops_health_reports_stale_and_active_pipeline_jobs(tmp_path):
                 now - 1_800,
             ),
         )
+        conn.executemany(
+            """
+            INSERT INTO pipeline_jobs(
+                job_type, wallet, subject_key, tier, priority, shard, status,
+                lease_owner, lease_until, attempts, max_attempts, next_attempt_at,
+                input_json, output_json, last_error, created_at, updated_at
+            ) VALUES ('wallet_evidence_backfill', ?, 'medium_pending', 'l1_light',
+                      10, 0, 'running', 'stale-worker', 1, 1, 3, 0,
+                      '{}', '{}', '', ?, ?)
+            """,
+            [
+                (f"0x{index:040x}", now - index, now - index)
+                for index in range(10, 17)
+            ],
+        )
+        conn.execute(
+            """
+            INSERT INTO pipeline_jobs(
+                job_type, wallet, subject_key, tier, priority, shard, status,
+                lease_owner, lease_until, attempts, max_attempts, next_attempt_at,
+                input_json, output_json, last_error, created_at, updated_at
+            ) VALUES ('copyability_evidence', ?, 'copyability', 'copyability',
+                      20, 0, 'failed', NULL, 0, 3, 3, 0,
+                      '{}', '{}', 'rate limit exhausted', ?, ?)
+            """,
+            ("0x" + "f" * 40, now - 20, now - 10),
+        )
         conn.commit()
     finally:
         conn.close()
@@ -2240,7 +2268,9 @@ def test_dashboard_ops_health_reports_stale_and_active_pipeline_jobs(tmp_path):
     progress = {row["job_type"]: row for row in data["ops_health"]["queue_progress"]}
 
     assert data["ops_health"]["health"] == "attention"
-    assert data["ops_health"]["stale_running_count"] == 1
+    assert data["ops_health"]["stale_running_count"] == 8
+    assert len(data["ops_health"]["stale_running_samples"]) == 6
+    assert data["ops_health"]["failed_job_samples"][0]["last_error"] == "rate limit exhausted"
     assert status_counts[("wallet_evidence_backfill", "queued")] == 1
     assert status_counts[("copyability_evidence", "running")] == 1
     assert progress["wallet_evidence_backfill"]["queued_count"] == 1
@@ -2258,6 +2288,8 @@ def test_dashboard_ops_health_reports_stale_and_active_pipeline_jobs(tmp_path):
     assert "Paper 候选" in html
     assert "复核停靠分布" in html
     assert "高分阻塞分布" in html
+    assert "失败任务样本" in html
+    assert "rate limit exhausted" in html
     assert "高分待验证" in html
     assert "主阻塞" in html
     assert "来源质量摘要" in html
@@ -2742,11 +2774,213 @@ def test_wallet_table_signal_filters_copy_candidates(tmp_path):
 def test_wallet_detail_includes_features_activity_and_quality(tmp_path):
     settings = _settings(tmp_path)
     _seed(settings)
+    wallet = "0xabc0000000000000000000000000000000000001"
+    conn = connect(settings.db_path)
+    try:
+        conn.execute(
+            """
+            INSERT INTO wallet_processing_state(
+                wallet, discovery_tier, evidence_status, evidence_depth,
+                evidence_confidence, priority, current_stage, next_action,
+                next_action_at, activity_count, distinct_markets,
+                non_fast_trade_count, updated_at
+            ) VALUES (?, 'l2_medium', 'needs_deep', 800, 0.82, 10,
+                      'medium_done', 'deep_pending', 0, 800, 12, 220, 1800000000)
+            """,
+            (wallet,),
+        )
+        conn.execute(
+            """
+            INSERT INTO pipeline_jobs(
+                job_type, wallet, subject_key, tier, priority, shard, status,
+                lease_owner, lease_until, attempts, max_attempts, next_attempt_at,
+                input_json, output_json, last_error, created_at, updated_at
+            ) VALUES ('wallet_evidence_backfill', ?, 'deep_pending', 'l2_medium',
+                      10, 0, 'failed', NULL, 0, 3, 3, 0,
+                      '{}', '{}', 'upstream timeout', 1799999900, 1800000001)
+            """,
+            (wallet,),
+        )
+        conn.execute(
+            """
+            INSERT INTO leader_scores(
+                address, leader_score, review_stage, review_reason,
+                components_json, penalties_json, policy_version, scored_at
+            ) VALUES (?, 48.0, 'needs_data', 'history_incomplete', '{}', '{}',
+                      'test-old', 1799999900)
+            """,
+            (wallet,),
+        )
+        conn.execute(
+            """
+            INSERT INTO leader_scores(
+                address, leader_score, review_stage, review_reason,
+                components_json, penalties_json, policy_version, scored_at
+            ) VALUES (?, 55.5, 'needs_manual_review', 'thin but promising', '{}', '{}',
+                      'test', 1800000001)
+            """,
+            (wallet,),
+        )
+        conn.execute(
+            """
+            INSERT INTO review_events(address, from_stage, to_stage, reason, created_at)
+            VALUES (?, 'needs_data', 'needs_manual_review', 'evidence_improved', 1800000000)
+            """,
+            (wallet,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
-    detail = wallet_detail_data(settings, "0xabc0000000000000000000000000000000000001")
+    detail = wallet_detail_data(settings, wallet)
+    html = _render_wallet_detail(settings, wallet)
 
     assert detail["found"] is True
     assert detail["latest_score"]["review_reason"] == "thin but promising"
     assert detail["feature"]["extra"]["materialized"] is True
     assert detail["recent_activity"][0]["market_slug"] == "test-market"
     assert detail["paper_quality"]["orders"] == 3
+    assert detail["processing_state"]["discovery_tier"] == "l2_medium"
+    assert detail["processing_state"]["next_action"] == "deep_pending"
+    assert detail["pipeline_jobs"][0]["last_error"] == "upstream timeout"
+    assert detail["processing_diagnostic"]["state"] == "critical"
+    assert detail["processing_diagnostic"]["headline"] == "最近一次证据任务失败"
+    assert len(detail["score_history"]) == 3
+    assert any(row["review_reason"] == "history_incomplete" for row in detail["score_history"])
+    assert detail["review_events"][0]["reason"] == "evidence_improved"
+    assert detail["history_timeline"][0]["event_type"] == "score"
+    assert "证据处理状态" in html
+    assert "任务历史" in html
+    assert "upstream timeout" in html
+    assert "最近一次证据任务失败" in html
+    assert "历史证据" in html
+    assert "补深度历史" in html
+    assert "重试 / 租约" in html
+    assert "评分与阶段时间线" in html
+    assert "自动复核中" in html
+
+
+def test_wallet_pipeline_diagnostic_distinguishes_stale_lease_and_retry_wait():
+    candidate = {"candidate_stage": "needs_manual_review"}
+    processing_state = {
+        "evidence_status": "queued",
+        "discovery_tier": "l2_medium",
+        "next_action": "deep_pending",
+        "next_action_at": 90,
+    }
+    stale = _wallet_pipeline_diagnostic(
+        candidate,
+        processing_state,
+        [
+            {
+                "job_type": "wallet_evidence_backfill",
+                "status": "running",
+                "lease_until": 99,
+                "attempts": 1,
+                "max_attempts": 3,
+            }
+        ],
+        now=100,
+    )
+    waiting = _wallet_pipeline_diagnostic(
+        candidate,
+        processing_state,
+        [
+            {
+                "job_type": "wallet_evidence_backfill",
+                "status": "queued",
+                "next_attempt_at": 3700,
+                "attempts": 1,
+                "max_attempts": 3,
+            }
+        ],
+        now=100,
+    )
+
+    assert stale["state"] == "critical"
+    assert stale["headline"] == "运行租约已经过期"
+    assert waiting["state"] == "attention"
+    assert waiting["headline"] == "任务正在等待重试窗口"
+    assert "小时后可再次领取" in waiting["suggested_action"]
+
+
+def test_wallet_timeline_escapes_malformed_score_values(tmp_path):
+    settings = _settings(tmp_path)
+    _seed(settings)
+    wallet = "0xabc0000000000000000000000000000000000001"
+    conn = connect(settings.db_path)
+    try:
+        conn.execute(
+            "UPDATE leader_scores SET leader_score = ? WHERE address = ?",
+            ("<script>alert(1)</script>", wallet),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    html = _render_wallet_detail(settings, wallet)
+
+    assert "<script>alert(1)</script>" not in html
+    assert "&lt;script&gt;alert(1)&lt;/script&gt;" in html
+
+
+def test_wallet_detail_history_queries_have_long_running_indexes(tmp_path):
+    settings = _settings(tmp_path)
+    _seed(settings)
+    conn = connect(settings.db_path)
+    try:
+        pipeline_indexes = {
+            row["name"]
+            for row in conn.execute("PRAGMA index_list('pipeline_jobs')").fetchall()
+        }
+        review_indexes = {
+            row["name"]
+            for row in conn.execute("PRAGMA index_list('review_events')").fetchall()
+        }
+        pipeline_plan = " ".join(
+            row["detail"]
+            for row in conn.execute(
+                """
+                EXPLAIN QUERY PLAN
+                SELECT job_id FROM pipeline_jobs
+                WHERE wallet = ?
+                ORDER BY updated_at DESC, job_id DESC
+                LIMIT 30
+                """,
+                ("0xabc0000000000000000000000000000000000001",),
+            ).fetchall()
+        )
+        review_plan = " ".join(
+            row["detail"]
+            for row in conn.execute(
+                """
+                EXPLAIN QUERY PLAN
+                SELECT event_id FROM review_events
+                WHERE address = ?
+                ORDER BY created_at DESC, event_id DESC
+                LIMIT 20
+                """,
+                ("0xabc0000000000000000000000000000000000001",),
+            ).fetchall()
+        )
+        failed_jobs_plan = " ".join(
+            row["detail"]
+            for row in conn.execute(
+                """
+                EXPLAIN QUERY PLAN
+                SELECT job_id FROM pipeline_jobs
+                WHERE status = 'failed'
+                ORDER BY updated_at DESC, priority ASC, job_id DESC
+                LIMIT 10
+                """
+            ).fetchall()
+        )
+    finally:
+        conn.close()
+
+    assert "idx_pipeline_jobs_wallet_updated" in pipeline_indexes
+    assert "idx_pipeline_jobs_status_updated" in pipeline_indexes
+    assert "idx_review_events_address_created" in review_indexes
+    assert "idx_pipeline_jobs_wallet_updated" in pipeline_plan
+    assert "idx_pipeline_jobs_status_updated" in failed_jobs_plan
+    assert "idx_review_events_address_created" in review_plan
