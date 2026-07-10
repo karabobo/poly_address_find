@@ -252,8 +252,8 @@ def test_nas_research_control_runs_ordered_cycle_with_sharded_workers():
     assert "PM_ROBOT_PIPELINE_WORKER_INTERVAL=60" in env
     assert "PM_ROBOT_PIPELINE_PRIORITY_AGING_SECONDS=1800" in env
     assert "PM_ROBOT_RESEARCH_CONTROL_INTERVAL=300" in env
-    assert "PM_ROBOT_PIPELINE_STATE_LIMIT=250" in env
-    assert "PM_ROBOT_PIPELINE_STATE_COMMIT_EVERY=50" in env
+    assert "PM_ROBOT_PIPELINE_STATE_LIMIT=25" in env
+    assert "PM_ROBOT_PIPELINE_STATE_COMMIT_EVERY=5" in env
     assert "PM_ROBOT_PIPELINE_PLANNER_MAX_ACTIVE_JOBS=240" in env
     assert "PM_ROBOT_ELIGIBILITY_REPAIR_LIMIT=100" in env
     assert "PM_ROBOT_RESEARCH_MIN_SCORE=40" in env
@@ -266,6 +266,10 @@ def test_nas_research_control_runs_ordered_cycle_with_sharded_workers():
     assert '--planner-lock-attempts "$PLANNER_LOCK_ATTEMPTS"' in control
     assert '--planner-lock-sleep-seconds "$PLANNER_LOCK_SLEEP_SECONDS"' in control
     assert "--state-stale-only" in control
+    assert "PM_ROBOT_PIPELINE_STATE_LIMIT:-25" in control
+    assert "PM_ROBOT_PIPELINE_STATE_COMMIT_EVERY:-5" in control
+    assert "PM_ROBOT_RESEARCH_BUSY_TIMEOUT_SECONDS:-15" in control
+    assert "PM_ROBOT_RESEARCH_PLANNER_LOCK_ATTEMPTS:-4" in control
     assert '--wallet-max-active-jobs "$WALLET_MAX_ACTIVE_JOBS"' in control
     assert '--copyability-max-active-jobs "$COPYABILITY_MAX_ACTIVE_JOBS"' in control
     assert '--copyability-shard-count "$COPYABILITY_SHARD_COUNT"' in control
@@ -865,8 +869,8 @@ def test_nas_research_control_runs_planning_features_and_scoring_in_one_cycle():
     assert "research-control-restart" in helper
     assert "score-up" in helper
     assert "PM_ROBOT_RESEARCH_CONTROL_INTERVAL=300" in env
-    assert "PM_ROBOT_RESEARCH_BUSY_TIMEOUT_SECONDS=5" in env
-    assert "PM_ROBOT_RESEARCH_PLANNER_LOCK_ATTEMPTS=2" in env
+    assert "PM_ROBOT_RESEARCH_BUSY_TIMEOUT_SECONDS=15" in env
+    assert "PM_ROBOT_RESEARCH_PLANNER_LOCK_ATTEMPTS=4" in env
     assert "PM_ROBOT_RESEARCH_PLANNER_LOCK_SLEEP_SECONDS=1" in env
     assert "PM_ROBOT_SCORE_FEATURE_LIMIT=80" in env
     assert "PM_ROBOT_SCORE_LIMIT=300" in env
