@@ -7,6 +7,7 @@ import json
 import sqlite3
 import time
 from dataclasses import dataclass
+from fractions import Fraction
 from typing import Any
 
 from pm_robot.clients.polymarket_public import PublicPolymarketClient
@@ -98,15 +99,23 @@ def plan_wallet_pipeline_jobs(
         raise ValueError("shard_count must be positive")
 
     def _plan_once() -> WalletPipelinePlanSummary:
-        return _plan_wallet_pipeline_jobs_once(
-            conn,
-            light_limit=light_limit,
-            medium_limit=medium_limit,
-            deep_limit=deep_limit,
-            shard_count=shard_count,
-            max_active_jobs=max_active_jobs,
-            now=now,
-        )
+        conn.commit()
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            summary = _plan_wallet_pipeline_jobs_once(
+                conn,
+                light_limit=light_limit,
+                medium_limit=medium_limit,
+                deep_limit=deep_limit,
+                shard_count=shard_count,
+                max_active_jobs=max_active_jobs,
+                now=now,
+            )
+            conn.commit()
+            return summary
+        except BaseException:
+            conn.rollback()
+            raise
 
     return retry_sqlite_locked(
         _plan_once,
@@ -139,15 +148,19 @@ def _plan_wallet_pipeline_jobs_once(
             throttled=True,
             reason="active_queue_waterline",
         )
+    available_slots = (
+        max(0, max_active_jobs - active_jobs)
+        if max_active_jobs > 0
+        else None
+    )
     targets = _select_pipeline_targets(
         conn,
         light_limit=light_limit,
         medium_limit=medium_limit,
         deep_limit=deep_limit,
+        max_targets=available_slots,
         now=ts,
     )
-    if max_active_jobs > 0:
-        targets = targets[: max(0, max_active_jobs - active_jobs)]
     enqueued = 0
     for target in targets:
         wallet = str(target["wallet"]).lower()
@@ -173,7 +186,6 @@ def _plan_wallet_pipeline_jobs_once(
             next_attempt_at=max(0, int(target["next_action_at"] or 0)),
             now=ts,
         ) else 0
-    conn.commit()
     return WalletPipelinePlanSummary(
         targets_seen=len(targets),
         jobs_enqueued=enqueued,
@@ -194,6 +206,7 @@ def run_wallet_pipeline_worker(
     page_limit: int = 200,
     sleep_seconds: float = 0.02,
     lease_seconds: int = 900,
+    priority_aging_seconds: int = 1_800,
     worker_id: str = "",
     client: PublicPolymarketClient | None = None,
 ) -> WalletPipelineWorkerSummary:
@@ -237,6 +250,7 @@ def run_wallet_pipeline_worker(
                     shard=shard_index,
                     worker_id=worker_id,
                     lease_seconds=lease_seconds,
+                    priority_aging_seconds=priority_aging_seconds,
                 ),
                 rollback=conn.rollback,
                 attempts=LOCK_RETRY_ATTEMPTS,
@@ -524,20 +538,147 @@ def _select_pipeline_targets(
     light_limit: int,
     medium_limit: int,
     deep_limit: int,
+    max_targets: int | None,
     now: int,
 ) -> list[dict[str, Any]]:
-    targets: list[dict[str, Any]] = []
-    if light_limit > 0:
-        targets.extend(_targets_for_action(conn, DEFAULT_EVIDENCE_JOB_STAGE, light_limit, now))
-    if medium_limit > 0:
-        targets.extend(
-            _targets_for_action(conn, EvidenceJobStage.MEDIUM_PENDING.value, medium_limit, now)
+    stage_limits = (
+        (DEFAULT_EVIDENCE_JOB_STAGE, light_limit),
+        (EvidenceJobStage.MEDIUM_PENDING.value, medium_limit),
+        (EvidenceJobStage.DEEP_PENDING.value, deep_limit),
+    )
+    targets_by_stage = {
+        evidence_job_stage: _targets_for_action(conn, evidence_job_stage, limit, now)
+        for evidence_job_stage, limit in stage_limits
+        if limit > 0
+    }
+    target_count = sum(len(stage_targets) for stage_targets in targets_by_stage.values())
+    selection_limit = target_count if max_targets is None else min(max_targets, target_count)
+    if selection_limit <= 0:
+        return []
+
+    stage_weights = {
+        evidence_job_stage: limit
+        for evidence_job_stage, limit in stage_limits
+        if limit > 0
+    }
+    active_by_stage = _active_wallet_pipeline_jobs_by_stage(conn)
+    scheduler_state = _wallet_pipeline_scheduler_state(
+        conn,
+        tuple(stage_weights),
+    )
+    stage_rank = {
+        evidence_job_stage: rank
+        for rank, (evidence_job_stage, _limit) in enumerate(stage_limits)
+    }
+    selected: list[dict[str, Any]] = []
+    while len(selected) < selection_limit:
+        available_stages = [
+            evidence_job_stage
+            for evidence_job_stage, stage_targets in targets_by_stage.items()
+            if stage_targets
+        ]
+        if not available_stages:
+            break
+        for stage in available_stages:
+            scheduler_state[stage]["current_weight"] += stage_weights[stage]
+        minimum_active_share = min(
+            Fraction(active_by_stage.get(stage, 0), stage_weights[stage])
+            for stage in available_stages
         )
-    if deep_limit > 0:
-        targets.extend(
-            _targets_for_action(conn, EvidenceJobStage.DEEP_PENDING.value, deep_limit, now)
+        least_represented_stages = [
+            stage
+            for stage in available_stages
+            if Fraction(active_by_stage.get(stage, 0), stage_weights[stage])
+            == minimum_active_share
+        ]
+        # Persisted smooth weighted round-robin survives fully drained planner cycles.
+        evidence_job_stage = max(
+            least_represented_stages,
+            key=lambda stage: (
+                scheduler_state[stage]["current_weight"],
+                -scheduler_state[stage]["last_selected_at"],
+                -stage_rank[stage],
+            ),
         )
-    return targets
+        selected.append(targets_by_stage[evidence_job_stage].pop(0))
+        scheduler_state[evidence_job_stage]["current_weight"] -= sum(
+            stage_weights[stage] for stage in available_stages
+        )
+        scheduler_state[evidence_job_stage]["last_selected_at"] = now
+        active_by_stage[evidence_job_stage] = active_by_stage.get(evidence_job_stage, 0) + 1
+    _persist_wallet_pipeline_scheduler_state(conn, scheduler_state, now=now)
+    return selected
+
+
+def _active_wallet_pipeline_jobs_by_stage(conn: sqlite3.Connection) -> dict[str, int]:
+    rows = conn.execute(
+        """
+        SELECT subject_key, COUNT(*) AS job_count
+        FROM pipeline_jobs
+        WHERE job_type = ?
+          AND status IN ('queued', 'running')
+        GROUP BY subject_key
+        """,
+        (JOB_TYPE,),
+    ).fetchall()
+    return {str(row["subject_key"]): int(row["job_count"]) for row in rows}
+
+
+def _wallet_pipeline_scheduler_state(
+    conn: sqlite3.Connection,
+    evidence_job_stages: tuple[str, ...],
+) -> dict[str, dict[str, int]]:
+    state = {
+        evidence_job_stage: {"current_weight": 0, "last_selected_at": 0}
+        for evidence_job_stage in evidence_job_stages
+    }
+    if not evidence_job_stages:
+        return state
+    placeholders = ", ".join("?" for _stage in evidence_job_stages)
+    rows = conn.execute(
+        f"""
+        SELECT subject_key, current_weight, last_selected_at
+        FROM pipeline_scheduler_state
+        WHERE job_type = ?
+          AND subject_key IN ({placeholders})
+        """,
+        (JOB_TYPE, *evidence_job_stages),
+    ).fetchall()
+    for row in rows:
+        state[str(row["subject_key"])] = {
+            "current_weight": int(row["current_weight"] or 0),
+            "last_selected_at": int(row["last_selected_at"] or 0),
+        }
+    return state
+
+
+def _persist_wallet_pipeline_scheduler_state(
+    conn: sqlite3.Connection,
+    scheduler_state: dict[str, dict[str, int]],
+    *,
+    now: int,
+) -> None:
+    conn.executemany(
+        """
+        INSERT INTO pipeline_scheduler_state(
+            job_type, subject_key, current_weight, last_selected_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(job_type, subject_key) DO UPDATE SET
+            current_weight = excluded.current_weight,
+            last_selected_at = excluded.last_selected_at,
+            updated_at = excluded.updated_at
+        """,
+        (
+            (
+                JOB_TYPE,
+                evidence_job_stage,
+                int(stage_state["current_weight"]),
+                int(stage_state["last_selected_at"]),
+                now,
+            )
+            for evidence_job_stage, stage_state in scheduler_state.items()
+        ),
+    )
 
 
 def _targets_for_action(
@@ -556,7 +697,8 @@ def _targets_for_action(
             wps.next_action,
             wps.next_action_at,
             wps.evidence_confidence,
-            wps.activity_count
+            wps.activity_count,
+            wps.updated_at
         FROM wallet_processing_state wps
         JOIN candidate_wallets cw
           ON cw.address = wps.wallet

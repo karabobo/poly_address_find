@@ -1283,9 +1283,13 @@ def claim_pipeline_job(
     shard: int,
     worker_id: str,
     lease_seconds: int,
+    priority_aging_seconds: int = 0,
     now: int | None = None,
 ) -> dict[str, Any] | None:
+    """Claim one job atomically, promoting sufficiently old work ahead of normal priority."""
     ts = now or int(time.time())
+    aging_seconds = max(0, int(priority_aging_seconds))
+    aging_cutoff = ts - aging_seconds
     conn.execute("BEGIN IMMEDIATE")
     row = conn.execute(
         """
@@ -1299,10 +1303,24 @@ def claim_pipeline_job(
                 status = 'queued'
                 OR (status = 'running' AND lease_until <= ?)
           )
-        ORDER BY priority ASC, updated_at ASC, job_id ASC
+        ORDER BY
+            CASE WHEN ? > 0 AND updated_at <= ? THEN 0 ELSE 1 END ASC,
+            CASE WHEN ? > 0 AND updated_at <= ? THEN updated_at END ASC,
+            priority ASC,
+            updated_at ASC,
+            job_id ASC
         LIMIT 1
         """,
-        (job_type, shard, ts, ts),
+        (
+            job_type,
+            shard,
+            ts,
+            ts,
+            aging_seconds,
+            aging_cutoff,
+            aging_seconds,
+            aging_cutoff,
+        ),
     ).fetchone()
     if row is None:
         conn.commit()

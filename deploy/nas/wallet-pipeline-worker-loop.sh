@@ -8,6 +8,7 @@ LIMIT="${PM_ROBOT_PIPELINE_WORKER_LIMIT:-6}"
 PAGE_LIMIT="${PM_ROBOT_PIPELINE_WORKER_PAGE_LIMIT:-120}"
 SLEEP_SECONDS="${PM_ROBOT_PIPELINE_WORKER_SLEEP:-0.05}"
 LEASE_SECONDS="${PM_ROBOT_PIPELINE_WORKER_LEASE_SECONDS:-900}"
+PRIORITY_AGING_SECONDS="${PM_ROBOT_PIPELINE_PRIORITY_AGING_SECONDS:-1800}"
 HOSTNAME_VALUE="$(hostname 2>/dev/null || echo nas)"
 WORKER_ID="${PM_ROBOT_PIPELINE_WORKER_ID:-nas-wallet-pipeline-${SHARD_INDEX}-${HOSTNAME_VALUE}}"
 
@@ -20,6 +21,7 @@ while true; do
       --page-limit "$PAGE_LIMIT" \
       --sleep "$SLEEP_SECONDS" \
       --lease-seconds "$LEASE_SECONDS" \
+      --priority-aging-seconds "$PRIORITY_AGING_SECONDS" \
       --worker-id "$WORKER_ID"; then
     echo "$(date -Iseconds) wallet pipeline worker ${SHARD_INDEX}/${SHARD_COUNT}: ok"
   else

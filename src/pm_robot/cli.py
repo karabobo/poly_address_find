@@ -314,6 +314,12 @@ def main() -> int:
     wallet_pipeline_worker_cmd.add_argument("--page-limit", type=int, default=200)
     wallet_pipeline_worker_cmd.add_argument("--sleep", type=float, default=0.02)
     wallet_pipeline_worker_cmd.add_argument("--lease-seconds", type=int, default=900)
+    wallet_pipeline_worker_cmd.add_argument(
+        "--priority-aging-seconds",
+        type=int,
+        default=1_800,
+        help="Claim the oldest queued job after this wait even when its numeric priority is lower; 0 disables",
+    )
     wallet_pipeline_worker_cmd.add_argument("--worker-id", default="")
 
     wallet_pipeline_jobs_cmd = sub.add_parser("wallet-pipeline-jobs", help="Print v2 wallet evidence job status")
@@ -1013,6 +1019,7 @@ def main() -> int:
                 page_limit=args.page_limit,
                 sleep_seconds=args.sleep,
                 lease_seconds=args.lease_seconds,
+                priority_aging_seconds=args.priority_aging_seconds,
                 worker_id=args.worker_id,
             )
         finally:

@@ -98,6 +98,13 @@ default `up`, `restart`, `runtime-ensure`, or watchdog commands.
 - Workers renew leases around long work and can only complete or retry jobs they still own.
 - Maintenance requeues expired leases and stale runtime records.
 - Planner backpressure limits queued/running wallet evidence jobs.
+- When queue capacity is tight, the planner allocates slots across light, medium, and deep evidence stages by
+  configured weight, current active-job share, and a persistent smooth weighted round-robin cursor. Priority
+  ordering remains intact within each stage, while fully drained planner cycles cannot reset stage fairness.
+- Wallet queue capacity checks and job admission run in one SQLite write transaction, so concurrent planners
+  cannot reserve the same high-waterline slot.
+- Workers normally claim by wallet priority, then promote the oldest queued job after the configured aging
+  threshold. This preserves urgent-wallet ordering without allowing low-priority L2/L3 work to wait forever.
 - Public Polymarket HTTP clients reserve global and endpoint request slots atomically through the shared
   `api_rate_limit_state` table, while retaining the existing per-process limiter.
 - HTTP `429 Retry-After` cooldowns are shared across containers. Short waits are handled in the HTTP client;

@@ -242,6 +242,7 @@ def test_nas_wallet_pipeline_runs_as_sharded_compose_services():
     assert "runtime-status" in helper
     assert "PM_ROBOT_PIPELINE_WORKER_LIMIT=6" in env
     assert "PM_ROBOT_PIPELINE_WORKER_INTERVAL=60" in env
+    assert "PM_ROBOT_PIPELINE_PRIORITY_AGING_SECONDS=1800" in env
     assert "PM_ROBOT_PIPELINE_PLANNER_INTERVAL=120" in env
     assert "PM_ROBOT_PIPELINE_STATE_LIMIT=250" in env
     assert "PM_ROBOT_PIPELINE_STATE_COMMIT_EVERY=50" in env
@@ -253,6 +254,7 @@ def test_nas_wallet_pipeline_runs_as_sharded_compose_services():
     assert "--max-active-jobs \"$MAX_ACTIVE_JOBS\"" in planner
     assert "wallet-pipeline-worker" in worker
     assert "PM_ROBOT_PIPELINE_WORKER_INTERVAL:-60" in worker
+    assert "--priority-aging-seconds \"$PRIORITY_AGING_SECONDS\"" in worker
     assert "sleep \"$INTERVAL\"" in planner
     assert "sleep \"$INTERVAL\"" in worker
 
