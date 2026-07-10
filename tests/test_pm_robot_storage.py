@@ -1,5 +1,6 @@
 import json
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -27,6 +28,46 @@ from pm_robot.storage.repository import (
     upsert_gamma_market_cache,
     upsert_wallet_feature,
 )
+
+
+def test_current_schema_check_does_not_wait_for_database_write_lock(tmp_path):
+    db_path = tmp_path / "robot.sqlite"
+    conn = connect(db_path)
+    locker = sqlite3.connect(db_path, timeout=0)
+    try:
+        run_migrations(conn)
+        conn.execute("PRAGMA busy_timeout = 1")
+        locker.execute("BEGIN IMMEDIATE")
+
+        assert run_migrations(conn) == []
+    finally:
+        locker.rollback()
+        locker.close()
+        conn.close()
+
+
+def test_concurrent_migration_runners_apply_each_version_once(tmp_path):
+    db_path = tmp_path / "robot.sqlite"
+
+    def migrate() -> list[int]:
+        conn = connect(db_path)
+        try:
+            return run_migrations(conn)
+        finally:
+            conn.close()
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        results = list(pool.map(lambda _index: migrate(), range(4)))
+
+    conn = connect(db_path)
+    try:
+        stored_versions = [int(row[0]) for row in conn.execute("SELECT version FROM schema_migrations")]
+    finally:
+        conn.close()
+
+    assert sum(bool(result) for result in results) == 1
+    assert len(stored_versions) == len(set(stored_versions))
+    assert len(stored_versions) == max(len(result) for result in results)
 
 
 def test_runtime_heartbeat_lock_failure_cannot_rollback_committed_wallet_data(tmp_path):
