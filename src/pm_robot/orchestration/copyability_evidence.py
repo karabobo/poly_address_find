@@ -13,6 +13,7 @@ from typing import Any
 from pm_robot.config import load_policy
 from pm_robot.models import CandidateAddress
 from pm_robot.orchestration.feature_materializer import materialize_wallet_feature
+from pm_robot.orchestration.review_pipeline import apply_paper_evidence_guard
 from pm_robot.pipeline_terms import PipelineJobType
 from pm_robot.research.copy_backtest import backtest_copy_stream_for_leaders
 from pm_robot.research.copy_graph import mine_copy_graph_for_leaders
@@ -407,7 +408,10 @@ def _score_wallet_after_copyability(
         links=candidate_row["links"],
         status=candidate_row["status"],
     )
-    score = score_candidate(candidate, _feature_from_row(feature_row), policy)
+    score = apply_paper_evidence_guard(
+        conn,
+        score_candidate(candidate, _feature_from_row(feature_row), policy),
+    )
     persist_score(conn, score, policy_version=policy_version)
     return True
 

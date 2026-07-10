@@ -93,7 +93,7 @@ def score_database(
     written_scores = 0
     for candidate in candidates:
         score = score_candidate(candidate, features_by_address.get(candidate.address), policy)
-        score = _apply_paper_evidence_guard(conn, score)
+        score = apply_paper_evidence_guard(conn, score)
         if _should_skip_incomplete_overwrite(conn, score, policy_version=policy_version):
             skipped_incomplete_overwrites += 1
             continue
@@ -132,7 +132,9 @@ def score_database(
     return counts
 
 
-def _apply_paper_evidence_guard(conn: sqlite3.Connection, score: ScoreBreakdown) -> ScoreBreakdown:
+def apply_paper_evidence_guard(conn: sqlite3.Connection, score: ScoreBreakdown) -> ScoreBreakdown:
+    """Keep a scored wallet out of paper stages until shared L3 evidence is ready."""
+
     if score.stage.value not in PAPER_REQUIRES_L3_STAGES:
         return score
     if _paper_evidence_ready(conn, score.address):
@@ -197,8 +199,7 @@ def repair_paper_stage_evidence_incomplete(
          AND latest.rn = 1
         LEFT JOIN wallet_processing_state wps
           ON wps.wallet = cw.address
-        WHERE cw.candidate_stage IN ('paper_candidate', 'paper_approved')
-          AND latest.review_stage IN ('paper_candidate', 'paper_approved')
+        WHERE cw.candidate_stage IN ('paper_candidate', 'paper_approved', 'live_eligible')
           AND NOT {paper_ready_sql}
         """
         .format(paper_ready_sql=paper_evidence_ready_sql("wps"))
@@ -374,6 +375,7 @@ PAPER_READY_STAGES = {
 PAPER_REQUIRES_L3_STAGES = {
     CandidateStage.PAPER_CANDIDATE.value,
     CandidateStage.PAPER_APPROVED.value,
+    CandidateStage.LIVE_ELIGIBLE.value,
 }
 
 

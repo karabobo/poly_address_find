@@ -35,6 +35,21 @@ def _production_features(conn, wallet: str) -> None:
     )
 
 
+def _insert_l3_evidence(conn, wallet: str, *, updated_at: int = 20) -> None:
+    conn.execute(
+        """
+        INSERT INTO wallet_processing_state(
+            wallet, discovery_tier, evidence_status, evidence_depth,
+            evidence_confidence, priority, current_stage, next_action,
+            next_action_at, activity_count, distinct_markets,
+            non_fast_trade_count, updated_at
+        ) VALUES (?, 'l3_deep', 'summary_ready', 1000, 1.0, 10, 'deep_done',
+                  'score_wallet', 0, 1000, 20, 200, ?)
+        """,
+        (wallet, updated_at),
+    )
+
+
 def test_paper_portfolio_marks_positions_from_gamma_cache(tmp_path):
     conn = connect(tmp_path / "robot.sqlite")
     try:
@@ -240,6 +255,7 @@ def test_paper_quality_restores_ready_candidate_to_live_eligible(tmp_path):
         wallet = "0x" + "5" * 40
         upsert_candidate(conn, CandidateAddress(address=wallet, sources="test"))
         _production_features(conn, wallet)
+        _insert_l3_evidence(conn, wallet)
         conn.execute(
             "UPDATE candidate_wallets SET candidate_stage = ? WHERE address = ?",
             (CandidateStage.BLOCKED_COPYABILITY.value, wallet),
@@ -306,6 +322,7 @@ def test_paper_quality_restores_ready_candidate_after_long_ready_streak(tmp_path
         wallet = "0x" + "9" * 40
         upsert_candidate(conn, CandidateAddress(address=wallet, sources="test"))
         _production_features(conn, wallet)
+        _insert_l3_evidence(conn, wallet)
         conn.execute(
             "UPDATE candidate_wallets SET candidate_stage = ? WHERE address = ?",
             (CandidateStage.NEEDS_REVIEW.value, wallet),
@@ -341,6 +358,51 @@ def test_paper_quality_restores_ready_candidate_after_long_ready_streak(tmp_path
 
         assert blocked == 0
         assert candidate["candidate_stage"] == CandidateStage.LIVE_ELIGIBLE.value
+    finally:
+        conn.close()
+
+
+def test_paper_quality_does_not_promote_without_l3_evidence(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    try:
+        run_migrations(conn)
+        wallet = "0x" + "a" * 40
+        upsert_candidate(conn, CandidateAddress(address=wallet, sources="test"))
+        _production_features(conn, wallet)
+        conn.execute(
+            "UPDATE candidate_wallets SET candidate_stage = ? WHERE address = ?",
+            (CandidateStage.NEEDS_REVIEW.value, wallet),
+        )
+        conn.execute(
+            """
+            INSERT INTO paper_wallet_quality(
+                wallet, orders, open_positions, settled_positions,
+                gamma_marked_positions, fallback_marked_positions, mark_coverage,
+                settled_cost_usd, settled_pnl_usd, settled_roi,
+                total_pnl_usd, total_roi, production_ready, blockers_json, updated_at
+            ) VALUES (?, 250, 20, 40, 60, 0, 1, 1000, 100, 0.1, 120, 0.12, 1, '[]', 20)
+            """,
+            (wallet,),
+        )
+        for observed_at in (20, 1820, 3620):
+            conn.execute(
+                """
+                INSERT INTO paper_readiness_observations(
+                    wallet, observed_at, orders, settled_positions, mark_coverage,
+                    settled_roi, total_roi, production_ready, blockers_json
+                ) VALUES (?, ?, 250, 40, 1, 0.1, 0.12, 1, '[]')
+                """,
+                (wallet, observed_at),
+            )
+        conn.commit()
+
+        apply_paper_quality_blocks(conn, now=3800)
+        stage = conn.execute(
+            "SELECT candidate_stage FROM candidate_wallets WHERE address = ?",
+            (wallet,),
+        ).fetchone()["candidate_stage"]
+
+        assert stage == CandidateStage.NEEDS_REVIEW.value
     finally:
         conn.close()
 

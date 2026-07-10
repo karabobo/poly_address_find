@@ -564,7 +564,7 @@ def test_score_database_restores_valid_score_masked_by_prior_incomplete_rescore(
         conn.close()
 
 
-def test_score_database_syncs_stale_candidate_stage_from_latest_score(tmp_path):
+def test_score_database_repairs_stale_paper_stage_without_l3(tmp_path):
     conn = connect(tmp_path / "robot.sqlite")
     address = "0x" + "3" * 40
     try:
@@ -591,7 +591,8 @@ def test_score_database_syncs_stale_candidate_stage_from_latest_score(tmp_path):
             (address,),
         ).fetchone()["candidate_stage"]
 
-        assert counts["candidate_stage_synced_from_latest_score"] == 1
+        assert counts["paper_evidence_incomplete_downgraded"] == 1
+        assert "candidate_stage_synced_from_latest_score" not in counts
         assert stage == CandidateStage.NEEDS_REVIEW.value
     finally:
         conn.close()

@@ -1,8 +1,6 @@
-name: Polymarket Activity Probe
+name: Manual Polymarket Activity Probe
 
 on:
-  schedule:
-    - cron: "*/15 * * * *"
   workflow_dispatch:
     inputs:
       pages:

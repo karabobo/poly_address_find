@@ -78,6 +78,27 @@ def _seed_paper_eligibility(
     ]
     recent = _activity(timestamp=int(time.time()), idx=10_000)
     persist_wallet_activity(conn, address, [*old_rows, recent], ingested_at=int(time.time()))
+    conn.execute(
+        """
+        INSERT INTO wallet_processing_state(
+            wallet, discovery_tier, evidence_status, evidence_depth,
+            evidence_confidence, priority, current_stage, next_action,
+            next_action_at, activity_count, distinct_markets,
+            non_fast_trade_count, updated_at
+        ) VALUES (?, 'l3_deep', 'summary_ready', 1000, 1.0, 10, 'deep_done',
+                  'score_wallet', 0, 1000, 20, 200, ?)
+        ON CONFLICT(wallet) DO UPDATE SET
+            discovery_tier = excluded.discovery_tier,
+            evidence_status = excluded.evidence_status,
+            current_stage = excluded.current_stage,
+            activity_count = excluded.activity_count,
+            distinct_markets = excluded.distinct_markets,
+            non_fast_trade_count = excluded.non_fast_trade_count,
+            updated_at = excluded.updated_at
+        """,
+        (address, int(time.time())),
+    )
+    conn.commit()
 
 
 def test_paper_runner_ignores_unapproved_candidate(tmp_path):

@@ -13,6 +13,7 @@ import sqlite3
 from dataclasses import dataclass
 from typing import Any
 
+from pm_robot.orchestration.evidence_readiness import paper_evidence_ready
 from pm_robot.pipeline_terms import (
     PAPER_ELIGIBLE_CANDIDATE_STAGES,
     PROVISIONAL_CANDIDATE_STAGES,
@@ -68,6 +69,8 @@ def paper_eligibility_status(
         reasons.append("provisional_review_stage")
     if stage not in PAPER_ELIGIBLE_STAGES:
         reasons.append(f"stage_not_paper_eligible:{stage or 'missing'}")
+    if not paper_evidence_ready(row):
+        reasons.append("paper_evidence_tier_incomplete")
     if _float(row.get("leader_score")) < MIN_PAPER_LEADER_SCORE:
         reasons.append("below_min_paper_leader_score")
     if _int(row.get("source_count")) < MIN_PAPER_SOURCE_COUNT:
@@ -144,12 +147,20 @@ def _wallet_eligibility_facts(
             COALESCE(wf.walk_forward_consistency_pct, 0) AS walk_forward_consistency_pct,
             COALESCE(wf.extra_json, '{}') AS feature_extra_json,
             COALESCE(pwq.production_ready, 0) AS production_ready,
-            COALESCE(pwq.blockers_json, '[]') AS paper_blockers_json
+            COALESCE(pwq.blockers_json, '[]') AS paper_blockers_json,
+            wps.discovery_tier,
+            wps.evidence_status,
+            wps.current_stage,
+            COALESCE(wps.activity_count, 0) AS activity_count,
+            COALESCE(wps.distinct_markets, 0) AS distinct_markets,
+            COALESCE(wps.non_fast_trade_count, 0) AS non_fast_trade_count
         FROM candidate_wallets cw
         LEFT JOIN wallet_features wf
           ON wf.address = cw.address
         LEFT JOIN paper_wallet_quality pwq
           ON pwq.wallet = cw.address
+        LEFT JOIN wallet_processing_state wps
+          ON wps.wallet = cw.address
         LEFT JOIN leader_scores ls
           ON ls.score_id = (
               SELECT score_id

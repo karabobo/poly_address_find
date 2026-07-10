@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="${PM_ROBOT_NAS_ROOT:-/volume1/docker/pm-robot}"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="${PM_ROBOT_NAS_ROOT:-$SCRIPT_DIR}"
 DOCKER="${DOCKER:-/usr/local/bin/docker}"
 DOCKER_SUDO="${PM_ROBOT_DOCKER_SUDO:-auto}"
 DOCKER_RUNNER_READY=0

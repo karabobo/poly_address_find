@@ -6,6 +6,7 @@ import sqlite3
 import time
 from typing import Any
 
+from pm_robot.orchestration.evidence_readiness import paper_evidence_ready_sql
 from pm_robot.pipeline_terms import (
     EvidenceJobStage,
     PipelineJobType,
@@ -45,6 +46,7 @@ def pipeline_audit_report(
     *,
     top: int = 20,
     min_score: float = 40.0,
+    paper_min_score: float = 70.0,
     now: int | None = None,
 ) -> dict[str, Any]:
     """Return a read-only funnel report from observation through research export."""
@@ -62,7 +64,12 @@ def pipeline_audit_report(
         address_quality = address_quality_report(conn, tables=tables)
         evidence = _evidence_report(conn, tables, now=generated_at)
         queues = _queue_report(conn, tables, now=generated_at)
-        scoring = _scoring_report(conn, tables, min_score=min_score)
+        scoring = _scoring_report(
+            conn,
+            tables,
+            review_min_score=min_score,
+            paper_min_score=paper_min_score,
+        )
         export = _export_report(conn, tables)
         issues = _issues(
             schema=schema,
@@ -77,6 +84,8 @@ def pipeline_audit_report(
             "ok": True,
             "generated_at": generated_at,
             "min_score": min_score,
+            "review_min_score": min_score,
+            "paper_min_score": paper_min_score,
             "top": top,
             "schema": schema,
             "funnel": {
@@ -275,11 +284,19 @@ def _queue_report(conn: sqlite3.Connection, tables: set[str], *, now: int) -> di
     }
 
 
-def _scoring_report(conn: sqlite3.Connection, tables: set[str], *, min_score: float) -> dict[str, Any]:
+def _scoring_report(
+    conn: sqlite3.Connection,
+    tables: set[str],
+    *,
+    review_min_score: float,
+    paper_min_score: float,
+) -> dict[str, Any]:
     if not {"candidate_wallets", "leader_scores"}.issubset(tables):
         return {"available": False}
     return {
         "available": True,
+        "review_min_score": review_min_score,
+        "paper_min_score": paper_min_score,
         "latest_score_stage_counts": _latest_candidate_score_stage_counts(conn),
         "high_score_manual_review": _scalar(
             conn,
@@ -295,7 +312,23 @@ def _scoring_report(conn: sqlite3.Connection, tables: set[str], *, min_score: fl
                   LIMIT 1
               ), -1) >= ?
             """,
-            (min_score,),
+            (review_min_score,),
+        ),
+        "paper_score_manual_review": _scalar(
+            conn,
+            """
+            SELECT COUNT(*)
+            FROM candidate_wallets cw
+            WHERE cw.candidate_stage = 'needs_manual_review'
+              AND COALESCE((
+                  SELECT leader_score
+                  FROM leader_scores ls
+                  WHERE ls.address = cw.address
+                  ORDER BY scored_at DESC, score_id DESC
+                  LIMIT 1
+              ), -1) >= ?
+            """,
+            (paper_min_score,),
         ),
         "paper_candidate": _scalar(
             conn,
@@ -306,6 +339,7 @@ def _scoring_report(conn: sqlite3.Connection, tables: set[str], *, min_score: fl
             "SELECT COUNT(*) FROM candidate_wallets WHERE candidate_stage = 'live_eligible'",
         ),
         "candidate_stage_differs_latest_review": _actionable_candidate_stage_drift_count(conn),
+        "paper_stage_evidence_incomplete": _paper_stage_evidence_incomplete_count(conn, tables),
     }
 
 
@@ -407,6 +441,12 @@ def _issues(
         "high_score_manual_review",
         scoring.get("high_score_manual_review", 0),
     )
+    _add_count_issue(
+        issues,
+        "critical",
+        "paper_stage_evidence_incomplete",
+        scoring.get("paper_stage_evidence_incomplete", 0),
+    )
     return issues
 
 
@@ -423,6 +463,7 @@ def _samples(conn: sqlite3.Connection, tables: set[str], *, top: int, now: int) 
         ),
         "stale_running_jobs": _stale_running_job_samples(conn, tables, top, now=now),
         "unvalidated_core_copy_credit": _unvalidated_core_copy_samples(conn, tables, top),
+        "paper_stage_evidence_incomplete": _paper_stage_evidence_incomplete_samples(conn, tables, top),
     }
 
 
@@ -449,6 +490,8 @@ def _next_steps(issues: list[dict[str, Any]]) -> list[str]:
         steps.append("inspect failed pipeline_jobs.last_error before retrying")
     if "high_score_manual_review" in codes:
         steps.append("run pipeline-smoothness to separate copyability/hygiene/manual blockers")
+    if "paper_stage_evidence_incomplete" in codes:
+        steps.append("downgrade paper/live labels without L3 evidence, then resume wallet-pipeline backfill")
     if not steps:
         steps.append("no high-priority handoff break found; keep workers running and monitor copyability/backlog")
     return steps
@@ -746,6 +789,51 @@ def _actionable_candidate_stage_drift_count(conn: sqlite3.Connection) -> int:
         """,
         (*BLOCKING_CANDIDATE_STAGES, *PAPER_READY_CANDIDATE_STAGES),
     )
+
+
+def _paper_stage_evidence_incomplete_count(conn: sqlite3.Connection, tables: set[str]) -> int:
+    if not {"candidate_wallets", "wallet_processing_state"}.issubset(tables):
+        return 0
+    return _scalar(
+        conn,
+        f"""
+        SELECT COUNT(*)
+        FROM candidate_wallets cw
+        LEFT JOIN wallet_processing_state wps
+          ON wps.wallet = cw.address
+        WHERE cw.candidate_stage IN ('paper_candidate', 'paper_approved', 'live_eligible')
+          AND NOT {paper_evidence_ready_sql('wps')}
+        """,
+    )
+
+
+def _paper_stage_evidence_incomplete_samples(
+    conn: sqlite3.Connection,
+    tables: set[str],
+    top: int,
+) -> list[dict[str, Any]]:
+    if not {"candidate_wallets", "wallet_processing_state"}.issubset(tables):
+        return []
+    rows = conn.execute(
+        f"""
+        SELECT
+            cw.address AS wallet,
+            cw.candidate_stage,
+            COALESCE(wps.discovery_tier, '') AS evidence_tier,
+            COALESCE(wps.evidence_status, '') AS evidence_status,
+            COALESCE(wps.current_stage, '') AS evidence_job_stage,
+            COALESCE(wps.activity_count, 0) AS activity_count
+        FROM candidate_wallets cw
+        LEFT JOIN wallet_processing_state wps
+          ON wps.wallet = cw.address
+        WHERE cw.candidate_stage IN ('paper_candidate', 'paper_approved', 'live_eligible')
+          AND NOT {paper_evidence_ready_sql('wps')}
+        ORDER BY cw.updated_at ASC, cw.address ASC
+        LIMIT ?
+        """,
+        (top,),
+    ).fetchall()
+    return [dict(row) for row in rows]
 
 
 def _promoted_missing_candidate_samples(

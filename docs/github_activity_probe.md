@@ -1,16 +1,15 @@
 # GitHub Activity Probe
 
-GitHub Actions is a supplemental discovery probe, not the primary robot runtime.
+GitHub Actions provides a manual supplemental discovery probe, not a runtime.
 
-The VPS remains the source of truth for:
+The NAS research/scoring deployment remains the source of truth for:
 
 - SQLite writes
 - wallet activity and position backfill
 - scoring
-- paper evaluation
-- published leader handoff
+- paper-candidate observation
 
-The GitHub workflow scans recent Polymarket `/trades` pages and exports candidate wallets as JSON.
+The GitHub workflow scans recent Polymarket `/trades` pages and exports candidate wallets as JSON. It does not write to the NAS database or feed the production queue automatically.
 
 ## Workflow
 
@@ -20,10 +19,10 @@ File:
 .github/workflows/polymarket-activity-probe.yml
 ```
 
-Schedule:
+Trigger:
 
 ```text
-every 15 minutes
+manual workflow_dispatch only
 ```
 
 Default probe:
@@ -55,13 +54,4 @@ containing:
 artifacts/polymarket-candidates.json
 ```
 
-## Optional Push
-
-If these GitHub repository secrets are configured, the workflow POSTs the JSON payload to the VPS:
-
-```text
-PM_ROBOT_PROBE_PUSH_URL
-PM_ROBOT_PROBE_TOKEN
-```
-
-The current project does not expose a VPS ingest endpoint yet, so artifact-only mode is the safe default.
+The artifact is diagnostic output only. Importing it into the candidate registry requires a separate, explicit review step.

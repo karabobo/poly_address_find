@@ -54,6 +54,18 @@ def _seed_publishable_winner(conn, wallet: str) -> None:
     )
     conn.execute(
         """
+        INSERT INTO wallet_processing_state(
+            wallet, discovery_tier, evidence_status, evidence_depth,
+            evidence_confidence, priority, current_stage, next_action,
+            next_action_at, activity_count, distinct_markets,
+            non_fast_trade_count, updated_at
+        ) VALUES (?, 'l3_deep', 'summary_ready', 1000, 1.0, 10, 'deep_done',
+                  'score_wallet', 0, 1000, 20, 200, 10)
+        """,
+        (wallet,),
+    )
+    conn.execute(
+        """
         INSERT INTO leader_scores(
             address, leader_score, review_stage, review_reason,
             components_json, penalties_json, policy_version, scored_at
@@ -219,3 +231,20 @@ def test_winner_library_exports_only_publishable_eligible_wallets(tmp_path):
     assert summary["wallet_count"] == 1
     assert summary["stage_counts"] == {CandidateStage.LIVE_ELIGIBLE.value: 1}
     assert [row["address"] for row in rows] == [winner]
+
+
+def test_winner_library_rejects_live_stage_without_l3_evidence(tmp_path):
+    db_path = tmp_path / "robot.sqlite"
+    wallet = "0x" + "d" * 40
+    conn = connect(db_path)
+    try:
+        run_migrations(conn)
+        _seed_publishable_winner(conn, wallet)
+        conn.execute("DELETE FROM wallet_processing_state WHERE wallet = ?", (wallet,))
+        conn.commit()
+    finally:
+        conn.close()
+
+    summary = build_winner_library(_settings(db_path), json_output_path=tmp_path / "winner_library.json")
+
+    assert summary["wallet_count"] == 0

@@ -218,7 +218,8 @@ def test_wallet_evidence_summary_and_state_are_idempotent(tmp_path):
         assert evidence["activity_count"] == 240
         assert state["discovery_tier"] == "l2_medium"
         assert summary["distinct_markets"] == 6
-        assert copyability["usable_for_paper"] is True
+        assert copyability["usable_for_copyability"] is True
+        assert "usable_for_paper" not in copyability
         assert state_row["priority"] == 12
         assert state_row["evidence_status"] == "needs_deep"
         assert state_row["next_action"] == "deep_pending"

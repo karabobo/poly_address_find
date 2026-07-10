@@ -176,6 +176,76 @@ def test_pipeline_audit_counts_latest_scores_for_current_candidates(tmp_path):
         conn.close()
 
 
+def test_pipeline_audit_separates_review_and_paper_score_thresholds(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    wallet = "0x" + "5" * 40
+    try:
+        run_migrations(conn)
+        upsert_candidate(conn, CandidateAddress(address=wallet, sources="test_source"))
+        conn.execute(
+            "UPDATE candidate_wallets SET candidate_stage = 'needs_manual_review' WHERE address = ?",
+            (wallet,),
+        )
+        conn.execute(
+            """
+            INSERT INTO leader_scores(
+                address, leader_score, review_stage, review_reason,
+                components_json, penalties_json, policy_version, scored_at
+            ) VALUES (?, 50, 'needs_manual_review', 'watchlist_score', '{}', '{}', 'test', 20)
+            """,
+            (wallet,),
+        )
+        conn.commit()
+
+        report = pipeline_audit_report(conn, min_score=40, paper_min_score=70, now=50_000)
+        scoring = report["funnel"]["scoring"]
+
+        assert report["review_min_score"] == 40
+        assert report["paper_min_score"] == 70
+        assert scoring["high_score_manual_review"] == 1
+        assert scoring["paper_score_manual_review"] == 0
+    finally:
+        conn.close()
+
+
+def test_pipeline_audit_flags_paper_stage_without_l3_evidence(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    wallet = "0x" + "4" * 40
+    try:
+        run_migrations(conn)
+        upsert_candidate(conn, CandidateAddress(address=wallet, sources="test_source"))
+        conn.execute(
+            "UPDATE candidate_wallets SET candidate_stage = 'live_eligible' WHERE address = ?",
+            (wallet,),
+        )
+        conn.commit()
+
+        report = pipeline_audit_report(conn, now=50_000)
+
+        assert report["funnel"]["scoring"]["paper_stage_evidence_incomplete"] == 1
+        assert report["samples"]["paper_stage_evidence_incomplete"][0]["wallet"] == wallet
+        assert any(issue["code"] == "paper_stage_evidence_incomplete" for issue in report["issues"])
+
+        conn.execute(
+            """
+            INSERT INTO wallet_processing_state(
+                wallet, discovery_tier, evidence_status, evidence_depth,
+                evidence_confidence, priority, current_stage, next_action,
+                next_action_at, activity_count, distinct_markets,
+                non_fast_trade_count, updated_at
+            ) VALUES (?, 'l3_deep', 'summary_ready', 1000, 1.0, 10, 'deep_done',
+                      'score_wallet', 0, 1000, 20, 200, 20)
+            """,
+            (wallet,),
+        )
+        conn.commit()
+
+        repaired = pipeline_audit_report(conn, now=50_020)
+        assert repaired["funnel"]["scoring"]["paper_stage_evidence_incomplete"] == 0
+    finally:
+        conn.close()
+
+
 def test_pipeline_audit_ignores_protected_stage_mismatch(tmp_path):
     conn = connect(tmp_path / "robot.sqlite")
     rejected_wallet = "0x" + "9" * 40

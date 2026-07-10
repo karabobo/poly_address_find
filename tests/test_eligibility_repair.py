@@ -138,6 +138,18 @@ def test_eligibility_repair_does_not_queue_paper_eligible_wallet(tmp_path):
         )
         _score(conn, wallet, score=60, stage=CandidateStage.PAPER_CANDIDATE)
         persist_wallet_activity(conn, wallet, _trade_events(wallet, 100), ingested_at=20_000)
+        conn.execute(
+            """
+            INSERT INTO wallet_processing_state(
+                wallet, discovery_tier, evidence_status, evidence_depth,
+                evidence_confidence, priority, current_stage, next_action,
+                next_action_at, activity_count, distinct_markets,
+                non_fast_trade_count, updated_at
+            ) VALUES (?, 'l3_deep', 'summary_ready', 1000, 1.0, 10, 'deep_done',
+                      'score_wallet', 0, 1000, 20, 200, 20_000)
+            """,
+            (wallet,),
+        )
         conn.commit()
 
         summary = plan_eligibility_repair_jobs(conn, limit=10, shard_count=1, now=50_000)

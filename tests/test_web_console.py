@@ -10,6 +10,8 @@ from pm_robot.web import (
     _render_dashboard,
     _render_wallet_detail,
     _render_wallets,
+    _paper_candidate_thresholds,
+    _paper_pool_expansion_panel,
     _paper_pool_expansion_state,
     _runtime_build_info,
     _storage_maintenance_panel,
@@ -31,6 +33,21 @@ from pm_robot.web import (
 
 def _settings(tmp_path):
     return RobotSettings(db_path=tmp_path / "pm_robot.sqlite", execution_mode="research")
+
+
+def _insert_l3_evidence(conn, wallet: str, *, updated_at: int) -> None:
+    conn.execute(
+        """
+        INSERT INTO wallet_processing_state(
+            wallet, discovery_tier, evidence_status, evidence_depth,
+            evidence_confidence, priority, current_stage, next_action,
+            next_action_at, activity_count, distinct_markets,
+            non_fast_trade_count, updated_at
+        ) VALUES (?, 'l3_deep', 'summary_ready', 1000, 1.0, 10, 'deep_done',
+                  'score_wallet', 0, 1000, 20, 200, ?)
+        """,
+        (wallet, updated_at),
+    )
 
 
 def _seed(settings):
@@ -181,6 +198,33 @@ def _seed(settings):
         conn.commit()
     finally:
         conn.close()
+
+
+def test_paper_threshold_policy_error_is_visible(tmp_path):
+    settings = RobotSettings(
+        db_path=tmp_path / "pm_robot.sqlite",
+        policy_path=tmp_path / "missing-policy.json",
+        execution_mode="research",
+    )
+
+    thresholds = _paper_candidate_thresholds(settings)
+    html = _paper_pool_expansion_panel(
+        {
+            "wallet_count": 0,
+            "near_paper_count": 0,
+            "copyability_needed_count": 0,
+            "best_score": 0,
+            "wallets": [],
+            "scope": {"watch_min_score": 65, "paper_min_score": thresholds["min_score"]},
+            "policy_loaded": thresholds["policy_loaded"],
+            "policy_error": thresholds["policy_error"],
+        }
+    )
+
+    assert thresholds["policy_loaded"] is False
+    assert "FileNotFoundError" in thresholds["policy_error"]
+    assert "评分策略加载失败" in html
+    assert "故障回退值" in html
 
 
 def test_dashboard_data_reads_research_summaries(tmp_path):
@@ -719,6 +763,7 @@ def test_dashboard_shows_readonly_paper_observer_preview(tmp_path):
             """,
             (wallet, now),
         )
+        _insert_l3_evidence(conn, wallet, updated_at=now)
         rows = []
         for idx in range(99):
             rows.append((wallet, now - 100_000 - idx, "old-market", f"old-asset-{idx}", "YES", "TRADE", "BUY", 0.54, 10, 5.4, f"0xold{idx}", "{}", now))
@@ -916,6 +961,7 @@ def test_dashboard_explains_no_paper_observer_signal_when_latest_buy_is_stale(tm
             """,
             (wallet, now),
         )
+        _insert_l3_evidence(conn, wallet, updated_at=now)
         rows = [
             (wallet, now - 90_000 - idx, "old-market", f"old-asset-{idx}", "YES", "TRADE", "BUY", 0.54, 10, 5.4, f"0xstale{idx}", "{}", now)
             for idx in range(100)

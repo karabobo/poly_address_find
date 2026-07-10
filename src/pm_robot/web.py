@@ -176,13 +176,16 @@ def paper_pool_expansion_data(settings: RobotSettings, *, limit: int = 50) -> di
     paper_thresholds = _paper_candidate_thresholds(settings)
     conn = connect_readonly(settings.db_path)
     try:
-        return _paper_pool_expansion_audit(
+        result = _paper_pool_expansion_audit(
             conn,
             paper_min_score=paper_thresholds["min_score"],
             min_copy_events=paper_thresholds["min_copy_events"],
             min_copy_markets=paper_thresholds["min_copy_markets"],
             limit=limit,
         )
+        result["policy_loaded"] = paper_thresholds["policy_loaded"]
+        result["policy_error"] = paper_thresholds["policy_error"]
+        return result
     finally:
         conn.close()
 
@@ -695,6 +698,8 @@ def _dashboard_data(
     manual_review_actions = _manual_review_action_rows(conn, paper_min_score=paper_min_score)
     needs_data_reasons = _needs_data_reason_rows(conn)
     score_policy = _score_policy_freshness(conn, settings, paper_min_score=paper_min_score)
+    score_policy["threshold_policy_loaded"] = paper_thresholds["policy_loaded"]
+    score_policy["threshold_policy_error"] = paper_thresholds["policy_error"]
     paper_handoff = _paper_handoff_summary(conn, settings)
     paper_observer_preview = _paper_observer_preview_summary(conn, limit=8)
     paper_observer_evaluation = paper_observer_evaluation_data(settings)
@@ -3878,16 +3883,24 @@ def _paper_pool_expansion_state(
     return "score_gap_large", "分数离 paper 较远；暂不扩池，保留观察。"
 
 
-def _paper_candidate_thresholds(settings: RobotSettings) -> dict[str, float | int]:
+def _paper_candidate_thresholds(settings: RobotSettings) -> dict[str, Any]:
     try:
         policy = load_policy(settings.policy_path)
         return {
             "min_score": float((policy.get("review_bands") or {}).get("paper_candidate", 70)),
             "min_copy_events": int(threshold(policy, "min_copy_events", 5)),
             "min_copy_markets": int(threshold(policy, "min_copy_markets", 5)),
+            "policy_loaded": True,
+            "policy_error": "",
         }
-    except (OSError, ValueError, TypeError, json.JSONDecodeError):
-        return {"min_score": 70.0, "min_copy_events": 5, "min_copy_markets": 5}
+    except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        return {
+            "min_score": 70.0,
+            "min_copy_events": 5,
+            "min_copy_markets": 5,
+            "policy_loaded": False,
+            "policy_error": f"{type(exc).__name__}: {str(exc)[:160]}",
+        }
 
 
 def _paper_candidate_min_score(settings: RobotSettings) -> float:
@@ -4422,6 +4435,8 @@ def _paper_handoff_formal_blockers(row: dict[str, Any], *, research_only: bool) 
         blockers.append("runtime_research_only")
     if stage != "live_eligible":
         blockers.append(f"stage_not_live_eligible:{stage or 'missing'}")
+    if not paper_evidence_ready(row):
+        blockers.append("paper_evidence_tier_incomplete")
     if not paper_quality_present:
         blockers.append("missing_paper_wallet_quality")
     elif not paper_ready:
@@ -4437,6 +4452,7 @@ def _paper_handoff_formal_blockers(row: dict[str, Any], *, research_only: bool) 
 
     priority_actions = {
         "runtime_research_only": "当前 NAS 只做 research/scoring；正式化需要独立 paper/settle/publish 运行面。",
+        "paper_evidence_tier_incomplete": "先完成 L3 深度证据，再进入 paper 和正式发布链路。",
         "missing_paper_wallet_quality": "等待及时信号后生成 paper_orders，并通过 settle 形成 paper_wallet_quality。",
         "paper_quality_not_production_ready": "继续累计纸面订单、结算和风险观察，直到 production_ready。",
         "no_paper_orders": "先让 paper observer 捕捉可及时跟的 BUY 信号，再进入纸面订单验证。",
@@ -5979,6 +5995,13 @@ def _paper_pool_expansion_panel(values: dict[str, Any]) -> str:
         return '<p class="empty">暂无 paper 扩池审计数据。</p>'
     wallets = values.get("wallets") or []
     scope = values.get("scope") or {}
+    policy_warning = ""
+    if values.get("policy_loaded") is False:
+        policy_warning = (
+            '<p class="empty">评分策略加载失败；当前阈值仅为故障回退值：'
+            + _e(values.get("policy_error") or "unknown")
+            + "</p>"
+        )
     cards = [
         ("待审钱包", _fmt_int(values.get("wallet_count")), "needs_manual_review", "ok" if wallets else "warn"),
         ("近 Paper", _fmt_int(values.get("near_paper_count")), f">= {_fmt_num(scope.get('watch_min_score'))}", "ok" if int(values.get("near_paper_count") or 0) else "warn"),
@@ -5993,6 +6016,7 @@ def _paper_pool_expansion_panel(values: dict[str, Any]) -> str:
                 for label, value, note, state in cards
             )
             + "</div>"
+            + policy_warning
             + '<p class="empty">暂无 needs_manual_review 钱包。</p>'
         )
     body = []
@@ -6017,6 +6041,7 @@ def _paper_pool_expansion_panel(values: dict[str, Any]) -> str:
             for label, value, note, state in cards
         )
         + "</div>"
+        + policy_warning
         + _simple_table(values.get("state_counts") or [], ["state", "count"], ["扩池状态", "数量"])
         + _table(["钱包", "分数", "扩池判断", "Copy 证据", "历史证据", "Hygiene/PnL"], "".join(body))
         + '<p class="muted">JSON: /api/paper-pool-expansion · read-only，只做扩池审计，不自动升级 paper。</p>'

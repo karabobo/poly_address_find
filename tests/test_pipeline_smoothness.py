@@ -78,6 +78,7 @@ def test_pipeline_smoothness_reports_eligibility_blockers_and_backlog(tmp_path):
         )
         _score(conn, paper_ready, score=60, stage=CandidateStage.PAPER_CANDIDATE, reason="paper_candidate")
         persist_wallet_activity(conn, paper_ready, _trade_events(paper_ready, 100), ingested_at=20_000)
+        _insert_l3_evidence(conn, paper_ready)
         conn.commit()
 
         plan_eligibility_repair_jobs(conn, limit=10, shard_count=1, now=50_000)
@@ -106,3 +107,18 @@ def test_pipeline_smoothness_reports_eligibility_blockers_and_backlog(tmp_path):
         assert any("copyability" in step for step in report["next_steps"])
     finally:
         conn.close()
+
+
+def _insert_l3_evidence(conn, wallet: str) -> None:
+    conn.execute(
+        """
+        INSERT INTO wallet_processing_state(
+            wallet, discovery_tier, evidence_status, evidence_depth,
+            evidence_confidence, priority, current_stage, next_action,
+            next_action_at, activity_count, distinct_markets,
+            non_fast_trade_count, updated_at
+        ) VALUES (?, 'l3_deep', 'summary_ready', 1000, 1.0, 10, 'deep_done',
+                  'score_wallet', 0, 1000, 20, 200, 20_000)
+        """,
+        (wallet,),
+    )

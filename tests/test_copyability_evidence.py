@@ -40,6 +40,101 @@ def test_copyability_worker_run_type_includes_worker_identity():
     assert first != second
 
 
+def test_copyability_rescore_cannot_bypass_paper_evidence_gate(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    wallet = "0x" + "d" * 40
+    policy = load_policy(Path("config/leader_scoring_policy.json"))
+    try:
+        run_migrations(conn)
+        upsert_candidate(conn, CandidateAddress(address=wallet, sources="test"))
+        upsert_wallet_feature(
+            conn,
+            WalletFeatures(
+                address=wallet,
+                cumulative_win_rate=0.72,
+                recent_30d_volume_usdc=750_000,
+                net_pnl_usdc=250_000,
+                total_volume_usdc=5_000_000,
+                event_win_rate=0.88,
+                trade_win_rate=0.58,
+                avg_dca_entries=25,
+                sell_pct=2,
+                bot_score=45,
+                maker_fraction=0.1,
+                leader_in_degree=8,
+                copy_event_count=40,
+                copy_market_count=12,
+                containment_pct_median=0.95,
+                copy_stream_roi=0.025,
+                edge_retention_pct=70,
+                walk_forward_consistency_pct=60,
+                survival_score=70,
+                single_market_pnl_share=0.2,
+                net_to_gross_exposure=0.7,
+                hygiene_status="clean",
+                primary_category="politics",
+                extra={"paper_roi_after_slippage": 0.08},
+            ),
+        )
+        conn.commit()
+
+        assert copyability_evidence._score_wallet_after_copyability(
+            conn,
+            wallet=wallet,
+            policy=policy,
+            policy_version=str(policy["version"]),
+        )
+        missing_evidence = conn.execute(
+            """
+            SELECT review_stage, review_reason
+            FROM leader_scores
+            WHERE address = ?
+            ORDER BY score_id DESC
+            LIMIT 1
+            """,
+            (wallet,),
+        ).fetchone()
+
+        assert missing_evidence["review_stage"] == CandidateStage.NEEDS_REVIEW.value
+        assert missing_evidence["review_reason"] == "paper_evidence_tier_incomplete"
+
+        conn.execute(
+            """
+            INSERT INTO wallet_processing_state(
+                wallet, discovery_tier, evidence_status, evidence_depth,
+                evidence_confidence, priority, current_stage, next_action,
+                next_action_at, activity_count, updated_at
+            ) VALUES (?, 'l3_deep', 'summary_ready', 1000, 1.0, 10,
+                      'deep_done', 'score_wallet', 0, 1000, 100)
+            """,
+            (wallet,),
+        )
+        assert copyability_evidence._score_wallet_after_copyability(
+            conn,
+            wallet=wallet,
+            policy=policy,
+            policy_version=str(policy["version"]),
+        )
+        ready = conn.execute(
+            """
+            SELECT review_stage, review_reason
+            FROM leader_scores
+            WHERE address = ?
+            ORDER BY score_id DESC
+            LIMIT 1
+            """,
+            (wallet,),
+        ).fetchone()
+
+        assert ready["review_stage"] in {
+            CandidateStage.PAPER_CANDIDATE.value,
+            CandidateStage.PAPER_APPROVED.value,
+        }
+        assert ready["review_reason"] != "paper_evidence_tier_incomplete"
+    finally:
+        conn.close()
+
+
 def test_copyability_worker_retries_locked_finish_run(tmp_path, monkeypatch):
     conn = connect(tmp_path / "robot.sqlite")
     calls = {"finish": 0}

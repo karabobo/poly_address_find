@@ -344,7 +344,13 @@ def main() -> int:
     )
     audit_cmd.add_argument("--db", dest="command_db", default=None, help="SQLite database path")
     audit_cmd.add_argument("--top", type=int, default=20)
-    audit_cmd.add_argument("--min-score", type=float, default=40.0)
+    audit_cmd.add_argument("--min-score", type=float, default=40.0, help="Manual-review triage score floor")
+    audit_cmd.add_argument(
+        "--paper-min-score",
+        type=float,
+        default=None,
+        help="Paper score floor; defaults to the active scoring policy",
+    )
 
     cycle_cmd = sub.add_parser(
         "pipeline-cycle",
@@ -1056,9 +1062,20 @@ def main() -> int:
         print(json.dumps(report, ensure_ascii=False, indent=2))
         return 0 if report["ok"] else 1
     if args.command == "pipeline-audit":
+        paper_min_score = args.paper_min_score
+        if paper_min_score is None:
+            policy = load_policy(settings.policy_path)
+            paper_min_score = (policy.get("review_bands") or {}).get("paper_candidate")
+            if paper_min_score is None:
+                raise ValueError("active scoring policy is missing review_bands.paper_candidate")
         conn = connect_readonly(db_path)
         try:
-            report = pipeline_audit_report(conn, top=args.top, min_score=args.min_score)
+            report = pipeline_audit_report(
+                conn,
+                top=args.top,
+                min_score=args.min_score,
+                paper_min_score=float(paper_min_score),
+            )
         finally:
             conn.close()
         print(json.dumps(report, ensure_ascii=False, indent=2))

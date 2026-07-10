@@ -16,6 +16,7 @@ from pm_robot.models import (
     TradeSignal,
     WalletFeatures,
 )
+from pm_robot.orchestration.evidence_readiness import paper_evidence_ready_sql
 from pm_robot.pipeline_terms import (
     EvidenceJobStage,
     EvidenceStatus,
@@ -886,7 +887,7 @@ def upsert_wallet_evidence_summary(
             non_fast_trade_count=non_fast_trade_count,
             fast_market_share=fast_market_share,
         ),
-        "usable_for_paper": (
+        "usable_for_copyability": (
             evidence_tier in {EvidenceTier.L2_MEDIUM.value, EvidenceTier.L3_DEEP.value}
             and fast_market_share < 0.85
             and non_fast_trade_count >= 10
@@ -2471,7 +2472,10 @@ def apply_paper_quality_blocks(conn: sqlite3.Connection, *, now: int | None = No
           ON cw.address = pwq.wallet
         JOIN wallet_features wf
           ON wf.address = pwq.wallet
+        JOIN wallet_processing_state wps
+          ON wps.wallet = pwq.wallet
         WHERE pwq.production_ready = 1
+          AND {paper_ready_sql}
           AND cw.candidate_stage NOT IN ('rejected', 'blocked_hygiene', 'live_eligible')
           AND lower(COALESCE(wf.hygiene_status, '')) IN ('clean', 'screened')
           AND wf.maker_fraction IS NOT NULL
@@ -2536,7 +2540,7 @@ def apply_paper_quality_blocks(conn: sqlite3.Connection, *, now: int | None = No
                     )
               )
           )
-        """,
+        """.format(paper_ready_sql=paper_evidence_ready_sql("wps")),
         (
             MIN_STABLE_READY_OBSERVATIONS,
             MIN_STABLE_READY_SPAN_SECONDS,

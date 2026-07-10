@@ -51,6 +51,22 @@ def test_publish_leaders_skips_unstable_wallet(tmp_path):
         conn.close()
 
 
+def test_publish_leaders_skips_live_stage_without_l3_evidence(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    try:
+        run_migrations(conn)
+        wallet = "0x" + "6" * 40
+        _insert_publishable_wallet(conn, wallet)
+        conn.execute("DELETE FROM wallet_processing_state WHERE wallet = ?", (wallet,))
+        conn.commit()
+
+        rows = publishable_leader_rows(conn, published_at=1_000, expires_at=1_600)
+
+        assert rows == []
+    finally:
+        conn.close()
+
+
 def test_publish_leaders_revokes_no_longer_publishable(tmp_path):
     conn = connect(tmp_path / "robot.sqlite")
     try:
@@ -137,6 +153,18 @@ def _insert_publishable_wallet(
     conn.execute(
         "UPDATE candidate_wallets SET candidate_stage = ? WHERE address = ?",
         (CandidateStage.LIVE_ELIGIBLE.value, wallet),
+    )
+    conn.execute(
+        """
+        INSERT INTO wallet_processing_state(
+            wallet, discovery_tier, evidence_status, evidence_depth,
+            evidence_confidence, priority, current_stage, next_action,
+            next_action_at, activity_count, distinct_markets,
+            non_fast_trade_count, updated_at
+        ) VALUES (?, 'l3_deep', 'summary_ready', 1000, 1.0, 10, 'deep_done',
+                  'score_wallet', 0, 1000, 20, 200, 10)
+        """,
+        (wallet,),
     )
     conn.execute(
         """
