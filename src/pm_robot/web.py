@@ -6083,6 +6083,10 @@ def _copyability_lane_summary(
         """,
     )
     totals = {str(row.get("status") or ""): int(row.get("count") or 0) for row in status_counts}
+    active = totals.get("queued", 0) + totals.get("running", 0)
+    max_active_jobs = max(0, _web_env_int("PM_ROBOT_COPYABILITY_PLANNER_MAX_ACTIVE_JOBS", 50))
+    available_slots = max(0, max_active_jobs - active) if max_active_jobs else 0
+    utilization_pct = round((active / max_active_jobs) * 100, 1) if max_active_jobs else 0.0
     active_by_priority = _rows(
         conn,
         """
@@ -6216,7 +6220,11 @@ def _copyability_lane_summary(
         "running": totals.get("running", 0),
         "done": totals.get("done", 0),
         "failed": totals.get("failed", 0),
-        "active": totals.get("queued", 0) + totals.get("running", 0),
+        "active": active,
+        "max_active_jobs": max_active_jobs,
+        "available_slots": available_slots,
+        "queue_utilization_pct": utilization_pct,
+        "queue_waterline_reached": bool(max_active_jobs and active >= max_active_jobs),
         "completed_24h": completed_24h,
         "completed_1h": queue_progress.get("completed_1h", 0),
         "completed_6h": queue_progress.get("completed_6h", 0),
@@ -7380,7 +7388,12 @@ def _copyability_lane_panel(values: dict[str, Any]) -> str:
     running = int(values.get("running") or 0)
     queued = int(values.get("queued") or 0)
     active = int(values.get("active") or 0)
-    if running:
+    max_active_jobs = int(values.get("max_active_jobs") or 0)
+    waterline_reached = bool(values.get("queue_waterline_reached"))
+    if waterline_reached:
+        banner_state = "attention"
+        note = "copyability 队列已达到活动水位，规划器会暂停新增任务。"
+    elif running:
         banner_state = "ok"
         note = "copyability worker 正在处理候选钱包。"
     elif queued:
@@ -7398,6 +7411,12 @@ def _copyability_lane_panel(values: dict[str, Any]) -> str:
         f"precedes >= {_fmt_num(thresholds.get('min_leader_precedes'))}"
     )
     cards = [
+        (
+            "队列水位",
+            f"{_fmt_int(active)}/{_fmt_int(max_active_jobs)}" if max_active_jobs else "未限制",
+            f"剩余 {_fmt_int(values.get('available_slots'))} 个槽位" if max_active_jobs else "active limit disabled",
+            "warn" if float(values.get("queue_utilization_pct") or 0) >= 80 else "ok",
+        ),
         ("排队", _fmt_int(queued), "queued jobs", "warn" if queued else "ok"),
         ("运行", _fmt_int(running), "running jobs", "ok" if running else "warn" if queued else "ok"),
         ("近1h完成", _fmt_int(values.get("completed_1h")), "done jobs", "ok"),

@@ -57,6 +57,11 @@ class CopyabilityPlanSummary:
     jobs_reprioritized: int
     shard_count: int
     status: str
+    active_jobs: int = 0
+    max_active_jobs: int = 0
+    available_slots: int = 0
+    throttled: bool = False
+    reason: str = ""
 
 
 @dataclass(frozen=True)
@@ -83,27 +88,82 @@ def plan_copyability_evidence_jobs(
     conn: sqlite3.Connection,
     *,
     limit: int = 50,
+    max_active_jobs: int = 50,
     min_score: float = 40.0,
     min_activity_events: int = 25,
     shard_count: int = 3,
     rescan_seconds: int = 21_600,
     now: int | None = None,
 ) -> CopyabilityPlanSummary:
-    ts = now or int(time.time())
     if shard_count <= 0:
         raise ValueError("shard_count must be positive")
+
+    def _plan_once() -> CopyabilityPlanSummary:
+        conn.commit()
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            summary = _plan_copyability_evidence_jobs_once(
+                conn,
+                limit=limit,
+                max_active_jobs=max_active_jobs,
+                min_score=min_score,
+                min_activity_events=min_activity_events,
+                shard_count=shard_count,
+                rescan_seconds=rescan_seconds,
+                now=now,
+            )
+            conn.commit()
+            return summary
+        except BaseException:
+            conn.rollback()
+            raise
+
+    return retry_sqlite_locked(
+        _plan_once,
+        rollback=conn.rollback,
+        attempts=LOCK_RETRY_ATTEMPTS,
+        sleep_seconds=LOCK_RETRY_SLEEP_SECONDS,
+    )
+
+
+def _plan_copyability_evidence_jobs_once(
+    conn: sqlite3.Connection,
+    *,
+    limit: int,
+    max_active_jobs: int,
+    min_score: float,
+    min_activity_events: int,
+    shard_count: int,
+    rescan_seconds: int,
+    now: int | None,
+) -> CopyabilityPlanSummary:
+    """Reserve copyability queue capacity and enqueue work under one write lock."""
+
+    ts = now or int(time.time())
     active_jobs = _active_copyability_job_count(conn)
-    if limit > 0 and active_jobs >= limit:
+    batch_limit = max(0, int(limit))
+    waterline_slots = (
+        max(0, int(max_active_jobs) - active_jobs)
+        if max_active_jobs > 0
+        else batch_limit
+    )
+    available_slots = min(batch_limit, waterline_slots)
+    if max_active_jobs > 0 and waterline_slots == 0:
         return CopyabilityPlanSummary(
             targets_seen=0,
             jobs_enqueued=0,
             jobs_reprioritized=0,
             shard_count=shard_count,
             status="backlog_active",
+            active_jobs=active_jobs,
+            max_active_jobs=int(max_active_jobs),
+            available_slots=0,
+            throttled=True,
+            reason="active_queue_waterline",
         )
     targets = _select_copyability_targets(
         conn,
-        limit=limit,
+        limit=available_slots,
         min_score=min_score,
         min_activity_events=min_activity_events,
         rescan_seconds=rescan_seconds,
@@ -142,13 +202,16 @@ def plan_copyability_evidence_jobs(
             now=ts,
         ) else 0
     reprioritized = _reprioritize_queued_copyability_jobs(conn, now=ts)
-    conn.commit()
     return CopyabilityPlanSummary(
         targets_seen=len(targets),
         jobs_enqueued=enqueued,
         jobs_reprioritized=reprioritized,
         shard_count=shard_count,
         status="ok",
+        active_jobs=active_jobs,
+        max_active_jobs=max(0, int(max_active_jobs)),
+        available_slots=available_slots,
+        throttled=False,
     )
 
 
@@ -638,12 +701,6 @@ def _select_copyability_targets(
               ON latest_id.address = ls.address
              AND latest_id.max_id = ls.score_id
         ),
-        active_jobs AS (
-            SELECT COUNT(*) AS active_count
-            FROM pipeline_jobs
-            WHERE job_type = ?
-              AND status IN ('queued', 'running')
-        ),
         candidate_base AS (
             SELECT
                 cw.address,
@@ -681,10 +738,8 @@ def _select_copyability_targets(
                 COALESCE(json_extract(wf.extra_json, '$.copy_candidate_pair_count'), 0) AS feature_copy_candidate_pair_count,
                 COALESCE(json_extract(wf.extra_json, '$.copy_candidate_event_count'), 0) AS feature_copy_candidate_event_count,
                 COALESCE(json_extract(wf.extra_json, '$.copy_candidate_market_count'), 0) AS feature_copy_candidate_market_count,
-                COALESCE(json_extract(wf.extra_json, '$.copy_validated_pair_count'), 0) AS feature_copy_validated_pair_count,
-                active_jobs.active_count AS active_job_count
+                COALESCE(json_extract(wf.extra_json, '$.copy_validated_pair_count'), 0) AS feature_copy_validated_pair_count
             FROM candidate_wallets cw
-            CROSS JOIN active_jobs
             JOIN latest
               ON latest.address = cw.address
             LEFT JOIN wallet_processing_state wps
@@ -778,7 +833,6 @@ def _select_copyability_targets(
                     )
                  OR (
                         existing_job_status = 'done'
-                    AND active_job_count = 0
                     AND existing_completed_at <= ?
                  )
                  OR (
@@ -869,7 +923,6 @@ def _select_copyability_targets(
         LIMIT ?
         """,
         (
-            JOB_TYPE,
             JOB_TYPE,
             TIER,
             SUBJECT_KEY,

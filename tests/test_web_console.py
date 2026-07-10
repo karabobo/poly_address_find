@@ -7,6 +7,7 @@ import time
 from pm_robot.config import RobotSettings
 from pm_robot.storage.db import connect, run_migrations
 from pm_robot.web import (
+    _copyability_lane_panel,
     _render_dashboard,
     _render_wallet_detail,
     _render_wallets,
@@ -1302,7 +1303,8 @@ def test_wallet_dashboard_snapshot_tracks_dashboard_inputs(tmp_path):
         conn.close()
 
 
-def test_dashboard_copyability_lane_reports_queue_and_worker_progress(tmp_path):
+def test_dashboard_copyability_lane_reports_queue_and_worker_progress(tmp_path, monkeypatch):
+    monkeypatch.setenv("PM_ROBOT_COPYABILITY_PLANNER_MAX_ACTIVE_JOBS", "2")
     settings = _settings(tmp_path)
     _seed(settings)
     wallet = "0xabc0000000000000000000000000000000000001"
@@ -1383,6 +1385,10 @@ def test_dashboard_copyability_lane_reports_queue_and_worker_progress(tmp_path):
     assert lane["queued"] == 1
     assert lane["running"] == 0
     assert lane["active"] == 1
+    assert lane["max_active_jobs"] == 2
+    assert lane["available_slots"] == 1
+    assert lane["queue_utilization_pct"] == 50.0
+    assert lane["queue_waterline_reached"] is False
     assert lane["high_priority_active"] == 1
     assert lane["completed_1h"] == 1
     assert lane["completed_6h"] == 1
@@ -1405,12 +1411,22 @@ def test_dashboard_copyability_lane_reports_queue_and_worker_progress(tmp_path):
     assert lane["recent_runs"][0]["run_type"] == "copyability_evidence_worker_0_test"
     assert lane["recent_runs"][0]["duration_seconds"] == 30
     assert "Copyability 证据通道" in html
+    assert "队列水位" in html
+    assert "1/2" in html
     assert "粗略剩余" in html
     assert "估算/小时" in html
     assert "Pair 质量诊断" in html
     assert "弱信号钱包" in html
     assert "队列前排" in html
     assert "最近 Worker" in html
+
+    monkeypatch.setenv("PM_ROBOT_COPYABILITY_PLANNER_MAX_ACTIVE_JOBS", "1")
+    saturated = dashboard_data(settings)["copyability_lane"]
+    saturated_html = _copyability_lane_panel(saturated)
+    assert saturated["available_slots"] == 0
+    assert saturated["queue_utilization_pct"] == 100.0
+    assert saturated["queue_waterline_reached"] is True
+    assert "已达到活动水位" in saturated_html
 
 
 def test_dashboard_discovery_freshness_reports_recent_source_and_observed_flow(tmp_path, monkeypatch):

@@ -100,12 +100,13 @@ default `up`, `restart`, `runtime-ensure`, or watchdog commands.
 - Maintenance marks expired or queued jobs failed once their attempt budget is exhausted, so unclaimable jobs
   cannot occupy planner queue capacity indefinitely. Failed jobs respect `next_attempt_at`; after the cooldown,
   planners may reopen them with a fresh attempt budget while retaining the previous error for diagnosis.
-- Planner backpressure limits queued/running wallet evidence jobs.
+- Planner backpressure limits queued/running wallet evidence and copyability jobs. Copyability planning keeps
+  its per-pass batch limit separate from the active-queue waterline and only fills currently available slots.
 - When queue capacity is tight, the planner allocates slots across light, medium, and deep evidence stages by
   configured weight, current active-job share, and a persistent smooth weighted round-robin cursor. Priority
   ordering remains intact within each stage, while fully drained planner cycles cannot reset stage fairness.
-- Wallet queue capacity checks and job admission run in one SQLite write transaction, so concurrent planners
-  cannot reserve the same high-waterline slot.
+- Wallet and copyability queue capacity checks and job admission run in one SQLite write transaction, so
+  concurrent planners cannot reserve the same high-waterline slot.
 - Workers normally claim by wallet priority, then promote the oldest queued job after the configured aging
   threshold. This preserves urgent-wallet ordering without allowing low-priority L2/L3 work to wait forever.
 - `wallet-pipeline-jobs` and the research console expose the same per-stage queue counts, configured weights,

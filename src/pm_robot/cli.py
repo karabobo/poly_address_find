@@ -228,7 +228,13 @@ def main() -> int:
 
     copyability_plan_cmd = sub.add_parser("copyability-plan", help="Plan dedicated copyability evidence jobs")
     copyability_plan_cmd.add_argument("--db", dest="command_db", default=None, help="SQLite database path")
-    copyability_plan_cmd.add_argument("--limit", type=int, default=50)
+    copyability_plan_cmd.add_argument("--limit", type=int, default=50, help="Maximum new jobs per planning pass")
+    copyability_plan_cmd.add_argument(
+        "--max-active-jobs",
+        type=int,
+        default=50,
+        help="Queued/running copyability job waterline; 0 disables",
+    )
     copyability_plan_cmd.add_argument("--min-score", type=float, default=40.0)
     copyability_plan_cmd.add_argument("--min-activity-events", type=int, default=25)
     copyability_plan_cmd.add_argument("--shard-count", type=int, default=3)
@@ -394,6 +400,7 @@ def main() -> int:
     cycle_cmd.add_argument("--wallet-medium-limit", type=int, default=20)
     cycle_cmd.add_argument("--wallet-deep-limit", type=int, default=5)
     cycle_cmd.add_argument("--copyability-limit", type=int, default=50)
+    cycle_cmd.add_argument("--copyability-max-active-jobs", type=int, default=50)
     cycle_cmd.add_argument("--copyability-min-activity-events", type=int, default=25)
     cycle_cmd.add_argument("--feature-limit", type=int, default=10)
     cycle_cmd.add_argument("--feature-min-activity-events", type=int, default=25)
@@ -880,6 +887,7 @@ def main() -> int:
             summary = plan_copyability_evidence_jobs(
                 conn,
                 limit=args.limit,
+                max_active_jobs=args.max_active_jobs,
                 min_score=args.min_score,
                 min_activity_events=args.min_activity_events,
                 shard_count=args.shard_count,
@@ -1152,6 +1160,7 @@ def main() -> int:
                     wallet_medium_limit=args.wallet_medium_limit,
                     wallet_deep_limit=args.wallet_deep_limit,
                     copyability_limit=args.copyability_limit,
+                    copyability_max_active_jobs=args.copyability_max_active_jobs,
                     copyability_min_activity_events=args.copyability_min_activity_events,
                     feature_limit=args.feature_limit,
                     feature_min_activity_events=args.feature_min_activity_events,

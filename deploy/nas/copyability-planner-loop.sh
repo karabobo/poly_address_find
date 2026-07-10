@@ -3,6 +3,7 @@ set -eu
 
 INTERVAL="${PM_ROBOT_COPYABILITY_PLANNER_INTERVAL:-600}"
 LIMIT="${PM_ROBOT_COPYABILITY_PLANNER_LIMIT:-50}"
+MAX_ACTIVE_JOBS="${PM_ROBOT_COPYABILITY_PLANNER_MAX_ACTIVE_JOBS:-50}"
 MIN_SCORE="${PM_ROBOT_COPYABILITY_MIN_SCORE:-40}"
 MIN_ACTIVITY_EVENTS="${PM_ROBOT_COPYABILITY_MIN_ACTIVITY_EVENTS:-25}"
 SHARD_COUNT="${PM_ROBOT_COPYABILITY_SHARD_COUNT:-1}"
@@ -22,6 +23,7 @@ while true; do
   echo "$(date -Iseconds) copyability planner: start"
   if python -m pm_robot.cli --env /app/.env copyability-plan \
       --limit "$LIMIT" \
+      --max-active-jobs "$MAX_ACTIVE_JOBS" \
       --min-score "$MIN_SCORE" \
       --min-activity-events "$MIN_ACTIVITY_EVENTS" \
       --shard-count "$SHARD_COUNT" \

@@ -259,6 +259,16 @@ def test_nas_wallet_pipeline_runs_as_sharded_compose_services():
     assert "sleep \"$INTERVAL\"" in worker
 
 
+def test_nas_copyability_planner_enforces_active_queue_waterline():
+    env = Path("deploy/nas/env.example").read_text(encoding="utf-8")
+    planner = Path("deploy/nas/copyability-planner-loop.sh").read_text(encoding="utf-8")
+
+    assert "PM_ROBOT_COPYABILITY_PLANNER_LIMIT=50" in env
+    assert "PM_ROBOT_COPYABILITY_PLANNER_MAX_ACTIVE_JOBS=50" in env
+    assert "PM_ROBOT_COPYABILITY_PLANNER_MAX_ACTIVE_JOBS:-50" in planner
+    assert '--max-active-jobs "$MAX_ACTIVE_JOBS"' in planner
+
+
 @pytest.mark.skipif(not Path("deploy/nas/README.md").exists(), reason="README files are intentionally excluded")
 def test_nas_helper_auto_uses_passwordless_sudo_for_synology_docker():
     helper = Path("deploy/nas/pmrobot-nas.sh").read_text(encoding="utf-8")

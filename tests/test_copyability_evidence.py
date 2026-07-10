@@ -535,7 +535,7 @@ def test_copyability_planner_queues_manual_review_wallets_missing_copyability(tm
         conn.close()
 
 
-def test_copyability_planner_defers_done_rescans_while_backlog_is_active(tmp_path):
+def test_copyability_planner_uses_available_capacity_for_stale_done_rescans(tmp_path):
     conn = connect(tmp_path / "robot.sqlite")
     stale_done = "0x" + "7" * 40
     active_backlog = "0x" + "8" * 40
@@ -586,41 +586,23 @@ def test_copyability_planner_defers_done_rescans_while_backlog_is_active(tmp_pat
         summary = plan_copyability_evidence_jobs(
             conn,
             limit=10,
+            max_active_jobs=2,
             min_score=40,
             min_activity_events=25,
             shard_count=1,
             rescan_seconds=100,
             now=10_000,
         )
-        status_with_backlog = conn.execute(
+        status = conn.execute(
             "SELECT status FROM pipeline_jobs WHERE job_type = ? AND wallet = ?",
             (JOB_TYPE, stale_done),
         ).fetchone()["status"]
 
-        conn.execute(
-            "UPDATE pipeline_jobs SET status = 'done', completed_at = 9999 WHERE job_type = ? AND wallet = ?",
-            (JOB_TYPE, active_backlog),
-        )
-        conn.commit()
-        summary_after_backlog = plan_copyability_evidence_jobs(
-            conn,
-            limit=10,
-            min_score=40,
-            min_activity_events=25,
-            shard_count=1,
-            rescan_seconds=100,
-            now=10_100,
-        )
-        status_without_backlog = conn.execute(
-            "SELECT status FROM pipeline_jobs WHERE job_type = ? AND wallet = ?",
-            (JOB_TYPE, stale_done),
-        ).fetchone()["status"]
-
-        assert summary.targets_seen == 0
-        assert status_with_backlog == "done"
-        assert summary_after_backlog.targets_seen == 1
-        assert summary_after_backlog.jobs_enqueued == 1
-        assert status_without_backlog == "queued"
+        assert summary.targets_seen == 1
+        assert summary.jobs_enqueued == 1
+        assert summary.active_jobs == 1
+        assert summary.available_slots == 1
+        assert status == "queued"
     finally:
         conn.close()
 
@@ -902,7 +884,8 @@ def test_copyability_planner_short_circuits_when_active_backlog_exceeds_limit(tm
 
         summary = plan_copyability_evidence_jobs(
             conn,
-            limit=1,
+            limit=10,
+            max_active_jobs=1,
             min_score=40,
             min_activity_events=25,
             shard_count=1,
@@ -917,7 +900,122 @@ def test_copyability_planner_short_circuits_when_active_backlog_exceeds_limit(tm
         assert summary.status == "backlog_active"
         assert summary.targets_seen == 0
         assert summary.jobs_enqueued == 0
+        assert summary.active_jobs == 2
+        assert summary.max_active_jobs == 1
+        assert summary.available_slots == 0
+        assert summary.throttled is True
+        assert summary.reason == "active_queue_waterline"
         assert status == "done"
+    finally:
+        conn.close()
+
+
+def test_copyability_planner_fills_only_remaining_active_queue_slots(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    first = "0x" + "1" * 40
+    second = "0x" + "2" * 40
+    active = "0x" + "3" * 40
+    try:
+        run_migrations(conn)
+        for wallet, score in ((first, 70), (second, 69)):
+            upsert_candidate(conn, CandidateAddress(address=wallet, sources="test"))
+            conn.execute(
+                "UPDATE candidate_wallets SET candidate_stage = 'needs_manual_review' WHERE address = ?",
+                (wallet,),
+            )
+            conn.execute(
+                """
+                INSERT INTO leader_scores(
+                    address, leader_score, review_stage, review_reason,
+                    components_json, penalties_json, policy_version, scored_at
+                ) VALUES (?, ?, 'needs_manual_review', 'watchlist_score', '{}', '{}', 'test', 10000)
+                """,
+                (wallet, score),
+            )
+            conn.execute(
+                """
+                INSERT INTO wallet_processing_state(
+                    wallet, discovery_tier, evidence_status, evidence_depth,
+                    evidence_confidence, priority, current_stage, next_action,
+                    next_action_at, activity_count, non_fast_trade_count,
+                    distinct_markets, updated_at
+                ) VALUES (?, 'l3_deep', 'summary_ready', 500, 1.0, 10,
+                    'deep_done', 'score_wallet', 0, 500, 300, 10, 10000)
+                """,
+                (wallet,),
+            )
+        conn.execute(
+            """
+            INSERT INTO pipeline_jobs(
+                job_type, wallet, subject_key, tier, priority, shard, status,
+                lease_owner, lease_until, attempts, max_attempts, next_attempt_at,
+                input_json, output_json, last_error, created_at, updated_at
+            ) VALUES (?, ?, 'copyability', 'copyability', 10, 0, 'queued',
+                NULL, 0, 0, 3, 0, '{}', '{}', '', 100, 100)
+            """,
+            (JOB_TYPE, active),
+        )
+        conn.commit()
+
+        summary = plan_copyability_evidence_jobs(
+            conn,
+            limit=10,
+            max_active_jobs=2,
+            min_score=40,
+            min_activity_events=25,
+            shard_count=1,
+            now=20_000,
+        )
+        queued = conn.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM pipeline_jobs
+            WHERE job_type = ?
+              AND status IN ('queued', 'running')
+            """,
+            (JOB_TYPE,),
+        ).fetchone()["count"]
+
+        assert summary.status == "ok"
+        assert summary.targets_seen == 1
+        assert summary.jobs_enqueued == 1
+        assert summary.active_jobs == 1
+        assert summary.max_active_jobs == 2
+        assert summary.available_slots == 1
+        assert summary.throttled is False
+        assert queued == 2
+    finally:
+        conn.close()
+
+
+def test_copyability_planner_checks_capacity_inside_write_transaction(tmp_path, monkeypatch):
+    conn = connect(tmp_path / "robot.sqlite")
+    observed_transactions: list[bool] = []
+    real_active_count = copyability_evidence._active_copyability_job_count
+
+    def observing_active_count(conn_arg):
+        observed_transactions.append(conn_arg.in_transaction)
+        return real_active_count(conn_arg)
+
+    try:
+        run_migrations(conn)
+        monkeypatch.setattr(
+            copyability_evidence,
+            "_active_copyability_job_count",
+            observing_active_count,
+        )
+
+        summary = plan_copyability_evidence_jobs(
+            conn,
+            limit=0,
+            max_active_jobs=50,
+            shard_count=1,
+            now=20_000,
+        )
+
+        assert summary.status == "ok"
+        assert observed_transactions == [True]
+        assert conn.in_transaction is False
     finally:
         conn.close()
 

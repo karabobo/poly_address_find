@@ -34,6 +34,7 @@ class PipelineCycleOptions:
     wallet_medium_limit: int = 20
     wallet_deep_limit: int = 5
     copyability_limit: int = 50
+    copyability_max_active_jobs: int = 50
     copyability_min_activity_events: int = 25
     feature_limit: int = 10
     feature_min_activity_events: int = 25
@@ -115,6 +116,7 @@ def run_pipeline_cycle(conn: sqlite3.Connection, options: PipelineCycleOptions) 
     copyability_plan = plan_copyability_evidence_jobs(
         conn,
         limit=options.copyability_limit,
+        max_active_jobs=options.copyability_max_active_jobs,
         min_score=options.min_score,
         min_activity_events=options.copyability_min_activity_events,
         shard_count=options.shard_count,
@@ -181,6 +183,7 @@ def _dry_run_steps(options: PipelineCycleOptions) -> list[dict[str, Any]]:
             "would_execute",
             {
                 "limit": options.copyability_limit,
+                "max_active_jobs": options.copyability_max_active_jobs,
                 "min_score": options.min_score,
                 "min_activity_events": options.copyability_min_activity_events,
                 "shard_count": options.shard_count,
