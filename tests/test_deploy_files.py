@@ -73,9 +73,9 @@ def test_deploy_files_exist():
         "deploy/nas/vps-http-proxy-tunnel.sh",
         "deploy/nas/discovery-loop.sh",
         "deploy/nas/rtds-discovery-loop.sh",
-        "deploy/nas/wallet-pipeline-planner-loop.sh",
+        "deploy/nas/research-control-loop.sh",
         "deploy/nas/wallet-pipeline-worker-loop.sh",
-        "deploy/nas/score-loop.sh",
+        "deploy/nas/copyability-worker-loop.sh",
         "deploy/nas/paper-observer-loop.sh",
         "deploy/nas/maintenance-loop.sh",
         "deploy/nas/backup-loop.sh",
@@ -221,53 +221,102 @@ def test_nas_deploy_files_do_not_embed_host_specific_paths_or_bridge_ips():
     assert "PM_ROBOT_NAS_ROOT" in text
 
 
-def test_nas_wallet_pipeline_runs_as_sharded_compose_services():
+def test_nas_research_control_runs_ordered_cycle_with_sharded_workers():
     compose = Path("deploy/nas/docker-compose.yml").read_text(encoding="utf-8")
     env = Path("deploy/nas/env.example").read_text(encoding="utf-8")
-    planner = Path("deploy/nas/wallet-pipeline-planner-loop.sh").read_text(encoding="utf-8")
+    control = Path("deploy/nas/research-control-loop.sh").read_text(encoding="utf-8")
     worker = Path("deploy/nas/wallet-pipeline-worker-loop.sh").read_text(encoding="utf-8")
     helper = Path("deploy/nas/pmrobot-nas.sh").read_text(encoding="utf-8")
 
-    assert "pipeline-planner:" in compose
+    assert "research-control:" in compose
+    assert "container_name: pm-robot-research-control" in compose
     assert "pipeline-worker-0:" in compose
     assert "pipeline-worker-1:" in compose
     assert "pipeline-worker-2:" in compose
-    assert "wallet-pipeline-planner-loop.sh" in compose
+    assert "research-control-loop.sh" in compose
     assert "wallet-pipeline-worker-loop.sh" in compose
+    assert "pipeline-planner:" not in compose
+    assert "copyability-planner:" not in compose
+    assert "score-loop:" not in compose
     assert "PM_ROBOT_PIPELINE_SHARD_INDEX: \"0\"" in compose
     assert "PM_ROBOT_PIPELINE_SHARD_INDEX: \"1\"" in compose
     assert "PM_ROBOT_PIPELINE_SHARD_INDEX: \"2\"" in compose
-    assert "pipeline-planner" in helper
+    assert "CONTROL_SERVICES=\"research-control\"" in helper
+    assert "remove_legacy_control_containers" in helper
+    assert "pm-robot-pipeline-planner pm-robot-copyability-planner pm-robot-score-loop" in helper
+    assert 'docker_cli rm -f "$container"' in helper
     assert "pipeline-jobs" in helper
     assert "pipeline-audit" in helper
     assert "runtime-status" in helper
     assert "PM_ROBOT_PIPELINE_WORKER_LIMIT=6" in env
     assert "PM_ROBOT_PIPELINE_WORKER_INTERVAL=60" in env
     assert "PM_ROBOT_PIPELINE_PRIORITY_AGING_SECONDS=1800" in env
-    assert "PM_ROBOT_PIPELINE_PLANNER_INTERVAL=120" in env
+    assert "PM_ROBOT_RESEARCH_CONTROL_INTERVAL=300" in env
     assert "PM_ROBOT_PIPELINE_STATE_LIMIT=250" in env
     assert "PM_ROBOT_PIPELINE_STATE_COMMIT_EVERY=50" in env
     assert "PM_ROBOT_PIPELINE_PLANNER_MAX_ACTIVE_JOBS=240" in env
-    assert "wallet-pipeline-state" in planner
-    assert "--stale-only" in planner
-    assert "loop_wallet_pipeline_state" in planner
-    assert "wallet-pipeline-plan" in planner
-    assert "--max-active-jobs \"$MAX_ACTIVE_JOBS\"" in planner
+    assert "PM_ROBOT_ELIGIBILITY_REPAIR_LIMIT=100" in env
+    assert "PM_ROBOT_RESEARCH_MIN_SCORE=40" in env
+    assert "pipeline-cycle" in control
+    assert "--execute-plan" in control
+    assert "--continue-on-error" in control
+    assert "--heartbeat-prefix loop_research_control_step" in control
+    assert "--no-diagnostics" in control
+    assert "--state-stale-only" in control
+    assert '--wallet-max-active-jobs "$WALLET_MAX_ACTIVE_JOBS"' in control
+    assert '--copyability-max-active-jobs "$COPYABILITY_MAX_ACTIVE_JOBS"' in control
+    assert '--copyability-shard-count "$COPYABILITY_SHARD_COUNT"' in control
+    assert "paper-handoff-export" in control
+    assert "loop_research_control" in control
     assert "wallet-pipeline-worker" in worker
     assert "PM_ROBOT_PIPELINE_WORKER_INTERVAL:-60" in worker
     assert "--priority-aging-seconds \"$PRIORITY_AGING_SECONDS\"" in worker
-    assert "sleep \"$INTERVAL\"" in planner
+    assert "sleep \"$INTERVAL\"" in control
     assert "sleep \"$INTERVAL\"" in worker
 
 
 def test_nas_copyability_planner_enforces_active_queue_waterline():
     env = Path("deploy/nas/env.example").read_text(encoding="utf-8")
-    planner = Path("deploy/nas/copyability-planner-loop.sh").read_text(encoding="utf-8")
+    control = Path("deploy/nas/research-control-loop.sh").read_text(encoding="utf-8")
 
     assert "PM_ROBOT_COPYABILITY_PLANNER_LIMIT=50" in env
     assert "PM_ROBOT_COPYABILITY_PLANNER_MAX_ACTIVE_JOBS=50" in env
-    assert "PM_ROBOT_COPYABILITY_PLANNER_MAX_ACTIVE_JOBS:-50" in planner
-    assert '--max-active-jobs "$MAX_ACTIVE_JOBS"' in planner
+    assert "PM_ROBOT_COPYABILITY_PLANNER_MAX_ACTIVE_JOBS:-50" in control
+    assert '--copyability-max-active-jobs "$COPYABILITY_MAX_ACTIVE_JOBS"' in control
+
+
+def test_nas_helper_exposes_shared_control_lifecycle_and_cleans_legacy_loops():
+    helper = Path("deploy/nas/pmrobot-nas.sh").read_text(encoding="utf-8")
+    cleanup_gate = helper.split('case "$cmd" in', 2)[1]
+
+    for command in (
+        "up",
+        "down",
+        "research-control-up",
+        "research-control-down",
+        "research-control-restart",
+        "pipeline-up",
+        "pipeline-down",
+        "copyability-up",
+        "copyability-down",
+        "score-up",
+        "score-down",
+        "score-restart",
+    ):
+        assert command in cleanup_gate
+    assert "remove_legacy_control_containers" in cleanup_gate
+    assert "score-up is a compatibility alias for research-control-up" in helper
+    assert "score-down is a compatibility alias for research-control-down" in helper
+    assert "score-restart is a compatibility alias for research-control-restart" in helper
+    assert "This also pauses wallet/copyability admission" in helper
+    assert "research-control may admit jobs up to the configured waterline" in helper
+
+
+def test_nas_copyability_workers_have_stable_unique_ids():
+    compose = Path("deploy/nas/docker-compose.yml").read_text(encoding="utf-8")
+
+    assert compose.count('PM_ROBOT_COPYABILITY_WORKER_ID: "nas-copyability-worker-0"') == 1
+    assert compose.count('PM_ROBOT_COPYABILITY_WORKER_ID: "nas-copyability-worker-1"') == 1
 
 
 @pytest.mark.skipif(not Path("deploy/nas/README.md").exists(), reason="README files are intentionally excluded")
@@ -295,19 +344,19 @@ def test_nas_helper_auto_uses_passwordless_sudo_for_synology_docker():
 def test_nas_copyability_queue_runs_two_workers_on_one_conservative_queue():
     compose = Path("deploy/nas/docker-compose.yml").read_text(encoding="utf-8")
     env = Path("deploy/nas/env.example").read_text(encoding="utf-8")
-    planner = Path("deploy/nas/copyability-planner-loop.sh").read_text(encoding="utf-8")
+    control = Path("deploy/nas/research-control-loop.sh").read_text(encoding="utf-8")
     worker = Path("deploy/nas/copyability-worker-loop.sh").read_text(encoding="utf-8")
     helper = Path("deploy/nas/pmrobot-nas.sh").read_text(encoding="utf-8")
 
-    assert "copyability-planner:" in compose
+    assert "research-control:" in compose
     assert "copyability-worker-0:" in compose
     assert "copyability-worker-1:" in compose
     assert "copyability-worker-2:" not in compose
-    assert "copyability-planner-loop.sh" in compose
+    assert "research-control-loop.sh" in compose
     assert "copyability-worker-loop.sh" in compose
     assert compose.count("PM_ROBOT_COPYABILITY_SHARD_INDEX: \"0\"") == 2
     assert "PM_ROBOT_COPYABILITY_WORKER_ID: \"nas-copyability-worker-1\"" in compose
-    assert "copyability-plan" in planner
+    assert "pipeline-cycle" in control
     assert "copyability-worker" in worker
     assert "copyability-up" in helper
     assert "copyability-jobs" in helper
@@ -322,7 +371,7 @@ def test_nas_copyability_queue_runs_two_workers_on_one_conservative_queue():
     assert "host_policy_rescore_once" in helper
     assert "host_recover_once" in helper
     assert "SELECT COUNT(*) FROM pipeline_jobs WHERE job_type = ? AND status = ?" in helper
-    assert "COPYABILITY_SERVICES=\"copyability-planner copyability-worker-0 copyability-worker-1\"" in helper
+    assert "COPYABILITY_SERVICES=\"copyability-worker-0 copyability-worker-1\"" in helper
     assert "compose up -d --no-deps --no-recreate copyability-worker-0 copyability-worker-1" in helper
     assert "force-recreate copyability-worker-0 copyability-worker-1" in helper
     assert "compose build copyability-worker-0 copyability-worker-1" not in helper
@@ -353,7 +402,7 @@ def test_nas_runtime_is_research_scoring_only():
     assert "paper_candidate" in readme
     assert "research/scoring only" in helper
     assert "PAPER_OBSERVER_SERVICES=\"paper-observer-loop\"" in helper
-    assert "RESEARCH_SERVICES=\"$CORE_SERVICES $DISCOVERY_SERVICES $PIPELINE_SERVICES $COPYABILITY_SERVICES $SCORE_SERVICES $PAPER_OBSERVER_SERVICES $MAINTENANCE_SERVICES $BACKUP_SERVICES\"" in helper
+    assert "RESEARCH_SERVICES=\"$CORE_SERVICES $DISCOVERY_SERVICES $CONTROL_SERVICES $PIPELINE_SERVICES $COPYABILITY_SERVICES $PAPER_OBSERVER_SERVICES $MAINTENANCE_SERVICES $BACKUP_SERVICES\"" in helper
     assert "runtime-ensure" in helper
     assert "compose up -d --no-deps --no-recreate $RESEARCH_SERVICES" in helper
     assert "watchdog-once" in helper
@@ -591,12 +640,12 @@ def test_nas_runtime_status_reports_paper_handoff_export_health():
             "reason": "paper handoff export file is missing",
         }
     ]
-    assert stale["paper_handoff"]["action"] == "./pmrobot-nas.sh score-restart"
+    assert stale["paper_handoff"]["action"] == "./pmrobot-nas.sh research-control-restart"
     assert stale["actions"] == [
         {
             "service": "paper_handoff",
-            "command": "./pmrobot-nas.sh score-restart",
-            "reason": "paper handoff export is stale; score-loop should refresh it after scoring",
+            "command": "./pmrobot-nas.sh research-control-restart",
+            "reason": "paper handoff export is stale; research-control should refresh it after scoring",
         }
     ]
 
@@ -798,18 +847,21 @@ def test_nas_discovery_loop_runs_high_quality_sources_without_queue_planning():
     assert "RTDS rows for all other wallets are not bulk-saved" in readme
 
 
-def test_nas_scoring_loop_runs_materialize_score_without_queue_planning():
+def test_nas_research_control_runs_planning_features_and_scoring_in_one_cycle():
     compose = Path("deploy/nas/docker-compose.yml").read_text(encoding="utf-8")
     env = Path("deploy/nas/env.example").read_text(encoding="utf-8")
-    loop = Path("deploy/nas/score-loop.sh").read_text(encoding="utf-8")
+    loop = Path("deploy/nas/research-control-loop.sh").read_text(encoding="utf-8")
     helper = Path("deploy/nas/pmrobot-nas.sh").read_text(encoding="utf-8")
 
-    assert "score-loop:" in compose
-    assert "container_name: pm-robot-score-loop" in compose
-    assert "score-loop.sh" in compose
-    assert "SCORE_SERVICES=\"score-loop\"" in helper
+    assert "research-control:" in compose
+    assert "container_name: pm-robot-research-control" in compose
+    assert "research-control-loop.sh" in compose
+    assert "SCORE_SERVICES=\"$CONTROL_SERVICES\"" in helper
+    assert "research-control-up" in helper
+    assert "research-control-down" in helper
+    assert "research-control-restart" in helper
     assert "score-up" in helper
-    assert "PM_ROBOT_SCORE_FULL_INTERVAL=300" in env
+    assert "PM_ROBOT_RESEARCH_CONTROL_INTERVAL=300" in env
     assert "PM_ROBOT_SCORE_FEATURE_LIMIT=80" in env
     assert "PM_ROBOT_SCORE_LIMIT=300" in env
     assert "PM_ROBOT_PAPER_ACTIVITY_WALLET_LIMIT=10" in env
@@ -817,38 +869,33 @@ def test_nas_scoring_loop_runs_materialize_score_without_queue_planning():
     assert "PM_ROBOT_PAPER_OBSERVER_MAX_ACTIONABLE_SIGNAL_AGE_SEC=300" in env
     assert "PM_ROBOT_PAPER_OBSERVER_EVALUATION_LIMIT=25" in env
     assert "PM_ROBOT_PAPER_OBSERVER_MAX_STAKE_USD=40" in env
-    assert "materialize-features" in loop
+    assert "pipeline-cycle" in loop
+    assert "--execute-plan" in loop
+    assert "--continue-on-error" in loop
+    assert "--heartbeat-prefix loop_research_control_step" in loop
+    assert "--no-diagnostics" in loop
+    assert "--state-stale-only" in loop
     assert "PM_ROBOT_SCORE_FEATURE_LIMIT:-80" in loop
-    assert "build-review" in loop
-    assert "--incremental" in loop
-    assert "--no-import-csv" in loop
+    assert '--score-limit "$SCORE_LIMIT"' in loop
     assert "paper-handoff-export" in loop
     assert "/app/reports/paper_handoff.json" in loop
     assert "/app/reports/paper_handoff.csv" in loop
     assert "loop_score_paper_handoff" in loop
+    assert loop.index("paper-handoff-export") > loop.index("one or more isolated pipeline-cycle phases failed")
     assert "paper-observer-preview" not in loop
     assert "paper-observer-evaluate" not in loop
     assert "loop_score_paper_observer_preview" not in loop
     assert "loop_score_paper_observer_evaluation" not in loop
-    assert "prioritize-backfill" not in loop
-    assert "wallet-pipeline-state" not in loop
-    assert "wallet-pipeline-plan" not in loop
     assert "sleep \"$INTERVAL\"" in loop
 
 
 def test_nas_wallet_pipeline_control_plane_has_one_owner():
-    planner = Path("deploy/nas/wallet-pipeline-planner-loop.sh").read_text(encoding="utf-8")
-    discovery = Path("deploy/nas/discovery-loop.sh").read_text(encoding="utf-8")
-    scoring = Path("deploy/nas/score-loop.sh").read_text(encoding="utf-8")
+    owners = []
+    for path in Path("deploy/nas").glob("*-loop.sh"):
+        if "pipeline-cycle" in path.read_text(encoding="utf-8"):
+            owners.append(path.name)
 
-    state_command = "python -m pm_robot.cli --env /app/.env wallet-pipeline-state"
-    plan_command = "python -m pm_robot.cli --env /app/.env wallet-pipeline-plan"
-    assert planner.count(state_command) == 1
-    assert planner.count(plan_command) == 1
-    assert "wallet-pipeline-state" not in discovery
-    assert "wallet-pipeline-plan" not in discovery
-    assert "wallet-pipeline-state" not in scoring
-    assert "wallet-pipeline-plan" not in scoring
+    assert owners == ["research-control-loop.sh"]
 
 
 @pytest.mark.skipif(not Path("deploy/nas/README.md").exists(), reason="README files are intentionally excluded")

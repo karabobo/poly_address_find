@@ -53,19 +53,19 @@ services:
       - ./reports:/app/reports
       - ./config:/app/config:ro
 
-  pipeline-planner:
+  research-control:
     build:
       context: ./app
       dockerfile: deploy/nas/Dockerfile
     image: pm-robot:nas
-    container_name: pm-robot-pipeline-planner
+    container_name: pm-robot-research-control
     restart: unless-stopped
     env_file:
       - ./.env
     working_dir: /app
     command:
       - /bin/sh
-      - /app/deploy/nas/wallet-pipeline-planner-loop.sh
+      - /app/deploy/nas/research-control-loop.sh
     volumes:
       - ./app/src:/app/src:ro
       - ./app/deploy:/app/deploy:ro
@@ -143,7 +143,7 @@ services:
       - /app/deploy/nas/wallet-pipeline-worker-loop.sh
     depends_on:
       - proxy-tunnel
-      - pipeline-planner
+      - research-control
     volumes:
       - ./app/src:/app/src:ro
       - ./app/deploy:/app/deploy:ro
@@ -171,7 +171,7 @@ services:
       - /app/deploy/nas/wallet-pipeline-worker-loop.sh
     depends_on:
       - proxy-tunnel
-      - pipeline-planner
+      - research-control
     volumes:
       - ./app/src:/app/src:ro
       - ./app/deploy:/app/deploy:ro
@@ -199,30 +199,7 @@ services:
       - /app/deploy/nas/wallet-pipeline-worker-loop.sh
     depends_on:
       - proxy-tunnel
-      - pipeline-planner
-    volumes:
-      - ./app/src:/app/src:ro
-      - ./app/deploy:/app/deploy:ro
-      - ./app/scripts:/app/scripts:ro
-      - ./data:/app/data
-      - ./logs:/app/logs
-      - ./backups:/app/backups
-      - ./reports:/app/reports
-      - ./config:/app/config:ro
-
-  copyability-planner:
-    build:
-      context: ./app
-      dockerfile: deploy/nas/Dockerfile
-    image: pm-robot:nas
-    container_name: pm-robot-copyability-planner
-    restart: unless-stopped
-    env_file:
-      - ./.env
-    working_dir: /app
-    command:
-      - /bin/sh
-      - /app/deploy/nas/copyability-planner-loop.sh
+      - research-control
     volumes:
       - ./app/src:/app/src:ro
       - ./app/deploy:/app/deploy:ro
@@ -244,12 +221,13 @@ services:
       - ./.env
     environment:
       PM_ROBOT_COPYABILITY_SHARD_INDEX: "0"
+      PM_ROBOT_COPYABILITY_WORKER_ID: "nas-copyability-worker-0"
     working_dir: /app
     command:
       - /bin/sh
       - /app/deploy/nas/copyability-worker-loop.sh
     depends_on:
-      - copyability-planner
+      - research-control
     volumes:
       - ./app/src:/app/src:ro
       - ./app/deploy:/app/deploy:ro
@@ -278,30 +256,7 @@ services:
       - /bin/sh
       - /app/deploy/nas/copyability-worker-loop.sh
     depends_on:
-      - copyability-planner
-    volumes:
-      - ./app/src:/app/src:ro
-      - ./app/deploy:/app/deploy:ro
-      - ./app/scripts:/app/scripts:ro
-      - ./data:/app/data
-      - ./logs:/app/logs
-      - ./backups:/app/backups
-      - ./reports:/app/reports
-      - ./config:/app/config:ro
-
-  score-loop:
-    build:
-      context: ./app
-      dockerfile: deploy/nas/Dockerfile
-    image: pm-robot:nas
-    container_name: pm-robot-score-loop
-    restart: unless-stopped
-    env_file:
-      - ./.env
-    working_dir: /app
-    command:
-      - /bin/sh
-      - /app/deploy/nas/score-loop.sh
+      - research-control
     volumes:
       - ./app/src:/app/src:ro
       - ./app/deploy:/app/deploy:ro

@@ -1,10 +1,17 @@
 import json
+import sqlite3
 from pathlib import Path
 
 from pm_robot.models import CandidateAddress, CandidateStage, ScoreBreakdown, WalletFeatures
 from pm_robot.orchestration.pipeline_cycle import PipelineCycleOptions, run_pipeline_cycle
 from pm_robot.storage.db import connect, run_migrations
-from pm_robot.storage.repository import persist_score, persist_wallet_activity, upsert_candidate, upsert_wallet_feature
+from pm_robot.storage.repository import (
+    materialize_wallet_processing_state,
+    persist_score,
+    persist_wallet_activity,
+    upsert_candidate,
+    upsert_wallet_feature,
+)
 
 
 def _trade_events(wallet: str, count: int) -> list[dict]:
@@ -54,7 +61,7 @@ def test_pipeline_cycle_dry_run_is_read_only(tmp_path):
 
         report = run_pipeline_cycle(
             conn,
-            PipelineCycleOptions(execute_plan=False, shard_count=1, min_score=40),
+            PipelineCycleOptions(execute_plan=False, wallet_shard_count=1, min_score=40),
         )
         jobs = conn.execute("SELECT * FROM pipeline_jobs").fetchall()
         budgets = conn.execute("SELECT * FROM evidence_backfill_budget").fetchall()
@@ -100,7 +107,8 @@ def test_pipeline_cycle_routes_repairs_through_canonical_planners(tmp_path):
             conn,
             PipelineCycleOptions(
                 execute_plan=True,
-                shard_count=1,
+                wallet_shard_count=3,
+                copyability_shard_count=1,
                 min_score=40,
                 feature_limit=0,
                 run_scoring=False,
@@ -126,6 +134,7 @@ def test_pipeline_cycle_routes_repairs_through_canonical_planners(tmp_path):
         ]
         runs = conn.execute("SELECT * FROM ingest_runs").fetchall()
         steps = {step["name"]: step for step in report["steps"]}
+        step_names = [step["name"] for step in report["steps"]]
 
         assert report["ok"] is True
         assert report["dry_run"] is False
@@ -136,14 +145,103 @@ def test_pipeline_cycle_routes_repairs_through_canonical_planners(tmp_path):
         assert thin_jobs[0]["tier"] == "l0_discovered"
         assert json.loads(thin_jobs[0]["input_json"])["source"] == "wallet_processing_state"
         assert len(copyability_jobs) == 1
+        assert copyability_jobs[0]["shard"] == 0
         assert json.loads(copyability_jobs[0]["input_json"])["source"] == "copyability_planner"
         assert "eligibility_repair" not in all_job_sources
         assert steps["eligibility_repair_prepare"]["data"]["wallet_repairs_prepared"] == 1
         assert steps["eligibility_repair_prepare"]["data"]["copyability_repairs_ready"] == 1
+        assert step_names.index("eligibility_repair_prepare") < step_names.index("wallet_pipeline_state_materialize")
+        assert step_names.index("wallet_pipeline_state_materialize") < step_names.index("wallet_pipeline_plan")
+        assert step_names.index("wallet_pipeline_plan") < step_names.index("copyability_plan")
+        assert step_names.index("copyability_plan") < step_names.index("materialize_features")
+        assert step_names.index("materialize_features") < step_names.index("incremental_score")
         assert runs == []
         assert report["after"]["queues"]["wallet_pipeline"]["statuses"]
         assert report["after"]["queues"]["copyability"]["statuses"] == [
             {"job_type": "copyability_evidence", "status": "queued", "count": 1}
+        ]
+    finally:
+        conn.close()
+
+
+def test_pipeline_cycle_can_materialize_only_stale_wallet_state(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    wallet = "0x" + "4" * 40
+    try:
+        run_migrations(conn)
+        upsert_candidate(conn, CandidateAddress(address=wallet, sources="test_source"))
+        conn.commit()
+        materialize_wallet_processing_state(conn, stale_only=True)
+
+        report = run_pipeline_cycle(
+            conn,
+            PipelineCycleOptions(
+                execute_plan=True,
+                state_stale_only=True,
+                state_commit_every=1,
+                wallet_shard_count=1,
+                feature_limit=0,
+                run_scoring=False,
+                policy_path=Path("config/leader_scoring_policy.json"),
+                include_diagnostics=False,
+            ),
+        )
+        steps = {step["name"]: step for step in report["steps"]}
+
+        assert steps["wallet_pipeline_state_materialize"]["data"]["wallets_materialized"] == 0
+    finally:
+        conn.close()
+
+
+def test_pipeline_cycle_isolates_failed_phase_and_continues_committed_work(tmp_path, monkeypatch):
+    conn = connect(tmp_path / "robot.sqlite")
+    wallet = "0x" + "5" * 40
+    reported_steps: list[dict] = []
+    try:
+        run_migrations(conn)
+        upsert_candidate(conn, CandidateAddress(address=wallet, sources="test_source"))
+        conn.commit()
+
+        def fail_wallet_plan(*args, **kwargs):
+            raise sqlite3.OperationalError("database is locked")
+
+        monkeypatch.setattr(
+            "pm_robot.orchestration.pipeline_cycle.plan_wallet_pipeline_jobs",
+            fail_wallet_plan,
+        )
+        report = run_pipeline_cycle(
+            conn,
+            PipelineCycleOptions(
+                execute_plan=True,
+                continue_on_error=True,
+                include_diagnostics=False,
+                wallet_shard_count=1,
+                copyability_shard_count=1,
+                feature_limit=0,
+                run_scoring=True,
+                policy_path=Path("config/leader_scoring_policy.json"),
+            ),
+            step_reporter=reported_steps.append,
+        )
+        steps = {step["name"]: step for step in report["steps"]}
+
+        assert report["ok"] is False
+        assert report["partial"] is True
+        assert report["failed_steps"] == ["wallet_pipeline_plan"]
+        assert report["before"] == {}
+        assert report["after"] == {}
+        assert steps["wallet_pipeline_plan"]["status"] == "failed"
+        assert steps["wallet_pipeline_plan"]["data"]["error_type"] == "OperationalError"
+        assert steps["copyability_plan"]["status"] == "executed"
+        assert steps["materialize_features"]["status"] == "executed"
+        assert steps["incremental_score"]["status"] == "executed"
+        assert [step["name"] for step in reported_steps] == [
+            "eligibility_repair_prepare",
+            "wallet_pipeline_state_materialize",
+            "wallet_pipeline_plan",
+            "copyability_plan",
+            "materialize_features",
+            "incremental_score",
         ]
     finally:
         conn.close()

@@ -10,14 +10,15 @@ DOCKER_RUNNER=()
 WATCHDOG_DISABLED_FILE="${PM_ROBOT_WATCHDOG_DISABLED_FILE:-$ROOT/.watchdog-disabled}"
 CORE_SERVICES="proxy-tunnel web"
 DISCOVERY_SERVICES="discovery-loop rtds-discovery"
-PIPELINE_SERVICES="pipeline-planner pipeline-worker-0 pipeline-worker-1 pipeline-worker-2"
-COPYABILITY_SERVICES="copyability-planner copyability-worker-0 copyability-worker-1"
-SCORE_SERVICES="score-loop"
+CONTROL_SERVICES="research-control"
+PIPELINE_SERVICES="pipeline-worker-0 pipeline-worker-1 pipeline-worker-2"
+COPYABILITY_SERVICES="copyability-worker-0 copyability-worker-1"
+SCORE_SERVICES="$CONTROL_SERVICES"
 PAPER_OBSERVER_SERVICES="paper-observer-loop"
 MAINTENANCE_SERVICES="maintenance-loop"
 BACKUP_SERVICES="backup-loop"
-APP_SERVICES="web $DISCOVERY_SERVICES $PIPELINE_SERVICES $COPYABILITY_SERVICES $SCORE_SERVICES $PAPER_OBSERVER_SERVICES $MAINTENANCE_SERVICES $BACKUP_SERVICES"
-RESEARCH_SERVICES="$CORE_SERVICES $DISCOVERY_SERVICES $PIPELINE_SERVICES $COPYABILITY_SERVICES $SCORE_SERVICES $PAPER_OBSERVER_SERVICES $MAINTENANCE_SERVICES $BACKUP_SERVICES"
+APP_SERVICES="web $DISCOVERY_SERVICES $CONTROL_SERVICES $PIPELINE_SERVICES $COPYABILITY_SERVICES $PAPER_OBSERVER_SERVICES $MAINTENANCE_SERVICES $BACKUP_SERVICES"
+RESEARCH_SERVICES="$CORE_SERVICES $DISCOVERY_SERVICES $CONTROL_SERVICES $PIPELINE_SERVICES $COPYABILITY_SERVICES $PAPER_OBSERVER_SERVICES $MAINTENANCE_SERVICES $BACKUP_SERVICES"
 EXECUTION_SERVICES="paper-runner-loop paper-settle-loop publish-loop"
 
 resolve_docker_runner() {
@@ -58,6 +59,16 @@ compose() {
 
 execution_compose() {
   compose -f docker-compose.yml -f docker-compose.execution.yml --profile execution "$@"
+}
+
+remove_legacy_control_containers() {
+  local container
+  for container in pm-robot-pipeline-planner pm-robot-copyability-planner pm-robot-score-loop; do
+    if docker_cli inspect "$container" >/dev/null 2>&1; then
+      echo "Removing legacy control container: $container"
+      docker_cli rm -f "$container" >/dev/null
+    fi
+  done
 }
 
 execution_preflight() {
@@ -379,12 +390,12 @@ def _deployment_status(
     elif paper_handoff_state == "stale":
         paper_handoff = {
             **paper_handoff,
-            "action": paper_handoff.get("action") or "./pmrobot-nas.sh score-restart",
+            "action": paper_handoff.get("action") or "./pmrobot-nas.sh research-control-restart",
         }
         actions.append({
             "service": "paper_handoff",
             "command": paper_handoff["action"],
-            "reason": "paper handoff export is stale; score-loop should refresh it after scoring",
+            "reason": "paper handoff export is stale; research-control should refresh it after scoring",
         })
     if paper_observer is None:
         paper_observer = {}
@@ -479,7 +490,7 @@ def paper_handoff_file_report(root):
         "json_exists": True,
         "csv_exists": csv_path.exists(),
         "state": "stale" if stale else "current",
-        "action": "./pmrobot-nas.sh score-restart" if stale else "",
+        "action": "./pmrobot-nas.sh research-control-restart" if stale else "",
         "schema_version": payload.get("schema_version") or "",
         "generated_at": generated_at,
         "age_seconds": max(0, age_seconds),
@@ -920,6 +931,12 @@ watchdog_enable() {
 }
 
 case "$cmd" in
+  up|down|restart|app-restart|runtime-ensure|watchdog-once|web-up|web-restart|discovery-up|discovery-down|discovery-restart|research-control-up|research-control-down|research-control-restart|pipeline-up|pipeline-down|pipeline-restart|copyability-up|copyability-down|copyability-restart|score-up|score-down|score-restart|observer-up|observer-down|observer-restart|maintenance-up|maintenance-down|maintenance-restart|backup-up|backup-down|backup-restart|execution-up|execution-down|execution-restart)
+    remove_legacy_control_containers
+    ;;
+esac
+
+case "$cmd" in
   up)
     compose up -d --build $RESEARCH_SERVICES
     ;;
@@ -931,9 +948,11 @@ case "$cmd" in
     compose restart web
     ;;
   pipeline-up)
-    compose up -d --build $PIPELINE_SERVICES
+    echo "Starting the shared research control loop and wallet evidence workers."
+    compose up -d --build $CONTROL_SERVICES $PIPELINE_SERVICES
     ;;
   copyability-up)
+    echo "Starting copyability workers; research-control owns queue admission."
     compose up -d --build $COPYABILITY_SERVICES
     ;;
   discovery-up)
@@ -943,15 +962,33 @@ case "$cmd" in
     compose stop $DISCOVERY_SERVICES
     ;;
   pipeline-down)
-    compose stop $PIPELINE_SERVICES
+    echo "Stopping wallet evidence workers and shared research-control."
+    echo "This also pauses wallet/copyability admission, feature refresh, scoring, and handoff export."
+    compose stop $CONTROL_SERVICES $PIPELINE_SERVICES
     ;;
   copyability-down)
+    echo "Stopping copyability workers only; research-control may admit jobs up to the configured waterline."
     compose stop $COPYABILITY_SERVICES
     ;;
+  research-control-up)
+    compose up -d --build $CONTROL_SERVICES
+    ;;
+  research-control-down)
+    echo "Stopping shared research-control pauses queue admission, feature refresh, scoring, and handoff export."
+    compose stop $CONTROL_SERVICES
+    ;;
+  research-control-restart)
+    compose up -d --build $CONTROL_SERVICES
+    compose restart $CONTROL_SERVICES
+    ;;
   score-up)
+    echo "score-up is a compatibility alias for research-control-up."
+    echo "The shared control loop also owns wallet/copyability admission and handoff export."
     compose up -d --build $SCORE_SERVICES
     ;;
   score-down)
+    echo "score-down is a compatibility alias for research-control-down."
+    echo "Stopping it also pauses wallet/copyability admission and handoff export."
     compose stop $SCORE_SERVICES
     ;;
   observer-up)
@@ -1027,8 +1064,8 @@ case "$cmd" in
     compose restart $DISCOVERY_SERVICES
     ;;
   pipeline-restart)
-    compose up -d --build $PIPELINE_SERVICES
-    compose restart $PIPELINE_SERVICES
+    compose up -d --build $CONTROL_SERVICES $PIPELINE_SERVICES
+    compose restart $CONTROL_SERVICES $PIPELINE_SERVICES
     ;;
   copyability-restart)
     compose up -d --build $COPYABILITY_SERVICES
@@ -1065,6 +1102,8 @@ PY
     exit 1
     ;;
   score-restart)
+    echo "score-restart is a compatibility alias for research-control-restart."
+    echo "The shared control loop also owns wallet/copyability admission and handoff export."
     compose up -d --build $SCORE_SERVICES
     compose restart $SCORE_SERVICES
     ;;
@@ -1140,7 +1179,7 @@ PY
     compose run --rm --entrypoint /bin/sh task
     ;;
   *)
-    echo "Usage: $0 {up|web-up|web-restart|discovery-up|discovery-down|pipeline-up|pipeline-down|copyability-up|copyability-down|score-up|score-down|observer-up|observer-down|maintenance-up|maintenance-down|backup-up|backup-down|backup-restart|backup-now|execution-up|execution-down|execution-restart|execution-status|execution-preflight|execution-logs [tail] [service]|down|restart|app-restart|runtime-ensure|watchdog-once|watchdog-status|watchdog-disable [reason]|watchdog-enable|discovery-restart|pipeline-restart|copyability-restart|copyability-ensure-workers|copyability-restart-when-idle [timeout_seconds] [poll_seconds]|score-restart|observer-restart|maintenance-restart|logs [tail] [service]|status|runtime-status|copyability-drain-once [limit<=5]|materialize-once [limit<=500]|score-once [limit<=500]|policy-rescore-once [score_limit<=500] [optional_feature_limit<=500]|recover-once [copyability_limit<=5] [score_limit<=500] [feature_limit<=500]|wal-truncate-window [checkpoint_timeout_seconds]|wal-truncate-when-idle [wait_timeout_seconds] [checkpoint_timeout_seconds] [poll_seconds]|migrate|health|app-status|maintenance|pipeline-jobs|pipeline-audit|copyability-jobs|shell}" >&2
+    echo "Usage: $0 {up|web-up|web-restart|discovery-up|discovery-down|research-control-up|research-control-down|research-control-restart|pipeline-up|pipeline-down|copyability-up|copyability-down|score-up|score-down|observer-up|observer-down|maintenance-up|maintenance-down|backup-up|backup-down|backup-restart|backup-now|execution-up|execution-down|execution-restart|execution-status|execution-preflight|execution-logs [tail] [service]|down|restart|app-restart|runtime-ensure|watchdog-once|watchdog-status|watchdog-disable [reason]|watchdog-enable|discovery-restart|pipeline-restart|copyability-restart|copyability-ensure-workers|copyability-restart-when-idle [timeout_seconds] [poll_seconds]|score-restart|observer-restart|maintenance-restart|logs [tail] [service]|status|runtime-status|copyability-drain-once [limit<=5]|materialize-once [limit<=500]|score-once [limit<=500]|policy-rescore-once [score_limit<=500] [optional_feature_limit<=500]|recover-once [copyability_limit<=5] [score_limit<=500] [feature_limit<=500]|wal-truncate-window [checkpoint_timeout_seconds]|wal-truncate-when-idle [wait_timeout_seconds] [checkpoint_timeout_seconds] [poll_seconds]|migrate|health|app-status|maintenance|pipeline-jobs|pipeline-audit|copyability-jobs|shell}" >&2
     exit 2
     ;;
 esac

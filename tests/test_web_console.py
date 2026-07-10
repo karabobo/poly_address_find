@@ -2375,8 +2375,7 @@ def test_dashboard_ops_health_reports_runtime_loop_freshness(tmp_path):
                 ("wallet_pipeline_worker_0", now - 300, now - 290, "ok", 42, ""),
                 ("copyability_evidence_worker_0_test", now - 120, now - 110, "ok", 9, ""),
                 ("loop_discovery_leaderboard", now - 180, now - 170, "ok", 5, ""),
-                ("loop_wallet_pipeline_state", now - 90, now - 80, "ok", 0, ""),
-                ("loop_score_review", now - 7_200, now - 7_100, "ok", 12, ""),
+                ("loop_research_control", now - 7_200, now - 7_100, "ok", 12, ""),
                 ("loop_maintenance", now - 60, now - 50, "failed", 0, "checkpoint failed"),
             ],
         )
@@ -2395,13 +2394,12 @@ def test_dashboard_ops_health_reports_runtime_loop_freshness(tmp_path):
     assert by_key["wallet_pipeline_workers"]["state"] == "ok"
     assert by_key["copyability_workers"]["state"] == "ok"
     assert by_key["discovery_leaderboard"]["state"] == "ok"
-    assert by_key["pipeline_state"]["state"] == "ok"
-    assert by_key["score_review"]["state"] == "stale"
+    assert by_key["research_control"]["state"] == "stale"
     assert by_key["maintenance"]["state"] == "error"
     assert by_key["discovery_activity"]["state"] == "no_data"
     assert "常驻循环新鲜度" in html
     assert "摘要/错误" in html
-    assert "评分复核" in html
+    assert "研究控制循环" in html
     assert "checkpoint failed" in html
 
 

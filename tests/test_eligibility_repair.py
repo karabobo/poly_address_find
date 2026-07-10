@@ -69,6 +69,57 @@ def test_eligibility_repair_prepares_thin_review_wallet_for_wallet_planner(tmp_p
         conn.close()
 
 
+def test_eligibility_repair_does_not_refresh_unchanged_budget(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    wallet = "0x" + "4" * 40
+    try:
+        run_migrations(conn)
+        upsert_candidate(conn, CandidateAddress(address=wallet, sources="manual"))
+        _score(conn, wallet, score=72)
+        conn.commit()
+
+        first = prepare_eligibility_repairs(conn, limit=10, now=50_000)
+        before = conn.execute(
+            "SELECT updated_at, evidence_json FROM evidence_backfill_budget WHERE wallet = ?",
+            (wallet,),
+        ).fetchone()
+        second = prepare_eligibility_repairs(conn, limit=10, now=60_000)
+        after = conn.execute(
+            "SELECT updated_at, evidence_json FROM evidence_backfill_budget WHERE wallet = ?",
+            (wallet,),
+        ).fetchone()
+
+        assert first.evidence_budgets_seeded == 1
+        assert second.wallet_repairs_prepared == 1
+        assert second.evidence_budgets_seeded == 0
+        assert dict(after) == dict(before)
+    finally:
+        conn.close()
+
+
+def test_eligibility_repair_limit_advances_past_prepared_wallets(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    wallets = ["0x" + digit * 40 for digit in ("5", "6", "7")]
+    try:
+        run_migrations(conn)
+        for index, wallet in enumerate(wallets):
+            upsert_candidate(conn, CandidateAddress(address=wallet, sources="manual"))
+            _score(conn, wallet, score=72 - index)
+        conn.commit()
+
+        first = prepare_eligibility_repairs(conn, limit=1, now=50_000)
+        second = prepare_eligibility_repairs(conn, limit=1, now=60_000)
+        third = prepare_eligibility_repairs(conn, limit=1, now=70_000)
+        budget_count = conn.execute("SELECT COUNT(*) FROM evidence_backfill_budget").fetchone()[0]
+
+        assert first.evidence_budgets_seeded == 1
+        assert second.evidence_budgets_seeded == 1
+        assert third.evidence_budgets_seeded == 1
+        assert budget_count == 3
+    finally:
+        conn.close()
+
+
 def test_eligibility_repair_leaves_copyability_admission_to_copyability_planner(tmp_path):
     conn = connect(tmp_path / "robot.sqlite")
     wallet = "0x" + "2" * 40

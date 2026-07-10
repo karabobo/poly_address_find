@@ -47,16 +47,22 @@ promising scored wallet
 The historical database column `wallet_processing_state.discovery_tier` is called `evidence_tier` in code.
 `pipeline_jobs.tier` is a job scope/dedupe field, not the wallet's real evidence tier.
 
-The NAS wallet pipeline has one control-plane owner: `wallet-pipeline-planner-loop.sh` materializes
-`wallet_processing_state` and then plans `wallet_evidence_backfill` jobs. Discovery only writes observation and
-candidate inputs; scoring only materializes features and writes review results. Neither loop enqueues wallet
-evidence jobs. The control loop materializes only wallets with changed candidate metadata, evidence budgets, or
-activity watermarks. Copyability retains its own planner because it is a separate evidence lane and job type.
+The NAS research/scoring stack has one control-plane owner: `research-control-loop.sh`. It executes the ordered
+`pipeline-cycle` handoff across eligibility preparation, stale wallet state, wallet/copyability queue admission,
+feature materialization, incremental scoring, and paper handoff export. Discovery and queue workers remain
+asynchronous. The control loop materializes only wallets with changed candidate metadata, evidence budgets, or
+activity watermarks.
+Each database phase commits independently. In NAS mode, a failed phase is rolled back and recorded, while later
+phases continue against the latest committed data. Paper handoff export runs after every cycle attempt, including
+partial cycles, so planner contention cannot make an otherwise valid handoff stale.
+The frequent control loop skips full smoothness diagnostics; those scans remain available through the explicit
+audit/report commands instead of being repeated during every scheduling pass.
 Eligibility repair only prepares evidence budgets and planner-ready actions; it never writes `pipeline_jobs`.
-`pipeline-cycle` therefore prepares repairs before state materialization, then delegates admission to the same
-wallet and copyability planners used by the NAS loops.
-The optional systemd deployment follows the same ownership rule through `pm-robot-evidence-planner.service`;
-its scoring service does not materialize wallet state or enqueue evidence jobs.
+Queue admission remains delegated to the canonical wallet and copyability planners, and unchanged repair budgets
+are not rewritten on every control pass.
+The files under `deploy/systemd` describe the older non-NAS deployment and do not share this scheduler. Do not run
+those timers beside the NAS Compose stack. The NAS Compose control loop is the supported scheduling architecture
+for this repository's current research/scoring deployment.
 
 ## Evidence Tiers
 
@@ -87,9 +93,9 @@ The default Compose stack runs:
 
 - proxy tunnel and web console;
 - polling and RTDS discovery;
-- one evidence control loop for state materialization and job planning, plus sharded wallet workers;
-- copyability planner and workers;
-- scoring and paper-observer loops;
+- one ordered research control loop for eligibility, queue admission, features, scoring, and handoff export;
+- sharded wallet and copyability workers;
+- the read-only paper-observer loop;
 - maintenance and verified SQLite backup loops.
 
 The opt-in execution profile contains paper-run, paper-settle, and publish loops. It is not started by the

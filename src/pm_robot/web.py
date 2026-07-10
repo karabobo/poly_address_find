@@ -139,11 +139,7 @@ _RUNTIME_LOOP_SPECS = (
     RuntimeLoopSpec("copyability_workers", "Copyability workers", "copyability_evidence_worker_%", 900),
     RuntimeLoopSpec("discovery_leaderboard", "Leaderboard 发现", "loop_discovery_leaderboard", 7_200),
     RuntimeLoopSpec("discovery_activity", "大额交易发现", "loop_discovery_activity", 7_200),
-    RuntimeLoopSpec("pipeline_state", "钱包证据状态物化", "loop_wallet_pipeline_state", 900),
-    RuntimeLoopSpec("pipeline_planner", "证据队列规划", "loop_wallet_pipeline_planner", 3_600),
-    RuntimeLoopSpec("copyability_planner", "Copyability 规划", "loop_copyability_planner", 3_600),
-    RuntimeLoopSpec("score_features", "特征物化", "loop_score_features", 1_800),
-    RuntimeLoopSpec("score_review", "评分复核", "loop_score_review", 1_800),
+    RuntimeLoopSpec("research_control", "研究控制循环", "loop_research_control", 1_800),
     RuntimeLoopSpec("paper_observer_activity", "Paper 活动快刷", "loop_paper_observer_activity", 300),
     RuntimeLoopSpec("paper_observer_preview", "Paper 预览快刷", "loop_paper_observer_preview", 300),
     RuntimeLoopSpec("paper_observer_evaluation", "Paper 报价快评", "loop_paper_observer_evaluation", 300),
@@ -5041,7 +5037,7 @@ def _paper_observer_evaluation_file(settings: RobotSettings) -> dict[str, Any]:
             "json_exists": True,
             "state": "invalid",
             "error": f"{type(exc).__name__}: {str(exc)[:180]}",
-            "next_action": "评估文件无法读取，重启 score-loop 重新生成。",
+            "next_action": "评估文件无法读取，重启 paper-observer-loop 重新生成。",
         }
     generated_at = int(payload.get("generated_at") or 0)
     mtime = int(path.stat().st_mtime)
@@ -5050,7 +5046,7 @@ def _paper_observer_evaluation_file(settings: RobotSettings) -> dict[str, Any]:
     next_action = (
         "报价评估已生成；actionable 才代表在时间窗内可跟，accepted 只代表盘口可模拟成交。"
         if state == "current"
-        else "报价评估已过期，等待下一轮 score-loop 刷新。"
+        else "报价评估已过期，等待下一轮 paper-observer-loop 刷新。"
     )
     return {
         **payload,

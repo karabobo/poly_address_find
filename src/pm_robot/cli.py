@@ -393,19 +393,50 @@ def main() -> int:
     cycle_cmd.add_argument("--top", type=int, default=20)
     cycle_cmd.add_argument("--min-score", type=float, default=40.0)
     cycle_cmd.add_argument("--state-limit", type=int, default=0)
+    cycle_cmd.add_argument("--state-stale-only", action="store_true")
+    cycle_cmd.add_argument("--state-commit-every", type=int, default=100)
     cycle_cmd.add_argument("--repair-limit", type=int, default=100)
-    cycle_cmd.add_argument("--shard-count", type=int, default=3)
+    cycle_cmd.add_argument(
+        "--shard-count",
+        dest="wallet_shard_count",
+        type=int,
+        default=3,
+        help="Wallet evidence queue shard count",
+    )
     cycle_cmd.add_argument("--wallet-light-limit", type=int, default=30)
     cycle_cmd.add_argument("--wallet-medium-limit", type=int, default=20)
     cycle_cmd.add_argument("--wallet-deep-limit", type=int, default=5)
+    cycle_cmd.add_argument("--wallet-max-active-jobs", type=int, default=240)
     cycle_cmd.add_argument("--copyability-limit", type=int, default=50)
     cycle_cmd.add_argument("--copyability-max-active-jobs", type=int, default=50)
     cycle_cmd.add_argument("--copyability-min-activity-events", type=int, default=25)
+    cycle_cmd.add_argument(
+        "--copyability-shard-count",
+        type=int,
+        default=1,
+        help="Copyability evidence queue shard count",
+    )
+    cycle_cmd.add_argument("--copyability-rescan-seconds", type=int, default=21_600)
     cycle_cmd.add_argument("--feature-limit", type=int, default=10)
     cycle_cmd.add_argument("--feature-min-activity-events", type=int, default=25)
     cycle_cmd.add_argument("--score-limit", type=int, default=0)
     cycle_cmd.add_argument("--policy", default=str(DEFAULT_POLICY_PATH))
     cycle_cmd.add_argument("--no-score", action="store_true", help="Skip local incremental scoring in execute mode")
+    cycle_cmd.add_argument(
+        "--continue-on-error",
+        action="store_true",
+        help="Rollback a failed phase and continue later phases against the latest committed data",
+    )
+    cycle_cmd.add_argument(
+        "--heartbeat-prefix",
+        default="",
+        help="Record one runtime heartbeat per executed phase using this stable prefix",
+    )
+    cycle_cmd.add_argument(
+        "--no-diagnostics",
+        action="store_true",
+        help="Skip repeated smoothness reports in a frequent production control loop",
+    )
 
     prioritize_backfill_cmd = sub.add_parser("prioritize-backfill", help="Promote scored review wallets into the evidence backfill queue")
     prioritize_backfill_cmd.add_argument("--db", dest="command_db", default=None, help="SQLite database path")
@@ -1145,6 +1176,25 @@ def main() -> int:
         conn = connect(db_path)
         try:
             run_migrations(conn)
+            heartbeat_prefix = str(args.heartbeat_prefix or "").strip()
+
+            def report_cycle_step(step: dict) -> None:
+                if not heartbeat_prefix:
+                    return
+                step_status = str(step.get("status") or "")
+                heartbeat_status = "failed" if step_status == "failed" else "ok"
+                data = step.get("data") if isinstance(step.get("data"), dict) else {}
+                try:
+                    record_runtime_heartbeat(
+                        conn,
+                        f"{heartbeat_prefix}_{step['name']}",
+                        status=heartbeat_status,
+                        error=str(data.get("error") or ""),
+                    )
+                except Exception:
+                    conn.rollback()
+                    raise
+
             report = run_pipeline_cycle(
                 conn,
                 PipelineCycleOptions(
@@ -1152,20 +1202,28 @@ def main() -> int:
                     top=args.top,
                     min_score=args.min_score,
                     state_limit=args.state_limit,
+                    state_stale_only=args.state_stale_only,
+                    state_commit_every=args.state_commit_every,
                     repair_limit=args.repair_limit,
-                    shard_count=args.shard_count,
+                    wallet_shard_count=args.wallet_shard_count,
                     wallet_light_limit=args.wallet_light_limit,
                     wallet_medium_limit=args.wallet_medium_limit,
                     wallet_deep_limit=args.wallet_deep_limit,
+                    wallet_max_active_jobs=args.wallet_max_active_jobs,
                     copyability_limit=args.copyability_limit,
                     copyability_max_active_jobs=args.copyability_max_active_jobs,
                     copyability_min_activity_events=args.copyability_min_activity_events,
+                    copyability_shard_count=args.copyability_shard_count,
+                    copyability_rescan_seconds=args.copyability_rescan_seconds,
                     feature_limit=args.feature_limit,
                     feature_min_activity_events=args.feature_min_activity_events,
                     score_limit=args.score_limit,
                     run_scoring=not args.no_score,
                     policy_path=Path(args.policy),
+                    continue_on_error=args.continue_on_error,
+                    include_diagnostics=not args.no_diagnostics,
                 ),
+                step_reporter=report_cycle_step if heartbeat_prefix else None,
             )
         finally:
             conn.close()

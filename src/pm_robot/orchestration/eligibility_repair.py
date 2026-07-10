@@ -57,7 +57,8 @@ def prepare_eligibility_repairs(
     """
 
     ts = now or int(time.time())
-    rows = _candidate_rows(conn, limit=limit, min_score=min_score)
+    rows = _candidate_rows(conn, limit=limit if dry_run else 0, min_score=min_score)
+    wallets_seen = 0
     ineligible = 0
     evidence_budgets_seeded = 0
     wallet_repairs = 0
@@ -66,6 +67,7 @@ def prepare_eligibility_repairs(
     action_counts: dict[str, int] = {}
 
     for row in rows:
+        wallets_seen += 1
         wallet = str(row["address"]).lower()
         result = paper_eligibility_status(conn, wallet)
         if result.eligible:
@@ -94,10 +96,12 @@ def prepare_eligibility_repairs(
             )
         if ACTION_COPYABILITY in actions:
             copyability_repairs += 1
+        if limit > 0 and evidence_budgets_seeded >= limit:
+            break
     if not dry_run:
         conn.commit()
     return EligibilityRepairPreparationSummary(
-        wallets_seen=len(rows),
+        wallets_seen=wallets_seen,
         wallets_ineligible=ineligible,
         evidence_budgets_seeded=evidence_budgets_seeded,
         wallet_repairs_prepared=wallet_repairs,
@@ -201,12 +205,30 @@ def _seed_wallet_evidence_budget(
     reasons: tuple[str, ...],
     now: int,
 ) -> bool:
+    priority = _priority(leader_score)
+    existing = conn.execute(
+        """
+        SELECT source, priority, target_depth
+        FROM evidence_backfill_budget
+        WHERE wallet = ?
+        """,
+        (wallet.lower(),),
+    ).fetchone()
+    if existing:
+        sources = {item.strip() for item in str(existing["source"] or "").split("|")}
+        if (
+            REPAIR_SOURCE in sources
+            and int(existing["priority"] or 100) <= priority
+            and int(existing["target_depth"] or 0) >= LIGHT_DEPTH
+        ):
+            return False
+
     before = conn.total_changes
     seed_evidence_backfill_budget(
         conn,
         wallet,
         source=REPAIR_SOURCE,
-        priority=_priority(leader_score),
+        priority=priority,
         target_depth=LIGHT_DEPTH,
         evidence={
             "source": REPAIR_SOURCE,
