@@ -1,0 +1,10 @@
+[Unit]
+Description=pm-robot SQLite backup
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/pm-robot
+EnvironmentFile=/opt/pm-robot/.env
+Environment=PM_ROBOT_LOCK_WAIT=120
+Environment=PM_ROBOT_TASK_NAME=backup
+ExecStart=/opt/pm-robot/deploy/scripts/run_locked.sh /opt/pm-robot/.venv/bin/python -m pm_robot.cli --env /opt/pm-robot/.env backup

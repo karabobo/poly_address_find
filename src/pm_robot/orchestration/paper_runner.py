@@ -1,0 +1,621 @@
+"""Paper execution loop for approved wallet-copy signals."""
+
+from __future__ import annotations
+
+import sqlite3
+import time
+from dataclasses import dataclass
+from dataclasses import replace
+from pathlib import Path
+
+from pm_robot.clients.polymarket_public import PublicPolymarketClient
+from pm_robot.execution.paper_broker import PAPER_MAX_PRICE, PAPER_MIN_PRICE, PaperBroker
+from pm_robot.execution.paper_quote import simulate_buy_quote
+from pm_robot.models import TradeSignal
+from pm_robot.pipeline_terms import PAPER_ELIGIBLE_CANDIDATE_STAGES, PROVISIONAL_CANDIDATE_STAGES
+from pm_robot.risk.eligibility import paper_eligibility_status
+from pm_robot.storage.repository import persist_paper_signal_evaluations
+
+
+PAPER_STAGES = PAPER_ELIGIBLE_CANDIDATE_STAGES
+PAPER_BLOCKERS = ("non_positive_settled_roi", "non_positive_total_roi")
+PAPER_OBSERVER_PREVIEW_SCHEMA_VERSION = "paper_observer_preview_v1"
+PAPER_OBSERVER_EVALUATION_SCHEMA_VERSION = "paper_observer_evaluation_v1"
+PAPER_OBSERVER_DIAGNOSTIC_WINDOWS = (
+    (21_600, "6h"),
+    (86_400, "24h"),
+    (259_200, "72h"),
+    (604_800, "168h"),
+)
+
+
+@dataclass(frozen=True)
+class PaperRunSummary:
+    signals_seen: int
+    orders_recorded: int
+    skipped: int
+    rejections_recorded: int = 0
+
+
+@dataclass(frozen=True)
+class PaperObserverPreview:
+    schema_version: str
+    generated_at: int
+    max_signal_age_sec: int
+    min_timestamp: int
+    paper_stage_wallets: int
+    recent_buy_events: int
+    latest_activity_ts: int | None
+    latest_buy_ts: int | None
+    latest_activity_ingested_at: int | None
+    latest_buy_ingested_at: int | None
+    latest_activity_age_sec: int | None
+    latest_buy_age_sec: int | None
+    recent_buy_avg_ingest_lag_sec: float | None
+    recent_buy_max_ingest_lag_sec: int | None
+    no_signal_reason: str
+    window_diagnostics: list[dict[str, object]]
+    signals_seen: int
+    signals: list[dict[str, object]]
+
+
+@dataclass(frozen=True)
+class PaperObserverEvaluation:
+    schema_version: str
+    generated_at: int
+    max_signal_age_sec: int
+    max_actionable_signal_age_sec: int
+    max_stake_usd: float
+    signals_seen: int
+    quotes_attempted: int
+    quotes_succeeded: int
+    accepted_signals: int
+    actionable_signals: int
+    rejected_signals: int
+    stale_signal_rejections: int
+    quote_error_signals: int
+    actionable_rate_pct: float
+    average_slippage_bps: float | None
+    average_latency_ms: float | None
+    evaluations_persisted: int
+    evaluations: list[dict[str, object]]
+
+
+def preview_paper_observer(
+    conn: sqlite3.Connection,
+    *,
+    limit: int = 50,
+    max_signal_age_sec: int = 21_600,
+    now: int | None = None,
+) -> PaperObserverPreview:
+    """Return eligible recent paper signals without quotes, orders, or writes."""
+
+    generated_at = int(time.time()) if now is None else int(now)
+    safe_limit = min(max(int(limit), 1), 250)
+    safe_max_signal_age_sec = max(int(max_signal_age_sec), 0)
+    min_timestamp = generated_at - safe_max_signal_age_sec if safe_max_signal_age_sec > 0 else 0
+    rows = _candidate_activity_rows(
+        conn,
+        limit=safe_limit,
+        min_timestamp=min_timestamp,
+        include_watchlist_min_score=None,
+        include_review_min_score=None,
+    )
+    signals = [_observation_from_row(row) for row in rows]
+    context = _observer_activity_context(conn, min_timestamp=min_timestamp, generated_at=generated_at)
+    no_signal_reason = "" if signals else _observer_no_signal_reason(context, min_timestamp=min_timestamp)
+    return PaperObserverPreview(
+        schema_version=PAPER_OBSERVER_PREVIEW_SCHEMA_VERSION,
+        generated_at=generated_at,
+        max_signal_age_sec=safe_max_signal_age_sec,
+        min_timestamp=min_timestamp,
+        paper_stage_wallets=int(context.get("paper_stage_wallets") or 0),
+        recent_buy_events=int(context.get("recent_buy_events") or 0),
+        latest_activity_ts=context.get("latest_activity_ts"),
+        latest_buy_ts=context.get("latest_buy_ts"),
+        latest_activity_ingested_at=context.get("latest_activity_ingested_at"),
+        latest_buy_ingested_at=context.get("latest_buy_ingested_at"),
+        latest_activity_age_sec=context.get("latest_activity_age_sec"),
+        latest_buy_age_sec=context.get("latest_buy_age_sec"),
+        recent_buy_avg_ingest_lag_sec=context.get("recent_buy_avg_ingest_lag_sec"),
+        recent_buy_max_ingest_lag_sec=context.get("recent_buy_max_ingest_lag_sec"),
+        no_signal_reason=no_signal_reason,
+        window_diagnostics=_observer_window_diagnostics(conn, generated_at=generated_at, limit=safe_limit),
+        signals_seen=len(signals),
+        signals=signals,
+    )
+
+
+def evaluate_paper_observer(
+    conn: sqlite3.Connection,
+    *,
+    limit: int = 50,
+    max_stake_usd: float = 40.0,
+    max_signal_age_sec: int = 21_600,
+    max_actionable_signal_age_sec: int = 300,
+    now: int | None = None,
+    persist: bool = False,
+    client: PublicPolymarketClient | None = None,
+) -> PaperObserverEvaluation:
+    """Quote eligible paper-stage signals without writing paper orders."""
+
+    generated_at = int(time.time()) if now is None else int(now)
+    safe_limit = min(max(int(limit), 1), 250)
+    safe_max_signal_age_sec = max(int(max_signal_age_sec), 0)
+    safe_max_actionable_signal_age_sec = max(int(max_actionable_signal_age_sec), 0)
+    safe_max_stake_usd = max(float(max_stake_usd), 1.0)
+    min_timestamp = generated_at - safe_max_signal_age_sec if safe_max_signal_age_sec > 0 else 0
+    rows = _candidate_activity_rows(
+        conn,
+        limit=safe_limit,
+        min_timestamp=min_timestamp,
+        include_watchlist_min_score=None,
+        include_review_min_score=None,
+    )
+    broker = PaperBroker(ledger_path=None, conn=None, max_stake_usd=safe_max_stake_usd)
+    client = client or PublicPolymarketClient()
+    evaluations: list[dict[str, object]] = []
+    for row in rows:
+        evaluations.append(
+            _evaluate_observation_row(
+                row,
+                broker=broker,
+                client=client,
+                generated_at=generated_at,
+                max_actionable_signal_age_sec=safe_max_actionable_signal_age_sec,
+            )
+        )
+    evaluations_persisted = (
+        persist_paper_signal_evaluations(conn, evaluations, evaluated_at=generated_at)
+        if persist
+        else 0
+    )
+    accepted = [row for row in evaluations if row.get("accepted")]
+    actionable = [row for row in evaluations if row.get("actionable")]
+    stale = [row for row in evaluations if row.get("actionability_reason") == "signal_too_old"]
+    quote_errors = [row for row in evaluations if row.get("quote_error")]
+    latencies = [float(row["quote_latency_ms"]) for row in evaluations if row.get("quote_latency_ms") is not None]
+    slippages = [float(row["slippage_bps"]) for row in accepted if row.get("slippage_bps") is not None]
+    return PaperObserverEvaluation(
+        schema_version=PAPER_OBSERVER_EVALUATION_SCHEMA_VERSION,
+        generated_at=generated_at,
+        max_signal_age_sec=safe_max_signal_age_sec,
+        max_actionable_signal_age_sec=safe_max_actionable_signal_age_sec,
+        max_stake_usd=round(safe_max_stake_usd, 2),
+        signals_seen=len(evaluations),
+        quotes_attempted=len(evaluations),
+        quotes_succeeded=len(evaluations) - len(quote_errors),
+        accepted_signals=len(accepted),
+        actionable_signals=len(actionable),
+        rejected_signals=len(evaluations) - len(accepted),
+        stale_signal_rejections=len(stale),
+        quote_error_signals=len(quote_errors),
+        actionable_rate_pct=round((len(actionable) / len(evaluations)) * 100, 2) if evaluations else 0.0,
+        average_slippage_bps=_average(slippages),
+        average_latency_ms=_average(latencies),
+        evaluations_persisted=evaluations_persisted,
+        evaluations=evaluations,
+    )
+
+
+def run_paper(
+    conn: sqlite3.Connection,
+    *,
+    ledger_path: Path | None = None,
+    limit: int = 50,
+    max_stake_usd: float = 40.0,
+    max_signal_age_sec: int = 21_600,
+    include_watchlist_min_score: float | None = None,
+    include_review_min_score: float | None = None,
+    client: PublicPolymarketClient | None = None,
+) -> PaperRunSummary:
+    broker = PaperBroker(ledger_path=ledger_path, conn=conn, max_stake_usd=max_stake_usd)
+    client = client or PublicPolymarketClient(conn=conn)
+    min_timestamp = int(time.time()) - max_signal_age_sec if max_signal_age_sec > 0 else 0
+    rows = _candidate_activity_rows(
+        conn,
+        limit=limit,
+        min_timestamp=min_timestamp,
+        include_watchlist_min_score=include_watchlist_min_score,
+        include_review_min_score=include_review_min_score,
+    )
+    recorded = 0
+    skipped = 0
+    rejections = 0
+    for row in rows:
+        signal = _signal_from_row(row)
+        quote_started = time.monotonic()
+        try:
+            quote = simulate_buy_quote(client.book(signal.asset_id), broker.requested_stake(signal))
+            signal = replace(
+                signal,
+                best_bid=quote.best_bid,
+                best_ask=quote.best_ask,
+                executable_price=quote.executable_price,
+                fillable_stake_usd=quote.fillable_stake_usd,
+                quote_snapshot_at=quote.snapshot_at,
+                quote_latency_ms=int((time.monotonic() - quote_started) * 1000),
+                quote_source=quote.source,
+                quote_json=quote.raw_json,
+            )
+        except Exception as exc:
+            signal = replace(
+                signal,
+                quote_snapshot_at=int(time.time()),
+                quote_latency_ms=int((time.monotonic() - quote_started) * 1000),
+                quote_source=f"quote_error:{type(exc).__name__}",
+            )
+        decision = broker.evaluate(signal)
+        broker.submit(signal, decision)
+        if not decision.accepted:
+            skipped += 1
+            rejections += 1
+            continue
+        recorded += 1
+    return PaperRunSummary(len(rows), recorded, skipped, rejections)
+
+
+def _evaluate_observation_row(
+    row: sqlite3.Row,
+    *,
+    broker: PaperBroker,
+    client: PublicPolymarketClient,
+    generated_at: int,
+    max_actionable_signal_age_sec: int,
+) -> dict[str, object]:
+    signal = _signal_from_row(row)
+    requested_stake = broker.requested_stake(signal)
+    quote_started = time.monotonic()
+    quote_error = ""
+    try:
+        quote = simulate_buy_quote(client.book(signal.asset_id), requested_stake)
+        signal = replace(
+            signal,
+            best_bid=quote.best_bid,
+            best_ask=quote.best_ask,
+            executable_price=quote.executable_price,
+            fillable_stake_usd=quote.fillable_stake_usd,
+            quote_snapshot_at=quote.snapshot_at,
+            quote_latency_ms=int((time.monotonic() - quote_started) * 1000),
+            quote_source=quote.source,
+            quote_json=quote.raw_json,
+        )
+    except Exception as exc:
+        quote_error = f"{type(exc).__name__}: {str(exc)[:180]}"
+        signal = replace(
+            signal,
+            quote_snapshot_at=int(time.time()),
+            quote_latency_ms=int((time.monotonic() - quote_started) * 1000),
+            quote_source=f"quote_error:{type(exc).__name__}",
+        )
+    decision = broker.evaluate(signal)
+    signal_age_sec = max(0, generated_at - signal.detected_at)
+    signal_fresh = max_actionable_signal_age_sec <= 0 or signal_age_sec <= max_actionable_signal_age_sec
+    actionable = bool(decision.accepted and signal_fresh)
+    actionability_reason = _actionability_reason(
+        accepted=decision.accepted,
+        signal_fresh=signal_fresh,
+        decision_reason=decision.reason,
+    )
+    return {
+        **_observation_from_row(row),
+        "signal_age_sec": signal_age_sec,
+        "max_actionable_signal_age_sec": max_actionable_signal_age_sec,
+        "requested_stake_usd": round(requested_stake, 2),
+        "best_bid": signal.best_bid,
+        "best_ask": signal.best_ask,
+        "executable_price": signal.executable_price,
+        "fillable_stake_usd": round(signal.fillable_stake_usd, 6),
+        "quote_snapshot_at": signal.quote_snapshot_at,
+        "quote_latency_ms": signal.quote_latency_ms,
+        "quote_source": signal.quote_source,
+        "quote_error": quote_error,
+        "accepted": decision.accepted,
+        "actionable": actionable,
+        "actionability_reason": actionability_reason,
+        "decision_reason": decision.reason,
+        "stake_usd": decision.stake_usd,
+        "route": decision.route,
+        "fee_usd": decision.fee_usd,
+        "slippage_bps": decision.slippage_bps if decision.accepted else None,
+        "observer_action": "external_paper_evaluate_no_order",
+    }
+
+
+def _actionability_reason(*, accepted: bool, signal_fresh: bool, decision_reason: str) -> str:
+    if not accepted:
+        return decision_reason
+    if not signal_fresh:
+        return "signal_too_old"
+    return "actionable_quote"
+
+
+def _observation_from_row(row: sqlite3.Row) -> dict[str, object]:
+    signal = _signal_from_row(row)
+    return {
+        "signal_id": signal.signal_id,
+        "wallet": signal.wallet,
+        "market_slug": signal.market_slug,
+        "asset_id": signal.asset_id,
+        "outcome": signal.outcome,
+        "side": signal.side,
+        "leader_price": signal.price,
+        "detected_at": signal.detected_at,
+        "ingested_at": int(row["ingested_at"] or 0),
+        "ingest_lag_sec": max(0, int(row["ingested_at"] or 0) - signal.detected_at),
+        "source": signal.source,
+        "validation_cohort": signal.validation_cohort,
+        "candidate_stage": row["candidate_stage"],
+        "leader_score": float(row["leader_score"] or 0),
+        "review_reason": row["review_reason"] or "",
+        "copy_event_count": float(row["copy_event_count"] or 0),
+        "hygiene_status": row["hygiene_status"] or "",
+        "trade_events": int(row["trade_events"] or 0),
+        "source_count": int(row["source_count"] or 0),
+        "observer_action": "external_paper_quote_and_evaluate",
+    }
+
+
+def _observer_activity_context(
+    conn: sqlite3.Connection,
+    *,
+    min_timestamp: int,
+    generated_at: int,
+) -> dict[str, int | None]:
+    placeholders = ",".join("?" for _ in PAPER_STAGES)
+    row = conn.execute(
+        f"""
+        SELECT
+            COUNT(DISTINCT cw.address) AS paper_stage_wallets,
+            MAX(wa.timestamp) AS latest_activity_ts,
+            MAX(wa.ingested_at) AS latest_activity_ingested_at,
+            MAX(CASE
+                WHEN wa.type = 'TRADE' AND UPPER(COALESCE(wa.side, '')) = 'BUY'
+                THEN wa.timestamp
+                ELSE NULL
+            END) AS latest_buy_ts,
+            MAX(CASE
+                WHEN wa.type = 'TRADE' AND UPPER(COALESCE(wa.side, '')) = 'BUY'
+                THEN wa.ingested_at
+                ELSE NULL
+            END) AS latest_buy_ingested_at,
+            SUM(CASE
+                WHEN wa.type = 'TRADE'
+                  AND UPPER(COALESCE(wa.side, '')) = 'BUY'
+                  AND wa.timestamp >= ?
+                THEN 1
+                ELSE 0
+            END) AS recent_buy_events
+            ,
+            AVG(CASE
+                WHEN wa.type = 'TRADE'
+                  AND UPPER(COALESCE(wa.side, '')) = 'BUY'
+                  AND wa.timestamp >= ?
+                THEN MAX(0, wa.ingested_at - wa.timestamp)
+                ELSE NULL
+            END) AS recent_buy_avg_ingest_lag_sec,
+            MAX(CASE
+                WHEN wa.type = 'TRADE'
+                  AND UPPER(COALESCE(wa.side, '')) = 'BUY'
+                  AND wa.timestamp >= ?
+                THEN MAX(0, wa.ingested_at - wa.timestamp)
+                ELSE NULL
+            END) AS recent_buy_max_ingest_lag_sec
+        FROM candidate_wallets cw
+        LEFT JOIN wallet_activity wa
+          ON wa.address = cw.address
+        WHERE cw.candidate_stage IN ({placeholders})
+        """,
+        (min_timestamp, min_timestamp, min_timestamp, *PAPER_STAGES),
+    ).fetchone()
+    latest_activity_ts = _optional_int(row["latest_activity_ts"] if row else None)
+    latest_buy_ts = _optional_int(row["latest_buy_ts"] if row else None)
+    latest_activity_ingested_at = _optional_int(row["latest_activity_ingested_at"] if row else None)
+    latest_buy_ingested_at = _optional_int(row["latest_buy_ingested_at"] if row else None)
+    return {
+        "paper_stage_wallets": int(row["paper_stage_wallets"] or 0) if row else 0,
+        "recent_buy_events": int(row["recent_buy_events"] or 0) if row else 0,
+        "latest_activity_ts": latest_activity_ts,
+        "latest_buy_ts": latest_buy_ts,
+        "latest_activity_ingested_at": latest_activity_ingested_at,
+        "latest_buy_ingested_at": latest_buy_ingested_at,
+        "latest_activity_age_sec": _age_seconds(latest_activity_ts, generated_at),
+        "latest_buy_age_sec": _age_seconds(latest_buy_ts, generated_at),
+        "recent_buy_avg_ingest_lag_sec": _optional_float(row["recent_buy_avg_ingest_lag_sec"] if row else None),
+        "recent_buy_max_ingest_lag_sec": _optional_int(row["recent_buy_max_ingest_lag_sec"] if row else None),
+    }
+
+
+def _observer_no_signal_reason(context: dict[str, int | None], *, min_timestamp: int) -> str:
+    if int(context.get("paper_stage_wallets") or 0) <= 0:
+        return "no_paper_stage_wallets"
+    latest_buy_ts = context.get("latest_buy_ts")
+    if latest_buy_ts is None:
+        return "no_buy_activity"
+    if int(latest_buy_ts) < min_timestamp:
+        return "latest_buy_outside_window"
+    if int(context.get("recent_buy_events") or 0) > 0:
+        return "recent_buys_failed_eligibility_or_deduped"
+    return "no_recent_buy_activity"
+
+
+def _observer_window_diagnostics(
+    conn: sqlite3.Connection,
+    *,
+    generated_at: int,
+    limit: int,
+) -> list[dict[str, object]]:
+    diagnostics: list[dict[str, object]] = []
+    for seconds, label in PAPER_OBSERVER_DIAGNOSTIC_WINDOWS:
+        min_timestamp = generated_at - seconds
+        rows = _candidate_activity_rows(
+            conn,
+            limit=limit,
+            min_timestamp=min_timestamp,
+            include_watchlist_min_score=None,
+            include_review_min_score=None,
+        )
+        context = _observer_activity_context(conn, min_timestamp=min_timestamp, generated_at=generated_at)
+        diagnostics.append(
+            {
+                "window_label": label,
+                "max_signal_age_sec": seconds,
+                "recent_buy_events": int(context.get("recent_buy_events") or 0),
+                "eligible_signals": len(rows),
+                "avg_ingest_lag_sec": context.get("recent_buy_avg_ingest_lag_sec"),
+                "max_ingest_lag_sec": context.get("recent_buy_max_ingest_lag_sec"),
+                "no_signal_reason": "" if rows else _observer_no_signal_reason(context, min_timestamp=min_timestamp),
+            }
+        )
+    return diagnostics
+
+
+def _optional_int(value: object) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _optional_float(value: object) -> float | None:
+    if value is None:
+        return None
+    try:
+        return round(float(value), 2)
+    except (TypeError, ValueError):
+        return None
+
+
+def _age_seconds(value: int | None, now: int) -> int | None:
+    if value is None:
+        return None
+    return max(0, int(now) - int(value))
+
+
+def _average(values: list[float]) -> float | None:
+    if not values:
+        return None
+    return round(sum(values) / len(values), 4)
+
+
+def _candidate_activity_rows(
+    conn: sqlite3.Connection,
+    *,
+    limit: int,
+    min_timestamp: int,
+    include_watchlist_min_score: float | None,
+    include_review_min_score: float | None,
+) -> list[sqlite3.Row]:
+    placeholders = ",".join("?" for _ in PAPER_STAGES)
+    params: list[object] = [*PAPER_STAGES]
+    _ = include_watchlist_min_score, include_review_min_score
+    stage_filter = f"cw.candidate_stage IN ({placeholders})"
+    params.extend([*PAPER_BLOCKERS, PAPER_MIN_PRICE, PAPER_MAX_PRICE, min_timestamp, limit])
+    rows = conn.execute(
+        f"""
+        SELECT
+            wa.activity_id,
+            wa.address,
+            wa.market_slug,
+            wa.asset_id,
+            wa.outcome,
+            wa.side,
+            wa.price,
+            wa.timestamp,
+            wa.ingested_at,
+            cw.candidate_stage,
+            COALESCE(ls.leader_score, 0) AS leader_score,
+            COALESCE(ls.review_reason, '') AS review_reason,
+            COALESCE(wf.copy_event_count, 0) AS copy_event_count,
+            COALESCE(wf.hygiene_status, '') AS hygiene_status,
+            COALESCE(pwq.blockers_json, '[]') AS paper_blockers_json,
+            (
+                SELECT COUNT(*)
+                FROM wallet_activity trade_events
+                WHERE trade_events.address = wa.address
+                  AND trade_events.type = 'TRADE'
+            ) AS trade_events,
+            (
+                SELECT COUNT(*)
+                FROM candidate_source_events cse
+                WHERE cse.address = wa.address
+            ) AS source_count
+        FROM wallet_activity wa
+        JOIN candidate_wallets cw
+          ON cw.address = wa.address
+        LEFT JOIN leader_scores ls
+          ON ls.score_id = (
+              SELECT score_id
+              FROM leader_scores
+              WHERE address = cw.address
+              ORDER BY scored_at DESC, score_id DESC
+              LIMIT 1
+          )
+        LEFT JOIN paper_wallet_quality pwq
+          ON pwq.wallet = wa.address
+        LEFT JOIN wallet_features wf
+          ON wf.address = wa.address
+        WHERE {stage_filter}
+          AND NOT EXISTS (
+              SELECT 1
+              FROM json_each(CASE
+                  WHEN json_valid(COALESCE(pwq.blockers_json, '[]')) THEN pwq.blockers_json
+                  ELSE '[]'
+              END) blocker
+              WHERE blocker.value IN ({",".join("?" for _ in PAPER_BLOCKERS)})
+          )
+          AND wa.type = 'TRADE'
+          AND UPPER(COALESCE(wa.side, '')) = 'BUY'
+          AND wa.price >= ?
+          AND wa.price <= ?
+          AND wa.timestamp >= ?
+          AND COALESCE(wa.market_slug, '') != ''
+          AND COALESCE(wa.asset_id, '') != ''
+          AND NOT EXISTS (
+              SELECT 1 FROM paper_orders po
+              WHERE po.signal_id = 'activity-' || wa.activity_id
+                AND (
+                    po.accepted = 1
+                    OR po.created_at >= strftime('%s','now') - 300
+                )
+          )
+        ORDER BY wa.timestamp DESC, wa.activity_id DESC
+        LIMIT ?
+        """,
+        params,
+    ).fetchall()
+    return [
+        row
+        for row in rows
+        if paper_eligibility_status(conn, row["address"], facts=row).eligible
+    ]
+
+
+def _signal_from_row(row: sqlite3.Row) -> TradeSignal:
+    return TradeSignal(
+        signal_id=f"activity-{row['activity_id']}",
+        wallet=row["address"],
+        market_slug=row["market_slug"],
+        asset_id=row["asset_id"],
+        outcome=row["outcome"] or "",
+        side=row["side"],
+        price=float(row["price"]),
+        detected_at=int(row["timestamp"]),
+        source=_signal_source(row),
+        confidence=1.0,
+        validation_cohort=(
+            "exploratory"
+            if row["candidate_stage"] in PROVISIONAL_CANDIDATE_STAGES
+            else "validation"
+        ),
+    )
+
+
+def _signal_source(row: sqlite3.Row) -> str:
+    if row["candidate_stage"] in PROVISIONAL_CANDIDATE_STAGES:
+        if row["review_reason"] == "watchlist_score":
+            return "paper_watchlist_activity"
+        return "paper_review_activity"
+    return "paper_wallet_activity"

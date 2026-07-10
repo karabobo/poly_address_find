@@ -1,0 +1,12 @@
+[Unit]
+Description=pm-robot full Gamma market metadata cache
+After=network-online.target pm-robot-activity.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/pm-robot
+EnvironmentFile=/opt/pm-robot/.env
+TimeoutStartSec=420
+Environment=PM_ROBOT_LOCK_WAIT=90
+Environment=PM_ROBOT_TASK_NAME=gamma
+ExecStart=/opt/pm-robot/deploy/scripts/run_locked.sh /opt/pm-robot/.venv/bin/python -m pm_robot.cli --env /opt/pm-robot/.env ingest-gamma-markets --limit 30 --ttl-seconds 43200 --sleep 0.05

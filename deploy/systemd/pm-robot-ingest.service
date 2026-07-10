@@ -1,0 +1,12 @@
+[Unit]
+Description=pm-robot positions ingestor
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/pm-robot
+EnvironmentFile=/opt/pm-robot/.env
+TimeoutStartSec=300
+Environment=PM_ROBOT_LOCK_WAIT=30
+Environment=PM_ROBOT_TASK_NAME=ingest
+ExecStart=/opt/pm-robot/deploy/scripts/run_locked.sh /opt/pm-robot/.venv/bin/python -m pm_robot.cli --env /opt/pm-robot/.env ingest-positions --limit 1 --size-threshold 0 --sleep 0.1

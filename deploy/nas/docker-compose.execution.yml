@@ -1,0 +1,44 @@
+x-pm-robot-execution-app: &pm_robot_execution_app
+  build:
+    context: ./app
+    dockerfile: deploy/nas/Dockerfile
+  image: pm-robot:nas
+  restart: unless-stopped
+  profiles:
+    - execution
+  env_file:
+    - ./.env
+  working_dir: /app
+  volumes:
+    - ./app/src:/app/src:ro
+    - ./app/deploy:/app/deploy:ro
+    - ./app/scripts:/app/scripts:ro
+    - ./data:/app/data
+    - ./logs:/app/logs
+    - ./backups:/app/backups
+    - ./reports:/app/reports
+    - ./config:/app/config:ro
+
+services:
+  paper-runner-loop:
+    <<: *pm_robot_execution_app
+    container_name: pm-robot-paper-runner-loop
+    command:
+      - /bin/sh
+      - /app/deploy/nas/paper-runner-loop.sh
+    depends_on:
+      - proxy-tunnel
+
+  paper-settle-loop:
+    <<: *pm_robot_execution_app
+    container_name: pm-robot-paper-settle-loop
+    command:
+      - /bin/sh
+      - /app/deploy/nas/paper-settle-loop.sh
+
+  publish-loop:
+    <<: *pm_robot_execution_app
+    container_name: pm-robot-publish-loop
+    command:
+      - /bin/sh
+      - /app/deploy/nas/publish-loop.sh

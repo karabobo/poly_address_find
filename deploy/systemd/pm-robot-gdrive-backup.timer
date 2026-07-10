@@ -1,0 +1,10 @@
+[Unit]
+Description=Run pm-robot Google Drive backup daily
+
+[Timer]
+OnCalendar=*-*-* 05:05:00 UTC
+AccuracySec=10min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

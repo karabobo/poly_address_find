@@ -1,0 +1,12 @@
+[Unit]
+Description=pm-robot copy graph miner
+After=network-online.target pm-robot-gamma.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/pm-robot
+EnvironmentFile=/opt/pm-robot/.env
+TimeoutStartSec=900
+Environment=PM_ROBOT_LOCK_WAIT=120
+Environment=PM_ROBOT_TASK_NAME=copy-graph
+ExecStart=/opt/pm-robot/deploy/scripts/run_locked.sh /opt/pm-robot/.venv/bin/python -m pm_robot.cli --env /opt/pm-robot/.env mine-copy-graph

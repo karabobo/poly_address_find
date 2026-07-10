@@ -1,0 +1,11 @@
+[Unit]
+Description=Run pm-robot evidence backfill catch-up every 6 minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitInactiveSec=6min
+AccuracySec=30s
+Persistent=true
+
+[Install]
+WantedBy=timers.target

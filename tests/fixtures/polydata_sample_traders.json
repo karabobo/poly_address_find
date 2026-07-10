@@ -1,0 +1,79 @@
+{
+  "source": "test-fixture",
+  "count": 5,
+  "traders": [
+    {
+      "nickname": "fixture-alpha",
+      "wallet": "0x6a72f61820b26b1fe4d956e17b6dc2a1ea3033ee",
+      "rank": 1,
+      "net_pnl": 1200.5,
+      "volume": 50000,
+      "win_rate": 58.5,
+      "smart_score": 82,
+      "smart_level": "Elite",
+      "bot_score": 12,
+      "bot_verdict": "manual",
+      "pnl": {
+        "win_rate": 0.585,
+        "pos_event_win_rate": 0.62,
+        "profit_factor": 1.8,
+        "pos_realized_pnl": 1000,
+        "top3_pnl": 250
+      },
+      "dca": {
+        "avg_dca": 2.4
+      },
+      "profile": {
+        "sell_pct": 48
+      },
+      "bot": {
+        "trades_per_day": 4.2,
+        "med_gap": 3600
+      },
+      "risk": {
+        "sharpe": 1.1,
+        "hhi": 0.12,
+        "top5_pct": 0.35
+      },
+      "categories": {
+        "Politics": {
+          "volume": 30000
+        },
+        "Sports": {
+          "volume": 20000
+        }
+      }
+    },
+    {
+      "nickname": "fixture-beta",
+      "wallet": "0x1111111111111111111111111111111111111111",
+      "net_pnl": 250,
+      "volume": 9000,
+      "win_rate": 51,
+      "pnl": {
+        "win_rate": 0.51
+      }
+    },
+    {
+      "nickname": "fixture-gamma",
+      "wallet": "0x2222222222222222222222222222222222222222",
+      "net_pnl": -50,
+      "volume": 3000,
+      "win_rate": 45
+    },
+    {
+      "nickname": "fixture-delta",
+      "wallet": "0x3333333333333333333333333333333333333333",
+      "net_pnl": 750,
+      "volume": 15000,
+      "win_rate": 54
+    },
+    {
+      "nickname": "fixture-epsilon",
+      "wallet": "0x4444444444444444444444444444444444444444",
+      "net_pnl": 125,
+      "volume": 6000,
+      "win_rate": 49
+    }
+  ]
+}

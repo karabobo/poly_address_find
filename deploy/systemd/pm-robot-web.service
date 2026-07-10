@@ -1,0 +1,14 @@
+[Unit]
+Description=pm-robot read-only research web console
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/pm-robot
+EnvironmentFile=/opt/pm-robot/.env
+ExecStart=/opt/pm-robot/.venv/bin/python -m pm_robot.cli --env /opt/pm-robot/.env web --host 127.0.0.1 --port 8787
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

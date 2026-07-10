@@ -1,0 +1,11 @@
+[Unit]
+Description=pm-robot v2 wallet evidence pipeline worker %i
+After=network-online.target pm-robot-evidence-planner.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/pm-robot
+EnvironmentFile=/opt/pm-robot/.env
+TimeoutStartSec=900
+Environment=PM_ROBOT_TASK_NAME=wallet-pipeline-worker-%i
+ExecStart=/opt/pm-robot/.venv/bin/python -m pm_robot.cli --env /opt/pm-robot/.env wallet-pipeline-worker --shard-index %i --shard-count 3 --limit 5 --page-limit 200 --sleep 0.02 --lease-seconds 900 --worker-id wallet-pipeline-worker-%i

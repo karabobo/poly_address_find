@@ -1,0 +1,84 @@
+{
+  "version": "2026-07-09-copyability-containment-calibrated",
+  "description": "Paper-driven Polymarket leader scoring and review policy; paper candidates require validated copyability evidence with containment calibrated for multi-strategy followers.",
+  "papers": [
+    {
+      "file": "ssrn-6624899.pdf",
+      "role": "smart-money wallet behavior and resolution-edge signals"
+    },
+    {
+      "file": "ssrn-6670318.pdf",
+      "role": "copy relationship identification and return-to-imitation signals"
+    }
+  ],
+  "thresholds": {
+    "min_directional_trades": 100,
+    "min_directional_volume_usdc": 1000,
+    "min_recent_30d_volume_usdc": 500,
+    "min_net_pnl_usdc_for_candidate": 50,
+    "min_copy_backtest_net_pnl_usdc": 5,
+    "min_copy_events": 5,
+    "min_copy_markets": 5,
+    "max_copy_lag_blocks": 1,
+    "max_copy_lag_seconds": 15,
+    "min_containment_pct": 0.2,
+    "min_leader_precedes_pct": 0.9,
+    "copy_backtest_stake_usdc": 10,
+    "copy_backtest_friction_bps": 150,
+    "min_copy_backtest_trades": 5,
+    "max_maker_fraction_for_directional_leader": 0.5,
+    "max_bot_score_without_penalty": 55,
+    "pure_bot_score": 80,
+    "max_hft_trades_per_day": 500,
+    "max_hft_median_gap_sec": 5,
+    "max_sell_pct_for_holder_bonus": 10,
+    "min_avg_dca_for_holder_bonus": 10,
+    "min_event_win_rate_for_bonus": 0.75,
+    "max_single_market_pnl_share": 0.5,
+    "min_net_to_gross_exposure": 0.35
+  },
+  "weights": {
+    "cumulative_win_rate": 18,
+    "recent_30d_activity": 14,
+    "net_pnl_quality": 10,
+    "event_win_rate": 14,
+    "dca_intensity": 10,
+    "low_sell_rate": 8,
+    "copy_leader_graph": 16,
+    "copy_stream_roi": 10,
+    "slow_resolution_specialization": 6,
+    "execution_copyability": 10,
+    "risk_adjusted_performance": 8
+  },
+  "penalties": {
+    "routing_operator": 100,
+    "wash_flag": 100,
+    "market_maker_taker": 40,
+    "pure_bot_or_hft": 20,
+    "one_off_big_win_salience": 12,
+    "single_market_pnl_concentration": 15,
+    "hedge_or_arbitrage_unreplicable": 25,
+    "negative_lifetime_pnl": 20,
+    "stale_wallet": 15
+  },
+  "review_bands": {
+    "paper_candidate": 70,
+    "formal_validation_candidate": 40,
+    "watchlist": 50,
+    "reject_below": 35
+  },
+  "required_score_components": [
+    "hygiene_status",
+    "cumulative_win_rate",
+    "recent_30d_volume_usdc",
+    "trade_win_rate",
+    "avg_dca_entries",
+    "sell_pct",
+    "bot_score",
+    "leader_in_degree",
+    "copy_event_count",
+    "copy_market_count",
+    "single_market_pnl_share",
+    "net_to_gross_exposure"
+  ]
+}

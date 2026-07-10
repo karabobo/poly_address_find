@@ -1,0 +1,397 @@
+services:
+  proxy-tunnel:
+    build:
+      context: ./app
+      dockerfile: deploy/nas/Dockerfile.tunnel
+    image: pm-robot:ssh-tunnel
+    container_name: pm-robot-proxy-tunnel
+    restart: unless-stopped
+    network_mode: host
+    env_file:
+      - ./.env
+    environment:
+      PM_ROBOT_PROXY_LOCAL_HOST: ${PM_ROBOT_PROXY_LOCAL_HOST:-172.19.0.1}
+      PM_ROBOT_PROXY_LOCAL_PORT: ${PM_ROBOT_PROXY_LOCAL_PORT:-18082}
+      PM_ROBOT_PROXY_REMOTE_HOST: ${PM_ROBOT_PROXY_REMOTE_HOST:-127.0.0.1}
+      PM_ROBOT_PROXY_REMOTE_PORT: ${PM_ROBOT_PROXY_REMOTE_PORT:-18081}
+      PM_ROBOT_VPS_KEY_PATH: /ssh/id_ed25519_pmrobot_vps
+      PM_ROBOT_PROXY_TUNNEL_LOG_PATH: /logs/vps-http-proxy-tunnel.log
+    volumes:
+      - ./ssh:/ssh:ro
+      - ./logs:/logs
+
+  web:
+    build:
+      context: ./app
+      dockerfile: deploy/nas/Dockerfile
+    image: pm-robot:nas
+    container_name: pm-robot-web
+    restart: unless-stopped
+    env_file:
+      - ./.env
+    working_dir: /app
+    command:
+      - python
+      - -m
+      - pm_robot.cli
+      - --env
+      - /app/.env
+      - web
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8787"
+    ports:
+      - "8787:8787"
+    volumes:
+      - ./app/src:/app/src:ro
+      - ./app/deploy:/app/deploy:ro
+      - ./app/scripts:/app/scripts:ro
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./backups:/app/backups
+      - ./reports:/app/reports
+      - ./config:/app/config:ro
+
+  pipeline-planner:
+    build:
+      context: ./app
+      dockerfile: deploy/nas/Dockerfile
+    image: pm-robot:nas
+    container_name: pm-robot-pipeline-planner
+    restart: unless-stopped
+    env_file:
+      - ./.env
+    working_dir: /app
+    command:
+      - /bin/sh
+      - /app/deploy/nas/wallet-pipeline-planner-loop.sh
+    depends_on:
+      - proxy-tunnel
+    volumes:
+      - ./app/src:/app/src:ro
+      - ./app/deploy:/app/deploy:ro
+      - ./app/scripts:/app/scripts:ro
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./backups:/app/backups
+      - ./reports:/app/reports
+      - ./config:/app/config:ro
+
+  discovery-loop:
+    build:
+      context: ./app
+      dockerfile: deploy/nas/Dockerfile
+    image: pm-robot:nas
+    container_name: pm-robot-discovery-loop
+    restart: unless-stopped
+    env_file:
+      - ./.env
+    working_dir: /app
+    command:
+      - /bin/sh
+      - /app/deploy/nas/discovery-loop.sh
+    depends_on:
+      - proxy-tunnel
+      - pipeline-planner
+    volumes:
+      - ./app/src:/app/src:ro
+      - ./app/deploy:/app/deploy:ro
+      - ./app/scripts:/app/scripts:ro
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./backups:/app/backups
+      - ./reports:/app/reports
+      - ./config:/app/config:ro
+
+  rtds-discovery:
+    build:
+      context: ./app
+      dockerfile: deploy/nas/Dockerfile
+    image: pm-robot:nas
+    container_name: pm-robot-rtds-discovery
+    restart: unless-stopped
+    env_file:
+      - ./.env
+    working_dir: /app
+    command:
+      - /bin/sh
+      - /app/deploy/nas/rtds-discovery-loop.sh
+    depends_on:
+      - proxy-tunnel
+      - pipeline-planner
+    volumes:
+      - ./app/src:/app/src:ro
+      - ./app/deploy:/app/deploy:ro
+      - ./app/scripts:/app/scripts:ro
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./backups:/app/backups
+      - ./reports:/app/reports
+      - ./config:/app/config:ro
+
+  pipeline-worker-0:
+    build:
+      context: ./app
+      dockerfile: deploy/nas/Dockerfile
+    image: pm-robot:nas
+    container_name: pm-robot-pipeline-worker-0
+    restart: unless-stopped
+    env_file:
+      - ./.env
+    environment:
+      PM_ROBOT_PIPELINE_SHARD_INDEX: "0"
+    working_dir: /app
+    command:
+      - /bin/sh
+      - /app/deploy/nas/wallet-pipeline-worker-loop.sh
+    depends_on:
+      - proxy-tunnel
+      - pipeline-planner
+    volumes:
+      - ./app/src:/app/src:ro
+      - ./app/deploy:/app/deploy:ro
+      - ./app/scripts:/app/scripts:ro
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./backups:/app/backups
+      - ./reports:/app/reports
+      - ./config:/app/config:ro
+
+  pipeline-worker-1:
+    build:
+      context: ./app
+      dockerfile: deploy/nas/Dockerfile
+    image: pm-robot:nas
+    container_name: pm-robot-pipeline-worker-1
+    restart: unless-stopped
+    env_file:
+      - ./.env
+    environment:
+      PM_ROBOT_PIPELINE_SHARD_INDEX: "1"
+    working_dir: /app
+    command:
+      - /bin/sh
+      - /app/deploy/nas/wallet-pipeline-worker-loop.sh
+    depends_on:
+      - proxy-tunnel
+      - pipeline-planner
+    volumes:
+      - ./app/src:/app/src:ro
+      - ./app/deploy:/app/deploy:ro
+      - ./app/scripts:/app/scripts:ro
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./backups:/app/backups
+      - ./reports:/app/reports
+      - ./config:/app/config:ro
+
+  pipeline-worker-2:
+    build:
+      context: ./app
+      dockerfile: deploy/nas/Dockerfile
+    image: pm-robot:nas
+    container_name: pm-robot-pipeline-worker-2
+    restart: unless-stopped
+    env_file:
+      - ./.env
+    environment:
+      PM_ROBOT_PIPELINE_SHARD_INDEX: "2"
+    working_dir: /app
+    command:
+      - /bin/sh
+      - /app/deploy/nas/wallet-pipeline-worker-loop.sh
+    depends_on:
+      - proxy-tunnel
+      - pipeline-planner
+    volumes:
+      - ./app/src:/app/src:ro
+      - ./app/deploy:/app/deploy:ro
+      - ./app/scripts:/app/scripts:ro
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./backups:/app/backups
+      - ./reports:/app/reports
+      - ./config:/app/config:ro
+
+  copyability-planner:
+    build:
+      context: ./app
+      dockerfile: deploy/nas/Dockerfile
+    image: pm-robot:nas
+    container_name: pm-robot-copyability-planner
+    restart: unless-stopped
+    env_file:
+      - ./.env
+    working_dir: /app
+    command:
+      - /bin/sh
+      - /app/deploy/nas/copyability-planner-loop.sh
+    depends_on:
+      - pipeline-planner
+    volumes:
+      - ./app/src:/app/src:ro
+      - ./app/deploy:/app/deploy:ro
+      - ./app/scripts:/app/scripts:ro
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./backups:/app/backups
+      - ./reports:/app/reports
+      - ./config:/app/config:ro
+
+  copyability-worker-0:
+    build:
+      context: ./app
+      dockerfile: deploy/nas/Dockerfile
+    image: pm-robot:nas
+    container_name: pm-robot-copyability-worker-0
+    restart: unless-stopped
+    env_file:
+      - ./.env
+    environment:
+      PM_ROBOT_COPYABILITY_SHARD_INDEX: "0"
+    working_dir: /app
+    command:
+      - /bin/sh
+      - /app/deploy/nas/copyability-worker-loop.sh
+    depends_on:
+      - copyability-planner
+    volumes:
+      - ./app/src:/app/src:ro
+      - ./app/deploy:/app/deploy:ro
+      - ./app/scripts:/app/scripts:ro
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./backups:/app/backups
+      - ./reports:/app/reports
+      - ./config:/app/config:ro
+
+  copyability-worker-1:
+    build:
+      context: ./app
+      dockerfile: deploy/nas/Dockerfile
+    image: pm-robot:nas
+    container_name: pm-robot-copyability-worker-1
+    restart: unless-stopped
+    env_file:
+      - ./.env
+    environment:
+      PM_ROBOT_COPYABILITY_SHARD_INDEX: "0"
+      PM_ROBOT_COPYABILITY_WORKER_ID: "nas-copyability-worker-1"
+      PM_ROBOT_COPYABILITY_PREFER_SCAN_MODE: "light_missing_copyability"
+    working_dir: /app
+    command:
+      - /bin/sh
+      - /app/deploy/nas/copyability-worker-loop.sh
+    depends_on:
+      - copyability-planner
+    volumes:
+      - ./app/src:/app/src:ro
+      - ./app/deploy:/app/deploy:ro
+      - ./app/scripts:/app/scripts:ro
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./backups:/app/backups
+      - ./reports:/app/reports
+      - ./config:/app/config:ro
+
+  score-loop:
+    build:
+      context: ./app
+      dockerfile: deploy/nas/Dockerfile
+    image: pm-robot:nas
+    container_name: pm-robot-score-loop
+    restart: unless-stopped
+    env_file:
+      - ./.env
+    working_dir: /app
+    command:
+      - /bin/sh
+      - /app/deploy/nas/score-loop.sh
+    depends_on:
+      - pipeline-planner
+    volumes:
+      - ./app/src:/app/src:ro
+      - ./app/deploy:/app/deploy:ro
+      - ./app/scripts:/app/scripts:ro
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./backups:/app/backups
+      - ./reports:/app/reports
+      - ./config:/app/config:ro
+
+  paper-observer-loop:
+    build:
+      context: ./app
+      dockerfile: deploy/nas/Dockerfile
+    image: pm-robot:nas
+    container_name: pm-robot-paper-observer-loop
+    restart: unless-stopped
+    env_file:
+      - ./.env
+    working_dir: /app
+    command:
+      - /bin/sh
+      - /app/deploy/nas/paper-observer-loop.sh
+    depends_on:
+      - proxy-tunnel
+    volumes:
+      - ./app/src:/app/src:ro
+      - ./app/deploy:/app/deploy:ro
+      - ./app/scripts:/app/scripts:ro
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./backups:/app/backups
+      - ./reports:/app/reports
+      - ./config:/app/config:ro
+
+  maintenance-loop:
+    build:
+      context: ./app
+      dockerfile: deploy/nas/Dockerfile
+    image: pm-robot:nas
+    container_name: pm-robot-maintenance-loop
+    restart: unless-stopped
+    env_file:
+      - ./.env
+    working_dir: /app
+    command:
+      - /bin/sh
+      - /app/deploy/nas/maintenance-loop.sh
+    volumes:
+      - ./app/src:/app/src:ro
+      - ./app/deploy:/app/deploy:ro
+      - ./app/scripts:/app/scripts:ro
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./backups:/app/backups
+      - ./reports:/app/reports
+      - ./config:/app/config:ro
+
+  task:
+    build:
+      context: ./app
+      dockerfile: deploy/nas/Dockerfile
+    image: pm-robot:nas
+    profiles:
+      - manual
+    env_file:
+      - ./.env
+    working_dir: /app
+    entrypoint:
+      - python
+      - -m
+      - pm_robot.cli
+      - --env
+      - /app/.env
+    volumes:
+      - ./app/src:/app/src:ro
+      - ./app/deploy:/app/deploy:ro
+      - ./app/scripts:/app/scripts:ro
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./backups:/app/backups
+      - ./reports:/app/reports
+      - ./config:/app/config:ro
+    command:
+      - status

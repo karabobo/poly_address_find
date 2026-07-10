@@ -1,0 +1,761 @@
+import json
+
+from pm_robot.models import CandidateAddress, CandidateStage
+from pm_robot.orchestration.copyability_evidence import JOB_TYPE as COPYABILITY_JOB_TYPE
+from pm_robot.orchestration.evidence_backfill import summarize_wallet_evidence
+from pm_robot.orchestration.wallet_pipeline import (
+    JOB_TYPE as WALLET_EVIDENCE_JOB_TYPE,
+    plan_wallet_pipeline_jobs,
+    run_wallet_pipeline_worker,
+    wallet_pipeline_job_status,
+)
+from pm_robot.pipeline_terms import (
+    CANDIDATE_STAGES,
+    COMPATIBLE_PIPELINE_STAGE_ORDER,
+    DEFAULT_EVIDENCE_JOB_STAGE,
+    EVIDENCE_JOB_STAGES,
+    EVIDENCE_STATUSES,
+    EVIDENCE_TIERS,
+    PAPER_ELIGIBLE_CANDIDATE_STAGES,
+    PAPER_READY_CANDIDATE_STAGES,
+    PENDING_EVIDENCE_JOB_STAGES,
+    PIPELINE_JOB_TYPES,
+    PROVISIONAL_CANDIDATE_STAGES,
+    PUBLISHABLE_CANDIDATE_STAGE,
+    REVIEW_FUNNEL_CANDIDATE_STAGES,
+    TERMINAL_EVIDENCE_JOB_STAGES,
+    EvidenceJobStage,
+    EvidenceStatus,
+    EvidenceTier,
+    PipelineJobType,
+)
+from pm_robot.storage.db import connect, run_migrations
+from pm_robot.storage.repository import (
+    claim_pipeline_job,
+    complete_pipeline_job,
+    enqueue_pipeline_job,
+    materialize_wallet_processing_state,
+    persist_wallet_activity,
+    pipeline_job_summary,
+    renew_pipeline_job_lease,
+    seed_evidence_backfill_budget,
+    sync_wallet_processing_state,
+    upsert_candidate,
+    upsert_wallet_evidence_summary,
+    wallet_pipeline_tier,
+)
+
+
+def _event(wallet: str, idx: int, *, market: str) -> dict:
+    return {
+        "proxyWallet": wallet,
+        "timestamp": 10_000 + idx,
+        "conditionId": f"condition-{idx % 30}",
+        "eventSlug": f"event-{idx % 30}",
+        "slug": market,
+        "asset": f"asset-{idx % 30}",
+        "outcome": "YES",
+        "type": "TRADE",
+        "side": "BUY" if idx % 4 else "SELL",
+        "price": 0.55,
+        "size": 20,
+        "usdcSize": 11,
+        "transactionHash": f"0x{idx:064x}",
+    }
+
+
+class FakePipelineClient:
+    def __init__(self, activity_by_wallet, positions_by_wallet=None):
+        self.activity_by_wallet = activity_by_wallet
+        self.positions_by_wallet = positions_by_wallet or {}
+        self.activity_calls = []
+        self.position_calls = []
+
+    def activity(self, wallet, *, limit, offset):
+        self.activity_calls.append((wallet, limit, offset))
+        rows = self.activity_by_wallet.get(wallet, [])
+        return rows[offset : offset + limit]
+
+    def positions(self, wallet, *, size_threshold=0.0):
+        self.position_calls.append((wallet, size_threshold))
+        return self.positions_by_wallet.get(wallet, [])
+
+
+def _seed_light_pending_state(conn, wallet: str, *, priority: int = 50, now: int = 30_000) -> None:
+    upsert_candidate(conn, CandidateAddress(address=wallet, sources="polymarket_trades_global"))
+    conn.execute(
+        """
+        INSERT INTO wallet_processing_state(
+            wallet, discovery_tier, evidence_status, evidence_depth,
+            evidence_confidence, priority, current_stage, next_action,
+            next_action_at, activity_count, distinct_markets,
+            non_fast_trade_count, updated_at
+        ) VALUES (?, 'l0_discovered', 'needs_light', 0, 0.0, ?,
+                  '', 'light_pending', 0, 0, 0, 0, ?)
+        """,
+        (wallet, priority, now),
+    )
+
+
+def test_wallet_pipeline_tier_thresholds():
+    assert wallet_pipeline_tier(0, 0, 0, 0.0) == "l0_discovered"
+    assert wallet_pipeline_tier(24, 2, 4, 0.0) == "l1_light"
+    assert wallet_pipeline_tier(240, 6, 220, 0.0) == "l2_medium"
+    assert wallet_pipeline_tier(1_000, 12, 100, 0.1) == "l3_deep"
+    assert wallet_pipeline_tier(240, 6, 20, 0.9) == "l1_light"
+
+
+def test_pipeline_terms_are_canonical_and_compatible():
+    assert EVIDENCE_TIERS == (
+        EvidenceTier.L0_DISCOVERED.value,
+        EvidenceTier.L1_LIGHT.value,
+        EvidenceTier.L2_MEDIUM.value,
+        EvidenceTier.L3_DEEP.value,
+    )
+    assert all("l4" not in value for value in EVIDENCE_TIERS)
+    assert EVIDENCE_JOB_STAGES == (
+        EvidenceJobStage.LIGHT_PENDING.value,
+        EvidenceJobStage.LIGHT_DONE.value,
+        EvidenceJobStage.MEDIUM_PENDING.value,
+        EvidenceJobStage.MEDIUM_DONE.value,
+        EvidenceJobStage.DEEP_PENDING.value,
+        EvidenceJobStage.DEEP_DONE.value,
+    )
+    assert PENDING_EVIDENCE_JOB_STAGES == (
+        EvidenceJobStage.LIGHT_PENDING.value,
+        EvidenceJobStage.MEDIUM_PENDING.value,
+        EvidenceJobStage.DEEP_PENDING.value,
+    )
+    assert TERMINAL_EVIDENCE_JOB_STAGES == (
+        EvidenceJobStage.LIGHT_DONE.value,
+        EvidenceJobStage.MEDIUM_DONE.value,
+        EvidenceJobStage.DEEP_DONE.value,
+    )
+    assert DEFAULT_EVIDENCE_JOB_STAGE == EvidenceJobStage.LIGHT_PENDING.value
+    assert PIPELINE_JOB_TYPES == (
+        PipelineJobType.WALLET_EVIDENCE_BACKFILL.value,
+        PipelineJobType.COPYABILITY_EVIDENCE.value,
+    )
+    assert EVIDENCE_STATUSES == (
+        EvidenceStatus.PENDING.value,
+        EvidenceStatus.NEEDS_LIGHT.value,
+        EvidenceStatus.NEEDS_MEDIUM.value,
+        EvidenceStatus.NEEDS_DEEP.value,
+        EvidenceStatus.QUEUED.value,
+        EvidenceStatus.SUMMARY_READY.value,
+        EvidenceStatus.PAUSED.value,
+    )
+
+    assert WALLET_EVIDENCE_JOB_TYPE == PipelineJobType.WALLET_EVIDENCE_BACKFILL.value
+    assert COPYABILITY_JOB_TYPE == PipelineJobType.COPYABILITY_EVIDENCE.value
+    assert CandidateStage.NEEDS_REVIEW.value in CANDIDATE_STAGES
+    assert CandidateStage.PAPER_CANDIDATE.value in CANDIDATE_STAGES
+    assert REVIEW_FUNNEL_CANDIDATE_STAGES == (
+        CandidateStage.NEEDS_REVIEW.value,
+        CandidateStage.PAPER_CANDIDATE.value,
+        CandidateStage.PAPER_APPROVED.value,
+        CandidateStage.LIVE_ELIGIBLE.value,
+    )
+    assert PAPER_ELIGIBLE_CANDIDATE_STAGES == (
+        CandidateStage.PAPER_CANDIDATE.value,
+        CandidateStage.PAPER_APPROVED.value,
+        CandidateStage.LIVE_ELIGIBLE.value,
+    )
+    assert PAPER_READY_CANDIDATE_STAGES == PAPER_ELIGIBLE_CANDIDATE_STAGES
+    assert PROVISIONAL_CANDIDATE_STAGES == (CandidateStage.NEEDS_REVIEW.value,)
+    assert PUBLISHABLE_CANDIDATE_STAGE == CandidateStage.LIVE_ELIGIBLE.value
+    assert COMPATIBLE_PIPELINE_STAGE_ORDER == (
+        CandidateStage.LIVE_ELIGIBLE.value,
+        CandidateStage.PAPER_APPROVED.value,
+        CandidateStage.PAPER_CANDIDATE.value,
+        CandidateStage.NEEDS_REVIEW.value,
+    )
+
+
+def test_wallet_evidence_summary_and_state_are_idempotent(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    wallet = "0x" + "1" * 40
+    try:
+        run_migrations(conn)
+        upsert_candidate(conn, CandidateAddress(address=wallet, sources="polymarket_trades_global"))
+        seed_evidence_backfill_budget(conn, wallet, source="polymarket_trades_global", priority=12)
+        persist_wallet_activity(
+            conn,
+            wallet,
+            [_event(wallet, idx, market=f"politics-market-{idx % 6}") for idx in range(240)],
+            ingested_at=20_000,
+        )
+        evidence = summarize_wallet_evidence(conn, wallet)
+
+        for _ in range(2):
+            upsert_wallet_evidence_summary(
+                conn,
+                wallet,
+                evidence,
+                source_artifacts=[f"sqlite://wallet_activity/{wallet}"],
+                computed_at=30_000,
+            )
+            state = sync_wallet_processing_state(
+                conn,
+                wallet,
+                evidence,
+                source="test",
+                now=30_000,
+            )
+            conn.commit()
+
+        summary = conn.execute(
+            "SELECT * FROM wallet_evidence_summary WHERE wallet = ?",
+            (wallet,),
+        ).fetchone()
+        state_row = conn.execute(
+            "SELECT * FROM wallet_processing_state WHERE wallet = ?",
+            (wallet,),
+        ).fetchone()
+        artifacts = conn.execute("SELECT * FROM data_artifacts").fetchall()
+        copyability = json.loads(summary["copyability_json"])
+
+        assert evidence["activity_count"] == 240
+        assert state["discovery_tier"] == "l2_medium"
+        assert summary["distinct_markets"] == 6
+        assert copyability["usable_for_paper"] is True
+        assert state_row["priority"] == 12
+        assert state_row["evidence_status"] == "needs_deep"
+        assert state_row["next_action"] == "deep_pending"
+        assert len(artifacts) == 1
+    finally:
+        conn.close()
+
+
+def test_wallet_pipeline_plans_and_runs_v2_backfill_job(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    wallet = "0x" + "4" * 40
+    try:
+        run_migrations(conn)
+        upsert_candidate(conn, CandidateAddress(address=wallet, sources="polymarket_trades_global"))
+        materialize_wallet_processing_state(conn, limit=10, source="test_seed")
+
+        plan = plan_wallet_pipeline_jobs(
+            conn,
+            light_limit=5,
+            medium_limit=0,
+            deep_limit=0,
+            shard_count=1,
+            now=40_000,
+        )
+        before = wallet_pipeline_job_status(conn)
+        client = FakePipelineClient(
+            {wallet: [_event(wallet, idx, market=f"politics-market-{idx % 6}") for idx in range(80)]},
+            {wallet: [{"asset": "asset-open", "size": 10, "marketSlug": "politics-market-1"}]},
+        )
+
+        summary = run_wallet_pipeline_worker(
+            conn,
+            shard_index=0,
+            shard_count=1,
+            limit=2,
+            page_limit=40,
+            sleep_seconds=0,
+            client=client,
+        )
+        after = wallet_pipeline_job_status(conn)
+        job_row = conn.execute(
+            "SELECT * FROM pipeline_jobs WHERE job_type = ? AND wallet = ?",
+            (WALLET_EVIDENCE_JOB_TYPE, wallet),
+        ).fetchone()
+        budget = conn.execute("SELECT * FROM evidence_backfill_budget WHERE wallet = ?", (wallet,)).fetchone()
+        state = conn.execute("SELECT * FROM wallet_processing_state WHERE wallet = ?", (wallet,)).fetchone()
+        evidence = conn.execute("SELECT * FROM wallet_evidence_summary WHERE wallet = ?", (wallet,)).fetchone()
+
+        assert plan.status == "ok"
+        assert plan.jobs_enqueued == 1
+        assert before["statuses"] == [
+            {"job_type": "wallet_evidence_backfill", "status": "queued", "count": 1}
+        ]
+        assert job_row["tier"] == "l0_discovered"
+        assert job_row["subject_key"] == DEFAULT_EVIDENCE_JOB_STAGE
+        assert summary.status == "ok"
+        assert summary.jobs_succeeded == 1
+        assert summary.activity_events_written == 80
+        assert summary.positions_written == 1
+        assert budget["stage"] == "medium_pending"
+        assert budget["target_depth"] == 1000
+        assert state["next_action"] == "medium_pending"
+        assert evidence["activity_count"] == 80
+        assert after["statuses"] == [
+            {"job_type": "wallet_evidence_backfill", "status": "done", "count": 1}
+        ]
+    finally:
+        conn.close()
+
+
+def test_pipeline_job_dedupe_scope_includes_tier(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    wallet = "0x" + "5" * 40
+    try:
+        run_migrations(conn)
+        assert enqueue_pipeline_job(
+            conn,
+            job_type=WALLET_EVIDENCE_JOB_TYPE,
+            wallet=wallet,
+            subject_key=DEFAULT_EVIDENCE_JOB_STAGE,
+            tier=EvidenceTier.L1_LIGHT.value,
+            priority=50,
+            shard=0,
+            input_data={"attempt": 1},
+            now=10_000,
+        )
+        assert enqueue_pipeline_job(
+            conn,
+            job_type=WALLET_EVIDENCE_JOB_TYPE,
+            wallet=wallet,
+            subject_key=DEFAULT_EVIDENCE_JOB_STAGE,
+            tier=EvidenceTier.L1_LIGHT.value,
+            priority=20,
+            shard=1,
+            input_data={"attempt": 2},
+            now=10_010,
+        )
+        assert enqueue_pipeline_job(
+            conn,
+            job_type=WALLET_EVIDENCE_JOB_TYPE,
+            wallet=wallet,
+            subject_key=DEFAULT_EVIDENCE_JOB_STAGE,
+            tier=EvidenceTier.L2_MEDIUM.value,
+            priority=30,
+            shard=2,
+            input_data={"attempt": 3},
+            now=10_020,
+        )
+        rows = conn.execute(
+            """
+            SELECT tier, priority, shard, input_json
+            FROM pipeline_jobs
+            WHERE job_type = ? AND wallet = ? AND subject_key = ?
+            ORDER BY tier
+            """,
+            (WALLET_EVIDENCE_JOB_TYPE, wallet, DEFAULT_EVIDENCE_JOB_STAGE),
+        ).fetchall()
+
+        assert len(rows) == 2
+        assert rows[0]["tier"] == EvidenceTier.L1_LIGHT.value
+        assert rows[0]["priority"] == 20
+        assert rows[0]["shard"] == 1
+        assert json.loads(rows[0]["input_json"]) == {"attempt": 2}
+        assert rows[1]["tier"] == EvidenceTier.L2_MEDIUM.value
+        assert rows[1]["priority"] == 30
+    finally:
+        conn.close()
+
+
+def test_enqueue_pipeline_job_does_not_reopen_completed_job(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    wallet = "0x" + "7" * 40
+    try:
+        run_migrations(conn)
+        assert enqueue_pipeline_job(
+            conn,
+            job_type=WALLET_EVIDENCE_JOB_TYPE,
+            wallet=wallet,
+            subject_key=DEFAULT_EVIDENCE_JOB_STAGE,
+            tier=EvidenceTier.L1_LIGHT.value,
+            priority=20,
+            shard=0,
+            input_data={"attempt": 1},
+            now=10_000,
+        )
+        conn.commit()
+
+        job = claim_pipeline_job(
+            conn,
+            job_type=WALLET_EVIDENCE_JOB_TYPE,
+            shard=0,
+            worker_id="worker-a",
+            lease_seconds=60,
+            now=10_001,
+        )
+        assert job is not None
+        complete_pipeline_job(conn, job_id=job["job_id"], output_data={"ok": True}, now=10_010)
+        conn.commit()
+
+        assert not enqueue_pipeline_job(
+            conn,
+            job_type=WALLET_EVIDENCE_JOB_TYPE,
+            wallet=wallet,
+            subject_key=DEFAULT_EVIDENCE_JOB_STAGE,
+            tier=EvidenceTier.L1_LIGHT.value,
+            priority=5,
+            shard=0,
+            input_data={"attempt": 2},
+            now=10_020,
+        )
+        row = conn.execute(
+            "SELECT status, priority, input_json, updated_at FROM pipeline_jobs WHERE wallet = ?",
+            (wallet,),
+        ).fetchone()
+
+        assert row["status"] == "done"
+        assert row["priority"] == 20
+        assert json.loads(row["input_json"]) == {"attempt": 1}
+        assert row["updated_at"] == 10_010
+    finally:
+        conn.close()
+
+
+def test_wallet_pipeline_planner_skips_completed_exact_scope_jobs(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    completed_wallet = "0x" + "8" * 40
+    fresh_wallet = "0x" + "9" * 40
+    try:
+        run_migrations(conn)
+        for wallet in (completed_wallet, fresh_wallet):
+            upsert_candidate(conn, CandidateAddress(address=wallet, sources="polymarket_trades_global"))
+            conn.execute(
+                """
+                INSERT INTO wallet_processing_state(
+                    wallet, discovery_tier, evidence_status, evidence_depth,
+                    evidence_confidence, priority, current_stage, next_action,
+                    next_action_at, activity_count, distinct_markets,
+                    non_fast_trade_count, updated_at
+                ) VALUES (?, 'l1_light', 'needs_light', 120, 0.7, ?,
+                          'light_done', 'light_pending', 0, ?, 1, ?, ?)
+                """,
+                (wallet, 1 if wallet == completed_wallet else 50, 8 if wallet == completed_wallet else 6, 8, 30_000),
+            )
+        assert enqueue_pipeline_job(
+            conn,
+            job_type=WALLET_EVIDENCE_JOB_TYPE,
+            wallet=completed_wallet,
+            subject_key=DEFAULT_EVIDENCE_JOB_STAGE,
+            tier=EvidenceTier.L1_LIGHT.value,
+            priority=1,
+            shard=0,
+            input_data={"attempt": 1},
+            now=30_000,
+        )
+        conn.commit()
+        job = claim_pipeline_job(
+            conn,
+            job_type=WALLET_EVIDENCE_JOB_TYPE,
+            shard=0,
+            worker_id="worker-a",
+            lease_seconds=60,
+            now=30_001,
+        )
+        assert job is not None
+        complete_pipeline_job(conn, job_id=job["job_id"], output_data={"ok": True}, now=30_010)
+        conn.commit()
+
+        plan = plan_wallet_pipeline_jobs(
+            conn,
+            light_limit=1,
+            medium_limit=0,
+            deep_limit=0,
+            shard_count=1,
+            now=40_000,
+        )
+        queued = conn.execute(
+            "SELECT wallet, status FROM pipeline_jobs WHERE status = 'queued'"
+        ).fetchall()
+
+        assert plan.targets_seen == 1
+        assert plan.jobs_enqueued == 1
+        assert [row["wallet"] for row in queued] == [fresh_wallet]
+    finally:
+        conn.close()
+
+
+def test_wallet_pipeline_planner_throttles_when_active_queue_is_full(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    active_wallet = "0x" + "b" * 40
+    pending_wallet = "0x" + "c" * 40
+    try:
+        run_migrations(conn)
+        _seed_light_pending_state(conn, pending_wallet, priority=10)
+        assert enqueue_pipeline_job(
+            conn,
+            job_type=WALLET_EVIDENCE_JOB_TYPE,
+            wallet=active_wallet,
+            subject_key=DEFAULT_EVIDENCE_JOB_STAGE,
+            tier=EvidenceTier.L0_DISCOVERED.value,
+            priority=1,
+            shard=0,
+            input_data={"stage": DEFAULT_EVIDENCE_JOB_STAGE},
+            now=30_000,
+        )
+        conn.commit()
+
+        plan = plan_wallet_pipeline_jobs(
+            conn,
+            light_limit=5,
+            medium_limit=0,
+            deep_limit=0,
+            shard_count=1,
+            max_active_jobs=1,
+            now=40_000,
+        )
+        queued = conn.execute(
+            "SELECT wallet FROM pipeline_jobs WHERE job_type = ? AND status = 'queued' ORDER BY wallet",
+            (WALLET_EVIDENCE_JOB_TYPE,),
+        ).fetchall()
+
+        assert plan.status == "ok"
+        assert plan.throttled is True
+        assert plan.reason == "active_queue_waterline"
+        assert plan.active_jobs == 1
+        assert plan.max_active_jobs == 1
+        assert plan.targets_seen == 0
+        assert plan.jobs_enqueued == 0
+        assert [row["wallet"] for row in queued] == [active_wallet]
+    finally:
+        conn.close()
+
+
+def test_wallet_pipeline_planner_truncates_targets_to_queue_capacity(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    active_wallet = "0x" + "d" * 40
+    first_wallet = "0x" + "e" * 40
+    second_wallet = "0x" + "f" * 40
+    try:
+        run_migrations(conn)
+        _seed_light_pending_state(conn, first_wallet, priority=10)
+        _seed_light_pending_state(conn, second_wallet, priority=20)
+        assert enqueue_pipeline_job(
+            conn,
+            job_type=WALLET_EVIDENCE_JOB_TYPE,
+            wallet=active_wallet,
+            subject_key=DEFAULT_EVIDENCE_JOB_STAGE,
+            tier=EvidenceTier.L0_DISCOVERED.value,
+            priority=1,
+            shard=0,
+            input_data={"stage": DEFAULT_EVIDENCE_JOB_STAGE},
+            now=30_000,
+        )
+        conn.commit()
+
+        plan = plan_wallet_pipeline_jobs(
+            conn,
+            light_limit=5,
+            medium_limit=0,
+            deep_limit=0,
+            shard_count=1,
+            max_active_jobs=2,
+            now=40_000,
+        )
+        queued = conn.execute(
+            "SELECT wallet FROM pipeline_jobs WHERE job_type = ? AND status = 'queued' ORDER BY priority, wallet",
+            (WALLET_EVIDENCE_JOB_TYPE,),
+        ).fetchall()
+
+        assert plan.status == "ok"
+        assert plan.throttled is False
+        assert plan.active_jobs == 1
+        assert plan.max_active_jobs == 2
+        assert plan.targets_seen == 1
+        assert plan.jobs_enqueued == 1
+        assert [row["wallet"] for row in queued] == [active_wallet, first_wallet]
+    finally:
+        conn.close()
+
+
+def test_wallet_processing_state_is_evidence_tier_source_of_truth(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    wallet = "0x" + "6" * 40
+    try:
+        run_migrations(conn)
+        upsert_candidate(conn, CandidateAddress(address=wallet, sources="polymarket_trades_global"))
+        persist_wallet_activity(
+            conn,
+            wallet,
+            [_event(wallet, idx, market=f"macro-market-{idx % 5}") for idx in range(240)],
+            ingested_at=20_000,
+        )
+        result = materialize_wallet_processing_state(conn, limit=10, source="test_materialize")
+        assert result["wallets_materialized"] == 1
+
+        assert enqueue_pipeline_job(
+            conn,
+            job_type=WALLET_EVIDENCE_JOB_TYPE,
+            wallet=wallet,
+            subject_key=DEFAULT_EVIDENCE_JOB_STAGE,
+            tier="manual_scope_not_evidence_tier",
+            priority=10,
+            shard=0,
+            input_data={"stage": DEFAULT_EVIDENCE_JOB_STAGE},
+            now=30_000,
+        )
+        state_row = conn.execute(
+            "SELECT discovery_tier FROM wallet_processing_state WHERE wallet = ?",
+            (wallet,),
+        ).fetchone()
+        job_row = conn.execute(
+            "SELECT tier FROM pipeline_jobs WHERE wallet = ? AND job_type = ?",
+            (wallet, WALLET_EVIDENCE_JOB_TYPE),
+        ).fetchone()
+
+        assert state_row["discovery_tier"] == EvidenceTier.L2_MEDIUM.value
+        assert job_row["tier"] == "manual_scope_not_evidence_tier"
+    finally:
+        conn.close()
+
+
+def test_wallet_processing_state_does_not_keep_stale_pending_stage(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    wallet = "0x" + "a" * 40
+    try:
+        run_migrations(conn)
+        upsert_candidate(conn, CandidateAddress(address=wallet, sources="polymarket_trades_global"))
+        seed_evidence_backfill_budget(conn, wallet, source="polymarket_trades_global", priority=10)
+        conn.execute(
+            """
+            UPDATE evidence_backfill_budget
+            SET stage = 'medium_pending', target_depth = 1000, current_depth = 1000
+            WHERE wallet = ?
+            """,
+            (wallet,),
+        )
+        persist_wallet_activity(
+            conn,
+            wallet,
+            [_event(wallet, idx, market=f"deep-market-{idx % 12}") for idx in range(1_050)],
+            ingested_at=20_000,
+        )
+        conn.commit()
+
+        result = materialize_wallet_processing_state(conn, limit=10, source="test_materialize")
+        state_row = conn.execute(
+            "SELECT discovery_tier, evidence_status, next_action FROM wallet_processing_state WHERE wallet = ?",
+            (wallet,),
+        ).fetchone()
+
+        assert result["wallets_materialized"] == 1
+        assert state_row["discovery_tier"] == EvidenceTier.L3_DEEP.value
+        assert state_row["evidence_status"] == "summary_ready"
+        assert state_row["next_action"] == "score_wallet"
+    finally:
+        conn.close()
+
+
+def test_materialize_wallet_processing_state_from_existing_activity(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    wallet = "0x" + "2" * 40
+    try:
+        run_migrations(conn)
+        upsert_candidate(conn, CandidateAddress(address=wallet, sources="polymarket_trades_global"))
+        persist_wallet_activity(
+            conn,
+            wallet,
+            [_event(wallet, idx, market=f"news-market-{idx % 4}") for idx in range(80)],
+            ingested_at=20_000,
+        )
+
+        result = materialize_wallet_processing_state(conn, limit=10, source="test_materialize")
+        state_row = conn.execute(
+            "SELECT * FROM wallet_processing_state WHERE wallet = ?",
+            (wallet,),
+        ).fetchone()
+
+        assert result["wallets_seen"] == 1
+        assert result["wallets_materialized"] == 1
+        assert state_row["discovery_tier"] == "l1_light"
+        assert state_row["next_action"] == "medium_pending"
+    finally:
+        conn.close()
+
+
+def test_pipeline_jobs_claim_complete_and_summarize(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    wallet = "0x" + "3" * 40
+    legacy_job_type = "wallet_evidence_l1"
+    try:
+        run_migrations(conn)
+        assert legacy_job_type not in PIPELINE_JOB_TYPES
+        assert enqueue_pipeline_job(
+            conn,
+            job_type=legacy_job_type,
+            wallet=wallet,
+            subject_key="activity",
+            tier="l1_light",
+            priority=5,
+            shard=1,
+            input_data={"target_depth": 200},
+            now=10_000,
+        )
+        conn.commit()
+
+        job = claim_pipeline_job(
+            conn,
+            job_type=legacy_job_type,
+            shard=1,
+            worker_id="worker-a",
+            lease_seconds=60,
+            now=10_001,
+        )
+        assert job is not None
+        assert job["wallet"] == wallet
+        assert job["attempts"] == 1
+
+        complete_pipeline_job(conn, job_id=job["job_id"], output_data={"ok": True}, now=10_010)
+        conn.commit()
+        summary = pipeline_job_summary(conn, job_type=legacy_job_type)
+
+        assert summary["statuses"] == [
+            {"job_type": legacy_job_type, "status": "done", "count": 1}
+        ]
+    finally:
+        conn.close()
+
+
+def test_running_pipeline_job_lease_can_only_be_renewed_by_owner(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    wallet = "0x" + "4" * 40
+    try:
+        run_migrations(conn)
+        assert enqueue_pipeline_job(
+            conn,
+            job_type="copyability_evidence",
+            wallet=wallet,
+            subject_key="copyability",
+            tier="copyability",
+            priority=5,
+            shard=0,
+            input_data={},
+            now=20_000,
+        )
+        conn.commit()
+
+        job = claim_pipeline_job(
+            conn,
+            job_type="copyability_evidence",
+            shard=0,
+            worker_id="worker-a",
+            lease_seconds=60,
+            now=20_001,
+        )
+        assert job is not None
+
+        assert not renew_pipeline_job_lease(
+            conn,
+            job_id=int(job["job_id"]),
+            worker_id="worker-b",
+            lease_seconds=600,
+            now=20_010,
+        )
+        assert renew_pipeline_job_lease(
+            conn,
+            job_id=int(job["job_id"]),
+            worker_id="worker-a",
+            lease_seconds=600,
+            now=20_010,
+        )
+        conn.commit()
+
+        row = conn.execute(
+            "SELECT lease_owner, lease_until, updated_at FROM pipeline_jobs WHERE job_id = ?",
+            (job["job_id"],),
+        ).fetchone()
+        assert row["lease_owner"] == "worker-a"
+        assert row["lease_until"] == 20_610
+        assert row["updated_at"] == 20_010
+    finally:
+        conn.close()

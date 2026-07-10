@@ -1,0 +1,11 @@
+FROM python:3.11-slim
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates openssh-client \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY deploy/nas/vps-http-proxy-tunnel.sh /usr/local/bin/vps-http-proxy-tunnel.sh
+
+RUN chmod 755 /usr/local/bin/vps-http-proxy-tunnel.sh
+
+CMD ["/usr/local/bin/vps-http-proxy-tunnel.sh"]

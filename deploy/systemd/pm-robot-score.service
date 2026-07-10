@@ -1,0 +1,18 @@
+[Unit]
+Description=pm-robot candidate scoring
+After=network-online.target pm-robot-copy-backtest.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/pm-robot
+EnvironmentFile=/opt/pm-robot/.env
+TimeoutStartSec=600
+Environment=PM_ROBOT_LOCK_WAIT=30
+Environment=PM_ROBOT_TASK_NAME=score
+ExecStart=/opt/pm-robot/deploy/scripts/run_locked.sh /opt/pm-robot/.venv/bin/python -m pm_robot.cli --env /opt/pm-robot/.env build-review
+ExecStart=/opt/pm-robot/deploy/scripts/run_locked.sh /opt/pm-robot/.venv/bin/python -m pm_robot.cli --env /opt/pm-robot/.env wallet-pipeline-state --materialize --limit 500 --commit-every 100
+ExecStart=/opt/pm-robot/deploy/scripts/run_locked.sh /opt/pm-robot/.venv/bin/python -m pm_robot.cli --env /opt/pm-robot/.env wallet-pipeline-plan --light-limit 80 --medium-limit 50 --deep-limit 20 --shard-count 3 --max-active-jobs 240
+ExecStart=/opt/pm-robot/.venv/bin/python -m pm_robot.cli --env /opt/pm-robot/.env paper-handoff-export --out /opt/pm-robot/reports/paper_handoff.json --csv-out /opt/pm-robot/reports/paper_handoff.csv --limit 250
+ExecStart=/opt/pm-robot/deploy/scripts/run_locked.sh /opt/pm-robot/.venv/bin/python -m pm_robot.cli --env /opt/pm-robot/.env ingest-activity --paper-stage-only --wallet-limit 10 --page-limit 50 --max-events-per-wallet 50 --sleep 0.1
+ExecStart=/opt/pm-robot/.venv/bin/python -m pm_robot.cli --env /opt/pm-robot/.env paper-observer-preview --out /opt/pm-robot/reports/paper_observer_preview.json --limit 50 --max-signal-age-sec 21600
+ExecStart=/opt/pm-robot/.venv/bin/python -m pm_robot.cli --env /opt/pm-robot/.env paper-observer-evaluate --out /opt/pm-robot/reports/paper_observer_evaluation.json --limit 25 --max-stake-usd 40 --max-signal-age-sec 21600 --max-actionable-signal-age-sec 300 --persist

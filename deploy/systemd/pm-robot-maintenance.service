@@ -1,0 +1,12 @@
+[Unit]
+Description=pm-robot database and backup maintenance
+After=network-online.target pm-robot-backup.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/pm-robot
+EnvironmentFile=/opt/pm-robot/.env
+TimeoutStartSec=900
+Environment=PM_ROBOT_LOCK_WAIT=120
+Environment=PM_ROBOT_TASK_NAME=maintenance
+ExecStart=/opt/pm-robot/deploy/scripts/run_locked.sh /opt/pm-robot/.venv/bin/python -m pm_robot.cli --env /opt/pm-robot/.env maintenance --keep-backups 2

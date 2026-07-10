@@ -1,0 +1,11 @@
+[Unit]
+Description=pm-robot legacy evidence backfill placeholder (disabled)
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/pm-robot
+EnvironmentFile=/opt/pm-robot/.env
+TimeoutStartSec=60
+Environment=PM_ROBOT_TASK_NAME=legacy-evidence-backfill-disabled
+ExecStart=/usr/bin/env sh -c 'echo "legacy evidence-backfill is disabled; use pm-robot-evidence-planner/worker v2 wallet pipeline services"'

@@ -1,0 +1,16 @@
+.git
+.venv
+.pytest_cache
+.DS_Store
+__pycache__
+*.pyc
+
+data/
+logs/
+backups/
+tmp/
+
+reports/*.csv
+reports/*.json
+reports/*.sql
+reports/._*
