@@ -10,6 +10,7 @@ from pathlib import Path
 
 from pm_robot.config import DEFAULT_POLICY_PATH, RobotSettings, load_policy
 from pm_robot.ops import (
+    DEFAULT_FAILED_JOB_COOLDOWN_SECONDS,
     backup_database,
     build_winner_library,
     build_wallet_registry,
@@ -645,7 +646,13 @@ def main() -> int:
     maintenance_cmd.add_argument(
         "--reset-stale-jobs",
         action="store_true",
-        help="Requeue expired running pipeline jobs; live unexpired leases are left untouched",
+        help="Recover expired/duplicate leases and fail exhausted queued jobs; live leases are untouched",
+    )
+    maintenance_cmd.add_argument(
+        "--failed-job-cooldown-seconds",
+        type=int,
+        default=DEFAULT_FAILED_JOB_COOLDOWN_SECONDS,
+        help="Cooldown before a failed exhausted job may receive a fresh attempt budget",
     )
     maintenance_cmd.add_argument(
         "--reset-stale-ingest-runs",
@@ -1444,6 +1451,7 @@ def main() -> int:
             wal_checkpoint=args.wal_checkpoint,
             skip_cleanup=args.skip_cleanup,
             reset_stale_jobs=args.reset_stale_jobs,
+            failed_job_cooldown_seconds=args.failed_job_cooldown_seconds,
             reset_stale_ingest_runs=args.reset_stale_ingest_runs,
             stale_ingest_run_seconds=args.stale_ingest_run_seconds,
         )

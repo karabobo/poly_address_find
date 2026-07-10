@@ -1767,7 +1767,7 @@ def test_dashboard_evidence_pipeline_reports_l1_l2_l3_queue_progress(tmp_path, m
     assert "老化排队" in html
     assert "最久等待" in html
     assert "尝试耗尽" in html
-    assert "worker 不会再领取" in html
+    assert "维护循环将标记失败并释放水位" in html
     assert "执行队列前排" in html
     assert "状态待派断点" in html
     assert "总到期待补" in html

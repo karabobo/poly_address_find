@@ -668,6 +668,7 @@ def _select_copyability_targets(
                 COALESCE(wps.current_stage, '') AS evidence_job_stage,
                 pj.job_id AS existing_job_id,
                 COALESCE(pj.status, '') AS existing_job_status,
+                COALESCE(pj.next_attempt_at, 0) AS existing_next_attempt_at,
                 COALESCE(pj.completed_at, 0) AS existing_completed_at,
                 COALESCE(
                     json_extract(pj.output_json, '$.graph_scan_mode'),
@@ -771,7 +772,10 @@ def _select_copyability_targets(
               )
               AND (
                     existing_job_id IS NULL
-                 OR existing_job_status = 'failed'
+                 OR (
+                        existing_job_status = 'failed'
+                    AND existing_next_attempt_at <= ?
+                    )
                  OR (
                         existing_job_status = 'done'
                     AND active_job_count = 0
@@ -872,6 +876,7 @@ def _select_copyability_targets(
             int(min_activity_events),
             float(min_score),
             LIGHT_NO_SIGNAL_DEEP_RESCAN_MIN_SCORE,
+            now,
             stale_before,
             LIGHT_NO_SIGNAL_DEEP_RESCAN_MIN_SCORE,
             int(limit),
@@ -901,7 +906,7 @@ def _reset_retriable_existing_job(conn: sqlite3.Connection, *, wallet: str, now:
             lease_until = 0,
             attempts = 0,
             next_attempt_at = 0,
-            last_error = '',
+            last_error = CASE WHEN status = 'failed' THEN last_error ELSE '' END,
             updated_at = ?
         WHERE job_type = ?
           AND wallet = ?

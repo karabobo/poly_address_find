@@ -891,6 +891,7 @@ def test_nas_maintenance_loop_runs_lightweight_storage_and_queue_repair():
     loop = Path("deploy/nas/maintenance-loop.sh").read_text(encoding="utf-8")
     helper = Path("deploy/nas/pmrobot-nas.sh").read_text(encoding="utf-8")
     readme = Path("deploy/nas/README.md").read_text(encoding="utf-8")
+    systemd_service = Path("deploy/systemd/pm-robot-maintenance.service").read_text(encoding="utf-8")
 
     assert "maintenance-loop:" in compose
     assert "container_name: pm-robot-maintenance-loop" in compose
@@ -901,13 +902,19 @@ def test_nas_maintenance_loop_runs_lightweight_storage_and_queue_repair():
     assert "PM_ROBOT_MAINTENANCE_INTERVAL=3600" in env
     assert "PM_ROBOT_MAINTENANCE_WAL_CHECKPOINT=none" in env
     assert "PM_ROBOT_MAINTENANCE_STALE_INGEST_RUN_SECONDS=21600" in env
+    assert "PM_ROBOT_MAINTENANCE_FAILED_JOB_COOLDOWN_SECONDS=21600" in env
     assert "--skip-cleanup" in loop
     assert "--reset-stale-jobs" in loop
+    assert "--failed-job-cooldown-seconds \"$FAILED_JOB_COOLDOWN_SECONDS\"" in loop
     assert "--reset-stale-ingest-runs" in loop
     assert "--stale-ingest-run-seconds \"$STALE_INGEST_RUN_SECONDS\"" in loop
     assert "--wal-checkpoint \"$WAL_CHECKPOINT\"" in loop
     assert "PM_ROBOT_MAINTENANCE_WAL_CHECKPOINT:-none" in loop
     assert "PM_ROBOT_MAINTENANCE_STALE_INGEST_RUN_SECONDS:-21600" in loop
+    assert "PM_ROBOT_MAINTENANCE_FAILED_JOB_COOLDOWN_SECONDS:-21600" in loop
+    assert "--reset-stale-jobs" in systemd_service
+    assert "--failed-job-cooldown-seconds 21600" in systemd_service
+    assert "--reset-stale-ingest-runs" in systemd_service
     assert "wal_truncate_window" in helper
     assert "wal-truncate-window" in helper
     assert "pipeline_running_job_counts" in helper

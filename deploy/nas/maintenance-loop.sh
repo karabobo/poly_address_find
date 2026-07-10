@@ -4,6 +4,7 @@ set -eu
 INTERVAL="${PM_ROBOT_MAINTENANCE_INTERVAL:-3600}"
 WAL_CHECKPOINT="${PM_ROBOT_MAINTENANCE_WAL_CHECKPOINT:-none}"
 STALE_INGEST_RUN_SECONDS="${PM_ROBOT_MAINTENANCE_STALE_INGEST_RUN_SECONDS:-21600}"
+FAILED_JOB_COOLDOWN_SECONDS="${PM_ROBOT_MAINTENANCE_FAILED_JOB_COOLDOWN_SECONDS:-21600}"
 KEEP_BACKUPS="${PM_ROBOT_MAINTENANCE_KEEP_BACKUPS:-14}"
 
 runtime_heartbeat() {
@@ -21,6 +22,7 @@ while true; do
   if python -m pm_robot.cli --env /app/.env maintenance \
       --skip-cleanup \
       --reset-stale-jobs \
+      --failed-job-cooldown-seconds "$FAILED_JOB_COOLDOWN_SECONDS" \
       --reset-stale-ingest-runs \
       --stale-ingest-run-seconds "$STALE_INGEST_RUN_SECONDS" \
       --keep-backups "$KEEP_BACKUPS" \

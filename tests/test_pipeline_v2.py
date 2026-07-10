@@ -1174,6 +1174,80 @@ def test_enqueue_pipeline_job_does_not_reopen_completed_job(tmp_path):
         conn.close()
 
 
+def test_enqueue_pipeline_job_reopens_failed_scope_only_after_cooldown(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    wallet = "0x" + "a" * 40
+    try:
+        run_migrations(conn)
+        assert enqueue_pipeline_job(
+            conn,
+            job_type=WALLET_EVIDENCE_JOB_TYPE,
+            wallet=wallet,
+            subject_key=DEFAULT_EVIDENCE_JOB_STAGE,
+            tier=EvidenceTier.L0_DISCOVERED.value,
+            priority=20,
+            shard=0,
+            now=1_000,
+        )
+        conn.execute(
+            """
+            UPDATE pipeline_jobs
+            SET status = 'failed', attempts = max_attempts,
+                next_attempt_at = 10000, last_error = 'persistent upstream failure'
+            WHERE wallet = ?
+            """,
+            (wallet,),
+        )
+        conn.commit()
+
+        assert not enqueue_pipeline_job(
+            conn,
+            job_type=WALLET_EVIDENCE_JOB_TYPE,
+            wallet=wallet,
+            subject_key=DEFAULT_EVIDENCE_JOB_STAGE,
+            tier=EvidenceTier.L0_DISCOVERED.value,
+            priority=10,
+            shard=0,
+            now=9_999,
+        )
+        deferred = conn.execute(
+            "SELECT status, attempts, next_attempt_at, last_error FROM pipeline_jobs WHERE wallet = ?",
+            (wallet,),
+        ).fetchone()
+
+        assert dict(deferred) == {
+            "status": "failed",
+            "attempts": 3,
+            "next_attempt_at": 10_000,
+            "last_error": "persistent upstream failure",
+        }
+
+        assert enqueue_pipeline_job(
+            conn,
+            job_type=WALLET_EVIDENCE_JOB_TYPE,
+            wallet=wallet,
+            subject_key=DEFAULT_EVIDENCE_JOB_STAGE,
+            tier=EvidenceTier.L0_DISCOVERED.value,
+            priority=10,
+            shard=0,
+            now=10_000,
+        )
+        reopened = conn.execute(
+            "SELECT status, attempts, next_attempt_at, priority, last_error FROM pipeline_jobs WHERE wallet = ?",
+            (wallet,),
+        ).fetchone()
+
+        assert dict(reopened) == {
+            "status": "queued",
+            "attempts": 0,
+            "next_attempt_at": 0,
+            "priority": 10,
+            "last_error": "persistent upstream failure",
+        }
+    finally:
+        conn.close()
+
+
 def test_wallet_pipeline_planner_skips_completed_exact_scope_jobs(tmp_path):
     conn = connect(tmp_path / "robot.sqlite")
     completed_wallet = "0x" + "8" * 40

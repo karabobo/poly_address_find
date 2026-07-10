@@ -897,6 +897,16 @@ def _targets_for_action(
           )
           AND NOT EXISTS (
               SELECT 1
+              FROM pipeline_jobs cooling_failed_job
+              WHERE cooling_failed_job.job_type = ?
+                AND cooling_failed_job.wallet = wps.wallet
+                AND cooling_failed_job.subject_key = ?
+                AND cooling_failed_job.tier = wps.discovery_tier
+                AND cooling_failed_job.status = 'failed'
+                AND cooling_failed_job.next_attempt_at > ?
+          )
+          AND NOT EXISTS (
+              SELECT 1
               FROM pipeline_jobs completed_job
               WHERE completed_job.job_type = ?
                 AND completed_job.wallet = wps.wallet
@@ -912,7 +922,18 @@ def _targets_for_action(
             wps.wallet ASC
         LIMIT ?
         """,
-        (evidence_job_stage, now, JOB_TYPE, evidence_job_stage, JOB_TYPE, evidence_job_stage, limit),
+        (
+            evidence_job_stage,
+            now,
+            JOB_TYPE,
+            evidence_job_stage,
+            JOB_TYPE,
+            evidence_job_stage,
+            now,
+            JOB_TYPE,
+            evidence_job_stage,
+            limit,
+        ),
     ).fetchall()
     return [dict(row) for row in rows]
 

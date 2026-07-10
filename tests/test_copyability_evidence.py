@@ -760,6 +760,96 @@ def test_copyability_planner_upgrades_high_score_light_no_signal_to_deep_scan(tm
         conn.close()
 
 
+def test_copyability_planner_reopens_failed_job_only_after_cooldown(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    wallet = "0x" + "4" * 40
+    try:
+        run_migrations(conn)
+        upsert_candidate(conn, CandidateAddress(address=wallet, sources="test"))
+        conn.execute(
+            "UPDATE candidate_wallets SET candidate_stage = 'needs_manual_review' WHERE address = ?",
+            (wallet,),
+        )
+        conn.execute(
+            """
+            INSERT INTO leader_scores(
+                address, leader_score, review_stage, review_reason,
+                components_json, penalties_json, policy_version, scored_at
+            ) VALUES (?, 60, 'needs_manual_review', 'watchlist_score', '{}', '{}', 'test', 1000)
+            """,
+            (wallet,),
+        )
+        conn.execute(
+            """
+            INSERT INTO wallet_processing_state(
+                wallet, discovery_tier, evidence_status, evidence_depth,
+                evidence_confidence, priority, current_stage, next_action,
+                next_action_at, activity_count, non_fast_trade_count,
+                distinct_markets, updated_at
+            ) VALUES (?, 'l2_medium', 'summary_ready', 500, 1.0, 10,
+                      'medium_done', 'score_wallet', 0, 500, 450, 8, 1000)
+            """,
+            (wallet,),
+        )
+        conn.execute(
+            """
+            INSERT INTO pipeline_jobs(
+                job_type, wallet, subject_key, tier, priority, shard, status,
+                lease_owner, lease_until, attempts, max_attempts, next_attempt_at,
+                input_json, output_json, last_error, created_at, updated_at
+            ) VALUES (?, ?, 'copyability', 'copyability', 10, 0, 'failed',
+                      NULL, 0, 3, 3, 20000, '{}', '{}', 'graph refresh failed', 1000, 1000)
+            """,
+            (JOB_TYPE, wallet),
+        )
+        conn.commit()
+
+        deferred = plan_copyability_evidence_jobs(
+            conn,
+            limit=10,
+            min_score=40,
+            min_activity_events=25,
+            shard_count=1,
+            now=19_999,
+        )
+        before = conn.execute(
+            "SELECT status, attempts, next_attempt_at, last_error FROM pipeline_jobs WHERE wallet = ?",
+            (wallet,),
+        ).fetchone()
+
+        assert deferred.targets_seen == 0
+        assert dict(before) == {
+            "status": "failed",
+            "attempts": 3,
+            "next_attempt_at": 20_000,
+            "last_error": "graph refresh failed",
+        }
+
+        reopened = plan_copyability_evidence_jobs(
+            conn,
+            limit=10,
+            min_score=40,
+            min_activity_events=25,
+            shard_count=1,
+            now=20_000,
+        )
+        after = conn.execute(
+            "SELECT status, attempts, next_attempt_at, last_error FROM pipeline_jobs WHERE wallet = ?",
+            (wallet,),
+        ).fetchone()
+
+        assert reopened.targets_seen == 1
+        assert reopened.jobs_enqueued == 1
+        assert dict(after) == {
+            "status": "queued",
+            "attempts": 0,
+            "next_attempt_at": 0,
+            "last_error": "graph refresh failed",
+        }
+    finally:
+        conn.close()
+
+
 def test_copyability_planner_short_circuits_when_active_backlog_exceeds_limit(tmp_path):
     conn = connect(tmp_path / "robot.sqlite")
     stale_done = "0x" + "9" * 40

@@ -19,6 +19,7 @@ from pm_robot.storage.repository import api_request_summary
 
 DAY_SECONDS = 86_400
 WAL_CHECKPOINT_MODES = ("none", "passive", "truncate")
+DEFAULT_FAILED_JOB_COOLDOWN_SECONDS = 21_600
 
 WALLET_REGISTRY_TABLE_COLUMNS = [
     "address",
@@ -410,6 +411,7 @@ def maintenance(
     wal_checkpoint: str = "none",
     skip_cleanup: bool = False,
     reset_stale_jobs: bool = False,
+    failed_job_cooldown_seconds: int = DEFAULT_FAILED_JOB_COOLDOWN_SECONDS,
     reset_stale_ingest_runs: bool = False,
     stale_ingest_run_seconds: int = 21_600,
 ) -> dict[str, Any]:
@@ -441,10 +443,17 @@ def maintenance(
         stale_jobs = _reset_stale_pipeline_jobs(
             conn,
             execute=reset_stale_jobs and not dry_run,
+            failed_job_cooldown_seconds=failed_job_cooldown_seconds,
         )
         duplicate_running_jobs = _reset_duplicate_running_pipeline_jobs(
             conn,
             execute=reset_stale_jobs and not dry_run,
+            failed_job_cooldown_seconds=failed_job_cooldown_seconds,
+        )
+        exhausted_queued_jobs = _fail_exhausted_queued_pipeline_jobs(
+            conn,
+            execute=reset_stale_jobs and not dry_run,
+            failed_job_cooldown_seconds=failed_job_cooldown_seconds,
         )
         stale_ingest_runs = _reset_stale_ingest_runs(
             conn,
@@ -460,9 +469,11 @@ def maintenance(
         "dry_run": dry_run,
         "vacuum": vacuum and not dry_run,
         "cleanup_skipped": skip_cleanup,
+        "failed_job_cooldown_seconds": max(0, int(failed_job_cooldown_seconds)),
         "wal_checkpoint": wal_checkpoint_report,
         "stale_jobs": stale_jobs,
         "duplicate_running_jobs": duplicate_running_jobs,
+        "exhausted_queued_jobs": exhausted_queued_jobs,
         "stale_ingest_runs": stale_ingest_runs,
         "deleted": deleted,
         "backup_cleanup": backup_cleanup,
@@ -471,18 +482,35 @@ def maintenance(
     }
 
 
-def _reset_stale_pipeline_jobs(conn: sqlite3.Connection, *, execute: bool) -> dict[str, Any]:
-    """Report or requeue expired running pipeline jobs without touching live leases."""
+def _reset_stale_pipeline_jobs(
+    conn: sqlite3.Connection,
+    *,
+    execute: bool,
+    failed_job_cooldown_seconds: int,
+) -> dict[str, Any]:
+    """Recover expired leases, failing jobs that already exhausted their attempts."""
     tables = {
         row[0]
         for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
     }
     if "pipeline_jobs" not in tables:
-        return {"available": False, "reset": False, "total": 0, "by_job_type": []}
+        return {
+            "available": False,
+            "reset": False,
+            "total": 0,
+            "requeued_count": 0,
+            "failed_count": 0,
+            "by_job_type": [],
+        }
     now = int(time.time())
+    failed_retry_at = now + max(0, int(failed_job_cooldown_seconds))
     rows = conn.execute(
         """
-        SELECT job_type, COUNT(*) AS count
+        SELECT
+            job_type,
+            COUNT(*) AS count,
+            SUM(CASE WHEN attempts < max_attempts THEN 1 ELSE 0 END) AS requeued_count,
+            SUM(CASE WHEN attempts >= max_attempts THEN 1 ELSE 0 END) AS failed_count
         FROM pipeline_jobs
         WHERE status = 'running'
           AND lease_until <= ?
@@ -492,48 +520,76 @@ def _reset_stale_pipeline_jobs(conn: sqlite3.Connection, *, execute: bool) -> di
         (now,),
     ).fetchall()
     total = sum(int(row["count"] or 0) for row in rows)
+    requeued_count = sum(int(row["requeued_count"] or 0) for row in rows)
+    failed_count = sum(int(row["failed_count"] or 0) for row in rows)
     if execute and total:
         conn.execute(
             """
             UPDATE pipeline_jobs
-            SET status = 'queued',
+            SET status = CASE
+                    WHEN attempts >= max_attempts THEN 'failed'
+                    ELSE 'queued'
+                END,
                 lease_owner = NULL,
                 lease_until = 0,
-                next_attempt_at = 0,
+                next_attempt_at = CASE
+                    WHEN attempts >= max_attempts THEN MAX(next_attempt_at, ?)
+                    ELSE 0
+                END,
                 last_error = CASE
-                    WHEN last_error = '' THEN 'expired_lease_requeued_by_maintenance'
-                    ELSE last_error
+                    WHEN last_error != '' THEN last_error
+                    WHEN attempts >= max_attempts THEN 'expired_lease_attempts_exhausted_by_maintenance'
+                    ELSE 'expired_lease_requeued_by_maintenance'
                 END,
                 updated_at = ?
             WHERE status = 'running'
               AND lease_until <= ?
             """,
-            (now, now),
+            (failed_retry_at, now, now),
         )
         conn.commit()
     return {
         "available": True,
         "reset": bool(execute),
         "total": total,
-        "by_job_type": [dict(row) for row in rows],
+        "requeued_count": requeued_count,
+        "failed_count": failed_count,
+        "by_job_type": [
+            {"job_type": str(row["job_type"]), "count": int(row["count"] or 0)}
+            for row in rows
+        ],
     }
 
 
-def _reset_duplicate_running_pipeline_jobs(conn: sqlite3.Connection, *, execute: bool) -> dict[str, Any]:
-    """Requeue older duplicate running leases for the same single-threaded worker."""
+def _reset_duplicate_running_pipeline_jobs(
+    conn: sqlite3.Connection,
+    *,
+    execute: bool,
+    failed_job_cooldown_seconds: int,
+) -> dict[str, Any]:
+    """Recover duplicate worker leases without reviving exhausted jobs."""
 
     tables = {
         row[0]
         for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
     }
     if "pipeline_jobs" not in tables:
-        return {"available": False, "reset": False, "total": 0, "by_job_type": []}
+        return {
+            "available": False,
+            "reset": False,
+            "total": 0,
+            "requeued_count": 0,
+            "failed_count": 0,
+            "by_job_type": [],
+        }
     rows = conn.execute(
         """
         WITH ranked AS (
             SELECT
                 job_id,
                 job_type,
+                attempts,
+                max_attempts,
                 ROW_NUMBER() OVER (
                     PARTITION BY job_type, lease_owner
                     ORDER BY updated_at DESC, job_id DESC
@@ -543,7 +599,11 @@ def _reset_duplicate_running_pipeline_jobs(conn: sqlite3.Connection, *, execute:
               AND lease_owner IS NOT NULL
               AND lease_owner != ''
         )
-        SELECT job_type, COUNT(*) AS count
+        SELECT
+            job_type,
+            COUNT(*) AS count,
+            SUM(CASE WHEN attempts < max_attempts THEN 1 ELSE 0 END) AS requeued_count,
+            SUM(CASE WHEN attempts >= max_attempts THEN 1 ELSE 0 END) AS failed_count
         FROM ranked
         WHERE owner_rank > 1
         GROUP BY job_type
@@ -551,8 +611,11 @@ def _reset_duplicate_running_pipeline_jobs(conn: sqlite3.Connection, *, execute:
         """
     ).fetchall()
     total = sum(int(row["count"] or 0) for row in rows)
+    requeued_count = sum(int(row["requeued_count"] or 0) for row in rows)
+    failed_count = sum(int(row["failed_count"] or 0) for row in rows)
     if execute and total:
         now = int(time.time())
+        failed_retry_at = now + max(0, int(failed_job_cooldown_seconds))
         conn.execute(
             """
             WITH ranked AS (
@@ -568,13 +631,20 @@ def _reset_duplicate_running_pipeline_jobs(conn: sqlite3.Connection, *, execute:
                   AND lease_owner != ''
             )
             UPDATE pipeline_jobs
-            SET status = 'queued',
+            SET status = CASE
+                    WHEN attempts >= max_attempts THEN 'failed'
+                    ELSE 'queued'
+                END,
                 lease_owner = NULL,
                 lease_until = 0,
-                next_attempt_at = 0,
+                next_attempt_at = CASE
+                    WHEN attempts >= max_attempts THEN MAX(next_attempt_at, ?)
+                    ELSE 0
+                END,
                 last_error = CASE
-                    WHEN last_error = '' THEN 'duplicate_running_owner_requeued_by_maintenance'
-                    ELSE last_error
+                    WHEN last_error != '' THEN last_error
+                    WHEN attempts >= max_attempts THEN 'duplicate_running_owner_attempts_exhausted_by_maintenance'
+                    ELSE 'duplicate_running_owner_requeued_by_maintenance'
                 END,
                 updated_at = ?
             WHERE job_id IN (
@@ -583,13 +653,79 @@ def _reset_duplicate_running_pipeline_jobs(conn: sqlite3.Connection, *, execute:
                 WHERE owner_rank > 1
             )
             """,
-            (now,),
+            (failed_retry_at, now),
         )
         conn.commit()
     return {
         "available": True,
         "reset": bool(execute),
         "total": total,
+        "requeued_count": requeued_count,
+        "failed_count": failed_count,
+        "by_job_type": [
+            {"job_type": str(row["job_type"]), "count": int(row["count"] or 0)}
+            for row in rows
+        ],
+    }
+
+
+def _fail_exhausted_queued_pipeline_jobs(
+    conn: sqlite3.Connection,
+    *,
+    execute: bool,
+    failed_job_cooldown_seconds: int,
+) -> dict[str, Any]:
+    """Close legacy queued jobs that no worker can claim and release queue capacity."""
+
+    tables = {
+        row[0]
+        for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+    }
+    if "pipeline_jobs" not in tables:
+        return {
+            "available": False,
+            "reset": False,
+            "total": 0,
+            "failed_count": 0,
+            "by_job_type": [],
+        }
+    rows = conn.execute(
+        """
+        SELECT job_type, COUNT(*) AS count
+        FROM pipeline_jobs
+        WHERE status = 'queued'
+          AND attempts >= max_attempts
+        GROUP BY job_type
+        ORDER BY job_type ASC
+        """
+    ).fetchall()
+    total = sum(int(row["count"] or 0) for row in rows)
+    if execute and total:
+        now = int(time.time())
+        failed_retry_at = now + max(0, int(failed_job_cooldown_seconds))
+        conn.execute(
+            """
+            UPDATE pipeline_jobs
+            SET status = 'failed',
+                lease_owner = NULL,
+                lease_until = 0,
+                next_attempt_at = MAX(next_attempt_at, ?),
+                last_error = CASE
+                    WHEN last_error = '' THEN 'attempts_exhausted_marked_failed_by_maintenance'
+                    ELSE last_error
+                END,
+                updated_at = ?
+            WHERE status = 'queued'
+              AND attempts >= max_attempts
+            """,
+            (failed_retry_at, now),
+        )
+        conn.commit()
+    return {
+        "available": True,
+        "reset": bool(execute),
+        "total": total,
+        "failed_count": total,
         "by_job_type": [dict(row) for row in rows],
     }
 

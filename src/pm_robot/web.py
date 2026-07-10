@@ -7490,7 +7490,7 @@ def _evidence_pipeline_panel(values: dict[str, Any]) -> str:
     aged_queued = int(values.get("aged_queued_jobs") or 0)
     if exhausted_queued:
         banner_state = "attention"
-        note = "有排队任务已经耗尽尝试次数，worker 不会再领取；需维护或人工处理。"
+        note = "有排队任务已经耗尽尝试次数，worker 不会再领取；维护循环将标记失败并释放水位。"
     elif aged_queued and not running:
         banner_state = "attention"
         note = "有久候任务已达到优先级老化阈值，但当前没有 running worker。"

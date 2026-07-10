@@ -1239,6 +1239,7 @@ def enqueue_pipeline_job(
     next_attempt_at: int = 0,
     now: int | None = None,
 ) -> bool:
+    """Enqueue a scope, reopening failed work only after its cooldown with fresh attempts."""
     ts = now or int(time.time())
     wallet = wallet.lower()
     before = conn.total_changes
@@ -1253,11 +1254,22 @@ def enqueue_pipeline_job(
             priority = MIN(pipeline_jobs.priority, excluded.priority),
             shard = excluded.shard,
             status = 'queued',
+            attempts = CASE
+                WHEN pipeline_jobs.status = 'failed' THEN 0
+                ELSE pipeline_jobs.attempts
+            END,
             max_attempts = excluded.max_attempts,
-            next_attempt_at = MIN(pipeline_jobs.next_attempt_at, excluded.next_attempt_at),
+            next_attempt_at = CASE
+                WHEN pipeline_jobs.status = 'failed' THEN excluded.next_attempt_at
+                ELSE MIN(pipeline_jobs.next_attempt_at, excluded.next_attempt_at)
+            END,
             input_json = excluded.input_json,
             updated_at = excluded.updated_at
         WHERE pipeline_jobs.status NOT IN ('running', 'done')
+          AND (
+                pipeline_jobs.status != 'failed'
+                OR pipeline_jobs.next_attempt_at <= excluded.updated_at
+          )
         """,
         (
             job_type,

@@ -97,6 +97,9 @@ default `up`, `restart`, `runtime-ensure`, or watchdog commands.
 - Queue claims use SQLite write serialization and leases.
 - Workers renew leases around long work and can only complete or retry jobs they still own.
 - Maintenance requeues expired leases and stale runtime records.
+- Maintenance marks expired or queued jobs failed once their attempt budget is exhausted, so unclaimable jobs
+  cannot occupy planner queue capacity indefinitely. Failed jobs respect `next_attempt_at`; after the cooldown,
+  planners may reopen them with a fresh attempt budget while retaining the previous error for diagnosis.
 - Planner backpressure limits queued/running wallet evidence jobs.
 - When queue capacity is tight, the planner allocates slots across light, medium, and deep evidence stages by
   configured weight, current active-job share, and a persistent smooth weighted round-robin cursor. Priority
