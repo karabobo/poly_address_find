@@ -2697,6 +2697,34 @@ def test_discovery_data_builds_workbench_metrics(tmp_path):
     assert data["signal_counts"][0]["signal"] == "needs_backfill"
 
 
+def test_dashboard_groups_secondary_sections_into_workspace_tabs(tmp_path):
+    settings = _settings(tmp_path)
+    _seed(settings)
+
+    html = _render_dashboard(settings)
+
+    assert 'role="tablist"' in html
+    assert 'data-workspace-tab="overview"' in html
+    assert 'data-workspace-tab="discovery"' in html
+    assert 'data-workspace-tab="paper"' in html
+    assert 'data-workspace-tab="operations"' in html
+    assert 'data-workspace-panel="overview"' in html
+    assert 'data-workspace-panel="discovery" hidden' in html
+    assert html.index("生产收敛摘要") < html.index("候选阶段")
+
+
+def test_wallet_workbench_places_candidate_queue_before_research_diagnostics(tmp_path):
+    settings = _settings(tmp_path)
+    _seed(settings)
+
+    html = _render_wallets(settings, stage="", source="", query="", signal="")
+
+    assert "候选队列" in html
+    assert "研究诊断" in html
+    assert html.index("候选队列") < html.index("研究诊断")
+    assert html.index("候选队列") < html.index("证据深度")
+
+
 def test_source_filtered_discovery_includes_focus_diagnostics(tmp_path):
     settings = _settings(tmp_path)
     _seed(settings)

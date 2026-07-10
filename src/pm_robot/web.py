@@ -2781,23 +2781,38 @@ def _render_dashboard(settings: RobotSettings) -> str:
     body = [
         _top_nav("dashboard"),
         '<main class="shell">',
-        '<section class="toolbar"><div><h1>研究总览</h1><p>NAS research/scoring：发现源、证据厚度、评分阶段和外部交接状态。</p></div>'
+        '<section class="toolbar workspace-hero"><div><p class="eyebrow">Research / Scoring</p>'
+        '<h1>研究控制台</h1><p>发现、证据、评分和外部 paper 交接的统一工作台。</p></div>'
         '<a class="button" href="/wallets">候选钱包</a></section>',
         '<section class="metric-grid">',
         "".join(f'<div class="metric"><span>{_e(label)}</span><strong>{value}</strong><small>{_e(note)}</small></div>' for label, value, note in tiles),
         "</section>",
+        _workspace_tabs(),
+        '<section id="workspace-panel-overview" class="workspace-panel active" role="tabpanel" aria-labelledby="workspace-tab-overview" data-workspace-panel="overview">',
+        _panel("生产收敛摘要", _production_readiness_panel(data["production_readiness"])),
+        '<section class="grid two">',
+        _panel("发现活水", _discovery_freshness_panel(data["discovery_freshness"])),
+        _panel("L1/L2/L3 证据流水线", _evidence_pipeline_panel(data["evidence_pipeline"])),
+        "</section>",
+        _panel("高分待验证", _top_review_candidates_panel(data["top_review_candidates"])),
+        "</section>",
+        '<section id="workspace-panel-discovery" class="workspace-panel" role="tabpanel" aria-labelledby="workspace-tab-discovery" data-workspace-panel="discovery" hidden>',
         '<section class="grid two">',
         _panel("候选阶段", _simple_table(data["stage_counts"], ["name", "count"], ["阶段", "数量"])),
         _panel("评分阶段", _simple_table(data["score_stage_counts"], ["name", "count", "avg_score", "max_score"], ["阶段", "数量", "均分", "最高分"])),
         "</section>",
-        _panel("评分规则", _dict_table(data["score_policy"])),
         '<section class="grid two">',
         _panel("发现来源", _simple_table(data["source_counts"], ["name", "count", "latest_at"], ["来源", "钱包数", "最近记录"])),
         _panel("补证据队列", _backfill_queue_tables(data["backfill_queue"])),
         "</section>",
-        _panel("发现活水", _discovery_freshness_panel(data["discovery_freshness"])),
-        _panel("L1/L2/L3 证据流水线", _evidence_pipeline_panel(data["evidence_pipeline"])),
-        _panel("生产收敛摘要", _production_readiness_panel(data["production_readiness"])),
+        _panel("评分规则", _dict_table(data["score_policy"])),
+        _panel("Copyability 证据通道", _copyability_lane_panel(data["copyability_lane"])),
+        _panel("Copyability 无信号高潜池", _copyability_no_signal_panel(data["copyability_no_signal"])),
+        _panel("Needs Data 原因", _needs_data_reason_table(data["needs_data_reasons"])),
+        _panel("来源质量摘要", _source_quality_table(data["source_quality"])),
+        _panel("高分阻塞分布", _simple_table(data["top_review_blockers"], ["blocker", "count", "max_score", "next_action", "example"], ["主阻塞", "数量", "最高分", "下一步", "例子"])),
+        "</section>",
+        '<section id="workspace-panel-paper" class="workspace-panel" role="tabpanel" aria-labelledby="workspace-tab-paper" data-workspace-panel="paper" hidden>',
         _panel("Execution Preflight 执行前检查", _execution_preflight_panel(data["execution_preflight"])),
         _panel("Paper 实时钱包审计", _paper_realtime_audit_panel(data["paper_realtime_audit"])),
         _panel("RTDS Watch 近 Paper 审计", _rtds_watch_audit_panel(data["rtds_watch_audit"])),
@@ -2805,19 +2820,16 @@ def _render_dashboard(settings: RobotSettings) -> str:
         _panel("Paper 交接观察", _paper_handoff_panel(data["paper_handoff"])),
         _panel("Paper Observer 预览", _paper_observer_preview_panel(data["paper_observer_preview"])),
         _panel("Paper Observer 报价评估", _paper_observer_evaluation_panel(data["paper_observer_evaluation"])),
-        _panel("Copyability 证据通道", _copyability_lane_panel(data["copyability_lane"])),
-        _panel("Copyability 无信号高潜池", _copyability_no_signal_panel(data["copyability_no_signal"])),
-        _panel("Needs Data 原因", _needs_data_reason_table(data["needs_data_reasons"])),
-        _panel("来源质量摘要", _source_quality_table(data["source_quality"])),
-        _panel("存储维护", _storage_maintenance_panel(data["storage_maintenance"])),
-        _panel("系统健康", _ops_health_panel(data["ops_health"])),
-        _panel("高分阻塞分布", _simple_table(data["top_review_blockers"], ["blocker", "count", "max_score", "next_action", "example"], ["主阻塞", "数量", "最高分", "下一步", "例子"])),
-        _panel("高分待验证", _top_review_candidates_panel(data["top_review_candidates"])),
         '<section class="grid two">',
         _panel("外部验证质量", _dict_table(data["paper_quality"])),
         _panel("本地发布库", _simple_table(data["published_leaders"], ["name", "count", "latest_at"], ["状态", "数量", "最近发布"])),
         "</section>",
+        "</section>",
+        '<section id="workspace-panel-operations" class="workspace-panel" role="tabpanel" aria-labelledby="workspace-tab-operations" data-workspace-panel="operations" hidden>',
+        _panel("存储维护", _storage_maintenance_panel(data["storage_maintenance"])),
+        _panel("系统健康", _ops_health_panel(data["ops_health"])),
         _panel("最近任务", _simple_table(data["recent_runs"], ["run_type", "status", "row_count", "started_at", "finished_at", "error"], ["任务", "状态", "行数", "开始", "结束", "错误"])),
+        "</section>",
         "</main>",
     ]
     return _render_page("pm-robot 研究总览", "".join(body))
@@ -2836,14 +2848,8 @@ def _render_wallets(settings: RobotSettings, *, stage: str, source: str, query: 
         _discovery_status_strip(data),
         _discovery_summary_tiles(data),
         _funnel_steps(data["funnel"]),
-        '<section class="grid three">',
-        _panel("证据深度", _evidence_depth_card(data["evidence_depth"])),
-        _panel("阶段分布", _mini_count_list(data["stage_counts"], "stage")),
-        _panel("快速筛选", _signal_filter_bar(data["signal_counts"], stage=stage, source=source, query=query, active=signal)),
-        "</section>",
-        _source_focus_section(data.get("source_focus") or {}),
         f"""
-        <form class="filters" method="get" action="/wallets">
+        <form class="filters sticky-filters" method="get" action="/wallets">
           <label>阶段<input name="stage" value="{_e(stage)}" placeholder="needs_manual_review"></label>
           <label>来源<input name="source" value="{_e(source)}" placeholder="trades_global"></label>
           <label>搜索<input name="q" value="{_e(query)}" placeholder="地址 / 标签 / 备注"></label>
@@ -2852,6 +2858,16 @@ def _render_wallets(settings: RobotSettings, *, stage: str, source: str, query: 
           <a class="button secondary" href="/wallets">清空</a>
         </form>
         """,
+        '<section class="section-head"><div><h2>候选队列</h2>'
+        f'<p>当前筛选返回 {_fmt_int(data["wallet_count"])} 个钱包，按综合发现优先级排序。</p></div></section>',
+        _wallets_table(rows),
+        '<details class="analysis-drawer"><summary><span>研究诊断</span><small>证据分布、来源质量与任务状态</small></summary><div class="analysis-content">',
+        '<section class="grid three">',
+        _panel("证据深度", _evidence_depth_card(data["evidence_depth"])),
+        _panel("阶段分布", _mini_count_list(data["stage_counts"], "stage")),
+        _panel("快速筛选", _signal_filter_bar(data["signal_counts"], stage=stage, source=source, query=query, active=signal)),
+        "</section>",
+        _source_focus_section(data.get("source_focus") or {}),
         '<section class="grid two">',
         _panel("发现来源质量", _source_quality_table(data["source_quality"])),
         _panel("最近发现事件", _simple_table(data["recent_source_events"], ["address", "source", "status", "labels", "recorded_at"], ["钱包", "来源", "状态", "标签", "记录"])),
@@ -2860,9 +2876,7 @@ def _render_wallets(settings: RobotSettings, *, stage: str, source: str, query: 
         _panel("补历史队列", _backfill_queue_tables(data["backfill_queue"])),
         _panel("发现相关任务", _simple_table(data["recent_runs"], ["run_type", "status", "row_count", "started_at", "finished_at", "error"], ["任务", "状态", "行数", "开始", "结束", "错误"])),
         "</section>",
-        '<section class="section-head"><div><h2>候选队列</h2>'
-        f'<p>当前筛选返回 {_fmt_int(data["wallet_count"])} 个钱包，按综合发现优先级排序。</p></div></section>',
-        _wallets_table(rows),
+        "</div></details>",
         "</main>",
     ]
     return _render_page("钱包发现工作台", "".join(body))
@@ -2959,9 +2973,29 @@ def _render_page(title: str, body: str) -> str:
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{_e(title)}</title>
   <style>{_CSS}</style>
+  <noscript><style>.workspace-tabs {{ display: none; }} .workspace-panel[hidden] {{ display: block; }}</style></noscript>
 </head>
-<body>{body}</body>
+<body>{body}<script>{_JS}</script></body>
 </html>"""
+
+
+def _workspace_tabs() -> str:
+    tabs = (
+        ("overview", "核心结论"),
+        ("discovery", "发现与评分"),
+        ("paper", "Paper 与 Copy"),
+        ("operations", "运行维护"),
+    )
+    return (
+        '<div class="workspace-tabs" role="tablist" aria-label="研究控制台分区">'
+        + "".join(
+            f'<button id="workspace-tab-{key}" type="button" role="tab" class="workspace-tab {"active" if key == "overview" else ""}" '
+            f'data-workspace-tab="{key}" aria-controls="workspace-panel-{key}" '
+            f'aria-selected="{"true" if key == "overview" else "false"}">{_e(label)}</button>'
+            for key, label in tabs
+        )
+        + "</div>"
+    )
 
 
 def _top_nav(active: str) -> str:
@@ -8296,11 +8330,58 @@ def _short(address: str) -> str:
 
 def _badge(value: Any) -> str:
     text = str(value or "")
-    return f'<span class="badge">{_e(text)}</span>'
+    style = ""
+    if text in {"paper_candidate", "paper_approved", "live_eligible", "ok", "screened"}:
+        style = " positive"
+    elif text in {"needs_data", "needs_manual_review", "incomplete", "queued", "running"}:
+        style = " attention"
+    elif text in {"rejected", "blocked_hygiene", "blocked_copyability", "failed"}:
+        style = " blocked"
+    return f'<span class="badge{style}">{_e(text)}</span>'
 
 
 def _e(value: Any) -> str:
     return html.escape(str(value if value is not None else ""), quote=True)
+
+
+_JS = """
+(() => {
+  const tabs = Array.from(document.querySelectorAll('[data-workspace-tab]'));
+  const panels = Array.from(document.querySelectorAll('[data-workspace-panel]'));
+  if (!tabs.length || !panels.length) return;
+
+  const activate = (key, updateHash) => {
+    const valid = tabs.some((tab) => tab.dataset.workspaceTab === key);
+    const selected = valid ? key : 'overview';
+    tabs.forEach((tab) => {
+      const active = tab.dataset.workspaceTab === selected;
+      tab.classList.toggle('active', active);
+      tab.setAttribute('aria-selected', active ? 'true' : 'false');
+      tab.tabIndex = active ? 0 : -1;
+    });
+    panels.forEach((panel) => {
+      const active = panel.dataset.workspacePanel === selected;
+      panel.hidden = !active;
+      panel.classList.toggle('active', active);
+    });
+    if (updateHash) history.replaceState(null, '', `#${selected}`);
+  };
+
+  tabs.forEach((tab) => {
+    tab.addEventListener('click', () => activate(tab.dataset.workspaceTab, true));
+    tab.addEventListener('keydown', (event) => {
+      if (!['ArrowLeft', 'ArrowRight'].includes(event.key)) return;
+      event.preventDefault();
+      const index = tabs.indexOf(tab);
+      const offset = event.key === 'ArrowRight' ? 1 : -1;
+      const next = tabs[(index + offset + tabs.length) % tabs.length];
+      activate(next.dataset.workspaceTab, true);
+      next.focus();
+    });
+  });
+  activate(location.hash.slice(1) || 'overview', false);
+})();
+"""
 
 
 _CSS = """
@@ -8377,6 +8458,7 @@ nav a.active, .button, button {
   gap: 20px;
   margin-bottom: 18px;
 }
+.workspace-hero { align-items: center; }
 .discovery-hero {
   padding: 4px 0 2px;
 }
@@ -8386,7 +8468,7 @@ nav a.active, .button, button {
   color: var(--accent-strong);
   font-size: 12px;
   font-weight: 800;
-  letter-spacing: 0.08em;
+  letter-spacing: 0;
   text-transform: uppercase;
 }
 h1 { margin: 0; font-size: 26px; line-height: 1.2; letter-spacing: 0; }
@@ -8428,6 +8510,31 @@ p { margin: 6px 0 0; color: var(--muted); }
 .metric { padding: 15px 16px; min-height: 92px; }
 .metric span, .metric small { display: block; color: var(--muted); }
 .metric strong { display: block; margin: 7px 0 3px; font-size: 25px; line-height: 1.1; overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
+.workspace-tabs {
+  position: sticky;
+  top: 56px;
+  z-index: 4;
+  display: flex;
+  gap: 4px;
+  margin: 0 0 16px;
+  padding: 5px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.97);
+  box-shadow: var(--shadow);
+  overflow-x: auto;
+}
+.workspace-tab {
+  flex: 1 0 auto;
+  min-height: 38px;
+  border-color: transparent;
+  background: transparent;
+  color: var(--muted);
+}
+.workspace-tab:hover { background: var(--surface-soft); color: var(--text); }
+.workspace-tab.active { border-color: var(--accent); background: var(--accent); color: #fff; }
+.workspace-panel > .panel { margin-bottom: 16px; }
+.workspace-panel[hidden] { display: none; }
 .health-banner {
   display: flex;
   align-items: center;
@@ -8541,6 +8648,8 @@ th, td { border-bottom: 1px solid #edf0ec; padding: 9px 10px; text-align: left; 
 th { color: #4d5751; font-size: 12px; font-weight: 700; background: #fafbf9; white-space: nowrap; }
 td { max-width: 520px; overflow-wrap: anywhere; }
 tbody tr:hover { background: #fbfcfb; }
+.table-panel table { min-width: 1180px; }
+.table-panel thead th { position: sticky; top: 0; z-index: 1; }
 .kv th { width: 210px; color: var(--muted); background: transparent; }
 .num { text-align: right; font-variant-numeric: tabular-nums; }
 .numline { font-weight: 800; font-variant-numeric: tabular-nums; white-space: nowrap; }
@@ -8580,6 +8689,9 @@ tbody tr:hover { background: #fbfcfb; }
   font-weight: 700;
   white-space: nowrap;
 }
+.badge.positive { background: var(--ok-soft); color: var(--ok); }
+.badge.attention { background: var(--amber-soft); color: var(--amber); }
+.badge.blocked { background: var(--rose-soft); color: var(--rose); }
 .source-pill, .depth-badge {
   display: inline-flex;
   align-items: center;
@@ -8658,6 +8770,29 @@ tbody tr:hover { background: #fbfcfb; }
   border-radius: 8px;
   box-shadow: var(--shadow);
 }
+.sticky-filters { position: sticky; top: 64px; z-index: 3; }
+.analysis-drawer {
+  margin-top: 18px;
+  border-top: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
+  background: transparent;
+}
+.analysis-drawer > summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 16px 2px;
+  cursor: pointer;
+  list-style: none;
+}
+.analysis-drawer > summary::-webkit-details-marker { display: none; }
+.analysis-drawer > summary span { font-size: 16px; font-weight: 800; }
+.analysis-drawer > summary small { color: var(--muted); }
+.analysis-drawer > summary::after { content: "+"; color: var(--accent); font-size: 22px; line-height: 1; }
+.analysis-drawer[open] > summary::after { content: "−"; }
+.analysis-content { padding: 0 0 4px; }
+.analysis-content > .panel { margin-bottom: 16px; }
 label { display: grid; gap: 5px; color: var(--muted); font-size: 12px; font-weight: 700; }
 input {
   width: 100%;
@@ -8691,11 +8826,15 @@ input {
   nav { flex-wrap: wrap; }
   .shell { padding: 20px 14px 36px; }
   .toolbar { flex-direction: column; }
+  .workspace-tabs { position: static; }
   .hero-actions { width: 100%; flex-wrap: wrap; }
   .metric-grid, .health-grid, .ops-columns, .grid.two, .grid.three, .filters { grid-template-columns: 1fr; }
   .status-strip { align-items: flex-start; flex-direction: column; }
   .status-strip span, .health-banner span { white-space: normal; }
   .funnel-grid { grid-template-columns: repeat(2, minmax(140px, 1fr)); }
   .metric { min-height: 80px; }
+  .sticky-filters { position: static; }
+  .analysis-drawer > summary { align-items: flex-start; }
+  .analysis-drawer > summary small { max-width: 60%; text-align: right; }
 }
 """
