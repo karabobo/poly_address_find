@@ -55,6 +55,12 @@ LOCK_RETRY_ATTEMPTS = 8
 LOCK_RETRY_SLEEP_SECONDS = 3.0
 UPSTREAM_COOLDOWN_BLOCK_SECONDS = 30.0
 WALLET_EVIDENCE_API_SCOPES = ("data:*", "data:/activity", "data:/positions")
+DEFAULT_PIPELINE_PRIORITY_AGING_SECONDS = 1_800
+DEFAULT_PIPELINE_STAGE_WEIGHTS = {
+    EvidenceJobStage.LIGHT_PENDING.value: 30,
+    EvidenceJobStage.MEDIUM_PENDING.value: 20,
+    EvidenceJobStage.DEEP_PENDING.value: 5,
+}
 
 
 @dataclass(frozen=True)
@@ -88,9 +94,9 @@ class WalletPipelineWorkerSummary:
 def plan_wallet_pipeline_jobs(
     conn: sqlite3.Connection,
     *,
-    light_limit: int = 30,
-    medium_limit: int = 20,
-    deep_limit: int = 5,
+    light_limit: int = DEFAULT_PIPELINE_STAGE_WEIGHTS[EvidenceJobStage.LIGHT_PENDING.value],
+    medium_limit: int = DEFAULT_PIPELINE_STAGE_WEIGHTS[EvidenceJobStage.MEDIUM_PENDING.value],
+    deep_limit: int = DEFAULT_PIPELINE_STAGE_WEIGHTS[EvidenceJobStage.DEEP_PENDING.value],
     shard_count: int = 3,
     max_active_jobs: int = 240,
     now: int | None = None,
@@ -206,7 +212,7 @@ def run_wallet_pipeline_worker(
     page_limit: int = 200,
     sleep_seconds: float = 0.02,
     lease_seconds: int = 900,
-    priority_aging_seconds: int = 1_800,
+    priority_aging_seconds: int = DEFAULT_PIPELINE_PRIORITY_AGING_SECONDS,
     worker_id: str = "",
     client: PublicPolymarketClient | None = None,
 ) -> WalletPipelineWorkerSummary:
@@ -514,8 +520,183 @@ def _require_pipeline_job_lease(
     conn.commit()
 
 
-def wallet_pipeline_job_status(conn: sqlite3.Connection) -> dict[str, Any]:
-    return pipeline_job_summary(conn, job_type=JOB_TYPE)
+def wallet_pipeline_job_status(
+    conn: sqlite3.Connection,
+    *,
+    now: int | None = None,
+    priority_aging_seconds: int = DEFAULT_PIPELINE_PRIORITY_AGING_SECONDS,
+    stage_weights: dict[str, int] | None = None,
+) -> dict[str, Any]:
+    summary = pipeline_job_summary(conn, job_type=JOB_TYPE)
+    summary.update(
+        wallet_pipeline_schedule_status(
+            conn,
+            now=now,
+            priority_aging_seconds=priority_aging_seconds,
+            stage_weights=stage_weights,
+        )
+    )
+    return summary
+
+
+def wallet_pipeline_schedule_status(
+    conn: sqlite3.Connection,
+    *,
+    now: int | None = None,
+    priority_aging_seconds: int = DEFAULT_PIPELINE_PRIORITY_AGING_SECONDS,
+    stage_weights: dict[str, int] | None = None,
+) -> dict[str, Any]:
+    """Return read-only stage backlog and fairness state using worker aging semantics."""
+    ts = int(time.time()) if now is None else int(now)
+    aging_seconds = max(0, int(priority_aging_seconds))
+    aging_cutoff = ts - aging_seconds
+    configured_weights = dict(DEFAULT_PIPELINE_STAGE_WEIGHTS)
+    if stage_weights:
+        configured_weights.update(
+            {
+                evidence_job_stage: max(0, int(weight))
+                for evidence_job_stage, weight in stage_weights.items()
+                if evidence_job_stage in PENDING_EVIDENCE_JOB_STAGES
+            }
+        )
+    scheduler_rows: dict[str, dict[str, Any]] = {}
+    if _pipeline_scheduler_state_exists(conn):
+        scheduler_rows = {
+            str(row["subject_key"]): dict(row)
+            for row in conn.execute(
+                """
+                SELECT subject_key, current_weight, last_selected_at, updated_at
+                FROM pipeline_scheduler_state
+                WHERE job_type = ?
+                """,
+                (JOB_TYPE,),
+            ).fetchall()
+        }
+
+    placeholders = ", ".join("?" for _stage in PENDING_EVIDENCE_JOB_STAGES)
+    stage_rows = {
+        str(row["job_action"]): dict(row)
+        for row in conn.execute(
+            f"""
+            SELECT
+                subject_key AS job_action,
+                SUM(CASE WHEN status = 'queued' THEN 1 ELSE 0 END) AS queued_count,
+                SUM(
+                    CASE
+                        WHEN status = 'queued'
+                             AND attempts < max_attempts
+                             AND next_attempt_at <= ?
+                        THEN 1 ELSE 0
+                    END
+                ) AS due_queued_count,
+                SUM(
+                    CASE
+                        WHEN status = 'queued'
+                             AND attempts < max_attempts
+                             AND next_attempt_at > ?
+                        THEN 1 ELSE 0
+                    END
+                ) AS deferred_queued_count,
+                SUM(
+                    CASE WHEN status = 'queued' AND attempts >= max_attempts THEN 1 ELSE 0 END
+                ) AS exhausted_queued_count,
+                SUM(CASE WHEN status = 'running' THEN 1 ELSE 0 END) AS running_count,
+                MIN(
+                    CASE
+                        WHEN status = 'queued'
+                             AND attempts < max_attempts
+                             AND next_attempt_at <= ?
+                        THEN updated_at
+                    END
+                ) AS oldest_claimable_queued_at,
+                SUM(
+                    CASE
+                        WHEN status = 'queued'
+                             AND attempts < max_attempts
+                             AND next_attempt_at <= ?
+                             AND ? > 0
+                             AND updated_at <= ?
+                        THEN 1 ELSE 0
+                    END
+                ) AS aged_queued_count
+            FROM pipeline_jobs
+            WHERE job_type = ?
+              AND subject_key IN ({placeholders})
+              AND status IN ('queued', 'running')
+            GROUP BY subject_key
+            """,
+            (
+                ts,
+                ts,
+                ts,
+                ts,
+                aging_seconds,
+                aging_cutoff,
+                JOB_TYPE,
+                *PENDING_EVIDENCE_JOB_STAGES,
+            ),
+        ).fetchall()
+    }
+
+    stages: list[dict[str, Any]] = []
+    for evidence_job_stage in PENDING_EVIDENCE_JOB_STAGES:
+        row = stage_rows.get(evidence_job_stage, {})
+        queued_count = int(row.get("queued_count") or 0)
+        due_queued_count = int(row.get("due_queued_count") or 0)
+        deferred_queued_count = int(row.get("deferred_queued_count") or 0)
+        exhausted_queued_count = int(row.get("exhausted_queued_count") or 0)
+        running_count = int(row.get("running_count") or 0)
+        active_count = queued_count + running_count
+        oldest_claimable_queued_at = int(row.get("oldest_claimable_queued_at") or 0)
+        configured_weight = int(configured_weights.get(evidence_job_stage) or 0)
+        scheduler = scheduler_rows.get(evidence_job_stage, {})
+        stages.append(
+            {
+                "job_action": evidence_job_stage,
+                "configured_weight": configured_weight,
+                "queued_count": queued_count,
+                "due_queued_count": due_queued_count,
+                "deferred_queued_count": deferred_queued_count,
+                "exhausted_queued_count": exhausted_queued_count,
+                "running_count": running_count,
+                "active_count": active_count,
+                "active_per_weight": (
+                    round(active_count / configured_weight, 4)
+                    if configured_weight > 0
+                    else None
+                ),
+                "aged_queued_count": int(row.get("aged_queued_count") or 0),
+                "oldest_claimable_queued_at": oldest_claimable_queued_at,
+                "oldest_claimable_wait_seconds": (
+                    max(0, ts - oldest_claimable_queued_at)
+                    if oldest_claimable_queued_at
+                    else 0
+                ),
+                "current_weight": int(scheduler.get("current_weight") or 0),
+                "last_selected_at": int(scheduler.get("last_selected_at") or 0),
+                "scheduler_updated_at": int(scheduler.get("updated_at") or 0),
+            }
+        )
+    return {
+        "priority_aging_seconds": aging_seconds,
+        "due_queued_count": sum(int(row["due_queued_count"]) for row in stages),
+        "deferred_queued_count": sum(int(row["deferred_queued_count"]) for row in stages),
+        "exhausted_queued_count": sum(int(row["exhausted_queued_count"]) for row in stages),
+        "aged_queued_count": sum(int(row["aged_queued_count"]) for row in stages),
+        "oldest_claimable_wait_seconds": max(
+            (int(row["oldest_claimable_wait_seconds"]) for row in stages),
+            default=0,
+        ),
+        "stage_schedule": stages,
+    }
+
+
+def _pipeline_scheduler_state_exists(conn: sqlite3.Connection) -> bool:
+    return bool(
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'pipeline_scheduler_state'"
+        ).fetchone()
+    )
 
 
 def _active_wallet_pipeline_jobs(conn: sqlite3.Connection) -> int:

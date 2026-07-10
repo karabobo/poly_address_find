@@ -105,6 +105,10 @@ default `up`, `restart`, `runtime-ensure`, or watchdog commands.
   cannot reserve the same high-waterline slot.
 - Workers normally claim by wallet priority, then promote the oldest queued job after the configured aging
   threshold. This preserves urgent-wallet ordering without allowing low-priority L2/L3 work to wait forever.
+- `wallet-pipeline-jobs` and the research console expose the same per-stage queue counts, configured weights,
+  scheduler cursor, and aged-job totals. Queue age is measured from `pipeline_jobs.updated_at` only when
+  `attempts < max_attempts` and `next_attempt_at` is due, matching the worker claim rule and avoiding false
+  alerts during retry backoff or after attempts are exhausted.
 - Public Polymarket HTTP clients reserve global and endpoint request slots atomically through the shared
   `api_rate_limit_state` table, while retaining the existing per-process limiter.
 - HTTP `429 Retry-After` cooldowns are shared across containers. Short waits are handled in the HTTP client;

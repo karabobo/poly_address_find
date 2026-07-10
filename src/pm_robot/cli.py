@@ -52,10 +52,13 @@ from pm_robot.orchestration.pipeline_smoothness import pipeline_smoothness_repor
 from pm_robot.orchestration.rtds_discovery import run_rtds_activity_discovery
 from pm_robot.orchestration.trade_role_ingestor import ingest_trade_role_evidence
 from pm_robot.orchestration.wallet_pipeline import (
+    DEFAULT_PIPELINE_PRIORITY_AGING_SECONDS,
+    DEFAULT_PIPELINE_STAGE_WEIGHTS,
     plan_wallet_pipeline_jobs,
     run_wallet_pipeline_worker,
     wallet_pipeline_job_status,
 )
+from pm_robot.pipeline_terms import EvidenceJobStage
 from pm_robot.execution.paper_portfolio import paper_readiness_rows, settle_paper_portfolio
 from pm_robot.execution.preflight import (
     DEFAULT_EXECUTION_SERVICES,
@@ -295,9 +298,21 @@ def main() -> int:
 
     wallet_pipeline_plan_cmd = sub.add_parser("wallet-pipeline-plan", help="Plan v2 wallet evidence jobs from pipeline state")
     wallet_pipeline_plan_cmd.add_argument("--db", dest="command_db", default=None, help="SQLite database path")
-    wallet_pipeline_plan_cmd.add_argument("--light-limit", type=int, default=30)
-    wallet_pipeline_plan_cmd.add_argument("--medium-limit", type=int, default=20)
-    wallet_pipeline_plan_cmd.add_argument("--deep-limit", type=int, default=5)
+    wallet_pipeline_plan_cmd.add_argument(
+        "--light-limit",
+        type=int,
+        default=DEFAULT_PIPELINE_STAGE_WEIGHTS[EvidenceJobStage.LIGHT_PENDING.value],
+    )
+    wallet_pipeline_plan_cmd.add_argument(
+        "--medium-limit",
+        type=int,
+        default=DEFAULT_PIPELINE_STAGE_WEIGHTS[EvidenceJobStage.MEDIUM_PENDING.value],
+    )
+    wallet_pipeline_plan_cmd.add_argument(
+        "--deep-limit",
+        type=int,
+        default=DEFAULT_PIPELINE_STAGE_WEIGHTS[EvidenceJobStage.DEEP_PENDING.value],
+    )
     wallet_pipeline_plan_cmd.add_argument("--shard-count", type=int, default=3)
     wallet_pipeline_plan_cmd.add_argument(
         "--max-active-jobs",
@@ -317,7 +332,7 @@ def main() -> int:
     wallet_pipeline_worker_cmd.add_argument(
         "--priority-aging-seconds",
         type=int,
-        default=1_800,
+        default=DEFAULT_PIPELINE_PRIORITY_AGING_SECONDS,
         help="Claim the oldest queued job after this wait even when its numeric priority is lower; 0 disables",
     )
     wallet_pipeline_worker_cmd.add_argument("--worker-id", default="")
@@ -1030,7 +1045,27 @@ def main() -> int:
         conn = connect(db_path)
         try:
             run_migrations(conn)
-            rows = wallet_pipeline_job_status(conn)
+            rows = wallet_pipeline_job_status(
+                conn,
+                priority_aging_seconds=_env_int(
+                    "PM_ROBOT_PIPELINE_PRIORITY_AGING_SECONDS",
+                    DEFAULT_PIPELINE_PRIORITY_AGING_SECONDS,
+                ),
+                stage_weights={
+                    EvidenceJobStage.LIGHT_PENDING.value: _env_int(
+                        "PM_ROBOT_PIPELINE_PLANNER_LIGHT_LIMIT",
+                        DEFAULT_PIPELINE_STAGE_WEIGHTS[EvidenceJobStage.LIGHT_PENDING.value],
+                    ),
+                    EvidenceJobStage.MEDIUM_PENDING.value: _env_int(
+                        "PM_ROBOT_PIPELINE_PLANNER_MEDIUM_LIMIT",
+                        DEFAULT_PIPELINE_STAGE_WEIGHTS[EvidenceJobStage.MEDIUM_PENDING.value],
+                    ),
+                    EvidenceJobStage.DEEP_PENDING.value: _env_int(
+                        "PM_ROBOT_PIPELINE_PLANNER_DEEP_LIMIT",
+                        DEFAULT_PIPELINE_STAGE_WEIGHTS[EvidenceJobStage.DEEP_PENDING.value],
+                    ),
+                },
+            )
         finally:
             conn.close()
         print(json.dumps(rows, ensure_ascii=False, indent=2))
@@ -1457,6 +1492,13 @@ def _source_event_mode_arg(value: str) -> str:
     if value == "upsert-source":
         return "upsert_source"
     return value
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name) or default)
+    except (TypeError, ValueError):
+        return int(default)
 
 
 if __name__ == "__main__":

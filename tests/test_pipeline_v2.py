@@ -124,6 +124,47 @@ def test_legacy_evidence_backfill_plan_cli_does_not_require_wallet_waterline(
     assert payload["status"] == "ok"
 
 
+def test_wallet_pipeline_jobs_cli_uses_runtime_scheduler_configuration(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    from pm_robot.cli import main
+
+    db_path = tmp_path / "robot.sqlite"
+    conn = connect(db_path)
+    try:
+        run_migrations(conn)
+    finally:
+        conn.close()
+    monkeypatch.setenv("PM_ROBOT_PIPELINE_PRIORITY_AGING_SECONDS", "900")
+    monkeypatch.setenv("PM_ROBOT_PIPELINE_PLANNER_LIGHT_LIMIT", "9")
+    monkeypatch.setenv("PM_ROBOT_PIPELINE_PLANNER_MEDIUM_LIMIT", "6")
+    monkeypatch.setenv("PM_ROBOT_PIPELINE_PLANNER_DEEP_LIMIT", "3")
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "pm-robot",
+            "--env",
+            str(tmp_path / "missing.env"),
+            "--db",
+            str(db_path),
+            "wallet-pipeline-jobs",
+        ],
+    )
+
+    assert main() == 0
+    payload = json.loads(capsys.readouterr().out)
+    weights = {row["job_action"]: row["configured_weight"] for row in payload["stage_schedule"]}
+
+    assert payload["priority_aging_seconds"] == 900
+    assert weights == {
+        EvidenceJobStage.LIGHT_PENDING.value: 9,
+        EvidenceJobStage.MEDIUM_PENDING.value: 6,
+        EvidenceJobStage.DEEP_PENDING.value: 3,
+    }
+
+
 def test_pipeline_job_completion_rejects_stale_lease_owner(tmp_path):
     conn = connect(tmp_path / "robot.sqlite")
     wallet = "0x" + "2" * 40
@@ -318,6 +359,121 @@ def test_pipeline_claim_promotes_old_job_after_aging_threshold(tmp_path):
 
         assert job is not None
         assert job["wallet"] == aged_wallet
+    finally:
+        conn.close()
+
+
+def test_wallet_pipeline_status_reports_stage_backlog_and_scheduler_cursor(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    try:
+        run_migrations(conn)
+        assert enqueue_pipeline_job(
+            conn,
+            job_type=WALLET_EVIDENCE_JOB_TYPE,
+            wallet="0x" + "1" * 40,
+            subject_key=EvidenceJobStage.LIGHT_PENDING.value,
+            tier=EvidenceTier.L0_DISCOVERED.value,
+            priority=10,
+            shard=0,
+            now=1_000,
+        )
+        assert enqueue_pipeline_job(
+            conn,
+            job_type=WALLET_EVIDENCE_JOB_TYPE,
+            wallet="0x" + "2" * 40,
+            subject_key=EvidenceJobStage.MEDIUM_PENDING.value,
+            tier=EvidenceTier.L1_LIGHT.value,
+            priority=20,
+            shard=0,
+            now=3_500,
+        )
+        assert enqueue_pipeline_job(
+            conn,
+            job_type=WALLET_EVIDENCE_JOB_TYPE,
+            wallet="0x" + "3" * 40,
+            subject_key=EvidenceJobStage.DEEP_PENDING.value,
+            tier=EvidenceTier.L2_MEDIUM.value,
+            priority=30,
+            shard=0,
+            next_attempt_at=5_000,
+            now=1_000,
+        )
+        assert enqueue_pipeline_job(
+            conn,
+            job_type=WALLET_EVIDENCE_JOB_TYPE,
+            wallet="0x" + "4" * 40,
+            subject_key=EvidenceJobStage.DEEP_PENDING.value,
+            tier=EvidenceTier.L2_MEDIUM.value,
+            priority=40,
+            shard=0,
+            now=1_000,
+        )
+        conn.execute(
+            "UPDATE pipeline_jobs SET attempts = max_attempts WHERE wallet = ?",
+            ("0x" + "4" * 40,),
+        )
+        conn.execute(
+            """
+            UPDATE pipeline_jobs
+            SET status = 'running', lease_owner = 'worker', lease_until = 5000
+            WHERE subject_key = ?
+            """,
+            (EvidenceJobStage.MEDIUM_PENDING.value,),
+        )
+        conn.execute(
+            """
+            INSERT INTO pipeline_scheduler_state(
+                job_type, subject_key, current_weight, last_selected_at, updated_at
+            ) VALUES (?, ?, -2, 3900, 3900)
+            """,
+            (WALLET_EVIDENCE_JOB_TYPE, EvidenceJobStage.LIGHT_PENDING.value),
+        )
+        conn.commit()
+
+        status = wallet_pipeline_job_status(
+            conn,
+            now=4_000,
+            priority_aging_seconds=1_800,
+            stage_weights={
+                EvidenceJobStage.LIGHT_PENDING.value: 3,
+                EvidenceJobStage.MEDIUM_PENDING.value: 2,
+                EvidenceJobStage.DEEP_PENDING.value: 1,
+            },
+        )
+        stages = {row["job_action"]: row for row in status["stage_schedule"]}
+
+        assert status["aged_queued_count"] == 1
+        assert status["due_queued_count"] == 1
+        assert status["deferred_queued_count"] == 1
+        assert status["exhausted_queued_count"] == 1
+        assert status["oldest_claimable_wait_seconds"] == 3_000
+        assert stages[EvidenceJobStage.LIGHT_PENDING.value] == {
+            "job_action": EvidenceJobStage.LIGHT_PENDING.value,
+            "configured_weight": 3,
+            "queued_count": 1,
+            "due_queued_count": 1,
+            "deferred_queued_count": 0,
+            "exhausted_queued_count": 0,
+            "running_count": 0,
+            "active_count": 1,
+            "active_per_weight": 0.3333,
+            "aged_queued_count": 1,
+            "oldest_claimable_queued_at": 1_000,
+            "oldest_claimable_wait_seconds": 3_000,
+            "current_weight": -2,
+            "last_selected_at": 3_900,
+            "scheduler_updated_at": 3_900,
+        }
+        assert stages[EvidenceJobStage.MEDIUM_PENDING.value]["running_count"] == 1
+        assert stages[EvidenceJobStage.MEDIUM_PENDING.value]["active_per_weight"] == 0.5
+        assert stages[EvidenceJobStage.DEEP_PENDING.value]["queued_count"] == 2
+        assert stages[EvidenceJobStage.DEEP_PENDING.value]["due_queued_count"] == 0
+        assert stages[EvidenceJobStage.DEEP_PENDING.value]["deferred_queued_count"] == 1
+        assert stages[EvidenceJobStage.DEEP_PENDING.value]["exhausted_queued_count"] == 1
+        assert stages[EvidenceJobStage.DEEP_PENDING.value]["aged_queued_count"] == 0
+        assert stages[EvidenceJobStage.DEEP_PENDING.value]["oldest_claimable_wait_seconds"] == 0
+        index_names = {row[1] for row in conn.execute("PRAGMA index_list('pipeline_jobs')")}
+        assert "idx_pipeline_jobs_type_action_status_updated" in index_names
     finally:
         conn.close()
 

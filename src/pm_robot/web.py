@@ -39,6 +39,11 @@ from pm_robot.orchestration.pipeline_audit import (
 )
 from pm_robot.orchestration.paper_runner import preview_paper_observer
 from pm_robot.orchestration.evidence_readiness import paper_evidence_ready, paper_evidence_ready_sql
+from pm_robot.orchestration.wallet_pipeline import (
+    DEFAULT_PIPELINE_PRIORITY_AGING_SECONDS,
+    DEFAULT_PIPELINE_STAGE_WEIGHTS,
+    wallet_pipeline_schedule_status,
+)
 from pm_robot.models import CandidateStage
 from pm_robot.pipeline_terms import (
     PAPER_ELIGIBLE_CANDIDATE_STAGES,
@@ -285,6 +290,13 @@ def _dashboard_cache_ttl() -> int:
         return int(os.environ.get("PM_ROBOT_WEB_DASHBOARD_CACHE_TTL_SEC", str(DASHBOARD_CACHE_TTL_SEC)))
     except ValueError:
         return DASHBOARD_CACHE_TTL_SEC
+
+
+def _web_env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name) or default)
+    except (TypeError, ValueError):
+        return int(default)
 
 
 def _prewarm_dashboard_cache(settings: RobotSettings) -> None:
@@ -3408,14 +3420,20 @@ def _metric(label: str, value: Any) -> str:
     return f'<div class="metric"><span>{_e(label)}</span><strong>{_e(value)}</strong></div>'
 
 
-def _simple_table(rows: list[dict[str, Any]], keys: list[str], labels: list[str]) -> str:
+def _simple_table(
+    rows: list[dict[str, Any]],
+    keys: list[str],
+    labels: list[str],
+    *,
+    table_class: str = "",
+) -> str:
     if not rows:
         return '<p class="empty">暂无数据。</p>'
     body = []
     for row in rows:
         cells = "".join(f"<td>{_format_cell(row.get(key))}</td>" for key in keys)
         body.append(f"<tr>{cells}</tr>")
-    return _table(labels, "".join(body))
+    return _table(labels, "".join(body), table_class=table_class)
 
 
 def _operator_code(value: Any, labels: dict[str, str]) -> str:
@@ -5732,6 +5750,41 @@ def _score_policy_freshness(
 def _evidence_pipeline_summary(conn: sqlite3.Connection, *, limit: int = 10) -> dict[str, Any]:
     now = int(time.time())
     job_type = PipelineJobType.WALLET_EVIDENCE_BACKFILL.value
+    schedule_status = wallet_pipeline_schedule_status(
+        conn,
+        now=now,
+        priority_aging_seconds=_web_env_int(
+            "PM_ROBOT_PIPELINE_PRIORITY_AGING_SECONDS",
+            DEFAULT_PIPELINE_PRIORITY_AGING_SECONDS,
+        ),
+        stage_weights={
+            EvidenceJobStage.LIGHT_PENDING.value: _web_env_int(
+                "PM_ROBOT_PIPELINE_PLANNER_LIGHT_LIMIT",
+                DEFAULT_PIPELINE_STAGE_WEIGHTS[EvidenceJobStage.LIGHT_PENDING.value],
+            ),
+            EvidenceJobStage.MEDIUM_PENDING.value: _web_env_int(
+                "PM_ROBOT_PIPELINE_PLANNER_MEDIUM_LIMIT",
+                DEFAULT_PIPELINE_STAGE_WEIGHTS[EvidenceJobStage.MEDIUM_PENDING.value],
+            ),
+            EvidenceJobStage.DEEP_PENDING.value: _web_env_int(
+                "PM_ROBOT_PIPELINE_PLANNER_DEEP_LIMIT",
+                DEFAULT_PIPELINE_STAGE_WEIGHTS[EvidenceJobStage.DEEP_PENDING.value],
+            ),
+        },
+    )
+    stage_schedule = []
+    for raw_row in schedule_status.get("stage_schedule") or []:
+        row = dict(raw_row)
+        row["stage_label"] = _EVIDENCE_ACTION_LABELS.get(
+            str(row.get("job_action") or ""),
+            str(row.get("job_action") or ""),
+        )
+        row["oldest_wait_label"] = (
+            _duration_label(row.get("oldest_claimable_wait_seconds"))
+            if int(row.get("oldest_claimable_wait_seconds") or 0)
+            else "-"
+        )
+        stage_schedule.append(row)
     queue_progress = _queue_progress_for_job_type(conn, job_type, now=now)
     pending_state_backlog = _pending_evidence_backlog_summary(conn, now=now)
     status_counts = _rows(
@@ -5750,7 +5803,10 @@ def _evidence_pipeline_summary(conn: sqlite3.Connection, *, limit: int = 10) -> 
     totals = {str(row.get("status") or ""): int(row.get("count") or 0) for row in status_counts}
     active_count = totals.get("queued", 0) + totals.get("running", 0)
     pending_state_count = int(pending_state_backlog.get("pending_without_active_job") or 0)
-    total_due_backlog = active_count + pending_state_count
+    due_queued_count = int(schedule_status.get("due_queued_count") or 0)
+    deferred_queued_count = int(schedule_status.get("deferred_queued_count") or 0)
+    exhausted_queued_count = int(schedule_status.get("exhausted_queued_count") or 0)
+    total_due_backlog = due_queued_count + totals.get("running", 0) + pending_state_count
     recent_rate_per_hour = float(queue_progress.get("recent_rate_per_hour") or 0)
     total_eta_label = (
         _fmt_duration_hours(total_due_backlog / recent_rate_per_hour)
@@ -5898,6 +5954,19 @@ def _evidence_pipeline_summary(conn: sqlite3.Connection, *, limit: int = 10) -> 
         "total_due_backlog": total_due_backlog,
         "total_eta_label": total_eta_label,
         "latest_completed_at": queue_progress.get("latest_completed_at", 0),
+        "priority_aging_seconds": schedule_status.get("priority_aging_seconds", 0),
+        "priority_aging_label": _duration_label(schedule_status.get("priority_aging_seconds")),
+        "due_queued_jobs": due_queued_count,
+        "deferred_queued_jobs": deferred_queued_count,
+        "exhausted_queued_jobs": exhausted_queued_count,
+        "aged_queued_jobs": schedule_status.get("aged_queued_count", 0),
+        "oldest_claimable_wait_seconds": schedule_status.get("oldest_claimable_wait_seconds", 0),
+        "oldest_claimable_wait_label": (
+            _duration_label(schedule_status.get("oldest_claimable_wait_seconds"))
+            if int(schedule_status.get("oldest_claimable_wait_seconds") or 0)
+            else "-"
+        ),
+        "stage_schedule": stage_schedule,
         "state_by_tier": state_by_tier,
         "active_by_action": active_by_action,
         "pending_state_without_active_job": pending_state_count,
@@ -7415,9 +7484,23 @@ def _evidence_pipeline_panel(values: dict[str, Any]) -> str:
     active = int(values.get("active") or 0)
     pending_state = int(values.get("pending_state_without_active_job") or 0)
     high_priority_pending_state = int(values.get("high_priority_pending_state_without_active_job") or 0)
-    if running:
+    due_queued = int(values.get("due_queued_jobs") or 0)
+    deferred_queued = int(values.get("deferred_queued_jobs") or 0)
+    exhausted_queued = int(values.get("exhausted_queued_jobs") or 0)
+    aged_queued = int(values.get("aged_queued_jobs") or 0)
+    if exhausted_queued:
+        banner_state = "attention"
+        note = "有排队任务已经耗尽尝试次数，worker 不会再领取；需维护或人工处理。"
+    elif aged_queued and not running:
+        banner_state = "attention"
+        note = "有久候任务已达到优先级老化阈值，但当前没有 running worker。"
+    elif running:
         banner_state = "ok"
-        note = "历史证据 worker 正在补 L1/L2/L3。"
+        note = (
+            "历史证据 worker 正在补 L1/L2/L3；久候任务会被自动提升。"
+            if aged_queued
+            else "历史证据 worker 正在补 L1/L2/L3。"
+        )
     elif queued:
         banner_state = "attention"
         note = "历史证据队列有积压，但当前没有 running 任务。"
@@ -7435,6 +7518,9 @@ def _evidence_pipeline_panel(values: dict[str, Any]) -> str:
         ("L3 深证据", _fmt_int(values.get("l3_wallets")), "l3_deep", "ok"),
         ("摘要就绪", _fmt_int(values.get("summary_ready_wallets")), "summary_ready", "ok"),
         ("排队", _fmt_int(queued), "queued jobs", "warn" if queued else "ok"),
+        ("到期排队", _fmt_int(due_queued), "当前可领取", "warn" if due_queued and not running else "ok"),
+        ("退避排队", _fmt_int(deferred_queued), "等待 next_attempt_at", "ok"),
+        ("尝试耗尽", _fmt_int(exhausted_queued), "不会被 worker 领取", "warn" if exhausted_queued else "ok"),
         ("运行", _fmt_int(running), "running jobs", "ok" if running else "warn" if queued else "ok"),
         ("状态待派", _fmt_int(pending_state), "状态表有下一动作但无活动任务", "warn" if pending_state else "ok"),
         ("高优待派", _fmt_int(high_priority_pending_state), "优先级待派断点", "warn" if high_priority_pending_state else "ok"),
@@ -7446,6 +7532,18 @@ def _evidence_pipeline_panel(values: dict[str, Any]) -> str:
         ),
         ("近1h完成", _fmt_int(values.get("completed_1h")), "done jobs", "ok"),
         ("24h完成", _fmt_int(values.get("completed_24h")), "done jobs", "ok"),
+        (
+            "老化排队",
+            _fmt_int(aged_queued),
+            f">= {values.get('priority_aging_label') or '阈值'}",
+            "warn" if aged_queued else "ok",
+        ),
+        (
+            "最久等待",
+            values.get("oldest_claimable_wait_label") or "-",
+            "按 worker priority aging 口径",
+            "warn" if aged_queued else "ok",
+        ),
         ("估算/小时", _fmt_num(values.get("recent_rate_per_hour")), "recent throughput", "ok"),
         (
             "总 ETA",
@@ -7478,6 +7576,26 @@ def _evidence_pipeline_panel(values: dict[str, Any]) -> str:
                 "latest_updated_at",
             ],
             ["证据层级", "证据状态", "下一动作", "钱包数", "最高优先级", "平均事件", "最大事件", "最近更新"],
+        )
+        + '<h3 class="subhead">分层调度状态</h3>'
+        + _simple_table(
+            values.get("stage_schedule") or [],
+            [
+                "stage_label",
+                "configured_weight",
+                "queued_count",
+                "due_queued_count",
+                "deferred_queued_count",
+                "exhausted_queued_count",
+                "running_count",
+                "active_per_weight",
+                "aged_queued_count",
+                "oldest_wait_label",
+                "current_weight",
+                "last_selected_at",
+            ],
+            ["证据动作", "调度权重", "排队", "到期", "退避", "耗尽", "运行", "活跃/权重", "老化排队", "最久等待", "游标权重", "最近选择"],
+            table_class="scheduler-table",
         )
         + '<h3 class="subhead">执行队列分布</h3>'
         + _simple_table(
@@ -7847,9 +7965,10 @@ def _short_path(value: str, *, max_len: int = 36) -> str:
     return "..." + value[-(max_len - 3) :]
 
 
-def _table(headers: list[str], body: str) -> str:
+def _table(headers: list[str], body: str, *, table_class: str = "") -> str:
     head = "".join(f"<th>{_e(item)}</th>" for item in headers)
-    return f'<div class="table-wrap"><table><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table></div>'
+    class_attr = f' class="{_e(table_class)}"' if table_class else ""
+    return f'<div class="table-wrap"><table{class_attr}><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table></div>'
 
 
 def _paper_quality_summary(conn: sqlite3.Connection) -> dict[str, Any]:
@@ -8268,6 +8387,8 @@ p { margin: 6px 0 0; color: var(--muted); }
 }
 .table-wrap { overflow-x: auto; }
 table { width: 100%; border-collapse: collapse; }
+.scheduler-table { min-width: 920px; }
+.scheduler-table td { white-space: nowrap; }
 th, td { border-bottom: 1px solid #edf0ec; padding: 9px 10px; text-align: left; vertical-align: top; }
 th { color: #4d5751; font-size: 12px; font-weight: 700; background: #fafbf9; white-space: nowrap; }
 td { max-width: 520px; overflow-wrap: anywhere; }

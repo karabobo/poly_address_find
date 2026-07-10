@@ -1596,13 +1596,15 @@ def test_dashboard_discovery_freshness_reports_recent_source_and_observed_flow(t
     assert "观察池晋级" in html
 
 
-def test_dashboard_evidence_pipeline_reports_l1_l2_l3_queue_progress(tmp_path):
+def test_dashboard_evidence_pipeline_reports_l1_l2_l3_queue_progress(tmp_path, monkeypatch):
     settings = _settings(tmp_path)
     _seed(settings)
+    monkeypatch.setenv("PM_ROBOT_PIPELINE_PRIORITY_AGING_SECONDS", "1800")
     wallet = "0xabc0000000000000000000000000000000000001"
     deep_wallet = "0xabc00000000000000000000000000000000000d3"
     done_wallet = "0xabc00000000000000000000000000000000000d4"
     stalled_wallet = "0xabc00000000000000000000000000000000000d5"
+    exhausted_wallet = "0xabc00000000000000000000000000000000000d6"
     now = int(time.time())
     conn = connect(settings.db_path)
     try:
@@ -1664,9 +1666,28 @@ def test_dashboard_evidence_pipeline_reports_l1_l2_l3_queue_progress(tmp_path):
             (
                 wallet,
                 json.dumps({"stage": "medium_pending", "target_depth": 1000}),
-                now - 100,
-                now - 90,
+                now - 2_000,
+                now - 1_900,
             ),
+        )
+        conn.execute(
+            """
+            INSERT INTO pipeline_scheduler_state(
+                job_type, subject_key, current_weight, last_selected_at, updated_at
+            ) VALUES ('wallet_evidence_backfill', 'medium_pending', -5, ?, ?)
+            """,
+            (now - 60, now - 60),
+        )
+        conn.execute(
+            """
+            INSERT INTO pipeline_jobs(
+                job_type, wallet, subject_key, tier, priority, shard, status,
+                lease_owner, lease_until, attempts, max_attempts, next_attempt_at,
+                input_json, output_json, last_error, created_at, updated_at
+            ) VALUES ('wallet_evidence_backfill', ?, 'deep_pending', 'l2_medium',
+                      99, 0, 'queued', NULL, 0, 3, 3, 0, '{}', '{}', 'retry exhausted', ?, ?)
+            """,
+            (exhausted_wallet, now - 3_000, now - 3_000),
         )
         conn.execute(
             """
@@ -1705,9 +1726,9 @@ def test_dashboard_evidence_pipeline_reports_l1_l2_l3_queue_progress(tmp_path):
     pipeline = data["evidence_pipeline"]
     html = _render_dashboard(settings)
 
-    assert pipeline["queued"] == 1
+    assert pipeline["queued"] == 2
     assert pipeline["running"] == 0
-    assert pipeline["active"] == 1
+    assert pipeline["active"] == 2
     assert pipeline["completed_1h"] == 1
     assert pipeline["completed_24h"] == 1
     assert pipeline["eta_label"]
@@ -1717,6 +1738,16 @@ def test_dashboard_evidence_pipeline_reports_l1_l2_l3_queue_progress(tmp_path):
     assert pipeline["summary_ready_wallets"] == 1
     assert pipeline["active_by_action"][0]["job_action"] == "medium_pending"
     assert pipeline["active_by_action"][0]["job_scope"] == "l1_light"
+    assert pipeline["aged_queued_jobs"] == 1
+    assert pipeline["due_queued_jobs"] == 1
+    assert pipeline["deferred_queued_jobs"] == 0
+    assert pipeline["exhausted_queued_jobs"] == 1
+    assert pipeline["oldest_claimable_wait_seconds"] >= 1_900
+    stage_schedule = {row["job_action"]: row for row in pipeline["stage_schedule"]}
+    assert stage_schedule["medium_pending"]["configured_weight"] == 20
+    assert stage_schedule["medium_pending"]["queued_count"] == 1
+    assert stage_schedule["medium_pending"]["aged_queued_count"] == 1
+    assert stage_schedule["medium_pending"]["current_weight"] == -5
     assert pipeline["pending_state_without_active_job"] == 1
     assert pipeline["high_priority_pending_state_without_active_job"] == 0
     assert pipeline["pending_state_by_action"][0]["next_action"] == "deep_pending"
@@ -1727,6 +1758,16 @@ def test_dashboard_evidence_pipeline_reports_l1_l2_l3_queue_progress(tmp_path):
     assert pipeline["recent_completed_jobs"][0]["evidence_tier"] == "l1_light"
     assert "L1/L2/L3 证据流水线" in html
     assert "钱包证据层级" in html
+    assert "分层调度状态" in html
+    assert 'class="scheduler-table"' in html
+    assert "调度权重" in html
+    assert "到期" in html
+    assert "退避" in html
+    assert "耗尽" in html
+    assert "老化排队" in html
+    assert "最久等待" in html
+    assert "尝试耗尽" in html
+    assert "worker 不会再领取" in html
     assert "执行队列前排" in html
     assert "状态待派断点" in html
     assert "总到期待补" in html
