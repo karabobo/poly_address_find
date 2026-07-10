@@ -12,6 +12,8 @@ COPY config /app/config
 COPY deploy /app/deploy
 COPY scripts /app/scripts
 
+RUN pip install --no-cache-dir "duckdb>=1.5,<2"
+
 EXPOSE 8787
 
 CMD ["python", "-m", "pm_robot.cli", "--env", "/app/.env", "web", "--host", "0.0.0.0", "--port", "8787"]

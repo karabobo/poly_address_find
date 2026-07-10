@@ -3,7 +3,9 @@ name = "polymarket-copy-robot"
 version = "0.1.0"
 description = "Paper-driven Polymarket wallet discovery, scoring, and research evaluation system."
 requires-python = ">=3.11"
-dependencies = []
+dependencies = [
+    "duckdb>=1.5,<2",
+]
 
 [project.scripts]
 pm-robot = "pm_robot.cli:main"

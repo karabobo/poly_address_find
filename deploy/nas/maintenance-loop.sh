@@ -12,6 +12,7 @@ PRUNE_ENABLED="${PM_ROBOT_RETENTION_PRUNE_ENABLED:-1}"
 PRUNE_BATCHES="${PM_ROBOT_RETENTION_PRUNE_BATCHES:-1}"
 PRUNE_LIMIT="${PM_ROBOT_RETENTION_PRUNE_LIMIT:-5}"
 PRUNE_KEEP_RECENT_ACTIVITY="${PM_ROBOT_RETENTION_KEEP_RECENT_ACTIVITY:-0}"
+PRUNE_ARCHIVE_ENABLED="${PM_ROBOT_RETENTION_ARCHIVE_ENABLED:-1}"
 
 runtime_heartbeat() {
   name="$1"
@@ -45,8 +46,13 @@ while true; do
   if [ "$maintenance_ok" -eq 1 ] && [ "$PRUNE_ENABLED" = "1" ]; then
     batch=0
     while [ "$batch" -lt "$PRUNE_BATCHES" ]; do
+      archive_args="--no-archive"
+      if [ "$PRUNE_ARCHIVE_ENABLED" = "1" ]; then
+        archive_args="--archive"
+      fi
       if ! python -m pm_robot.cli --env /app/.env prune-evidence \
           --execute \
+          "$archive_args" \
           --limit "$PRUNE_LIMIT" \
           --keep-recent-activity "$PRUNE_KEEP_RECENT_ACTIVITY"; then
         maintenance_ok=0

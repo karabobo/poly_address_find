@@ -2062,6 +2062,8 @@ def persist_wallet_positions(
     commit: bool = True,
 ) -> int:
     address = address.lower()
+    if _raw_evidence_write_suppressed(conn, address):
+        return 0
     rows = []
     for position in positions:
         asset_id = str(position.get("asset") or position.get("asset_id") or position.get("token_id") or "")
@@ -2123,6 +2125,8 @@ def persist_wallet_activity(
     commit: bool = True,
 ) -> int:
     address = address.lower()
+    if _raw_evidence_write_suppressed(conn, address):
+        return 0
     rows = []
     for event in events:
         raw_event = dict(event)
@@ -2223,6 +2227,20 @@ def persist_wallet_activity(
     if commit:
         conn.commit()
     return inserted
+
+
+def _raw_evidence_write_suppressed(conn: sqlite3.Connection, address: str) -> bool:
+    """Prevent a frozen or pruned wallet from silently repopulating the hot store."""
+
+    if conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'wallet_registry'"
+    ).fetchone() is None:
+        return False
+    row = conn.execute(
+        "SELECT raw_retention_tier FROM wallet_registry WHERE address = ?",
+        (address.lower(),),
+    ).fetchone()
+    return row is not None and str(row["raw_retention_tier"] or "") == "summary_only"
 
 
 def activity_watermark(conn: sqlite3.Connection, address: str) -> dict[str, Any]:

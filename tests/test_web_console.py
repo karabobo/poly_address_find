@@ -2681,6 +2681,41 @@ def test_storage_maintenance_summary_does_not_warn_when_scheduled_backups_are_pa
     assert "暂停" in html
 
 
+def test_storage_maintenance_summary_exposes_parquet_archive_state(tmp_path):
+    settings = RobotSettings(
+        db_path=tmp_path / "data" / "pm_robot.sqlite",
+        archive_dir=tmp_path / "data" / "parquet",
+        execution_mode="research",
+    )
+    conn = connect(settings.db_path)
+    try:
+        run_migrations(conn)
+        conn.execute(
+            """
+            INSERT INTO evidence_archive_runs(
+                run_id, status, archive_path, wallet_count, row_count,
+                file_count, byte_size, created_at, pruned_at, updated_at
+            ) VALUES ('archive-test', 'pruned', 'evidence/test', 3, 120, 4, 4096, 100, 200, 200)
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    summary = _storage_maintenance_summary(
+        settings,
+        low_free_disk_bytes=1,
+        scheduled_backup_enabled=False,
+    )
+    html = _storage_maintenance_panel(summary)
+
+    assert summary["evidence_archive"]["wallet_count"] == 3
+    assert summary["evidence_archive"]["row_count"] == 120
+    assert summary["evidence_archive"]["byte_size"] == 4096
+    assert "Parquet 冷归档" in html
+    assert "3 钱包 / 120 行" in html
+
+
 def test_discovery_data_builds_workbench_metrics(tmp_path):
     settings = _settings(tmp_path)
     _seed(settings)

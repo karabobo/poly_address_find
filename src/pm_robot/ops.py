@@ -16,6 +16,19 @@ from pm_robot.config import RobotSettings
 from pm_robot.risk.eligibility import winner_library_eligibility_status
 from pm_robot.storage.api_rate_limit import api_rate_limit_summary
 from pm_robot.storage.db import connect, connect_readonly, is_sqlite_locked_error, run_migrations
+from pm_robot.storage.evidence_archive import (
+    EVIDENCE_TABLE_SPECS,
+    capture_archive_scope,
+    create_archive_run,
+    drop_prune_temp_tables,
+    ensure_archive_backend,
+    export_evidence_archive,
+    prepare_prune_temp_tables,
+    register_archive_manifest,
+    resumable_archive_run,
+    set_archive_run_status,
+    verify_archive_manifest,
+)
 from pm_robot.storage.repository import api_request_summary
 
 DAY_SECONDS = 86_400
@@ -448,8 +461,12 @@ def next_backup_delay_seconds(
         latest_mtime = latest.stat().st_mtime
     except FileNotFoundError:
         # Timestamped files without the verified marker may be interrupted backups.
+        try:
+            latest_is_symlink = latest.is_symlink()
+        except OSError:
+            latest_is_symlink = False
         has_unverified_artifact = (
-            latest.is_symlink()
+            latest_is_symlink
             or any(
                 path.name != latest.name
                 for path in backup_dir.glob("pm_robot-*.sqlite")
@@ -943,37 +960,126 @@ def prune_low_value_evidence(
     keep_recent_activity: int = 0,
     dry_run: bool = True,
     vacuum: bool = False,
+    archive: bool = False,
+    archive_dir: Path | None = None,
 ) -> dict[str, Any]:
-    """Prune raw evidence after a wallet decision has been summarized.
+    """Archive and prune raw evidence after a wallet decision is summarized.
 
     Candidate, feature, latest-score, source, and registry summary rows remain the
-    durable control-plane record. Raw event/backtest rows and redundant score
-    history are removed only after that summary has been refreshed.
+    durable control-plane record. When archive is enabled, verified Parquet files
+    are committed before any raw event, backtest, or redundant score row is removed.
     """
+
+    archive_root = archive_dir or settings.archive_dir
+    archive_run: dict[str, Any] | None = None
+    effective_keep_recent_activity = max(0, int(keep_recent_activity))
+    conn = connect(settings.db_path)
+    try:
+        run_migrations(conn)
+        if archive and not dry_run:
+            ensure_archive_backend()
+            archive_run = resumable_archive_run(conn)
+        wallets = (
+            list(archive_run["wallets"])
+            if archive_run is not None
+            else _low_value_prune_wallets(conn, limit=limit)
+        )
+        if archive and not dry_run and archive_run is None and wallets:
+            _materialize_wallet_registry(conn, limit=0, stages=(), addresses=tuple(wallets))
+            archive_run = create_archive_run(
+                conn,
+                wallets,
+                keep_recent_activity=effective_keep_recent_activity,
+            )
+            _stage_wallet_registry_archive(conn, wallets, run_id=str(archive_run["run_id"]))
+            _cancel_wallet_evidence_backfill(conn, wallets)
+            capture_archive_scope(
+                conn,
+                str(archive_run["run_id"]),
+                wallets,
+                keep_recent_activity=effective_keep_recent_activity,
+            )
+            conn.commit()
+        elif not archive and not dry_run:
+            _materialize_wallet_registry(conn, limit=0, stages=(), addresses=tuple(wallets))
+            conn.commit()
+    finally:
+        conn.close()
+    if archive_run is not None:
+        effective_keep_recent_activity = int(archive_run.get("keep_recent_activity") or 0)
+
+    archive_result: dict[str, Any] = {
+        "enabled": archive,
+        "status": "planned" if dry_run and archive else "disabled",
+        "run_id": "",
+        "manifest_path": "",
+        "row_count": 0,
+        "file_count": 0,
+        "byte_size": 0,
+    }
+    if archive and not dry_run and archive_run is not None:
+        archive_result = _complete_evidence_archive(
+            settings,
+            archive_root=archive_root,
+            archive_run=archive_run,
+            keep_recent_activity=effective_keep_recent_activity,
+        )
+        if not archive_result["ok"]:
+            return {
+                "ok": False,
+                "dry_run": False,
+                "vacuum": False,
+                "wallets": wallets,
+                "wallet_count": len(wallets),
+                "deleted": _empty_evidence_delete_counts(),
+                "archive": archive_result,
+                "storage": storage_report(settings),
+            }
 
     conn = connect(settings.db_path)
     try:
         run_migrations(conn)
-        wallets = _low_value_prune_wallets(conn, limit=limit)
-        if not dry_run:
-            _materialize_wallet_registry(conn, limit=0, stages=(), addresses=tuple(wallets))
-            conn.commit()
-            conn.execute("PRAGMA foreign_keys = OFF")
+        conn.execute("PRAGMA foreign_keys = OFF")
         deleted = _prune_wallet_evidence_batch(
             conn,
             wallets,
-            keep_recent_activity=keep_recent_activity,
+            keep_recent_activity=effective_keep_recent_activity,
             dry_run=dry_run,
+            archive_run_id=str(archive_result.get("run_id") or ""),
         )
         if not dry_run:
-            _mark_wallet_registry_pruned(conn, wallets)
-            _cancel_wallet_evidence_backfill(conn, wallets)
-            # Planner statistics are a low-frequency maintenance concern. Running
-            # optimize here turns every bounded prune into a large index scan.
-            if vacuum:
-                conn.execute("VACUUM")
+            raw_artifact_uri = ""
+            archive_run_id = ""
+            if archive_result.get("status") == "verified":
+                archive_run_id = str(archive_result["run_id"])
+                raw_artifact_uri = f"parquet://{archive_result['manifest_path']}"
+            residual = _remaining_wallet_evidence_counts(
+                conn,
+                wallets,
+                keep_recent_activity=effective_keep_recent_activity,
+            )
+            if not any(residual.values()):
+                _mark_wallet_registry_pruned(
+                    conn,
+                    wallets,
+                    archive_run_id=archive_run_id,
+                )
+            _cancel_wallet_evidence_backfill(
+                conn,
+                wallets,
+                raw_artifact_uri_prefix="parquet-wallet://" if raw_artifact_uri else "",
+            )
+            if archive_run_id:
+                final_archive_status = "pruned_partial" if any(residual.values()) else "pruned"
+                set_archive_run_status(conn, archive_run_id, final_archive_status)
+                archive_result["status"] = final_archive_status
+                archive_result["residual"] = residual
             conn.commit()
-            conn.execute("PRAGMA foreign_keys = ON")
+        else:
+            conn.rollback()
+        conn.execute("PRAGMA foreign_keys = ON")
+        if vacuum and not dry_run:
+            conn.execute("VACUUM")
     finally:
         conn.close()
     return {
@@ -983,8 +1089,74 @@ def prune_low_value_evidence(
         "wallets": wallets,
         "wallet_count": len(wallets),
         "deleted": deleted,
+        "archive": archive_result,
         "storage": storage_report(settings),
     }
+
+
+def _complete_evidence_archive(
+    settings: RobotSettings,
+    *,
+    archive_root: Path,
+    archive_run: dict[str, Any],
+    keep_recent_activity: int,
+) -> dict[str, Any]:
+    """Export or resume one archive run; a failure leaves SQLite evidence untouched."""
+
+    run_id = str(archive_run["run_id"])
+    try:
+        if str(archive_run.get("status") or "") == "verified" and archive_run.get("manifest_path"):
+            manifest = verify_archive_manifest(archive_root, str(archive_run["manifest_path"]))
+            manifest["manifest_path"] = str(archive_run["manifest_path"])
+        else:
+            conn = connect(settings.db_path)
+            try:
+                set_archive_run_status(conn, run_id, "exporting")
+                conn.commit()
+            finally:
+                conn.close()
+            manifest = export_evidence_archive(
+                settings.db_path,
+                archive_root,
+                run_id=run_id,
+                archive_path=str(archive_run["archive_path"]),
+                wallets=list(archive_run["wallets"]),
+                keep_recent_activity=keep_recent_activity,
+            )
+            conn = connect(settings.db_path)
+            try:
+                register_archive_manifest(conn, manifest)
+                conn.commit()
+            finally:
+                conn.close()
+        return {
+            "ok": True,
+            "enabled": True,
+            "status": "verified",
+            "run_id": run_id,
+            "manifest_path": str(manifest["manifest_path"]),
+            "row_count": int(manifest["row_count"]),
+            "file_count": int(manifest["file_count"]),
+            "byte_size": int(manifest["byte_size"]),
+        }
+    except Exception as exc:
+        conn = connect(settings.db_path)
+        try:
+            set_archive_run_status(conn, run_id, "failed", error=str(exc))
+            conn.commit()
+        finally:
+            conn.close()
+        return {
+            "ok": False,
+            "enabled": True,
+            "status": "failed",
+            "run_id": run_id,
+            "manifest_path": "",
+            "row_count": 0,
+            "file_count": 0,
+            "byte_size": 0,
+            "error": str(exc),
+        }
 
 
 def _materialize_wallet_registry(
@@ -1376,8 +1548,9 @@ def _wallet_registry_status(
     paper: dict[str, Any],
     tags: list[str],
 ) -> tuple[str, str]:
-    if str(row.get("existing_registry_status") or "") == "archived_raw_pruned":
-        return "archived_raw_pruned", "summary_only"
+    existing_status = str(row.get("existing_registry_status") or "")
+    if existing_status in {"archive_pending", "archived_raw_pruned"}:
+        return existing_status, "summary_only"
     stage = str(row.get("candidate_stage") or "")
     review_reason = str(score.get("review_reason") or "")
     leader_score = float(score.get("leader_score") or 0)
@@ -1705,7 +1878,7 @@ def _low_value_prune_wallets(conn: sqlite3.Connection, *, limit: int) -> list[st
         LEFT JOIN wallet_registry wr
           ON wr.address = cw.address
         WHERE cw.candidate_stage IN ('rejected', 'blocked_hygiene', 'blocked_copyability')
-          AND COALESCE(wr.raw_prune_version, '') != 'v2_zero_raw'
+          AND wr.raw_pruned_at IS NULL
           AND NOT EXISTS (
               SELECT 1
               FROM paper_wallet_quality pwq
@@ -1743,7 +1916,7 @@ def _low_value_prune_wallets(conn: sqlite3.Connection, *, limit: int) -> list[st
         LEFT JOIN wallet_registry wr
           ON wr.address = cw.address
         WHERE cw.candidate_stage = 'needs_data'
-          AND COALESCE(wr.raw_prune_version, '') != 'v2_zero_raw'
+          AND wr.raw_pruned_at IS NULL
           AND ls.review_stage = 'needs_data'
           AND ls.leader_score = 0
           AND instr(COALESCE(wf.extra_json, '{}'), 'feature_materializer_version') > 0
@@ -1789,21 +1962,9 @@ def _prune_wallet_evidence_batch(
     *,
     keep_recent_activity: int,
     dry_run: bool,
+    archive_run_id: str = "",
 ) -> dict[str, int]:
-    deleted: dict[str, int] = {
-        "wallet_activity": 0,
-        "wallet_episodes": 0,
-        "wallet_positions": 0,
-        "copy_backtest_trades": 0,
-        "copy_trade_links": 0,
-        "copy_pair_stats": 0,
-        "paper_fills": 0,
-        "paper_orders": 0,
-        "paper_positions": 0,
-        "paper_settlements": 0,
-        "paper_marks": 0,
-        "leader_scores": 0,
-    }
+    deleted = _empty_evidence_delete_counts()
     if not wallets:
         return deleted
 
@@ -1811,179 +1972,92 @@ def _prune_wallet_evidence_batch(
         row[0]
         for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
     }
-    conn.execute("CREATE TEMP TABLE IF NOT EXISTS temp_prune_wallets(wallet TEXT PRIMARY KEY)")
-    conn.execute("DELETE FROM temp_prune_wallets")
-    conn.executemany(
-        "INSERT OR IGNORE INTO temp_prune_wallets(wallet) VALUES (?)",
-        ((wallet.lower(),) for wallet in wallets),
+    prepare_prune_temp_tables(
+        conn,
+        wallets,
+        keep_recent_activity=keep_recent_activity,
     )
-    conn.execute("CREATE TEMP TABLE IF NOT EXISTS temp_prune_keep_activity(activity_id INTEGER PRIMARY KEY)")
-    conn.execute("DELETE FROM temp_prune_keep_activity")
-    if "wallet_activity" in tables and keep_recent_activity > 0:
-        conn.execute(
-            """
-            INSERT OR IGNORE INTO temp_prune_keep_activity(activity_id)
-            SELECT activity_id
-            FROM (
-                SELECT
-                    wa.activity_id,
-                    ROW_NUMBER() OVER (
-                        PARTITION BY wa.address
-                        ORDER BY wa.timestamp DESC, wa.activity_id DESC
-                    ) AS rn
-                FROM wallet_activity wa
-                JOIN temp_prune_wallets pw
-                  ON pw.wallet = wa.address
-            )
-            WHERE rn <= ?
-            """,
-            (keep_recent_activity,),
-        )
-
-    specs: list[tuple[str, str, str]] = [
-        (
-            "copy_backtest_trades",
-            """
-            SELECT COUNT(*)
-            FROM copy_backtest_trades
-            WHERE leader_wallet IN (SELECT wallet FROM temp_prune_wallets)
-               OR follower_wallet IN (SELECT wallet FROM temp_prune_wallets)
-            """,
-            """
-            DELETE FROM copy_backtest_trades
-            WHERE leader_wallet IN (SELECT wallet FROM temp_prune_wallets)
-               OR follower_wallet IN (SELECT wallet FROM temp_prune_wallets)
-            """,
-        ),
-        (
-            "copy_trade_links",
-            """
-            SELECT COUNT(*)
-            FROM copy_trade_links
-            WHERE link_id IN (
-                SELECT link_id
-                FROM copy_trade_links
-                WHERE leader_wallet IN (SELECT wallet FROM temp_prune_wallets)
-                UNION
-                SELECT link_id
-                FROM copy_trade_links
-                WHERE follower_wallet IN (SELECT wallet FROM temp_prune_wallets)
-            )
-            """,
-            """
-            DELETE FROM copy_trade_links
-            WHERE link_id IN (
-                SELECT link_id
-                FROM copy_trade_links
-                WHERE leader_wallet IN (SELECT wallet FROM temp_prune_wallets)
-                UNION
-                SELECT link_id
-                FROM copy_trade_links
-                WHERE follower_wallet IN (SELECT wallet FROM temp_prune_wallets)
-            )
-            """,
-        ),
-        (
-            "copy_pair_stats",
-            """
-            SELECT COUNT(*)
-            FROM copy_pair_stats
-            WHERE leader_wallet IN (SELECT wallet FROM temp_prune_wallets)
-               OR follower_wallet IN (SELECT wallet FROM temp_prune_wallets)
-            """,
-            """
-            DELETE FROM copy_pair_stats
-            WHERE leader_wallet IN (SELECT wallet FROM temp_prune_wallets)
-               OR follower_wallet IN (SELECT wallet FROM temp_prune_wallets)
-            """,
-        ),
-        (
-            "paper_fills",
-            "SELECT COUNT(*) FROM paper_fills WHERE wallet IN (SELECT wallet FROM temp_prune_wallets)",
-            "DELETE FROM paper_fills WHERE wallet IN (SELECT wallet FROM temp_prune_wallets)",
-        ),
-        (
-            "paper_orders",
-            "SELECT COUNT(*) FROM paper_orders WHERE wallet IN (SELECT wallet FROM temp_prune_wallets)",
-            "DELETE FROM paper_orders WHERE wallet IN (SELECT wallet FROM temp_prune_wallets)",
-        ),
-        (
-            "paper_positions",
-            "SELECT COUNT(*) FROM paper_positions WHERE wallet IN (SELECT wallet FROM temp_prune_wallets)",
-            "DELETE FROM paper_positions WHERE wallet IN (SELECT wallet FROM temp_prune_wallets)",
-        ),
-        (
-            "paper_settlements",
-            "SELECT COUNT(*) FROM paper_settlements WHERE wallet IN (SELECT wallet FROM temp_prune_wallets)",
-            "DELETE FROM paper_settlements WHERE wallet IN (SELECT wallet FROM temp_prune_wallets)",
-        ),
-        (
-            "paper_marks",
-            "SELECT COUNT(*) FROM paper_marks WHERE wallet IN (SELECT wallet FROM temp_prune_wallets)",
-            "DELETE FROM paper_marks WHERE wallet IN (SELECT wallet FROM temp_prune_wallets)",
-        ),
-        (
-            "wallet_episodes",
-            "SELECT COUNT(*) FROM wallet_episodes WHERE address IN (SELECT wallet FROM temp_prune_wallets)",
-            "DELETE FROM wallet_episodes WHERE address IN (SELECT wallet FROM temp_prune_wallets)",
-        ),
-        (
-            "wallet_activity",
-            """
-            SELECT COUNT(*)
-            FROM wallet_activity
-            WHERE address IN (SELECT wallet FROM temp_prune_wallets)
-              AND activity_id NOT IN (SELECT activity_id FROM temp_prune_keep_activity)
-            """,
-            """
-            DELETE FROM wallet_activity
-            WHERE address IN (SELECT wallet FROM temp_prune_wallets)
-              AND activity_id NOT IN (SELECT activity_id FROM temp_prune_keep_activity)
-            """,
-        ),
-        (
-            "wallet_positions",
-            "SELECT COUNT(*) FROM wallet_positions WHERE address IN (SELECT wallet FROM temp_prune_wallets)",
-            "DELETE FROM wallet_positions WHERE address IN (SELECT wallet FROM temp_prune_wallets)",
-        ),
-        (
-            "leader_scores",
-            """
-            SELECT COUNT(*)
-            FROM leader_scores
-            WHERE address IN (SELECT wallet FROM temp_prune_wallets)
-              AND score_id NOT IN (
-                  SELECT score_id
-                  FROM leader_latest_scores
-                  WHERE address IN (SELECT wallet FROM temp_prune_wallets)
-              )
-            """,
-            """
-            DELETE FROM leader_scores
-            WHERE address IN (SELECT wallet FROM temp_prune_wallets)
-              AND score_id NOT IN (
-                  SELECT score_id
-                  FROM leader_latest_scores
-                  WHERE address IN (SELECT wallet FROM temp_prune_wallets)
-              )
-            """,
-        ),
-    ]
-    for table, count_sql, delete_sql in specs:
-        if table not in tables:
+    for spec in EVIDENCE_TABLE_SPECS:
+        if spec.table not in tables:
             continue
         if dry_run:
-            deleted[table] = int(conn.execute(count_sql).fetchone()[0])
+            deleted[spec.table] = int(
+                conn.execute(
+                    f'SELECT COUNT(*) FROM "{spec.table}" WHERE {spec.where_sql}'
+                ).fetchone()[0]
+            )
             continue
         changes_before = conn.total_changes
-        conn.execute(delete_sql)
-        deleted[table] = conn.total_changes - changes_before
-    conn.execute("DROP TABLE IF EXISTS temp_prune_keep_activity")
-    conn.execute("DROP TABLE IF EXISTS temp_prune_wallets")
+        if archive_run_id:
+            conn.execute(
+                f"""
+                DELETE FROM "{spec.table}"
+                WHERE rowid IN (
+                    SELECT row_id
+                    FROM evidence_archive_scope
+                    WHERE run_id = ? AND table_name = ?
+                )
+                """,
+                (archive_run_id, spec.table),
+            )
+        else:
+            conn.execute(f'DELETE FROM "{spec.table}" WHERE {spec.where_sql}')
+        deleted[spec.table] = conn.total_changes - changes_before
+    drop_prune_temp_tables(conn)
     return deleted
 
 
-def _mark_wallet_registry_pruned(conn: sqlite3.Connection, wallets: list[str]) -> None:
+def _empty_evidence_delete_counts() -> dict[str, int]:
+    return {spec.table: 0 for spec in EVIDENCE_TABLE_SPECS}
+
+
+def _remaining_wallet_evidence_counts(
+    conn: sqlite3.Connection,
+    wallets: list[str],
+    *,
+    keep_recent_activity: int,
+) -> dict[str, int]:
+    """Detect rows that arrived after scope capture so they can be archived later."""
+
+    return _prune_wallet_evidence_batch(
+        conn,
+        wallets,
+        keep_recent_activity=keep_recent_activity,
+        dry_run=True,
+    )
+
+
+def _stage_wallet_registry_archive(
+    conn: sqlite3.Connection,
+    wallets: list[str],
+    *,
+    run_id: str,
+) -> None:
+    """Freeze raw ingestion for an archive run without changing candidate stage."""
+
+    if not wallets:
+        return
+    now = int(time.time())
+    conn.executemany(
+        """
+        UPDATE wallet_registry
+        SET registry_status = 'archive_pending',
+            raw_retention_tier = 'summary_only',
+            raw_archive_run_id = ?,
+            updated_at = ?,
+            last_evaluated_at = ?
+        WHERE address = ?
+        """,
+        ((run_id, now, now, wallet.lower()) for wallet in wallets),
+    )
+
+
+def _mark_wallet_registry_pruned(
+    conn: sqlite3.Connection,
+    wallets: list[str],
+    *,
+    archive_run_id: str = "",
+) -> None:
     if not wallets:
         return
     now = int(time.time())
@@ -1992,17 +2066,41 @@ def _mark_wallet_registry_pruned(conn: sqlite3.Connection, wallets: list[str]) -
         UPDATE wallet_registry
         SET registry_status = 'archived_raw_pruned',
             raw_retention_tier = 'summary_only',
-            raw_prune_version = 'v2_zero_raw',
+            raw_prune_version = ?,
             raw_pruned_at = ?,
+            raw_archive_run_id = ?,
+            raw_archived_at = CASE WHEN ? != '' THEN ? ELSE raw_archived_at END,
+            raw_archive_locator = CASE
+                WHEN ? != '' THEN 'parquet-wallet://' || address
+                ELSE raw_archive_locator
+            END,
             updated_at = ?,
             last_evaluated_at = ?
         WHERE address = ?
         """,
-        ((now, now, now, wallet.lower()) for wallet in wallets),
+        (
+            (
+                "v3_parquet_archive" if archive_run_id else "v2_zero_raw",
+                now,
+                archive_run_id,
+                archive_run_id,
+                now,
+                archive_run_id,
+                now,
+                now,
+                wallet.lower(),
+            )
+            for wallet in wallets
+        ),
     )
 
 
-def _cancel_wallet_evidence_backfill(conn: sqlite3.Connection, wallets: list[str]) -> None:
+def _cancel_wallet_evidence_backfill(
+    conn: sqlite3.Connection,
+    wallets: list[str],
+    *,
+    raw_artifact_uri_prefix: str = "",
+) -> None:
     if not wallets:
         return
     now = int(time.time())
@@ -2067,11 +2165,14 @@ def _cancel_wallet_evidence_backfill(conn: sqlite3.Connection, wallets: list[str
             SET evidence_status = 'summary_ready',
                 next_action = '',
                 next_action_at = 2147483647,
-                raw_artifact_uri = '',
+                raw_artifact_uri = CASE
+                    WHEN ? != '' THEN ? || wallet
+                    ELSE ''
+                END,
                 updated_at = ?
             WHERE wallet IN (SELECT wallet FROM temp_pruned_wallets)
             """,
-            (now,),
+            (raw_artifact_uri_prefix, raw_artifact_uri_prefix, now),
         )
     conn.execute("DROP TABLE IF EXISTS temp_pruned_wallets")
 

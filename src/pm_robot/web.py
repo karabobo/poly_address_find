@@ -54,6 +54,7 @@ from pm_robot.pipeline_terms import (
 )
 from pm_robot.storage.api_rate_limit import api_rate_limit_summary
 from pm_robot.storage.db import connect_readonly
+from pm_robot.storage.evidence_archive import evidence_archive_summary
 from pm_robot.storage.repository import evidence_backfill_summary
 
 
@@ -3189,6 +3190,7 @@ def _storage_maintenance_panel(values: dict[str, Any]) -> str:
     banner_state = "ok" if state == "ok" else "attention"
     wal_ratio = float(values.get("wal_to_db_ratio") or 0)
     free_ratio = float(values.get("free_disk_ratio") or 0)
+    archive = values.get("evidence_archive") or {}
     cards = [
         ("数据库", _fmt_bytes(int(values.get("db_bytes") or 0)), "SQLite 主文件", "ok"),
         (
@@ -3211,6 +3213,18 @@ def _storage_maintenance_panel(values: dict[str, Any]) -> str:
             "ok",
         ),
         ("手动恢复点", _fmt_int(values.get("backup_count")), "仅在明确需要时创建", "ok"),
+        (
+            "Parquet 冷归档",
+            _fmt_bytes(int(archive.get("byte_size") or 0)),
+            f"{_fmt_int(archive.get('wallet_count'))} 钱包 / {_fmt_int(archive.get('row_count'))} 行",
+            "warn" if int(archive.get("failed_count") or 0) else "ok",
+        ),
+        (
+            "待恢复归档",
+            _fmt_int(archive.get("pending_count")),
+            f"失败 {_fmt_int(archive.get('failed_count'))} 批",
+            "warn" if int(archive.get("pending_count") or 0) or int(archive.get("failed_count") or 0) else "ok",
+        ),
         ("WAL 提醒阈值", _fmt_bytes(int(values.get("wal_warn_bytes") or 0)), "超过后安排窗口", "ok"),
         ("WAL 严重阈值", _fmt_bytes(int(values.get("wal_critical_bytes") or 0)), "建议长窗口", "warn" if bool(values.get("critical_wal")) else "ok"),
     ]
@@ -6689,6 +6703,15 @@ def _storage_maintenance_summary(
         and latest_backup_age_seconds is not None
         and latest_backup_age_seconds <= int(backup_max_age_seconds)
     )
+    archive_summary: dict[str, Any]
+    try:
+        archive_conn = connect_readonly(settings.db_path)
+        try:
+            archive_summary = evidence_archive_summary(archive_conn)
+        finally:
+            archive_conn.close()
+    except (OSError, sqlite3.Error):
+        archive_summary = evidence_archive_summary_unavailable()
     if critical_wal:
         state = "wal_critical"
         next_action = "WAL 已明显偏大，安排维护窗口执行 ./pmrobot-nas.sh wal-truncate-window 900。"
@@ -6731,12 +6754,26 @@ def _storage_maintenance_summary(
         "backup_max_age_seconds": int(backup_max_age_seconds),
         "backup_fresh": backup_fresh,
         "scheduled_backup_enabled": bool(scheduled_backup_enabled),
+        "evidence_archive": archive_summary,
         "backup_now_command": "./pmrobot-nas.sh backup-now",
         "safe_command": "./pmrobot-nas.sh wal-truncate-window",
         "long_window_command": "./pmrobot-nas.sh wal-truncate-window 900",
         "idle_window_command": "./pmrobot-nas.sh wal-truncate-when-idle 7200 900 30",
         "read_only_check": "./pmrobot-nas.sh maintenance --dry-run",
         "maintenance_boundary": "WAL truncate 会临时停止 research/scoring 服务；不要在 worker 高峰时执行。",
+    }
+
+
+def evidence_archive_summary_unavailable() -> dict[str, int]:
+    return {
+        "run_count": 0,
+        "wallet_count": 0,
+        "file_count": 0,
+        "row_count": 0,
+        "byte_size": 0,
+        "failed_count": 0,
+        "pending_count": 0,
+        "latest_pruned_at": 0,
     }
 
 

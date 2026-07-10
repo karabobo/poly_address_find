@@ -985,6 +985,8 @@ def test_nas_maintenance_loop_runs_lightweight_storage_and_queue_repair():
     assert "PM_ROBOT_MAINTENANCE_STALE_INGEST_RUN_SECONDS=21600" in env
     assert "PM_ROBOT_MAINTENANCE_FAILED_JOB_COOLDOWN_SECONDS=21600" in env
     assert "PM_ROBOT_MAINTENANCE_RUNTIME_HEARTBEAT_DAYS=30" in env
+    assert "PM_ROBOT_RETENTION_ARCHIVE_ENABLED=1" in env
+    assert "PM_ROBOT_ARCHIVE_DIR=/app/data/parquet" in env
     assert "--skip-cleanup" in loop
     assert "--reset-stale-jobs" in loop
     assert "--failed-job-cooldown-seconds \"$FAILED_JOB_COOLDOWN_SECONDS\"" in loop
@@ -996,6 +998,9 @@ def test_nas_maintenance_loop_runs_lightweight_storage_and_queue_repair():
     assert "PM_ROBOT_MAINTENANCE_STALE_INGEST_RUN_SECONDS:-21600" in loop
     assert "PM_ROBOT_MAINTENANCE_FAILED_JOB_COOLDOWN_SECONDS:-21600" in loop
     assert "PM_ROBOT_MAINTENANCE_RUNTIME_HEARTBEAT_DAYS:-30" in loop
+    assert "PM_ROBOT_RETENTION_ARCHIVE_ENABLED:-1" in loop
+    assert 'archive_args="--archive"' in loop
+    assert '"$archive_args"' in loop
     assert "--reset-stale-jobs" in systemd_service
     assert "--failed-job-cooldown-seconds 21600" in systemd_service
     assert "--reset-stale-ingest-runs" in systemd_service

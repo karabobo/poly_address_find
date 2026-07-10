@@ -22,6 +22,7 @@ class RobotSettings:
     execution_mode: str = "paper"
     log_dir: Path = Path("logs")
     backup_dir: Path = Path("backups")
+    archive_dir: Path = Path("data/parquet")
     paper_bankroll_usd: float = 2000.0
 
     @classmethod
@@ -40,6 +41,7 @@ class RobotSettings:
             execution_mode=os.environ.get("PM_ROBOT_MODE", "paper").lower(),
             log_dir=Path(os.environ.get("PM_ROBOT_LOG_DIR", "logs")),
             backup_dir=Path(os.environ.get("PM_ROBOT_BACKUP_DIR", "backups")),
+            archive_dir=Path(os.environ.get("PM_ROBOT_ARCHIVE_DIR", "data/parquet")),
             paper_bankroll_usd=float(os.environ.get("PM_ROBOT_PAPER_BANKROLL_USD", "2000")),
         )
 

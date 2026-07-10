@@ -17,6 +17,8 @@ leaderboards / large trades / RTDS / curated imports
   -> wallet_features
   -> leader_scores
   -> candidate_wallets.candidate_stage
+  -> wallet_registry (durable decision summary)
+  -> verified Parquet archive before low-value raw evidence leaves SQLite
   -> paper observer / read-only handoff
   -> leader_publish for explicit downstream consumption
 ```
@@ -42,6 +44,9 @@ promising scored wallet
 | `wallet_evidence_summary` | Materialized historical evidence summary | Candidate-stage authority |
 | `wallet_features` | Current scoring inputs | Score history |
 | `leader_scores` | Append-only scoring/review decisions | Worker execution state |
+| `wallet_registry` | Durable wallet decision, retention policy, and archive pointer | Raw event storage |
+| `evidence_archive_*` | Archive run, wallet, file, checksum, and recovery state | Candidate or queue authority |
+| Parquet files | Compressed cold evidence removed from the SQLite hot store | Mutable workflow state |
 | `leader_publish` | Explicit read-only output for downstream consumers | Permission to trade from this repository |
 
 The historical database column `wallet_processing_state.discovery_tier` is called `evidence_tier` in code.
@@ -103,7 +108,11 @@ The default Compose stack runs:
 - one ordered research control loop for eligibility, queue admission, features, scoring, and handoff export;
 - sharded wallet and copyability workers;
 - the read-only paper-observer loop;
-- maintenance and verified SQLite backup loops.
+- lightweight maintenance with bounded, archive-aware evidence pruning.
+
+Full SQLite backups are manual in the current development phase. The default research stack does not start the
+backup loop. Cold Parquet evidence is not a database backup: it preserves reusable historical rows while SQLite
+remains the only workflow truth source.
 
 The opt-in execution profile contains paper-run, paper-settle, and publish loops. It is not started by the
 default `up`, `restart`, `runtime-ensure`, or watchdog commands.
@@ -111,6 +120,13 @@ default `up`, `restart`, `runtime-ensure`, or watchdog commands.
 ## Reliability Rules
 
 - Queue claims use SQLite write serialization and leases.
+- Evidence pruning is a state machine: wallets are frozen, jobs are closed, Parquet files are written to partial
+  paths, row counts and SHA-256 checksums are verified, manifests are atomically promoted, and only then are raw
+  SQLite rows deleted. Failed exports keep the SQLite rows and resume the same archive run on the next pass.
+- Archive batches are written per table rather than per wallet to avoid a NAS tiny-file explosion. The default
+  batch remains five wallets per hour.
+- `parquet-wallet://<address>` is the stable wallet-level archive locator. It resolves every verified, partial,
+  and completed archive run for that wallet; an individual archive run id is audit metadata, not a restore pointer.
 - Workers renew leases around long work and can only complete or retry jobs they still own.
 - Maintenance requeues expired leases and stale runtime records.
 - Lightweight maintenance retains `loop_*` runtime heartbeats for 30 days by default even when broad database
@@ -140,12 +156,12 @@ default `up`, `restart`, `runtime-ensure`, or watchdog commands.
   summaries count only wallets actually attempted and do not classify scheduler deferrals as job failures.
 - Shared limiter lock contention defers the caller instead of allowing an uncoordinated request. The
   coordination transaction uses a short timeout and never contains network I/O or sleep.
-- Daily online SQLite backups are integrity-checked; the dashboard warns when no backup exists or the latest
-  backup is older than the configured freshness window.
+- Optional SQLite recovery points are integrity-checked when explicitly created. Their freshness is not part of
+  default runtime health while scheduled backups are paused.
 - `paper_candidate` and `live_eligible` are research states, never implicit permission to place real orders.
 
 ## Current Follow-Up Work
 
 - Verify proxy reachability and logical loop liveness from the NAS runtime, not only container presence.
 - Measure shared request-budget write latency under the real NAS worker count before increasing concurrency.
-- Validate the complete Compose stack and backup schedule on the NAS after network access is restored.
+- Measure Parquet archive latency and compression on the real NAS before increasing the five-wallet batch size.

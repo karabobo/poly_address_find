@@ -75,6 +75,7 @@ from pm_robot.research.copy_backtest import backtest_copy_stream
 from pm_robot.research.copy_graph import mine_copy_graph
 from pm_robot.research.publish import active_published_leaders, publish_leaders
 from pm_robot.storage.db import connect, connect_readonly, initialize_database, run_migrations
+from pm_robot.storage.evidence_archive import archived_wallet_summary, evidence_archive_summary
 from pm_robot.storage.repository import (
     activity_coverage,
     activity_coverage_summary,
@@ -728,6 +729,24 @@ def main() -> int:
     prune_cmd.add_argument("--keep-recent-activity", type=int, default=0)
     prune_cmd.add_argument("--execute", action="store_true", help="Actually delete rows; default is dry-run")
     prune_cmd.add_argument("--vacuum", action="store_true")
+    prune_cmd.add_argument(
+        "--archive",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Require a verified Parquet archive before deletion; use --no-archive only to discard raw evidence",
+    )
+    prune_cmd.add_argument(
+        "--archive-dir",
+        default="",
+        help="Parquet archive root; defaults to PM_ROBOT_ARCHIVE_DIR",
+    )
+
+    archive_status_cmd = sub.add_parser("archive-status", help="Print Parquet evidence archive status")
+    archive_status_cmd.add_argument("--db", dest="command_db", default=None, help="SQLite database path")
+
+    archive_wallet_cmd = sub.add_parser("archive-wallet", help="Resolve all Parquet archives for one wallet")
+    archive_wallet_cmd.add_argument("--db", dest="command_db", default=None, help="SQLite database path")
+    archive_wallet_cmd.add_argument("--wallet", required=True)
 
     web_cmd = sub.add_parser("web", help="Run the read-only research web console")
     web_cmd.add_argument("--db", dest="command_db", default=None, help="SQLite database path")
@@ -1556,9 +1575,27 @@ def main() -> int:
             keep_recent_activity=args.keep_recent_activity,
             dry_run=not args.execute,
             vacuum=args.vacuum,
+            archive=args.archive,
+            archive_dir=Path(args.archive_dir) if args.archive_dir else None,
         )
         print(json.dumps(data, ensure_ascii=False, indent=2))
         return 0 if data["ok"] else 1
+    if args.command == "archive-status":
+        conn = connect_readonly(settings.db_path)
+        try:
+            data = evidence_archive_summary(conn)
+        finally:
+            conn.close()
+        print(json.dumps(data, ensure_ascii=False, indent=2))
+        return 0
+    if args.command == "archive-wallet":
+        conn = connect_readonly(settings.db_path)
+        try:
+            data = archived_wallet_summary(conn, args.wallet)
+        finally:
+            conn.close()
+        print(json.dumps(data, ensure_ascii=False, indent=2))
+        return 0
     if args.command == "web":
         run_web_console(
             WebConsoleConfig(
