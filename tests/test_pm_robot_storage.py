@@ -1,6 +1,9 @@
 import json
+import os
 import sqlite3
-from concurrent.futures import ThreadPoolExecutor
+import subprocess
+import sys
+import textwrap
 from pathlib import Path
 
 import pytest
@@ -48,16 +51,44 @@ def test_current_schema_check_does_not_wait_for_database_write_lock(tmp_path):
 
 def test_concurrent_migration_runners_apply_each_version_once(tmp_path):
     db_path = tmp_path / "robot.sqlite"
+    start_gate = tmp_path / "start-migrations"
+    script = textwrap.dedent(
+        """
+        import json
+        import sys
+        import time
+        from pathlib import Path
 
-    def migrate() -> list[int]:
+        from pm_robot.storage.db import connect, run_migrations
+
+        db_path = Path(sys.argv[1])
+        start_gate = Path(sys.argv[2])
+        while not start_gate.exists():
+            time.sleep(0.01)
         conn = connect(db_path)
         try:
-            return run_migrations(conn)
+            print(json.dumps(run_migrations(conn)))
         finally:
             conn.close()
-
-    with ThreadPoolExecutor(max_workers=4) as pool:
-        results = list(pool.map(lambda _index: migrate(), range(4)))
+        """
+    )
+    env = os.environ.copy()
+    source_root = str(Path(__file__).resolve().parents[1] / "src")
+    env["PYTHONPATH"] = os.pathsep.join(filter(None, (source_root, env.get("PYTHONPATH", ""))))
+    processes = [
+        subprocess.Popen(
+            [sys.executable, "-c", script, str(db_path), str(start_gate)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=env,
+        )
+        for _index in range(4)
+    ]
+    start_gate.touch()
+    outputs = [process.communicate(timeout=30) for process in processes]
+    assert [process.returncode for process in processes] == [0, 0, 0, 0], outputs
+    results = [json.loads(stdout) for stdout, _stderr in outputs]
 
     conn = connect(db_path)
     try:
