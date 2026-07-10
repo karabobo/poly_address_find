@@ -248,20 +248,44 @@ def list_candidates(conn: sqlite3.Connection) -> list[CandidateAddress]:
     ]
 
 
+def summary_only_wallets(conn: sqlite3.Connection, wallets: Any) -> set[str]:
+    """Return wallets whose raw evidence lifecycle is intentionally closed."""
+
+    normalized = sorted({str(wallet).lower() for wallet in wallets if wallet})
+    archived: set[str] = set()
+    for offset in range(0, len(normalized), 500):
+        batch = normalized[offset : offset + 500]
+        placeholders = ",".join("?" for _ in batch)
+        rows = conn.execute(
+            f"""
+            SELECT address
+            FROM wallet_registry
+            WHERE address IN ({placeholders})
+              AND raw_retention_tier = 'summary_only'
+            """,
+            batch,
+        ).fetchall()
+        archived.update(str(row["address"]).lower() for row in rows)
+    return archived
+
+
 def list_ingest_targets(conn: sqlite3.Connection, *, limit: int = 50) -> list[str]:
     rows = conn.execute(
         """
-        SELECT address FROM candidate_wallets
-        WHERE candidate_stage NOT IN ('rejected', 'blocked_hygiene', 'blocked_copyability')
+        SELECT cw.address
+        FROM candidate_wallets cw
+        LEFT JOIN wallet_registry wr ON wr.address = cw.address
+        WHERE cw.candidate_stage NOT IN ('rejected', 'blocked_hygiene', 'blocked_copyability')
+          AND COALESCE(wr.raw_retention_tier, '') != 'summary_only'
         ORDER BY
-            CASE candidate_stage
+            CASE cw.candidate_stage
                 WHEN 'live_eligible' THEN 0
                 WHEN 'paper_approved' THEN 1
                 WHEN 'paper_candidate' THEN 2
                 ELSE 3
             END ASC,
-            COALESCE(last_ingested_at, 0) ASC,
-            updated_at DESC
+            COALESCE(cw.last_ingested_at, 0) ASC,
+            cw.updated_at DESC
         LIMIT ?
         """,
         (limit,),
@@ -301,14 +325,17 @@ def list_activity_backfill_targets(
 ) -> list[str]:
     rows = conn.execute(
         """
-        SELECT cw.address, COUNT(wa.activity_id) AS activity_count
+        SELECT cw.address, COUNT(wa.activity_id) AS raw_activity_count
         FROM candidate_wallets cw
         LEFT JOIN wallet_activity wa
           ON wa.address = cw.address
+        LEFT JOIN wallet_registry wr
+          ON wr.address = cw.address
         WHERE cw.candidate_stage NOT IN ('rejected', 'blocked_hygiene', 'blocked_copyability')
+          AND COALESCE(wr.raw_retention_tier, '') != 'summary_only'
         GROUP BY cw.address
-        HAVING activity_count < ?
-        ORDER BY activity_count ASC, COALESCE(cw.last_ingested_at, 0) ASC, cw.updated_at DESC
+        HAVING raw_activity_count < ?
+        ORDER BY raw_activity_count ASC, COALESCE(cw.last_ingested_at, 0) ASC, cw.updated_at DESC
         LIMIT ?
         """,
         (target_events_per_wallet, limit),
@@ -462,9 +489,12 @@ def seed_missing_evidence_backfill_budgets(
           ON wa.address = cw.address
         LEFT JOIN evidence_backfill_budget ebb
           ON ebb.wallet = cw.address
+        LEFT JOIN wallet_registry wr
+          ON wr.address = cw.address
         WHERE cw.sources LIKE ?
           AND ebb.wallet IS NULL
           AND cw.candidate_stage NOT IN ('rejected', 'blocked_hygiene', 'blocked_copyability')
+          AND COALESCE(wr.raw_retention_tier, '') != 'summary_only'
         GROUP BY cw.address
         ORDER BY cw.updated_at DESC
         LIMIT ?
@@ -503,11 +533,14 @@ def list_evidence_backfill_targets(
         FROM evidence_backfill_budget ebb
         JOIN candidate_wallets cw
           ON cw.address = ebb.wallet
+        LEFT JOIN wallet_registry wr
+          ON wr.address = cw.address
         LEFT JOIN wallet_activity wa
           ON wa.address = ebb.wallet
         WHERE ebb.stage = ?
           AND ebb.next_attempt_at <= ?
           AND cw.candidate_stage NOT IN ('rejected', 'blocked_hygiene', 'blocked_copyability')
+          AND COALESCE(wr.raw_retention_tier, '') != 'summary_only'
         GROUP BY ebb.wallet
         ORDER BY ebb.priority ASC, ebb.updated_at ASC, ebb.wallet ASC
         LIMIT ?
@@ -641,6 +674,8 @@ def claim_evidence_backfill_job(
          AND ebb.target_depth = job.target_depth
         JOIN candidate_wallets cw
           ON cw.address = job.wallet
+        LEFT JOIN wallet_registry wr
+          ON wr.address = cw.address
         WHERE job.shard = ?
           AND job.next_attempt_at <= ?
           AND (
@@ -649,6 +684,7 @@ def claim_evidence_backfill_job(
           )
           AND ebb.next_attempt_at <= ?
           AND cw.candidate_stage NOT IN ('rejected', 'blocked_hygiene', 'blocked_copyability')
+          AND COALESCE(wr.raw_retention_tier, '') != 'summary_only'
         ORDER BY job.priority ASC, job.updated_at ASC, job.job_id ASC
         LIMIT 1
         """,
@@ -1143,7 +1179,10 @@ def materialize_wallet_processing_state(
           ON wps.wallet = cw.address
         LEFT JOIN wallet_activity_watermarks waw
           ON waw.address = cw.address
+        LEFT JOIN wallet_registry wr
+          ON wr.address = cw.address
         WHERE cw.candidate_stage NOT IN ('rejected', 'blocked_hygiene', 'blocked_copyability')
+          AND COALESCE(wr.raw_retention_tier, '') != 'summary_only'
     """
     if stale_only:
         sql += """

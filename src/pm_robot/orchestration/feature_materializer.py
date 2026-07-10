@@ -174,7 +174,10 @@ def _list_targets(conn: sqlite3.Connection, *, limit: int, min_activity_events: 
               ON wps.wallet = cw.address
             LEFT JOIN evidence_backfill_budget ebb
               ON ebb.wallet = cw.address
+            LEFT JOIN wallet_registry wr
+              ON wr.address = cw.address
             WHERE cw.candidate_stage NOT IN ('rejected', 'blocked_hygiene', 'blocked_copyability')
+              AND COALESCE(wr.raw_retention_tier, '') != 'summary_only'
         )
         SELECT
             address

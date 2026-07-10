@@ -625,6 +625,42 @@ def _seed_light_pending_state(conn, wallet: str, *, priority: int = 50, now: int
     )
 
 
+def test_wallet_pipeline_planner_does_not_revive_summary_only_wallet(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    wallet = "0x" + "0" * 40
+    try:
+        run_migrations(conn)
+        _seed_light_pending_state(conn, wallet)
+        conn.execute(
+            """
+            INSERT INTO wallet_registry(
+                address, candidate_stage, registry_status, raw_retention_tier,
+                last_evaluated_at, updated_at
+            ) VALUES (?, 'needs_data', 'archived_raw_pruned', 'summary_only', ?, ?)
+            """,
+            (wallet, 30_000, 30_000),
+        )
+        conn.commit()
+
+        plan = plan_wallet_pipeline_jobs(
+            conn,
+            light_limit=1,
+            medium_limit=0,
+            deep_limit=0,
+            shard_count=1,
+            now=40_000,
+        )
+
+        assert plan.targets_seen == 0
+        assert plan.jobs_enqueued == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM pipeline_jobs WHERE wallet = ?",
+            (wallet,),
+        ).fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
 def test_wallet_pipeline_stops_batch_and_preserves_attempts_on_shared_cooldown(tmp_path):
     conn = connect(tmp_path / "robot.sqlite")
     wallets = ["0x" + "a" * 40, "0x" + "b" * 40]

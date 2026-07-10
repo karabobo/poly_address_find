@@ -725,7 +725,7 @@ def main() -> int:
     prune_cmd = sub.add_parser("prune-evidence", help="Prune low-value raw wallet evidence after materialization")
     prune_cmd.add_argument("--db", dest="command_db", default=None, help="SQLite database path")
     prune_cmd.add_argument("--limit", type=int, default=20)
-    prune_cmd.add_argument("--keep-recent-activity", type=int, default=100)
+    prune_cmd.add_argument("--keep-recent-activity", type=int, default=0)
     prune_cmd.add_argument("--execute", action="store_true", help="Actually delete rows; default is dry-run")
     prune_cmd.add_argument("--vacuum", action="store_true")
 

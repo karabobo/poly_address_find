@@ -863,7 +863,10 @@ def _revalidate_pipeline_targets(
         FROM wallet_processing_state wps
         JOIN candidate_wallets cw
           ON cw.address = wps.wallet
+        LEFT JOIN wallet_registry wr
+          ON wr.address = wps.wallet
         WHERE wps.wallet IN ({placeholders})
+          AND COALESCE(wr.raw_retention_tier, '') != 'summary_only'
         """,
         tuple(wallets),
     ).fetchall()
@@ -1010,10 +1013,13 @@ def _targets_for_action(
         FROM wallet_processing_state wps
         JOIN candidate_wallets cw
           ON cw.address = wps.wallet
+        LEFT JOIN wallet_registry wr
+          ON wr.address = wps.wallet
         WHERE wps.next_action = ?
           AND wps.next_action_at <= ?
           AND wps.evidence_status NOT IN ('paused', 'summary_ready')
           AND cw.candidate_stage NOT IN ('rejected', 'blocked_hygiene', 'blocked_copyability')
+          AND COALESCE(wr.raw_retention_tier, '') != 'summary_only'
           AND NOT EXISTS (
               SELECT 1
               FROM pipeline_jobs active_job

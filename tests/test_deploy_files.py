@@ -409,7 +409,7 @@ def test_nas_runtime_is_research_scoring_only():
     assert "paper_candidate" in readme
     assert "research/scoring only" in helper
     assert "PAPER_OBSERVER_SERVICES=\"paper-observer-loop\"" in helper
-    assert "RESEARCH_SERVICES=\"$CORE_SERVICES $DISCOVERY_SERVICES $CONTROL_SERVICES $PIPELINE_SERVICES $COPYABILITY_SERVICES $PAPER_OBSERVER_SERVICES $MAINTENANCE_SERVICES $BACKUP_SERVICES\"" in helper
+    assert "RESEARCH_SERVICES=\"$CORE_SERVICES $DISCOVERY_SERVICES $CONTROL_SERVICES $PIPELINE_SERVICES $COPYABILITY_SERVICES $PAPER_OBSERVER_SERVICES $MAINTENANCE_SERVICES\"" in helper
     assert "runtime-ensure" in helper
     assert "compose up -d --no-deps --no-recreate $RESEARCH_SERVICES" in helper
     assert "watchdog-once" in helper
@@ -1010,7 +1010,7 @@ def test_nas_maintenance_loop_runs_lightweight_storage_and_queue_repair():
     assert "WAL shrinking is" in readme
 
 
-def test_nas_research_stack_runs_verified_daily_backups():
+def test_nas_research_stack_keeps_full_database_backups_manual_only():
     compose = Path("deploy/nas/docker-compose.yml").read_text(encoding="utf-8")
     env = Path("deploy/nas/env.example").read_text(encoding="utf-8")
     loop = Path("deploy/nas/backup-loop.sh").read_text(encoding="utf-8")
@@ -1019,15 +1019,20 @@ def test_nas_research_stack_runs_verified_daily_backups():
     assert "backup-loop:" in compose
     assert "container_name: pm-robot-backup-loop" in compose
     assert "backup-loop.sh" in compose
+    assert "manual-backup" in compose
     assert "BACKUP_SERVICES=\"backup-loop\"" in helper
     assert "backup-up" in helper
     assert "backup-down" in helper
     assert "backup-restart" in helper
     assert "backup-now" in helper
-    assert "$BACKUP_SERVICES" in helper
+    research_services = helper.split('RESEARCH_SERVICES="', 1)[1].split('"', 1)[0]
+    app_services = helper.split('APP_SERVICES="', 1)[1].split('"', 1)[0]
+    assert "$BACKUP_SERVICES" not in research_services
+    assert "$BACKUP_SERVICES" not in app_services
+    assert "PM_ROBOT_SCHEDULED_BACKUP_ENABLED=0" in env
     assert "PM_ROBOT_BACKUP_INTERVAL=86400" in env
     assert "PM_ROBOT_BACKUP_START_DELAY=600" in env
-    assert "PM_ROBOT_MAINTENANCE_KEEP_BACKUPS=14" in env
+    assert "PM_ROBOT_MAINTENANCE_KEEP_BACKUPS=0" in env
     assert "PM_ROBOT_BACKUP_INTERVAL:-86400" in loop
     assert "PM_ROBOT_BACKUP_START_DELAY:-600" in loop
     assert 'BACKUP_DIR="${PM_ROBOT_BACKUP_DIR:-/app/backups}"' in loop

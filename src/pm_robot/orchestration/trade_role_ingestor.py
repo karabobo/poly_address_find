@@ -110,7 +110,9 @@ def _targets(conn: sqlite3.Connection, limit: int) -> list[str]:
         FROM candidate_wallets cw
         JOIN wallet_features wf ON wf.address = cw.address
         LEFT JOIN wallet_trade_role_evidence wtre ON wtre.wallet = cw.address
+        LEFT JOIN wallet_registry wr ON wr.address = cw.address
         WHERE cw.candidate_stage NOT IN ('rejected', 'blocked_hygiene')
+          AND COALESCE(wr.raw_retention_tier, '') != 'summary_only'
           AND COALESCE(wf.extra_json, '{}') != ''
         ORDER BY
             CASE WHEN EXISTS (

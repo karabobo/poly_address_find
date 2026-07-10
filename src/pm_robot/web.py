@@ -144,7 +144,6 @@ _RUNTIME_LOOP_SPECS = (
     RuntimeLoopSpec("paper_observer_preview", "Paper 预览快刷", "loop_paper_observer_preview", 300),
     RuntimeLoopSpec("paper_observer_evaluation", "Paper 报价快评", "loop_paper_observer_evaluation", 300),
     RuntimeLoopSpec("maintenance", "维护循环", "loop_maintenance", 7_200),
-    RuntimeLoopSpec("backup", "数据库备份", "loop_backup", BACKUP_MAX_AGE_SECONDS),
     RuntimeLoopSpec("rtds_discovery", "RTDS 实时发现", "loop_rtds_discovery", 900),
 )
 
@@ -3172,26 +3171,17 @@ def _storage_maintenance_panel(values: dict[str, Any]) -> str:
             "warn" if bool(values.get("low_free_disk")) else "ok",
         ),
         (
-            "最近备份",
-            _fmt_ts(values.get("latest_backup_at")) if values.get("latest_backup_at") else "无",
-            (
-                str(values.get("latest_backup_name") or "尚未生成备份")
-                if values.get("latest_backup_age_seconds") is None
-                else f"{_fmt_duration_hours(float(values.get('latest_backup_age_seconds') or 0) / 3600)} 前"
-            ),
-            "ok" if bool(values.get("backup_fresh")) else "warn",
+            "自动整库备份",
+            "启用" if bool(values.get("scheduled_backup_enabled")) else "暂停",
+            "当前为可选策略，不参与运行健康判定",
+            "ok",
         ),
-        (
-            "备份数量",
-            _fmt_int(values.get("backup_count")),
-            f"新鲜阈值 {_fmt_duration_hours(float(values.get('backup_max_age_seconds') or 0) / 3600)}",
-            "ok" if bool(values.get("backup_fresh")) else "warn",
-        ),
+        ("手动恢复点", _fmt_int(values.get("backup_count")), "仅在明确需要时创建", "ok"),
         ("WAL 提醒阈值", _fmt_bytes(int(values.get("wal_warn_bytes") or 0)), "超过后安排窗口", "ok"),
         ("WAL 严重阈值", _fmt_bytes(int(values.get("wal_critical_bytes") or 0)), "建议长窗口", "warn" if bool(values.get("critical_wal")) else "ok"),
     ]
     commands = [
-        {"command": values.get("backup_now_command"), "when": "立即创建一致性 SQLite 备份"},
+        {"command": values.get("backup_now_command"), "when": "需要时手动创建一致性 SQLite 恢复点"},
         {"command": values.get("read_only_check"), "when": "先看报告，不改数据库"},
         {"command": values.get("idle_window_command"), "when": "推荐：等待队列空闲后自动进入维护窗口"},
         {"command": values.get("safe_command"), "when": "普通维护窗口"},
@@ -6630,6 +6620,7 @@ def _storage_maintenance_summary(
     wal_critical_bytes: int = WAL_CRITICAL_BYTES,
     low_free_disk_bytes: int = LOW_FREE_DISK_BYTES,
     backup_max_age_seconds: int = BACKUP_MAX_AGE_SECONDS,
+    scheduled_backup_enabled: bool | None = None,
     now: int | None = None,
 ) -> dict[str, Any]:
     now = int(time.time()) if now is None else int(now)
@@ -6643,6 +6634,10 @@ def _storage_maintenance_summary(
     needs_wal_window = wal_bytes >= int(wal_warn_bytes)
     critical_wal = wal_bytes >= int(wal_critical_bytes)
     low_free_disk = bool(free_disk_bytes and free_disk_bytes < int(low_free_disk_bytes))
+    if scheduled_backup_enabled is None:
+        scheduled_backup_enabled = os.environ.get(
+            "PM_ROBOT_SCHEDULED_BACKUP_ENABLED", "0"
+        ).strip().lower() in {"1", "true", "yes", "on"}
     backup_files = sorted(
         (
             path
@@ -6668,11 +6663,11 @@ def _storage_maintenance_summary(
         next_action = "WAL 超过常规阈值，等队列低峰时执行 ./pmrobot-nas.sh wal-truncate-window。"
     elif low_free_disk:
         state = "low_free_disk"
-        next_action = "NAS 数据卷可用空间偏低，先清理备份或归档旧原始证据。"
-    elif not latest_backup:
+        next_action = "NAS 数据卷可用空间偏低，优先归档或清理低价值原始证据。"
+    elif scheduled_backup_enabled and not latest_backup:
         state = "backup_missing"
         next_action = "尚无可验证数据库备份，立即执行 ./pmrobot-nas.sh backup-now。"
-    elif not backup_fresh:
+    elif scheduled_backup_enabled and not backup_fresh:
         state = "backup_stale"
         next_action = "最近数据库备份已过期，检查 backup-loop 并执行 ./pmrobot-nas.sh backup-now。"
     else:
@@ -6701,6 +6696,7 @@ def _storage_maintenance_summary(
         "latest_backup_age_seconds": latest_backup_age_seconds,
         "backup_max_age_seconds": int(backup_max_age_seconds),
         "backup_fresh": backup_fresh,
+        "scheduled_backup_enabled": bool(scheduled_backup_enabled),
         "backup_now_command": "./pmrobot-nas.sh backup-now",
         "safe_command": "./pmrobot-nas.sh wal-truncate-window",
         "long_window_command": "./pmrobot-nas.sh wal-truncate-window 900",

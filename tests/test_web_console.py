@@ -2606,6 +2606,7 @@ def test_storage_maintenance_summary_reports_missing_and_fresh_backups(tmp_path)
         now=100_000,
         backup_max_age_seconds=90_000,
         low_free_disk_bytes=1,
+        scheduled_backup_enabled=True,
     )
     assert missing["state"] == "backup_missing"
     assert missing["backup_count"] == 0
@@ -2620,6 +2621,7 @@ def test_storage_maintenance_summary_reports_missing_and_fresh_backups(tmp_path)
         now=int(backup.stat().st_mtime) + 60,
         backup_max_age_seconds=90_000,
         low_free_disk_bytes=1,
+        scheduled_backup_enabled=True,
     )
     html = _storage_maintenance_panel(fresh)
 
@@ -2627,7 +2629,7 @@ def test_storage_maintenance_summary_reports_missing_and_fresh_backups(tmp_path)
     assert fresh["backup_count"] == 1
     assert fresh["backup_fresh"] is True
     assert fresh["latest_backup_name"] == backup.name
-    assert "最近备份" in html
+    assert "自动整库备份" in html
     assert "backup-now" in html
 
 
@@ -2649,10 +2651,34 @@ def test_storage_maintenance_summary_marks_stale_backup(tmp_path):
         now=int(backup.stat().st_mtime) + 90_001,
         backup_max_age_seconds=90_000,
         low_free_disk_bytes=1,
+        scheduled_backup_enabled=True,
     )
     assert summary["state"] == "backup_stale"
     assert summary["backup_fresh"] is False
     assert summary["latest_backup_age_seconds"] == 90_001
+
+
+def test_storage_maintenance_summary_does_not_warn_when_scheduled_backups_are_paused(tmp_path):
+    settings = RobotSettings(
+        db_path=tmp_path / "data" / "pm_robot.sqlite",
+        backup_dir=tmp_path / "backups",
+        execution_mode="research",
+    )
+    settings.db_path.parent.mkdir(parents=True)
+    settings.db_path.write_bytes(b"db")
+
+    summary = _storage_maintenance_summary(
+        settings,
+        now=100_000,
+        low_free_disk_bytes=1,
+        scheduled_backup_enabled=False,
+    )
+    html = _storage_maintenance_panel(summary)
+
+    assert summary["state"] == "ok"
+    assert summary["scheduled_backup_enabled"] is False
+    assert "自动整库备份" in html
+    assert "暂停" in html
 
 
 def test_discovery_data_builds_workbench_metrics(tmp_path):

@@ -289,9 +289,12 @@ def _list_score_candidates(
           ON wf.address = cw.address
         LEFT JOIN wallet_processing_state wps
           ON wps.wallet = cw.address
+        LEFT JOIN wallet_registry wr
+          ON wr.address = cw.address
         LEFT JOIN latest
           ON latest.address = cw.address
         WHERE cw.candidate_stage NOT IN ('rejected', 'blocked_hygiene', 'blocked_copyability')
+          AND COALESCE(wr.raw_retention_tier, '') != 'summary_only'
           AND (
               latest.address IS NULL
               OR latest.policy_version != ?

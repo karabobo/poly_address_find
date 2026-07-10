@@ -1,7 +1,8 @@
 from pm_robot.clients.http import HttpClientError
 from pm_robot.orchestration.leaderboard_discovery import discover_leaderboard_candidates
 from pm_robot.storage.db import connect, run_migrations
-from pm_robot.storage.repository import get_wallet_features
+from pm_robot.storage.repository import get_wallet_features, upsert_candidate, upsert_wallet_feature
+from pm_robot.models import CandidateAddress, WalletFeatures
 
 
 class FakeLeaderboardClient:
@@ -123,5 +124,49 @@ def test_leaderboard_discovery_stops_batch_on_shared_cooldown(tmp_path):
         assert summary.snapshots_attempted == 1
         assert summary.v1_snapshots_attempted == 0
         assert client.calls == 1
+    finally:
+        conn.close()
+
+
+def test_leaderboard_discovery_does_not_revive_summary_only_wallet(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    wallet = "0x" + "1" * 40
+    try:
+        run_migrations(conn)
+        upsert_candidate(conn, CandidateAddress(address=wallet, sources="archived_source"))
+        upsert_wallet_feature(conn, WalletFeatures(address=wallet, net_pnl_usdc=42))
+        conn.execute(
+            """
+            INSERT INTO wallet_registry(
+                address, candidate_stage, registry_status, raw_retention_tier,
+                last_evaluated_at, updated_at
+            ) VALUES (?, 'needs_data', 'archived_raw_pruned', 'summary_only', ?, ?)
+            """,
+            (wallet, 10_000, 10_000),
+        )
+        conn.commit()
+
+        summary = discover_leaderboard_candidates(
+            conn,
+            metrics=(),
+            windows=(),
+            categories=("OVERALL",),
+            time_periods=("MONTH",),
+            order_bys=("PNL", "VOL"),
+            v1_limit=50,
+            v1_pages=1,
+            client=FakeLeaderboardClient(),
+        )
+
+        candidate = conn.execute(
+            "SELECT sources FROM candidate_wallets WHERE address = ?",
+            (wallet,),
+        ).fetchone()
+        feature = get_wallet_features(conn)[wallet]
+        assert summary.candidates_seen == 1
+        assert summary.candidates_inserted_or_updated == 0
+        assert summary.features_updated == 0
+        assert candidate["sources"] == "archived_source"
+        assert feature.net_pnl_usdc == 42
     finally:
         conn.close()

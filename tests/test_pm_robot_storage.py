@@ -297,8 +297,19 @@ def test_activity_backfill_targets_prioritize_undercovered_wallets(tmp_path):
         run_migrations(conn)
         empty = CandidateAddress(address="0x" + "6" * 40, sources="test")
         covered = CandidateAddress(address="0x" + "7" * 40, sources="test")
+        archived = CandidateAddress(address="0x" + "8" * 40, sources="test")
         upsert_candidate(conn, empty)
         upsert_candidate(conn, covered)
+        upsert_candidate(conn, archived)
+        conn.execute(
+            """
+            INSERT INTO wallet_registry(
+                address, candidate_stage, registry_status, raw_retention_tier,
+                last_evaluated_at, updated_at
+            ) VALUES (?, 'needs_data', 'archived_raw_pruned', 'summary_only', 2000, 2000)
+            """,
+            (archived.address,),
+        )
         persist_wallet_activity(
             conn,
             covered.address,
@@ -326,6 +337,7 @@ def test_activity_backfill_targets_prioritize_undercovered_wallets(tmp_path):
         coverage = activity_coverage(conn, limit=2)
 
         assert targets == [empty.address]
+        assert archived.address not in targets
         assert coverage[0]["address"] == empty.address
         assert coverage[0]["activity_count"] == 0
     finally:

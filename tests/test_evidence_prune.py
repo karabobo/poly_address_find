@@ -2,7 +2,13 @@ from pm_robot.config import RobotSettings
 from pm_robot.models import CandidateAddress, CandidateStage, ScoreBreakdown, WalletFeatures
 from pm_robot.ops import build_wallet_registry, prune_low_value_evidence
 from pm_robot.storage.db import connect, run_migrations
-from pm_robot.storage.repository import persist_score, persist_wallet_activity, upsert_candidate, upsert_wallet_feature
+from pm_robot.storage.repository import (
+    enqueue_pipeline_job,
+    persist_score,
+    persist_wallet_activity,
+    upsert_candidate,
+    upsert_wallet_feature,
+)
 
 
 def _settings(db_path):
@@ -86,7 +92,9 @@ def test_prune_evidence_dry_run_and_execute_low_value_only(tmp_path):
     try:
         assert dry["wallets"] == [low]
         assert dry["deleted"]["wallet_activity"] == 3
-        assert conn.execute("SELECT COUNT(*) FROM wallet_activity WHERE address = ?", (low,)).fetchone()[0] == 5
+        assert conn.execute(
+            "SELECT COUNT(*) FROM wallet_activity WHERE address = ?", (low,)
+        ).fetchone()[0] == 5
     finally:
         conn.close()
 
@@ -99,8 +107,12 @@ def test_prune_evidence_dry_run_and_execute_low_value_only(tmp_path):
     conn = connect(db_path)
     try:
         assert executed["wallets"] == [low]
-        assert conn.execute("SELECT COUNT(*) FROM wallet_activity WHERE address = ?", (low,)).fetchone()[0] == 2
-        assert conn.execute("SELECT COUNT(*) FROM wallet_activity WHERE address = ?", (high,)).fetchone()[0] == 5
+        assert conn.execute(
+            "SELECT COUNT(*) FROM wallet_activity WHERE address = ?", (low,)
+        ).fetchone()[0] == 2
+        assert conn.execute(
+            "SELECT COUNT(*) FROM wallet_activity WHERE address = ?", (high,)
+        ).fetchone()[0] == 5
         assert conn.execute(
             "SELECT COUNT(*) FROM wallet_activity WHERE address = ?",
             (unmaterialized,),
@@ -121,5 +133,134 @@ def test_prune_evidence_dry_run_and_execute_low_value_only(tmp_path):
             (low,),
         ).fetchone()
         assert rebuilt["registry_status"] == "archived_raw_pruned"
+    finally:
+        conn.close()
+
+
+def test_prune_terminal_wallet_freezes_summary_and_stops_automatic_work(tmp_path):
+    db_path = tmp_path / "robot.sqlite"
+    wallet = "0x" + "4" * 40
+    conn = connect(db_path)
+    try:
+        run_migrations(conn)
+        _seed_candidate(conn, wallet, materialized=True, roi=0.5)
+        leader = "0x" + "5" * 40
+        upsert_candidate(conn, CandidateAddress(address=leader, sources="test"))
+        conn.execute(
+            """
+            INSERT INTO copy_pair_stats(
+                leader_wallet, follower_wallet, copy_event_count, copy_market_count,
+                follower_trade_count, containment_pct, leader_precedes_pct,
+                median_lag_seconds, first_copy_ts, last_copy_ts, qualifies, updated_at
+            ) VALUES (?, ?, 3, 2, 4, 0.75, 1.0, 10, 1000, 2000, 1, 2000)
+            """,
+            (leader, wallet),
+        )
+        conn.execute(
+            "UPDATE candidate_wallets SET candidate_stage = ? WHERE address = ?",
+            (CandidateStage.BLOCKED_HYGIENE.value, wallet),
+        )
+        persist_score(
+            conn,
+            ScoreBreakdown(
+                address=wallet,
+                leader_score=42,
+                stage=CandidateStage.BLOCKED_HYGIENE,
+                reason="hygiene_hard_block",
+                components={"profitability": 60},
+                penalties={"hygiene": 30},
+            ),
+            policy_version="test-2",
+        )
+        conn.execute(
+            """
+            INSERT INTO wallet_processing_state(
+                wallet, evidence_status, next_action, next_action_at, updated_at
+            ) VALUES (?, 'queued', 'deep_pending', 0, 2000)
+            """,
+            (wallet,),
+        )
+        enqueue_pipeline_job(
+            conn,
+            job_type="wallet_evidence_backfill",
+            wallet=wallet,
+            subject_key="deep_pending",
+            tier="l3_deep",
+            now=2000,
+        )
+        enqueue_pipeline_job(
+            conn,
+            job_type="copyability_evidence",
+            wallet=wallet,
+            subject_key="copyability_backfill",
+            tier="graph_v1",
+            now=2000,
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    result = prune_low_value_evidence(_settings(db_path), limit=10, dry_run=False)
+    assert result["wallets"] == [wallet]
+    assert result["deleted"]["wallet_activity"] == 5
+    assert result["deleted"]["leader_scores"] == 1
+    assert result["deleted"]["copy_pair_stats"] == 1
+
+    conn = connect(db_path)
+    try:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM candidate_wallets WHERE address = ?", (wallet,)
+        ).fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT COUNT(*) FROM wallet_activity WHERE address = ?", (wallet,)
+        ).fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM copy_pair_stats WHERE follower_wallet = ?", (wallet,)
+        ).fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM leader_scores WHERE address = ?", (wallet,)
+        ).fetchone()[0] == 1
+        latest = conn.execute(
+            "SELECT review_stage, review_reason FROM leader_latest_scores WHERE address = ?",
+            (wallet,),
+        ).fetchone()
+        assert latest["review_stage"] == CandidateStage.BLOCKED_HYGIENE.value
+        assert latest["review_reason"] == "hygiene_hard_block"
+        registry = conn.execute(
+            """
+            SELECT registry_status, raw_prune_version, activity_count, review_reason
+            FROM wallet_registry
+            WHERE address = ?
+            """,
+            (wallet,),
+        ).fetchone()
+        assert registry["registry_status"] == "archived_raw_pruned"
+        assert registry["raw_prune_version"] == "v2_zero_raw"
+        assert registry["activity_count"] == 5
+        assert registry["review_reason"] == "hygiene_hard_block"
+        state = conn.execute(
+            "SELECT evidence_status, next_action FROM wallet_processing_state WHERE wallet = ?",
+            (wallet,),
+        ).fetchone()
+        assert state["evidence_status"] == "summary_ready"
+        assert state["next_action"] == ""
+        jobs = conn.execute(
+            "SELECT status, output_json FROM pipeline_jobs WHERE wallet = ? ORDER BY job_type",
+            (wallet,),
+        ).fetchall()
+        assert [row["status"] for row in jobs] == ["done", "done"]
+        assert all('"archived":true' in row["output_json"] for row in jobs)
+    finally:
+        conn.close()
+
+    build_wallet_registry(_settings(db_path))
+    conn = connect(db_path)
+    try:
+        frozen = conn.execute(
+            "SELECT activity_count, review_reason FROM wallet_registry WHERE address = ?",
+            (wallet,),
+        ).fetchone()
+        assert frozen["activity_count"] == 5
+        assert frozen["review_reason"] == "hygiene_hard_block"
     finally:
         conn.close()

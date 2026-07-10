@@ -150,6 +150,35 @@ def test_trade_role_ingestor_stops_batch_without_recording_wallet_error(tmp_path
         conn.close()
 
 
+def test_trade_role_ingestor_skips_summary_only_wallet(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    wallet = "0x" + "5" * 40
+    client = FakeTradeClient(_trades(20), _trades(10, prefix="taker"))
+    try:
+        run_migrations(conn)
+        _seed(conn, wallet)
+        conn.execute(
+            """
+            INSERT INTO wallet_registry(
+                address, candidate_stage, registry_status, raw_retention_tier,
+                last_evaluated_at, updated_at
+            ) VALUES (?, 'needs_data', 'archived_raw_pruned', 'summary_only', ?, ?)
+            """,
+            (wallet, 10_000, 10_000),
+        )
+        conn.commit()
+
+        summary = ingest_trade_role_evidence(conn, limit=1, client=client, now=20_000)
+
+        assert summary.wallets_attempted == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM wallet_trade_role_evidence WHERE wallet = ?",
+            (wallet,),
+        ).fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
 def test_capped_trade_sample_remains_incomplete(tmp_path):
     conn = connect(tmp_path / "robot.sqlite")
     wallet = "0x" + "2" * 40

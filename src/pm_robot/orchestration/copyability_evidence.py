@@ -772,12 +772,15 @@ def _select_copyability_targets(
               ON wps.wallet = cw.address
             LEFT JOIN wallet_features wf
               ON wf.address = cw.address
+            LEFT JOIN wallet_registry wr
+              ON wr.address = cw.address
             LEFT JOIN pipeline_jobs pj
               ON pj.job_type = ?
              AND pj.wallet = cw.address
              AND pj.tier = ?
              AND pj.subject_key = ?
             WHERE cw.candidate_stage NOT IN ('rejected', 'blocked_hygiene', 'blocked_copyability')
+              AND COALESCE(wr.raw_retention_tier, '') != 'summary_only'
               {candidate_address_filter}
               AND (
                     cw.candidate_stage IN (

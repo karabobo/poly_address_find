@@ -134,10 +134,13 @@ def prioritize_backfill_from_scores(
           ON ac.address = latest.address
         LEFT JOIN evidence_backfill_budget ebb
           ON ebb.wallet = latest.address
+        LEFT JOIN wallet_registry wr
+          ON wr.address = cw.address
         WHERE latest.rn = 1
           AND latest.leader_score >= ?
           AND latest.review_stage IN ({",".join("?" for _ in REVIEW_FUNNEL_CANDIDATE_STAGES)})
           AND cw.candidate_stage NOT IN ('rejected', 'blocked_hygiene', 'blocked_copyability')
+          AND COALESCE(wr.raw_retention_tier, '') != 'summary_only'
           AND COALESCE(ac.activity_count, 0) < ?
           AND COALESCE(ebb.stage, '') NOT IN ('medium_done', 'deep_done', 'paused_fast_market_specialist')
         ORDER BY latest.leader_score DESC, COALESCE(ac.activity_count, 0) ASC, cw.updated_at DESC

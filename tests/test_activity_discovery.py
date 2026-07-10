@@ -1,8 +1,8 @@
 from pm_robot.clients.http import HttpClientError
 from pm_robot.orchestration.activity_discovery import discover_activity_candidates
 from pm_robot.storage.db import connect, run_migrations
-from pm_robot.storage.repository import get_wallet_features, upsert_candidate
-from pm_robot.models import CandidateAddress
+from pm_robot.storage.repository import get_wallet_features, upsert_candidate, upsert_wallet_feature
+from pm_robot.models import CandidateAddress, WalletFeatures
 
 
 class FakeGlobalActivityClient:
@@ -241,6 +241,54 @@ def test_discover_activity_candidates_merges_existing_candidate_source(tmp_path)
         assert row["sources"] == "manual | polymarket_trades_global"
         assert row["labels"] == "watchlist | trade_activity_seed"
         assert observed["promotion_reason"] == "existing_candidate"
+    finally:
+        conn.close()
+
+
+def test_activity_discovery_observes_but_does_not_revive_summary_only_wallet(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    wallet = "0x" + "7" * 40
+    try:
+        run_migrations(conn)
+        upsert_candidate(conn, CandidateAddress(address=wallet, sources="archived_source"))
+        upsert_wallet_feature(conn, WalletFeatures(address=wallet, net_pnl_usdc=42))
+        conn.execute(
+            """
+            INSERT INTO wallet_registry(
+                address, candidate_stage, registry_status, raw_retention_tier,
+                last_evaluated_at, updated_at
+            ) VALUES (?, 'needs_data', 'archived_raw_pruned', 'summary_only', ?, ?)
+            """,
+            (wallet, 10_000, 10_000),
+        )
+        conn.commit()
+
+        summary = discover_activity_candidates(
+            conn,
+            pages=1,
+            client=FakeGlobalActivityClient({0: [_activity(wallet, "0xlarge", 500)]}),
+        )
+
+        candidate = conn.execute(
+            "SELECT sources FROM candidate_wallets WHERE address = ?",
+            (wallet,),
+        ).fetchone()
+        observed = conn.execute(
+            "SELECT recent_max_trade_usdc, promoted_at FROM observed_wallets WHERE wallet = ?",
+            (wallet,),
+        ).fetchone()
+        feature = get_wallet_features(conn)[wallet]
+        assert summary.observed_wallets == 1
+        assert summary.promoted_wallets == 0
+        assert summary.candidates_inserted_or_updated == 0
+        assert candidate["sources"] == "archived_source"
+        assert observed["recent_max_trade_usdc"] == 500
+        assert observed["promoted_at"] is None
+        assert feature.net_pnl_usdc == 42
+        assert conn.execute(
+            "SELECT COUNT(*) FROM evidence_backfill_budget WHERE wallet = ?",
+            (wallet,),
+        ).fetchone()[0] == 0
     finally:
         conn.close()
 

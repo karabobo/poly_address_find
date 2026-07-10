@@ -21,7 +21,6 @@ from pm_robot.storage.repository import api_request_summary
 DAY_SECONDS = 86_400
 WAL_CHECKPOINT_MODES = ("none", "passive", "truncate")
 DEFAULT_FAILED_JOB_COOLDOWN_SECONDS = 21_600
-
 WALLET_REGISTRY_TABLE_COLUMNS = [
     "address",
     "candidate_stage",
@@ -941,26 +940,24 @@ def prune_low_value_evidence(
     settings: RobotSettings,
     *,
     limit: int = 20,
-    keep_recent_activity: int = 100,
+    keep_recent_activity: int = 0,
     dry_run: bool = True,
     vacuum: bool = False,
 ) -> dict[str, Any]:
-    """Prune raw evidence for low-value wallets after features and scores are fixed.
+    """Prune raw evidence after a wallet decision has been summarized.
 
-    This intentionally does not touch wallet_features, leader_scores, publish rows,
-    source events, or evidence_backfill_budget summaries. It only removes bulky
-    raw per-wallet evidence for wallets that have already been materialized and
-    remain scored as needs_data with a zero score.
+    Candidate, feature, latest-score, source, and registry summary rows remain the
+    durable control-plane record. Raw event/backtest rows and redundant score
+    history are removed only after that summary has been refreshed.
     """
 
     conn = connect(settings.db_path)
     try:
         run_migrations(conn)
-        if not dry_run and _wallet_registry_refresh_needed(conn):
-            _materialize_wallet_registry(conn, limit=0, stages=())
-            conn.commit()
         wallets = _low_value_prune_wallets(conn, limit=limit)
         if not dry_run:
+            _materialize_wallet_registry(conn, limit=0, stages=(), addresses=tuple(wallets))
+            conn.commit()
             conn.execute("PRAGMA foreign_keys = OFF")
         deleted = _prune_wallet_evidence_batch(
             conn,
@@ -975,7 +972,6 @@ def prune_low_value_evidence(
             if vacuum:
                 conn.execute("VACUUM")
             conn.commit()
-            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
             conn.execute("PRAGMA foreign_keys = ON")
     finally:
         conn.close()
@@ -995,12 +991,26 @@ def _materialize_wallet_registry(
     *,
     limit: int = 0,
     stages: tuple[str, ...] = (),
+    addresses: tuple[str, ...] = (),
 ) -> list[dict[str, Any]]:
     now = int(time.time())
-    rows = [
-        _wallet_registry_row(dict(row), now=now)
-        for row in _wallet_registry_source_rows(conn, limit=limit, stages=stages)
-    ]
+    source_rows = _wallet_registry_source_rows(
+        conn,
+        limit=limit,
+        stages=stages,
+        addresses=addresses,
+    )
+    archived_rows = {
+        str(row["address"]): dict(row)
+        for row in conn.execute(
+            "SELECT * FROM wallet_registry WHERE registry_status = 'archived_raw_pruned'"
+        ).fetchall()
+    }
+    rows = []
+    for source_row in source_rows:
+        row = dict(source_row)
+        archived = archived_rows.get(str(row["address"]))
+        rows.append(archived if archived is not None else _wallet_registry_row(row, now=now))
     if not rows:
         return []
     placeholders = ", ".join("?" for _ in WALLET_REGISTRY_TABLE_COLUMNS)
@@ -1028,12 +1038,17 @@ def _wallet_registry_source_rows(
     *,
     limit: int,
     stages: tuple[str, ...],
+    addresses: tuple[str, ...] = (),
 ) -> list[sqlite3.Row]:
-    where = ""
+    predicates: list[str] = []
     params: list[Any] = []
     if stages:
-        where = f"WHERE cw.candidate_stage IN ({', '.join('?' for _ in stages)})"
+        predicates.append(f"cw.candidate_stage IN ({', '.join('?' for _ in stages)})")
         params.extend(stages)
+    if addresses:
+        predicates.append(f"cw.address IN ({', '.join('?' for _ in addresses)})")
+        params.extend(address.lower() for address in addresses)
+    where = f"WHERE {' AND '.join(predicates)}" if predicates else ""
     limit_sql = ""
     if limit > 0:
         limit_sql = "LIMIT ?"
@@ -1680,76 +1695,91 @@ def _cleanup_database(
 
 
 def _low_value_prune_wallets(conn: sqlite3.Connection, *, limit: int) -> list[str]:
-    rows = conn.execute(
+    if limit <= 0:
+        return []
+    terminal_rows = conn.execute(
         """
-        WITH latest_scores AS (
-            SELECT ls.*
-            FROM leader_scores ls
-            JOIN (
-                SELECT address, MAX(score_id) AS score_id
-                FROM leader_scores
-                GROUP BY address
-            ) latest
-              ON latest.score_id = ls.score_id
-        )
         SELECT cw.address
         FROM candidate_wallets cw
         LEFT JOIN wallet_registry wr
           ON wr.address = cw.address
-        JOIN wallet_features wf
-          ON wf.address = cw.address
-        JOIN latest_scores ls
-          ON ls.address = cw.address
-        LEFT JOIN paper_wallet_quality pwq
-          ON pwq.wallet = cw.address
-        LEFT JOIN leader_publish lp
-          ON lp.wallet = cw.address
-         AND lp.revoked_at IS NULL
-         AND lp.expires_at > strftime('%s','now')
-        LEFT JOIN evidence_backfill_budget ebb
-          ON ebb.wallet = cw.address
-        WHERE cw.candidate_stage = 'needs_data'
-          AND ls.review_stage = 'needs_data'
-          AND ls.leader_score = 0
-          AND (
-              (
-                  wr.registry_status = 'archive_low_value'
-                  AND wr.raw_retention_tier = 'summary_only'
-              )
-              OR (
-                  wr.address IS NULL
-                  AND instr(COALESCE(wf.extra_json, '{}'), 'feature_materializer_version') > 0
-                  AND COALESCE(ebb.stage, '') IN (
-                      '',
-                      'light_done',
-                      'medium_done',
-                      'paused_fast_market_specialist'
-                  )
-              )
-          )
-          AND COALESCE(pwq.production_ready, 0) = 0
-          AND COALESCE(pwq.total_roi, -999.0) <= 0
-          AND lp.wallet IS NULL
-          AND EXISTS (
+        WHERE cw.candidate_stage IN ('rejected', 'blocked_hygiene', 'blocked_copyability')
+          AND COALESCE(wr.raw_prune_version, '') != 'v2_zero_raw'
+          AND NOT EXISTS (
               SELECT 1
-              FROM wallet_activity wa
-              WHERE wa.address = cw.address
+              FROM paper_wallet_quality pwq
+              WHERE pwq.wallet = cw.address
+                AND pwq.production_ready = 1
+          )
+          AND NOT EXISTS (
+              SELECT 1
+              FROM leader_publish lp
+              WHERE lp.wallet = cw.address
+                AND lp.revoked_at IS NULL
+                AND lp.expires_at > strftime('%s','now')
           )
         ORDER BY
-          COALESCE(wr.activity_count, 999999999) ASC,
-          CASE COALESCE(ebb.stage, '')
-              WHEN 'paused_fast_market_specialist' THEN 0
-              WHEN 'light_done' THEN 1
-              ELSE 2
-          END ASC,
-          COALESCE(pwq.total_roi, -999.0) ASC,
           cw.updated_at ASC,
           cw.address ASC
         LIMIT ?
         """,
         (limit,),
     ).fetchall()
-    return [str(row["address"]) for row in rows]
+    wallets = [str(row["address"]) for row in terminal_rows]
+    remaining = limit - len(wallets)
+    if remaining <= 0:
+        return wallets
+    needs_data_rows = conn.execute(
+        """
+        SELECT cw.address
+        FROM candidate_wallets cw
+        JOIN wallet_features wf
+          ON wf.address = cw.address
+        JOIN leader_latest_scores ls
+          ON ls.address = cw.address
+        LEFT JOIN evidence_backfill_budget ebb
+          ON ebb.wallet = cw.address
+        LEFT JOIN wallet_registry wr
+          ON wr.address = cw.address
+        WHERE cw.candidate_stage = 'needs_data'
+          AND COALESCE(wr.raw_prune_version, '') != 'v2_zero_raw'
+          AND ls.review_stage = 'needs_data'
+          AND ls.leader_score = 0
+          AND instr(COALESCE(wf.extra_json, '{}'), 'feature_materializer_version') > 0
+          AND COALESCE(ebb.stage, '') IN (
+              '',
+              'light_done',
+              'medium_done',
+              'paused_fast_market_specialist',
+              'raw_pruned'
+          )
+          AND NOT EXISTS (
+              SELECT 1
+              FROM paper_wallet_quality pwq
+              WHERE pwq.wallet = cw.address
+                AND (pwq.production_ready = 1 OR pwq.total_roi > 0)
+          )
+          AND NOT EXISTS (
+              SELECT 1
+              FROM leader_publish lp
+              WHERE lp.wallet = cw.address
+                AND lp.revoked_at IS NULL
+                AND lp.expires_at > strftime('%s','now')
+          )
+        ORDER BY
+          CASE COALESCE(ebb.stage, '')
+              WHEN 'paused_fast_market_specialist' THEN 0
+              WHEN 'light_done' THEN 1
+              ELSE 2
+          END ASC,
+          cw.updated_at ASC,
+          cw.address ASC
+        LIMIT ?
+        """,
+        (remaining,),
+    ).fetchall()
+    wallets.extend(str(row["address"]) for row in needs_data_rows)
+    return wallets
 
 
 def _prune_wallet_evidence_batch(
@@ -1771,6 +1801,7 @@ def _prune_wallet_evidence_batch(
         "paper_positions": 0,
         "paper_settlements": 0,
         "paper_marks": 0,
+        "leader_scores": 0,
     }
     if not wallets:
         return deleted
@@ -1914,6 +1945,28 @@ def _prune_wallet_evidence_batch(
             "SELECT COUNT(*) FROM wallet_positions WHERE address IN (SELECT wallet FROM temp_prune_wallets)",
             "DELETE FROM wallet_positions WHERE address IN (SELECT wallet FROM temp_prune_wallets)",
         ),
+        (
+            "leader_scores",
+            """
+            SELECT COUNT(*)
+            FROM leader_scores
+            WHERE address IN (SELECT wallet FROM temp_prune_wallets)
+              AND score_id NOT IN (
+                  SELECT score_id
+                  FROM leader_latest_scores
+                  WHERE address IN (SELECT wallet FROM temp_prune_wallets)
+              )
+            """,
+            """
+            DELETE FROM leader_scores
+            WHERE address IN (SELECT wallet FROM temp_prune_wallets)
+              AND score_id NOT IN (
+                  SELECT score_id
+                  FROM leader_latest_scores
+                  WHERE address IN (SELECT wallet FROM temp_prune_wallets)
+              )
+            """,
+        ),
     ]
     for table, count_sql, delete_sql in specs:
         if table not in tables:
@@ -1935,11 +1988,13 @@ def _mark_wallet_registry_pruned(conn: sqlite3.Connection, wallets: list[str]) -
         UPDATE wallet_registry
         SET registry_status = 'archived_raw_pruned',
             raw_retention_tier = 'summary_only',
+            raw_prune_version = 'v2_zero_raw',
+            raw_pruned_at = ?,
             updated_at = ?,
             last_evaluated_at = ?
         WHERE address = ?
         """,
-        ((now, now, wallet.lower()) for wallet in wallets),
+        ((now, now, now, wallet.lower()) for wallet in wallets),
     )
 
 
@@ -1981,6 +2036,36 @@ def _cancel_wallet_evidence_backfill(conn: sqlite3.Connection, wallets: list[str
                 updated_at = ?
             WHERE wallet IN (SELECT wallet FROM temp_pruned_wallets)
               AND status IN ('queued', 'running', 'failed')
+            """,
+            (now,),
+        )
+    if "pipeline_jobs" in tables:
+        conn.execute(
+            """
+            UPDATE pipeline_jobs
+            SET status = 'done',
+                lease_owner = NULL,
+                lease_until = 0,
+                next_attempt_at = 2147483647,
+                output_json = '{"archived":true,"reason":"raw_evidence_pruned"}',
+                last_error = '',
+                updated_at = ?,
+                completed_at = ?
+            WHERE wallet IN (SELECT wallet FROM temp_pruned_wallets)
+              AND status IN ('queued', 'running', 'failed')
+            """,
+            (now, now),
+        )
+    if "wallet_processing_state" in tables:
+        conn.execute(
+            """
+            UPDATE wallet_processing_state
+            SET evidence_status = 'summary_ready',
+                next_action = '',
+                next_action_at = 2147483647,
+                raw_artifact_uri = '',
+                updated_at = ?
+            WHERE wallet IN (SELECT wallet FROM temp_pruned_wallets)
             """,
             (now,),
         )

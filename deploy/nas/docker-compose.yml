@@ -316,6 +316,8 @@ services:
       - ./config:/app/config:ro
 
   backup-loop:
+    profiles:
+      - manual-backup
     build:
       context: ./app
       dockerfile: deploy/nas/Dockerfile

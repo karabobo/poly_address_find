@@ -15,6 +15,7 @@ from pm_robot.models import CandidateAddress, WalletFeatures
 from pm_robot.storage.repository import (
     get_wallet_features,
     seed_evidence_backfill_budget,
+    summary_only_wallets,
     upsert_candidate,
     upsert_wallet_feature,
 )
@@ -378,6 +379,7 @@ def _persist_activity_items(
     target_depth: int,
 ) -> dict[str, Any]:
     existing = get_wallet_features(conn)
+    archived = summary_only_wallets(conn, wallets)
     candidates = 0
     features = 0
     observed = 0
@@ -393,6 +395,8 @@ def _persist_activity_items(
         )
         observation = _record_observed_wallet(conn, candidate, item, now=now)
         observed += 1
+        if item["wallet"] in archived:
+            continue
         if not _should_promote_observed_wallet(conn, item["wallet"], observation):
             continue
         if promoted >= max_candidates:

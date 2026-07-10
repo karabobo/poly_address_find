@@ -11,7 +11,12 @@ from pm_robot.clients.http import HttpClientError
 from pm_robot.clients.polymarket_public import PublicPolymarketClient
 from pm_robot.models import CandidateAddress, WalletFeatures
 from pm_robot.orchestration.retry_policy import is_upstream_scheduling_error
-from pm_robot.storage.repository import get_wallet_features, upsert_candidate, upsert_wallet_feature
+from pm_robot.storage.repository import (
+    get_wallet_features,
+    summary_only_wallets,
+    upsert_candidate,
+    upsert_wallet_feature,
+)
 
 
 DEFAULT_METRICS = ("profit", "volume")
@@ -161,10 +166,13 @@ def discover_leaderboard_candidates(
             break
 
     existing = get_wallet_features(conn)
+    archived = summary_only_wallets(conn, seen)
     candidate_count = 0
     feature_count = 0
     now = int(time.time())
     for wallet, item in seen.items():
+        if wallet in archived:
+            continue
         upsert_candidate(conn, _candidate_from_item(item, now=now))
         candidate_count += 1
         feature = _feature_from_item(item, existing.get(wallet))
