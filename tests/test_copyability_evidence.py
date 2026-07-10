@@ -245,7 +245,7 @@ def test_copyability_planner_reprioritizes_existing_queued_jobs_by_latest_score(
                 INSERT INTO leader_scores(
                     address, leader_score, review_stage, review_reason,
                     components_json, penalties_json, policy_version, scored_at
-                ) VALUES (?, ?, 'needs_manual_review', 'watchlist_score', '{}', '{}', 'test', 10_000)
+                ) VALUES (?, ?, 'needs_manual_review', 'watchlist_score', '{}', '{}', 'test', 10000)
                 """,
                 (wallet, score),
             )
@@ -256,7 +256,7 @@ def test_copyability_planner_reprioritizes_existing_queued_jobs_by_latest_score(
                 lease_owner, lease_until, attempts, max_attempts, next_attempt_at,
                 input_json, output_json, last_error, created_at, updated_at
             ) VALUES (?, ?, 'copyability', 'copyability', 5, 0, ?,
-                'worker', 20_000, 1, 3, 0, '{}', '{}', '', 10_000, 10_000)
+                'worker', 20000, 1, 3, 0, '{}', '{}', '', 10000, 10000)
             """,
             [
                 (JOB_TYPE, high, "queued"),
@@ -305,7 +305,7 @@ def test_copyability_planner_queues_score_blocked_wallets_missing_copyability(tm
             INSERT INTO leader_scores(
                 address, leader_score, review_stage, review_reason,
                 components_json, penalties_json, policy_version, scored_at
-            ) VALUES (?, 0, 'needs_data', ?, '{}', '{}', 'test', 10_000)
+            ) VALUES (?, 0, 'needs_data', ?, '{}', '{}', 'test', 10000)
             """,
             [
                 (
@@ -331,7 +331,7 @@ def test_copyability_planner_queues_score_blocked_wallets_missing_copyability(tm
                 next_action_at, activity_count, non_fast_trade_count,
                 distinct_markets, updated_at
             ) VALUES (?, ?, 'summary_ready', ?, 1.0, 10, 'deep_done', 'score_wallet',
-                0, ?, ?, ?, 10_000)
+                0, ?, ?, ?, 10000)
             """,
             [
                 (missing_copyability, "l3_deep", 1200, 1200, 900, 12),
@@ -392,7 +392,7 @@ def test_copyability_planner_queues_manual_review_wallets_missing_copyability(tm
             INSERT INTO leader_scores(
                 address, leader_score, review_stage, review_reason,
                 components_json, penalties_json, policy_version, scored_at
-            ) VALUES (?, ?, 'needs_manual_review', 'borderline_score', '{}', '{}', 'test', 10_000)
+            ) VALUES (?, ?, 'needs_manual_review', 'borderline_score', '{}', '{}', 'test', 10000)
             """,
             [
                 (manual_missing, 38.0),
@@ -407,7 +407,7 @@ def test_copyability_planner_queues_manual_review_wallets_missing_copyability(tm
                 next_action_at, activity_count, non_fast_trade_count,
                 distinct_markets, updated_at
             ) VALUES (?, ?, 'summary_ready', ?, 1.0, 10, ?, 'score_wallet',
-                0, ?, ?, ?, 10_000)
+                0, ?, ?, ?, 10000)
             """,
             [
                 (manual_missing, "l3_deep", 1200, "deep_done", 1200, 900, 12),
@@ -462,7 +462,7 @@ def test_copyability_planner_defers_done_rescans_while_backlog_is_active(tmp_pat
             INSERT INTO leader_scores(
                 address, leader_score, review_stage, review_reason,
                 components_json, penalties_json, policy_version, scored_at
-            ) VALUES (?, 65, 'needs_manual_review', 'watchlist_score', '{}', '{}', 'test', 10_000)
+            ) VALUES (?, 65, 'needs_manual_review', 'watchlist_score', '{}', '{}', 'test', 10000)
             """,
             (stale_done,),
         )
@@ -474,7 +474,7 @@ def test_copyability_planner_defers_done_rescans_while_backlog_is_active(tmp_pat
                 next_action_at, activity_count, non_fast_trade_count,
                 distinct_markets, updated_at
             ) VALUES (?, 'l3_deep', 'summary_ready', 500, 1.0, 10,
-                'deep_done', 'score_wallet', 0, 500, 300, 10, 10_000)
+                'deep_done', 'score_wallet', 0, 500, 300, 10, 10000)
             """,
             (stale_done,),
         )
@@ -509,7 +509,7 @@ def test_copyability_planner_defers_done_rescans_while_backlog_is_active(tmp_pat
         ).fetchone()["status"]
 
         conn.execute(
-            "UPDATE pipeline_jobs SET status = 'done', completed_at = 9_999 WHERE job_type = ? AND wallet = ?",
+            "UPDATE pipeline_jobs SET status = 'done', completed_at = 9999 WHERE job_type = ? AND wallet = ?",
             (JOB_TYPE, active_backlog),
         )
         conn.commit()
@@ -554,7 +554,7 @@ def test_copyability_planner_upgrades_high_score_light_no_signal_to_deep_scan(tm
                 INSERT INTO leader_scores(
                     address, leader_score, review_stage, review_reason,
                     components_json, penalties_json, policy_version, scored_at
-                ) VALUES (?, ?, 'needs_manual_review', 'borderline_score', '{}', '{}', 'test', 10_000)
+                ) VALUES (?, ?, 'needs_manual_review', 'borderline_score', '{}', '{}', 'test', 10000)
                 """,
                 (wallet, score),
             )
@@ -566,7 +566,7 @@ def test_copyability_planner_upgrades_high_score_light_no_signal_to_deep_scan(tm
                     next_action_at, activity_count, non_fast_trade_count,
                     distinct_markets, updated_at
                 ) VALUES (?, 'l2_medium', 'summary_ready', 700, 1.0, 10,
-                    'medium_done', 'score_wallet', 0, 700, 650, 10, 10_000)
+                    'medium_done', 'score_wallet', 0, 700, 650, 10, 10000)
                 """,
                 (wallet,),
             )
@@ -688,7 +688,7 @@ def test_copyability_planner_short_circuits_when_active_backlog_exceeds_limit(tm
             INSERT INTO leader_scores(
                 address, leader_score, review_stage, review_reason,
                 components_json, penalties_json, policy_version, scored_at
-            ) VALUES (?, 70, 'needs_manual_review', 'watchlist_score', '{}', '{}', 'test', 10_000)
+            ) VALUES (?, 70, 'needs_manual_review', 'watchlist_score', '{}', '{}', 'test', 10000)
             """,
             (stale_done,),
         )
@@ -700,7 +700,7 @@ def test_copyability_planner_short_circuits_when_active_backlog_exceeds_limit(tm
                 next_action_at, activity_count, non_fast_trade_count,
                 distinct_markets, updated_at
             ) VALUES (?, 'l3_deep', 'summary_ready', 500, 1.0, 10,
-                'deep_done', 'score_wallet', 0, 500, 300, 10, 10_000)
+                'deep_done', 'score_wallet', 0, 500, 300, 10, 10000)
             """,
             (stale_done,),
         )
@@ -1133,7 +1133,7 @@ def test_copyability_queue_refreshes_targeted_graph_backtest_and_features(tmp_pa
             INSERT INTO leader_scores(
                 address, leader_score, review_stage, review_reason,
                 components_json, penalties_json, policy_version, scored_at
-            ) VALUES (?, 56, 'needs_manual_review', 'watchlist_score', '{}', '{}', 'test', 20_000)
+            ) VALUES (?, 56, 'needs_manual_review', 'watchlist_score', '{}', '{}', 'test', 20000)
             """,
             (leader,),
         )

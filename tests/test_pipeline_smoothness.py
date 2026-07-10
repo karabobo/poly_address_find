@@ -118,7 +118,7 @@ def _insert_l3_evidence(conn, wallet: str) -> None:
             next_action_at, activity_count, distinct_markets,
             non_fast_trade_count, updated_at
         ) VALUES (?, 'l3_deep', 'summary_ready', 1000, 1.0, 10, 'deep_done',
-                  'score_wallet', 0, 1000, 20, 200, 20_000)
+                  'score_wallet', 0, 1000, 20, 200, 20000)
         """,
         (wallet,),
     )

@@ -152,7 +152,7 @@ def test_maintenance_requeues_older_duplicate_running_pipeline_leases(tmp_path):
                 lease_owner, lease_until, attempts, max_attempts, next_attempt_at,
                 input_json, output_json, last_error, created_at, updated_at
             ) VALUES ('copyability_evidence', ?, 'copyability', 'copyability', 10, 0,
-                'running', ?, 4_000_000_000, 1, 3, 0, '{}', '{}', '', ?, ?)
+                'running', ?, 4000000000, 1, 3, 0, '{}', '{}', '', ?, ?)
             """,
             [
                 (wallet_old, "copyability-worker-a", now, now),
