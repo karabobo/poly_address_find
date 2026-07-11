@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import sys
@@ -76,7 +77,13 @@ from pm_robot.execution.preflight import (
 from pm_robot.research.copy_backtest import backtest_copy_stream
 from pm_robot.research.copy_graph import mine_copy_graph
 from pm_robot.research.publish import active_published_leaders, publish_leaders
-from pm_robot.storage.db import connect, connect_readonly, initialize_database, run_migrations
+from pm_robot.storage.db import (
+    connect,
+    connect_readonly,
+    database_control_plane_guard,
+    initialize_database,
+    run_migrations,
+)
 from pm_robot.storage.evidence_archive import archived_wallet_summary, evidence_archive_summary
 from pm_robot.storage.repository import (
     activity_coverage,
@@ -453,6 +460,12 @@ def main() -> int:
         default=120.0,
         help="SQLite lock wait per write attempt; frequent control loops should use a small value",
     )
+    cycle_cmd.add_argument(
+        "--control-lock-timeout-seconds",
+        type=float,
+        default=120.0,
+        help="Wait for low-priority retention to yield before starting an execute cycle",
+    )
     cycle_cmd.add_argument("--planner-lock-attempts", type=int, default=8)
     cycle_cmd.add_argument("--planner-lock-sleep-seconds", type=float, default=3.0)
 
@@ -752,6 +765,12 @@ def main() -> int:
         ),
     )
     prune_cmd.add_argument("--keep-recent-activity", type=int, default=0)
+    prune_cmd.add_argument(
+        "--control-lock-timeout-seconds",
+        type=float,
+        default=120.0,
+        help="Wait for the high-priority research control cycle before pruning",
+    )
     prune_cmd.add_argument("--execute", action="store_true", help="Actually delete rows; default is dry-run")
     prune_cmd.add_argument("--vacuum", action="store_true")
     prune_cmd.add_argument(
@@ -779,6 +798,12 @@ def main() -> int:
     retention_cycle_cmd.add_argument("--keep-recent-activity", type=int, default=0)
     retention_cycle_cmd.add_argument("--batch-delay-seconds", type=float, default=10.0)
     retention_cycle_cmd.add_argument("--cycle-interval-seconds", type=int, default=900)
+    retention_cycle_cmd.add_argument(
+        "--control-lock-timeout-seconds",
+        type=float,
+        default=0.0,
+        help="Yield immediately when the high-priority research control cycle is active",
+    )
     retention_cycle_cmd.add_argument(
         "--execute", action="store_true", help="Actually delete rows; default is dry-run"
     )
@@ -1291,69 +1316,95 @@ def main() -> int:
         print(json.dumps(report, ensure_ascii=False, indent=2))
         return 0 if report["ok"] else 1
     if args.command == "pipeline-cycle":
-        conn = connect(db_path)
-        try:
-            busy_timeout_ms = max(0, int(float(args.busy_timeout_seconds) * 1000))
-            conn.execute(f"PRAGMA busy_timeout = {busy_timeout_ms}")
-            run_migrations(conn)
-            heartbeat_prefix = str(args.heartbeat_prefix or "").strip()
-
-            def report_cycle_step(step: dict) -> None:
-                if not heartbeat_prefix:
-                    return
-                step_status = str(step.get("status") or "")
-                heartbeat_status = "failed" if step_status == "failed" else "ok"
-                data = step.get("data") if isinstance(step.get("data"), dict) else {}
-                try:
-                    record_runtime_heartbeat(
-                        conn,
-                        f"{heartbeat_prefix}_{step['name']}",
-                        status=heartbeat_status,
-                        rows_written=_pipeline_cycle_step_rows_written(step),
-                        error=str(data.get("error") or ""),
-                        started_at=int(step.get("started_at") or 0) or None,
-                        finished_at=int(step.get("finished_at") or 0) or None,
+        control_stack = contextlib.ExitStack()
+        if args.execute_plan:
+            try:
+                control_stack.enter_context(
+                    database_control_plane_guard(
+                        db_path,
+                        timeout_seconds=max(
+                            0.0,
+                            float(args.control_lock_timeout_seconds),
+                        ),
                     )
-                except Exception:
-                    conn.rollback()
-                    raise
+                )
+            except TimeoutError as exc:
+                print(
+                    json.dumps(
+                        {
+                            "ok": False,
+                            "state": "control_plane_lock_timeout",
+                            "error": str(exc),
+                        },
+                        ensure_ascii=False,
+                        indent=2,
+                    )
+                )
+                return 1
+        with control_stack:
+            conn = connect(db_path)
+            try:
+                busy_timeout_ms = max(0, int(float(args.busy_timeout_seconds) * 1000))
+                conn.execute(f"PRAGMA busy_timeout = {busy_timeout_ms}")
+                run_migrations(conn)
+                heartbeat_prefix = str(args.heartbeat_prefix or "").strip()
 
-            report = run_pipeline_cycle(
-                conn,
-                PipelineCycleOptions(
-                    execute_plan=args.execute_plan,
-                    top=args.top,
-                    min_score=args.min_score,
-                    state_limit=args.state_limit,
-                    state_stale_only=args.state_stale_only,
-                    state_commit_every=args.state_commit_every,
-                    repair_limit=args.repair_limit,
-                    wallet_shard_count=args.wallet_shard_count,
-                    wallet_light_limit=args.wallet_light_limit,
-                    wallet_medium_limit=args.wallet_medium_limit,
-                    wallet_deep_limit=args.wallet_deep_limit,
-                    wallet_max_active_jobs=args.wallet_max_active_jobs,
-                    copyability_limit=args.copyability_limit,
-                    copyability_max_active_jobs=args.copyability_max_active_jobs,
-                    copyability_min_activity_events=args.copyability_min_activity_events,
-                    copyability_shard_count=args.copyability_shard_count,
-                    copyability_rescan_seconds=args.copyability_rescan_seconds,
-                    planner_lock_attempts=max(1, args.planner_lock_attempts),
-                    planner_lock_sleep_seconds=max(0.0, args.planner_lock_sleep_seconds),
-                    feature_limit=args.feature_limit,
-                    feature_min_activity_events=args.feature_min_activity_events,
-                    feature_commit_every=max(1, args.feature_commit_every),
-                    evidence_promotion_limit=args.evidence_promotion_limit,
-                    score_limit=args.score_limit,
-                    run_scoring=not args.no_score,
-                    policy_path=Path(args.policy),
-                    continue_on_error=args.continue_on_error,
-                    include_diagnostics=not args.no_diagnostics,
-                ),
-                step_reporter=report_cycle_step if heartbeat_prefix else None,
-            )
-        finally:
-            conn.close()
+                def report_cycle_step(step: dict) -> None:
+                    if not heartbeat_prefix:
+                        return
+                    step_status = str(step.get("status") or "")
+                    heartbeat_status = "failed" if step_status == "failed" else "ok"
+                    data = step.get("data") if isinstance(step.get("data"), dict) else {}
+                    try:
+                        record_runtime_heartbeat(
+                            conn,
+                            f"{heartbeat_prefix}_{step['name']}",
+                            status=heartbeat_status,
+                            rows_written=_pipeline_cycle_step_rows_written(step),
+                            error=str(data.get("error") or ""),
+                            started_at=int(step.get("started_at") or 0) or None,
+                            finished_at=int(step.get("finished_at") or 0) or None,
+                        )
+                    except Exception:
+                        conn.rollback()
+                        raise
+
+                report = run_pipeline_cycle(
+                    conn,
+                    PipelineCycleOptions(
+                        execute_plan=args.execute_plan,
+                        top=args.top,
+                        min_score=args.min_score,
+                        state_limit=args.state_limit,
+                        state_stale_only=args.state_stale_only,
+                        state_commit_every=args.state_commit_every,
+                        repair_limit=args.repair_limit,
+                        wallet_shard_count=args.wallet_shard_count,
+                        wallet_light_limit=args.wallet_light_limit,
+                        wallet_medium_limit=args.wallet_medium_limit,
+                        wallet_deep_limit=args.wallet_deep_limit,
+                        wallet_max_active_jobs=args.wallet_max_active_jobs,
+                        copyability_limit=args.copyability_limit,
+                        copyability_max_active_jobs=args.copyability_max_active_jobs,
+                        copyability_min_activity_events=args.copyability_min_activity_events,
+                        copyability_shard_count=args.copyability_shard_count,
+                        copyability_rescan_seconds=args.copyability_rescan_seconds,
+                        planner_lock_attempts=max(1, args.planner_lock_attempts),
+                        planner_lock_sleep_seconds=max(0.0, args.planner_lock_sleep_seconds),
+                        feature_limit=args.feature_limit,
+                        feature_min_activity_events=args.feature_min_activity_events,
+                        feature_commit_every=max(1, args.feature_commit_every),
+                        evidence_promotion_limit=args.evidence_promotion_limit,
+                        score_limit=args.score_limit,
+                        run_scoring=not args.no_score,
+                        policy_path=Path(args.policy),
+                        continue_on_error=args.continue_on_error,
+                        include_diagnostics=not args.no_diagnostics,
+                    ),
+                    step_reporter=report_cycle_step if heartbeat_prefix else None,
+                )
+            finally:
+                conn.close()
         print(json.dumps(report, ensure_ascii=False, indent=2))
         return 0 if report["ok"] else 1
     if args.command == "prioritize-backfill":
@@ -1658,6 +1709,7 @@ def main() -> int:
             limit=args.limit,
             max_activity_rows=args.max_activity_rows,
             keep_recent_activity=args.keep_recent_activity,
+            control_lock_timeout_seconds=args.control_lock_timeout_seconds,
             dry_run=not args.execute,
             vacuum=args.vacuum,
             archive=args.archive,
@@ -1674,6 +1726,7 @@ def main() -> int:
             keep_recent_activity=args.keep_recent_activity,
             batch_delay_seconds=args.batch_delay_seconds,
             cycle_interval_seconds=args.cycle_interval_seconds,
+            control_lock_timeout_seconds=args.control_lock_timeout_seconds,
             dry_run=not args.execute,
             archive=args.archive,
             archive_dir=Path(args.archive_dir) if args.archive_dir else None,

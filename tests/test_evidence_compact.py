@@ -6,7 +6,12 @@ import pm_robot.ops as ops
 from pm_robot.config import RobotSettings
 from pm_robot.models import CandidateAddress, CandidateStage, ScoreBreakdown, WalletFeatures
 from pm_robot.ops import compact_low_value_evidence
-from pm_robot.storage.db import connect, database_access_guard, run_migrations
+from pm_robot.storage.db import (
+    connect,
+    database_access_guard,
+    database_control_plane_guard,
+    run_migrations,
+)
 from pm_robot.storage.repository import (
     enqueue_pipeline_job,
     persist_score,
@@ -420,4 +425,13 @@ def test_database_access_guard_excludes_open_application_connections(tmp_path):
                 exclusive=False,
                 timeout_seconds=0.05,
             ):
+                pass
+
+
+def test_database_control_plane_guard_is_cross_process_style_exclusive(tmp_path):
+    db_path = tmp_path / "robot.sqlite"
+
+    with database_control_plane_guard(db_path, timeout_seconds=0.05):
+        with pytest.raises(TimeoutError, match="exclusive database access lock"):
+            with database_control_plane_guard(db_path, timeout_seconds=0.05):
                 pass

@@ -3547,6 +3547,8 @@ def _storage_maintenance_panel(values: dict[str, Any]) -> str:
         retention_eta_label = "已清完"
     elif retention_state == "inflow_outpacing_cleanup":
         retention_eta_label = "新增更快"
+    elif retention_state == "yielded_to_research":
+        retention_eta_label = "核心任务优先"
     elif net_eta_hours is not None:
         retention_eta_label = _fmt_duration_hours(float(net_eta_hours)) or "已清完"
     else:
@@ -7754,6 +7756,8 @@ def _retention_cycle_summary(
         "net_rate_per_hour": 0.0,
         "gross_eta_hours": None,
         "net_eta_hours": None,
+        "yielded_to_research": False,
+        "yielded_batch": None,
         "backlog_after": {},
         "storage": {},
         "error": "",
@@ -7793,6 +7797,8 @@ def _retention_cycle_summary(
             "net_rate_per_hour": _optional_float(payload.get("net_rate_per_hour")) or 0.0,
             "gross_eta_hours": _optional_float(payload.get("gross_eta_hours")),
             "net_eta_hours": _optional_float(payload.get("net_eta_hours")),
+            "yielded_to_research": bool(payload.get("yielded_to_research")),
+            "yielded_batch": _optional_int(payload.get("yielded_batch")),
             "backlog_after": {
                 key: _optional_int(backlog_after.get(key)) or 0
                 for key in (
@@ -7910,6 +7916,8 @@ def _storage_maintenance_summary(
         elif retention_state == "inflow_outpacing_cleanup":
             state = "retention_attention"
             next_action = "低价值证据新增速度高于清理速度；先观察连续周期，再安全提高批次数。"
+        elif retention_state == "yielded_to_research":
+            next_action = "研究评分周期正在运行，低价值清理已主动让路并将在短延迟后重试。"
         elif retention_state == "no_progress" and int(
             (retention_cycle.get("backlog_after") or {}).get("total_activity_rows") or 0
         ):

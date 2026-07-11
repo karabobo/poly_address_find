@@ -12,6 +12,7 @@ from typing import Callable, Iterator, TypeVar
 MIGRATIONS_DIR = Path(__file__).resolve().parents[1] / "migrations"
 T = TypeVar("T")
 DATABASE_ACCESS_LOCK_SUFFIX = ".access.lock"
+CONTROL_PLANE_LOCK_SUFFIX = ".control-plane"
 
 
 class _AccessLockedConnection(sqlite3.Connection):
@@ -157,6 +158,24 @@ def database_access_guard(
         yield
     finally:
         _release_database_access_lock(lock_file)
+
+
+@contextlib.contextmanager
+def database_control_plane_guard(
+    db_path: Path,
+    *,
+    timeout_seconds: float = 120.0,
+) -> Iterator[None]:
+    """Give research-control priority over low-priority retention writes."""
+
+    canonical_path = db_path.expanduser().resolve()
+    lock_key = Path(f"{canonical_path}{CONTROL_PLANE_LOCK_SUFFIX}")
+    with database_access_guard(
+        lock_key,
+        exclusive=True,
+        timeout_seconds=timeout_seconds,
+    ):
+        yield
 
 
 def _acquire_database_access_lock(

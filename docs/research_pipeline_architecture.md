@@ -66,6 +66,10 @@ The NAS control loop uses a short SQLite busy timeout and a bounded planner retr
 fails one isolated phase and yields to the next control pass instead of blocking workers for minutes. Every phase
 records its own start time, finish time, result count, and error; the system-health panel shows the latest six phase
 heartbeats only after phase data exists.
+An executing `pipeline-cycle` holds the shared control-plane priority lock for its complete ordered pass. Retention
+takes that lock only around one bounded prune batch and releases it before the inter-batch delay. If research-control
+already owns the lock, retention reports `yielded_to_research` and retries later instead of competing for SQLite's
+single writer slot. Direct `prune-evidence --execute` follows the same lock order.
 Wallet and copyability planners run candidate selection and copyability priority calculation before opening their
 short queue-admission write transaction. Under the write lock they recheck mutable eligibility, exact-scope dedupe,
 retry cooldown, and active-queue capacity before enqueueing.
@@ -134,6 +138,8 @@ default `up`, `restart`, `runtime-ensure`, or watchdog commands.
 - Maintenance marks expired or queued jobs failed once their attempt budget is exhausted, so unclaimable jobs
   cannot occupy planner queue capacity indefinitely. Failed jobs respect `next_attempt_at`; after the cooldown,
   planners may reopen them with a fresh attempt budget while retaining the previous error for diagnosis.
+- Retention catch-up is bounded. Maintenance runs another short pass only when new eligible raw rows outpace the
+  completed deletion or when retention yielded to research-control; it never turns cleanup into an unbounded loop.
 - Planner backpressure limits queued/running wallet evidence and copyability jobs. Copyability planning keeps
   its per-pass batch limit separate from the active-queue waterline and only fills currently available slots.
 - When queue capacity is tight, the planner allocates slots across light, medium, and deep evidence stages by
@@ -165,3 +171,4 @@ default `up`, `restart`, `runtime-ensure`, or watchdog commands.
 - Verify proxy reachability and logical loop liveness from the NAS runtime, not only container presence.
 - Measure shared request-budget write latency under the real NAS worker count before increasing concurrency.
 - Measure Parquet archive latency and compression on the real NAS before increasing the five-wallet batch size.
+- Measure net retention backlog movement after the research-priority lock has run through normal discovery load.

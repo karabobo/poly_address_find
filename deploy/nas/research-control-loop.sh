@@ -27,6 +27,7 @@ PAPER_HANDOFF_LIMIT="${PM_ROBOT_PAPER_HANDOFF_LIMIT:-250}"
 BUSY_TIMEOUT_SECONDS="${PM_ROBOT_RESEARCH_BUSY_TIMEOUT_SECONDS:-15}"
 PLANNER_LOCK_ATTEMPTS="${PM_ROBOT_RESEARCH_PLANNER_LOCK_ATTEMPTS:-4}"
 PLANNER_LOCK_SLEEP_SECONDS="${PM_ROBOT_RESEARCH_PLANNER_LOCK_SLEEP_SECONDS:-1}"
+CONTROL_LOCK_TIMEOUT_SECONDS="${PM_ROBOT_RESEARCH_CONTROL_LOCK_TIMEOUT_SECONDS:-120}"
 
 runtime_heartbeat() {
   name="$1"
@@ -46,6 +47,7 @@ while true; do
       --heartbeat-prefix loop_research_control_step \
       --no-diagnostics \
       --busy-timeout-seconds "$BUSY_TIMEOUT_SECONDS" \
+      --control-lock-timeout-seconds "$CONTROL_LOCK_TIMEOUT_SECONDS" \
       --planner-lock-attempts "$PLANNER_LOCK_ATTEMPTS" \
       --planner-lock-sleep-seconds "$PLANNER_LOCK_SLEEP_SECONDS" \
       --min-score "$MIN_SCORE" \

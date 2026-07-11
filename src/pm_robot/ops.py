@@ -23,6 +23,7 @@ from pm_robot.storage.db import (
     connect,
     connect_readonly,
     database_access_guard,
+    database_control_plane_guard,
     is_sqlite_locked_error,
     pending_migration_versions,
     run_migrations,
@@ -1856,27 +1857,40 @@ def prune_low_value_evidence(
     limit: int = 20,
     max_activity_rows: int = 0,
     keep_recent_activity: int = 0,
+    control_lock_timeout_seconds: float = 120.0,
     dry_run: bool = True,
     vacuum: bool = False,
     archive: bool = False,
     archive_dir: Path | None = None,
 ) -> dict[str, Any]:
-    """Serialize one direct prune against retention cycles and compaction."""
+    """Serialize one direct prune and defer writes to research-control."""
 
     with database_access_guard(
         _retention_cycle_lock_key(settings.db_path),
         exclusive=True,
     ):
-        return _prune_low_value_evidence_locked(
-            settings,
-            limit=limit,
-            max_activity_rows=max_activity_rows,
-            keep_recent_activity=keep_recent_activity,
-            dry_run=dry_run,
-            vacuum=vacuum,
-            archive=archive,
-            archive_dir=archive_dir,
-        )
+        control_stack = contextlib.ExitStack()
+        if not dry_run:
+            control_stack.enter_context(
+                database_control_plane_guard(
+                    settings.db_path,
+                    timeout_seconds=max(
+                        0.0,
+                        float(control_lock_timeout_seconds),
+                    ),
+                )
+            )
+        with control_stack:
+            return _prune_low_value_evidence_locked(
+                settings,
+                limit=limit,
+                max_activity_rows=max_activity_rows,
+                keep_recent_activity=keep_recent_activity,
+                dry_run=dry_run,
+                vacuum=vacuum,
+                archive=archive,
+                archive_dir=archive_dir,
+            )
 
 
 def _prune_low_value_evidence_locked(
@@ -2131,6 +2145,7 @@ def run_retention_cycle(
     keep_recent_activity: int = 0,
     batch_delay_seconds: float = 10.0,
     cycle_interval_seconds: int = 900,
+    control_lock_timeout_seconds: float = 0.0,
     dry_run: bool = True,
     archive: bool = False,
     archive_dir: Path | None = None,
@@ -2164,6 +2179,7 @@ def run_retention_cycle(
             keep_recent_activity=keep_recent_activity,
             batch_delay_seconds=batch_delay_seconds,
             cycle_interval_seconds=cycle_interval_seconds,
+            control_lock_timeout_seconds=control_lock_timeout_seconds,
             dry_run=dry_run,
             archive=archive,
             archive_dir=archive_dir,
@@ -2183,6 +2199,7 @@ def _run_retention_cycle_locked(
     keep_recent_activity: int = 0,
     batch_delay_seconds: float = 10.0,
     cycle_interval_seconds: int = 900,
+    control_lock_timeout_seconds: float = 0.0,
     dry_run: bool = True,
     archive: bool = False,
     archive_dir: Path | None = None,
@@ -2221,19 +2238,38 @@ def _run_retention_cycle_locked(
     deleted = _empty_evidence_delete_counts()
     batch_results: list[dict[str, Any]] = []
     ok = True
+    yielded_to_research = False
+    yielded_batch: int | None = None
 
     # Repeating a dry-run would preview the same oldest wallet set each time.
     batch_attempts = min(requested_batches, 1) if dry_run else requested_batches
     for batch_index in range(batch_attempts):
-        result = _prune_low_value_evidence_locked(
-            settings,
-            limit=limit,
-            max_activity_rows=max_activity_rows,
-            keep_recent_activity=keep_recent_activity,
-            dry_run=dry_run,
-            archive=archive,
-            archive_dir=archive_dir,
-        )
+        control_stack = contextlib.ExitStack()
+        if not dry_run:
+            try:
+                control_stack.enter_context(
+                    database_control_plane_guard(
+                        settings.db_path,
+                        timeout_seconds=max(
+                            0.0,
+                            float(control_lock_timeout_seconds),
+                        ),
+                    )
+                )
+            except TimeoutError:
+                yielded_to_research = True
+                yielded_batch = batch_index + 1
+                break
+        with control_stack:
+            result = _prune_low_value_evidence_locked(
+                settings,
+                limit=limit,
+                max_activity_rows=max_activity_rows,
+                keep_recent_activity=keep_recent_activity,
+                dry_run=dry_run,
+                archive=archive,
+                archive_dir=archive_dir,
+            )
         batch_deleted = result.get("deleted") or {}
         for table in planned:
             row_count = int(batch_deleted.get(table) or 0)
@@ -2310,6 +2346,8 @@ def _run_retention_cycle_locked(
         state = "dry_run"
     elif after_activity_rows <= 0:
         state = "caught_up"
+    elif yielded_to_research:
+        state = "yielded_to_research"
     elif net_rate_per_hour > 0:
         state = "draining"
     elif deleted_activity_rows > 0 and eligible_rows_added >= deleted_activity_rows:
@@ -2334,6 +2372,8 @@ def _run_retention_cycle_locked(
         "previous_report_max_age_seconds": previous_report_max_age_seconds,
         "batches_requested": requested_batches,
         "batches_completed": len(batch_results),
+        "yielded_to_research": yielded_to_research,
+        "yielded_batch": yielded_batch,
         "wallet_count": sum(int(row["wallet_count"]) for row in batch_results),
         "selected_activity_rows": sum(
             int(row["selected_activity_rows"]) for row in batch_results

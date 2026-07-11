@@ -97,20 +97,29 @@ def test_nas_retention_prune_is_bounded_and_staggered():
     assert "PM_ROBOT_RETENTION_PRUNE_LIMIT=20" in env
     assert "PM_ROBOT_RETENTION_PRUNE_MAX_ACTIVITY_ROWS=5000" in env
     assert "PM_ROBOT_RETENTION_PRUNE_BATCH_DELAY=10" in env
+    assert "PM_ROBOT_RETENTION_CONTROL_LOCK_TIMEOUT=0" in env
+    assert "PM_ROBOT_RETENTION_CATCHUP_PASSES=2" in env
+    assert "PM_ROBOT_RETENTION_CATCHUP_DELAY=60" in env
     assert 'CLEANUP_BATCH_LIMIT="${PM_ROBOT_MAINTENANCE_CLEANUP_BATCH_LIMIT:-500}"' in loop
     assert 'PRUNE_BATCHES="${PM_ROBOT_RETENTION_PRUNE_BATCHES:-6}"' in loop
     assert 'PRUNE_LIMIT="${PM_ROBOT_RETENTION_PRUNE_LIMIT:-20}"' in loop
     assert 'PRUNE_MAX_ACTIVITY_ROWS="${PM_ROBOT_RETENTION_PRUNE_MAX_ACTIVITY_ROWS:-5000}"' in loop
     assert 'PRUNE_BATCH_DELAY="${PM_ROBOT_RETENTION_PRUNE_BATCH_DELAY:-10}"' in loop
+    assert 'PRUNE_CONTROL_LOCK_TIMEOUT="${PM_ROBOT_RETENTION_CONTROL_LOCK_TIMEOUT:-0}"' in loop
+    assert 'PRUNE_CATCHUP_PASSES="${PM_ROBOT_RETENTION_CATCHUP_PASSES:-2}"' in loop
+    assert 'PRUNE_CATCHUP_DELAY="${PM_ROBOT_RETENTION_CATCHUP_DELAY:-60}"' in loop
     assert '--cleanup-batch-limit "$CLEANUP_BATCH_LIMIT"' in loop
     assert "retention-cycle" in loop
     assert '--batches "$PRUNE_BATCHES"' in loop
     assert '--max-activity-rows "$PRUNE_MAX_ACTIVITY_ROWS"' in loop
     assert '--batch-delay-seconds "$PRUNE_BATCH_DELAY"' in loop
     assert '--cycle-interval-seconds "$INTERVAL"' in loop
+    assert '--control-lock-timeout-seconds "$PRUNE_CONTROL_LOCK_TIMEOUT"' in loop
     assert '--previous-report "$PRUNE_REPORT_PATH"' in loop
     assert '--report-path "$PRUNE_REPORT_PATH"' in loop
     assert 'mv "$PRUNE_REPORT_TMP" "$PRUNE_REPORT_PATH"' not in loop
+    assert "inflow_outpacing_cleanup|yielded_to_research" in loop
+    assert 'sleep "$PRUNE_CATCHUP_DELAY"' in loop
     assert "--skip-cleanup" not in loop
 
 
@@ -286,18 +295,21 @@ def test_nas_research_control_runs_ordered_cycle_with_sharded_workers():
     assert "PM_ROBOT_PIPELINE_PLANNER_MAX_ACTIVE_JOBS=240" in env
     assert "PM_ROBOT_ELIGIBILITY_REPAIR_LIMIT=100" in env
     assert "PM_ROBOT_RESEARCH_MIN_SCORE=40" in env
+    assert "PM_ROBOT_RESEARCH_CONTROL_LOCK_TIMEOUT_SECONDS=120" in env
     assert "pipeline-cycle" in control
     assert "--execute-plan" in control
     assert "--continue-on-error" in control
     assert "--heartbeat-prefix loop_research_control_step" in control
     assert "--no-diagnostics" in control
     assert '--busy-timeout-seconds "$BUSY_TIMEOUT_SECONDS"' in control
+    assert '--control-lock-timeout-seconds "$CONTROL_LOCK_TIMEOUT_SECONDS"' in control
     assert '--planner-lock-attempts "$PLANNER_LOCK_ATTEMPTS"' in control
     assert '--planner-lock-sleep-seconds "$PLANNER_LOCK_SLEEP_SECONDS"' in control
     assert "--state-stale-only" in control
     assert "PM_ROBOT_PIPELINE_STATE_LIMIT:-25" in control
     assert "PM_ROBOT_PIPELINE_STATE_COMMIT_EVERY:-5" in control
     assert "PM_ROBOT_RESEARCH_BUSY_TIMEOUT_SECONDS:-15" in control
+    assert "PM_ROBOT_RESEARCH_CONTROL_LOCK_TIMEOUT_SECONDS:-120" in control
     assert "PM_ROBOT_RESEARCH_PLANNER_LOCK_ATTEMPTS:-4" in control
     assert '--wallet-max-active-jobs "$WALLET_MAX_ACTIVE_JOBS"' in control
     assert '--copyability-max-active-jobs "$COPYABILITY_MAX_ACTIVE_JOBS"' in control

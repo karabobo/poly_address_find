@@ -18,6 +18,9 @@ PRUNE_BATCH_DELAY="${PM_ROBOT_RETENTION_PRUNE_BATCH_DELAY:-10}"
 PRUNE_KEEP_RECENT_ACTIVITY="${PM_ROBOT_RETENTION_KEEP_RECENT_ACTIVITY:-0}"
 PRUNE_ARCHIVE_ENABLED="${PM_ROBOT_RETENTION_ARCHIVE_ENABLED:-0}"
 PRUNE_REPORT_PATH="${PM_ROBOT_RETENTION_PRUNE_REPORT_PATH:-/app/reports/retention_prune_status.json}"
+PRUNE_CATCHUP_PASSES="${PM_ROBOT_RETENTION_CATCHUP_PASSES:-2}"
+PRUNE_CATCHUP_DELAY="${PM_ROBOT_RETENTION_CATCHUP_DELAY:-60}"
+PRUNE_CONTROL_LOCK_TIMEOUT="${PM_ROBOT_RETENTION_CONTROL_LOCK_TIMEOUT:-0}"
 
 runtime_heartbeat() {
   name="$1"
@@ -71,27 +74,47 @@ while true; do
     if [ "$PRUNE_ARCHIVE_ENABLED" = "1" ]; then
       archive_args="--archive"
     fi
-    if prune_output="$(python -m pm_robot.cli --env /app/.env retention-cycle \
-        --execute \
-        "$archive_args" \
-        --batches "$PRUNE_BATCHES" \
-        --limit "$PRUNE_LIMIT" \
-        --max-activity-rows "$PRUNE_MAX_ACTIVITY_ROWS" \
-        --batch-delay-seconds "$PRUNE_BATCH_DELAY" \
-        --cycle-interval-seconds "$INTERVAL" \
-        --previous-report "$PRUNE_REPORT_PATH" \
-        --report-path "$PRUNE_REPORT_PATH" \
-        --keep-recent-activity "$PRUNE_KEEP_RECENT_ACTIVITY")"; then
-      prune_command_ok=1
-    else
-      prune_command_ok=0
-      maintenance_ok=0
-    fi
-    if [ -n "$prune_output" ]; then
-      printf '%s\n' "$prune_output"
-    elif [ "$prune_command_ok" -eq 0 ]; then
-      echo "$(date -Iseconds) maintenance loop: prune command failed without report" >&2
-    fi
+    prune_pass=1
+    while [ "$prune_pass" -le "$PRUNE_CATCHUP_PASSES" ]; do
+      if prune_output="$(python -m pm_robot.cli --env /app/.env retention-cycle \
+          --execute \
+          "$archive_args" \
+          --batches "$PRUNE_BATCHES" \
+          --limit "$PRUNE_LIMIT" \
+          --max-activity-rows "$PRUNE_MAX_ACTIVITY_ROWS" \
+          --batch-delay-seconds "$PRUNE_BATCH_DELAY" \
+          --cycle-interval-seconds "$INTERVAL" \
+          --control-lock-timeout-seconds "$PRUNE_CONTROL_LOCK_TIMEOUT" \
+          --previous-report "$PRUNE_REPORT_PATH" \
+          --report-path "$PRUNE_REPORT_PATH" \
+          --keep-recent-activity "$PRUNE_KEEP_RECENT_ACTIVITY")"; then
+        prune_command_ok=1
+      else
+        prune_command_ok=0
+        maintenance_ok=0
+      fi
+      if [ -n "$prune_output" ]; then
+        printf '%s\n' "$prune_output"
+      elif [ "$prune_command_ok" -eq 0 ]; then
+        echo "$(date -Iseconds) maintenance loop: prune command failed without report" >&2
+      fi
+      if [ "$prune_command_ok" -eq 0 ] || [ -z "$prune_output" ]; then
+        break
+      fi
+      prune_state="$(python -c 'import json, sys; print(json.load(open(sys.argv[1], encoding="utf-8")).get("state", ""))' "$PRUNE_REPORT_PATH" 2>/dev/null || true)"
+      case "$prune_state" in
+        inflow_outpacing_cleanup|yielded_to_research)
+          if [ "$prune_pass" -lt "$PRUNE_CATCHUP_PASSES" ]; then
+            echo "$(date -Iseconds) maintenance loop: retention ${prune_state}; retry in ${PRUNE_CATCHUP_DELAY}s"
+            sleep "$PRUNE_CATCHUP_DELAY"
+          fi
+          ;;
+        *)
+          break
+          ;;
+      esac
+      prune_pass=$((prune_pass + 1))
+    done
   fi
   if [ "$maintenance_ok" -eq 1 ]; then
     echo "$(date -Iseconds) maintenance loop: ok"

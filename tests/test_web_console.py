@@ -3304,6 +3304,53 @@ def test_storage_maintenance_summary_exposes_retention_cycle_progress(tmp_path):
     assert "33.3 小时" in html
 
 
+def test_storage_maintenance_shows_retention_yield_as_expected_priority(tmp_path):
+    settings = RobotSettings(
+        db_path=tmp_path / "data" / "pm_robot.sqlite",
+        execution_mode="research",
+    )
+    conn = connect(settings.db_path)
+    try:
+        run_migrations(conn)
+        conn.commit()
+    finally:
+        conn.close()
+    report_path = tmp_path / "reports" / "retention_prune_status.json"
+    report_path.parent.mkdir(parents=True)
+    report_path.write_text(
+        json.dumps(
+            {
+                "ok": True,
+                "dry_run": False,
+                "state": "yielded_to_research",
+                "yielded_to_research": True,
+                "yielded_batch": 2,
+                "backlog_after": {
+                    "total_wallets": 100,
+                    "total_activity_rows": 50_000,
+                },
+                "storage": {"total_data_bytes": 10_000},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    summary = _storage_maintenance_summary(
+        settings,
+        now=int(report_path.stat().st_mtime) + 10,
+        low_free_disk_bytes=1,
+        scheduled_backup_enabled=False,
+    )
+    html = _storage_maintenance_panel(summary)
+
+    retention = summary["retention_cycle"]
+    assert retention["yielded_to_research"] is True
+    assert retention["yielded_batch"] == 2
+    assert summary["state"] == "ok"
+    assert summary["next_action"] == "研究评分周期正在运行，低价值清理已主动让路并将在短延迟后重试。"
+    assert "核心任务优先" in html
+
+
 def test_storage_maintenance_does_not_present_stale_retention_eta_as_current(tmp_path):
     settings = RobotSettings(
         db_path=tmp_path / "data" / "pm_robot.sqlite",

@@ -310,3 +310,89 @@ def test_pipeline_cycle_phase_heartbeats_preserve_failure_and_recovery(tmp_path,
         assert all(int(row["finished_at"]) >= int(row["started_at"]) for row in rows)
     finally:
         conn.close()
+
+
+def test_pipeline_cycle_cli_holds_control_lock_for_execute_cycle(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    from pm_robot.cli import main
+
+    events: list[str] = []
+
+    class RecordingGuard:
+        def __enter__(self):
+            events.append("lock_enter")
+
+        def __exit__(self, exc_type, exc, traceback):
+            events.append("lock_exit")
+            return False
+
+    def fake_cycle(conn, options, *, step_reporter=None):
+        assert events == ["lock_enter"]
+        assert options.execute_plan is True
+        events.append("cycle")
+        return {"ok": True}
+
+    monkeypatch.setattr(
+        "pm_robot.cli.database_control_plane_guard",
+        lambda *args, **kwargs: RecordingGuard(),
+    )
+    monkeypatch.setattr("pm_robot.cli.run_pipeline_cycle", fake_cycle)
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "pm-robot",
+            "--env",
+            str(tmp_path / "missing.env"),
+            "--db",
+            str(tmp_path / "robot.sqlite"),
+            "pipeline-cycle",
+            "--execute-plan",
+            "--no-score",
+        ],
+    )
+
+    assert main() == 0
+    assert events == ["lock_enter", "cycle", "lock_exit"]
+    assert json.loads(capsys.readouterr().out)["ok"] is True
+
+
+def test_pipeline_cycle_cli_reports_control_lock_timeout(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    from pm_robot.cli import main
+
+    class BusyGuard:
+        def __enter__(self):
+            raise TimeoutError("retention batch still finishing")
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+    monkeypatch.setattr(
+        "pm_robot.cli.database_control_plane_guard",
+        lambda *args, **kwargs: BusyGuard(),
+    )
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "pm-robot",
+            "--env",
+            str(tmp_path / "missing.env"),
+            "--db",
+            str(tmp_path / "robot.sqlite"),
+            "pipeline-cycle",
+            "--execute-plan",
+            "--control-lock-timeout-seconds",
+            "0",
+        ],
+    )
+
+    assert main() == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["state"] == "control_plane_lock_timeout"
+    assert "retention batch" in payload["error"]

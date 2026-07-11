@@ -405,6 +405,176 @@ def test_retention_cycle_does_not_hide_internal_timeout(tmp_path, monkeypatch):
         run_retention_cycle(_settings(tmp_path / "robot.sqlite"))
 
 
+def test_direct_prune_acquires_control_lock_inside_retention_lock(
+    tmp_path,
+    monkeypatch,
+):
+    events: list[str] = []
+
+    class RecordingGuard:
+        def __init__(self, name):
+            self.name = name
+
+        def __enter__(self):
+            events.append(f"{self.name}_enter")
+
+        def __exit__(self, exc_type, exc, traceback):
+            events.append(f"{self.name}_exit")
+            return False
+
+    monkeypatch.setattr(
+        "pm_robot.ops.database_access_guard",
+        lambda *args, **kwargs: RecordingGuard("retention"),
+    )
+    monkeypatch.setattr(
+        "pm_robot.ops.database_control_plane_guard",
+        lambda *args, **kwargs: RecordingGuard("control"),
+    )
+    monkeypatch.setattr(
+        "pm_robot.ops._prune_low_value_evidence_locked",
+        lambda *args, **kwargs: events.append("prune") or {"ok": True},
+    )
+
+    result = prune_low_value_evidence(
+        _settings(tmp_path / "robot.sqlite"),
+        dry_run=False,
+    )
+
+    assert result == {"ok": True}
+    assert events == [
+        "retention_enter",
+        "control_enter",
+        "prune",
+        "control_exit",
+        "retention_exit",
+    ]
+
+
+def test_direct_prune_dry_run_does_not_take_control_lock(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "pm_robot.ops.database_control_plane_guard",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("unexpected lock")),
+    )
+    monkeypatch.setattr(
+        "pm_robot.ops._prune_low_value_evidence_locked",
+        lambda *args, **kwargs: {"ok": True},
+    )
+
+    assert prune_low_value_evidence(
+        _settings(tmp_path / "robot.sqlite"),
+        dry_run=True,
+    ) == {"ok": True}
+
+
+def test_retention_cycle_yields_before_batch_when_research_control_is_active(
+    tmp_path,
+    monkeypatch,
+):
+    db_path = tmp_path / "robot.sqlite"
+    wallet = "0x" + "7" * 40
+    conn = connect(db_path)
+    try:
+        run_migrations(conn)
+        _seed_candidate(conn, wallet, materialized=True, roi=-0.2)
+        conn.execute(
+            "UPDATE candidate_wallets SET candidate_stage = 'blocked_hygiene' WHERE address = ?",
+            (wallet,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    class BusyGuard:
+        def __enter__(self):
+            raise TimeoutError("research control active")
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+    monkeypatch.setattr(
+        "pm_robot.ops.database_control_plane_guard",
+        lambda *args, **kwargs: BusyGuard(),
+    )
+
+    result = run_retention_cycle(
+        _settings(db_path),
+        batches=2,
+        batch_delay_seconds=0,
+        dry_run=False,
+    )
+
+    assert result["ok"] is True
+    assert result["state"] == "yielded_to_research"
+    assert result["yielded_to_research"] is True
+    assert result["yielded_batch"] == 1
+    assert result["batches_completed"] == 0
+    assert result["deleted_activity_rows"] == 0
+
+
+def test_retention_cycle_releases_control_lock_between_batches(
+    tmp_path,
+    monkeypatch,
+):
+    db_path = tmp_path / "robot.sqlite"
+    wallets = ["0x" + digit * 40 for digit in ("8", "9")]
+    conn = connect(db_path)
+    try:
+        run_migrations(conn)
+        for wallet in wallets:
+            _seed_candidate(conn, wallet, materialized=True, roi=-0.2)
+            conn.execute(
+                "UPDATE candidate_wallets SET candidate_stage = 'blocked_hygiene' WHERE address = ?",
+                (wallet,),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+    events: list[str] = []
+
+    class RecordingGuard:
+        def __enter__(self):
+            events.append("enter")
+
+        def __exit__(self, exc_type, exc, traceback):
+            events.append("exit")
+            return False
+
+    monkeypatch.setattr(
+        "pm_robot.ops.database_control_plane_guard",
+        lambda *args, **kwargs: RecordingGuard(),
+    )
+
+    result = run_retention_cycle(
+        _settings(db_path),
+        batches=2,
+        limit=1,
+        max_activity_rows=5,
+        batch_delay_seconds=0,
+        dry_run=False,
+    )
+
+    assert result["batches_completed"] == 2
+    assert events == ["enter", "exit", "enter", "exit"]
+
+
+def test_retention_cycle_does_not_hide_timeout_inside_control_lock(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        "pm_robot.ops._prune_low_value_evidence_locked",
+        lambda *args, **kwargs: (_ for _ in ()).throw(TimeoutError("prune timeout")),
+    )
+
+    with pytest.raises(TimeoutError, match="prune timeout"):
+        run_retention_cycle(
+            _settings(tmp_path / "robot.sqlite"),
+            batches=1,
+            dry_run=False,
+        )
+
+
 def test_retention_lock_key_is_canonical(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
 
@@ -521,6 +691,7 @@ def test_prune_evidence_cli_remains_compatible(tmp_path, monkeypatch, capsys):
 
     assert main() == 0
     assert "previous_report_path" not in captured
+    assert captured["control_lock_timeout_seconds"] == 120.0
     assert json.loads(capsys.readouterr().out)["ok"] is True
 
 
