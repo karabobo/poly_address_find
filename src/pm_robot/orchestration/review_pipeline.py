@@ -11,6 +11,11 @@ from pm_robot.config import load_policy
 from pm_robot.io import load_candidate_addresses, load_wallet_features, write_rows
 from pm_robot.models import CandidateAddress, CandidateStage, ScoreBreakdown
 from pm_robot.orchestration.evidence_readiness import paper_evidence_ready, paper_evidence_ready_sql
+from pm_robot.pipeline_terms import (
+    PENDING_EVIDENCE_JOB_STAGES,
+    TERMINAL_EVIDENCE_JOB_STAGES,
+    EvidenceStatus,
+)
 from pm_robot.research.polydata_features import extract_polydata
 from pm_robot.research.scoring import review_row, score_candidate
 from pm_robot.storage.repository import (
@@ -91,6 +96,7 @@ def score_database(
     scores = []
     for candidate in candidates:
         score = score_candidate(candidate, features_by_address.get(candidate.address), policy)
+        score = apply_evidence_lifecycle_guard(conn, score)
         scores.append(apply_paper_evidence_guard(conn, score))
 
     def persist_scores() -> tuple[int, int, int]:
@@ -162,6 +168,65 @@ def apply_paper_evidence_guard(conn: sqlite3.Connection, score: ScoreBreakdown) 
         components=score.components,
         penalties=score.penalties,
     )
+
+
+PENDING_EVIDENCE_STATUSES = {
+    EvidenceStatus.PENDING.value,
+    EvidenceStatus.NEEDS_LIGHT.value,
+    EvidenceStatus.NEEDS_MEDIUM.value,
+    EvidenceStatus.NEEDS_DEEP.value,
+    EvidenceStatus.QUEUED.value,
+}
+BORDERLINE_LIFECYCLE_REPAIR_PENDING_STATUSES = tuple(sorted(PENDING_EVIDENCE_STATUSES))
+
+
+def apply_evidence_lifecycle_guard(
+    conn: sqlite3.Connection,
+    score: ScoreBreakdown,
+) -> ScoreBreakdown:
+    """Resolve a borderline score without confusing evidence work with manual review."""
+
+    if score.stage != CandidateStage.NEEDS_REVIEW or score.reason != "borderline_score":
+        return score
+    state = conn.execute(
+        """
+        SELECT current_stage, evidence_status, next_action
+        FROM wallet_processing_state
+        WHERE wallet = ?
+        """,
+        (score.address,),
+    ).fetchone()
+    if state is None:
+        return score
+
+    evidence_status = str(state["evidence_status"] or "")
+    next_action = str(state["next_action"] or "")
+    current_stage = str(state["current_stage"] or "")
+    if next_action in PENDING_EVIDENCE_JOB_STAGES or evidence_status in PENDING_EVIDENCE_STATUSES:
+        pending_step = next_action or evidence_status or current_stage or "unknown"
+        return ScoreBreakdown(
+            address=score.address,
+            leader_score=score.leader_score,
+            stage=CandidateStage.NEEDS_DATA,
+            reason=f"evidence_refinement_pending:{pending_step}",
+            components=score.components,
+            penalties=score.penalties,
+        )
+
+    evidence_complete = (
+        evidence_status == EvidenceStatus.SUMMARY_READY.value
+        and (next_action == "score_wallet" or current_stage in TERMINAL_EVIDENCE_JOB_STAGES)
+    )
+    if evidence_complete:
+        return ScoreBreakdown(
+            address=score.address,
+            leader_score=score.leader_score,
+            stage=CandidateStage.NEEDS_DATA,
+            reason="score_below_watchlist_after_evidence",
+            components=score.components,
+            penalties=score.penalties,
+        )
+    return score
 
 
 def _paper_evidence_ready(conn: sqlite3.Connection, address: str) -> bool:
@@ -275,8 +340,13 @@ def _list_score_candidates(
         candidates = list_candidates(conn)
         return candidates[:limit] if limit > 0 else candidates
 
+    pending_action_placeholders = ",".join("?" for _ in PENDING_EVIDENCE_JOB_STAGES)
+    pending_status_placeholders = ",".join(
+        "?" for _ in BORDERLINE_LIFECYCLE_REPAIR_PENDING_STATUSES
+    )
+    terminal_stage_placeholders = ",".join("?" for _ in TERMINAL_EVIDENCE_JOB_STAGES)
     rows = conn.execute(
-        """
+        f"""
         SELECT cw.address, cw.sources, cw.labels, cw.notes, cw.links, cw.status
         FROM candidate_wallets cw
         LEFT JOIN wallet_features wf
@@ -295,6 +365,22 @@ def _list_score_candidates(
               OR COALESCE(wf.updated_at, 0) > latest.scored_at
               OR COALESCE(wps.updated_at, 0) > latest.scored_at
               OR COALESCE(cw.updated_at, 0) > latest.scored_at
+              OR (
+                  cw.candidate_stage = 'needs_manual_review'
+                  AND latest.review_stage = 'needs_manual_review'
+                  AND latest.review_reason = 'borderline_score'
+                  AND (
+                      COALESCE(wps.next_action, '') IN ({pending_action_placeholders})
+                      OR COALESCE(wps.evidence_status, '') IN ({pending_status_placeholders})
+                      OR (
+                          COALESCE(wps.evidence_status, '') = ?
+                          AND (
+                              COALESCE(wps.next_action, '') = 'score_wallet'
+                              OR COALESCE(wps.current_stage, '') IN ({terminal_stage_placeholders})
+                          )
+                      )
+                  )
+              )
           )
           AND (
               wps.next_action = 'score_wallet'
@@ -328,7 +414,15 @@ def _list_score_candidates(
             cw.address ASC
         LIMIT CASE WHEN ? > 0 THEN ? ELSE 9223372036854775807 END
         """,
-        (policy_version, limit, limit),
+        (
+            policy_version,
+            *PENDING_EVIDENCE_JOB_STAGES,
+            *BORDERLINE_LIFECYCLE_REPAIR_PENDING_STATUSES,
+            EvidenceStatus.SUMMARY_READY.value,
+            *TERMINAL_EVIDENCE_JOB_STAGES,
+            limit,
+            limit,
+        ),
     ).fetchall()
     return [
         CandidateAddress(

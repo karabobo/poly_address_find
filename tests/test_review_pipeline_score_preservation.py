@@ -91,6 +91,19 @@ def _insert_l2_state(conn, address: str, *, updated_at: int = 50) -> None:
     )
 
 
+def _insert_pending_medium_state(conn, address: str, *, updated_at: int = 50) -> None:
+    conn.execute(
+        """
+        INSERT INTO wallet_processing_state(
+            wallet, discovery_tier, evidence_status, evidence_depth,
+            evidence_confidence, priority, current_stage, next_action,
+            next_action_at, activity_count, updated_at
+        ) VALUES (?, 'l1_light', 'queued', 200, 0.5, 10, 'light_done', 'medium_pending', 0, 200, ?)
+        """,
+        (address, updated_at),
+    )
+
+
 def _insert_bounded_deep_state(conn, address: str, *, updated_at: int = 50) -> None:
     conn.execute(
         """
@@ -104,6 +117,222 @@ def _insert_bounded_deep_state(conn, address: str, *, updated_at: int = 50) -> N
         """,
         (address, updated_at, updated_at),
     )
+
+
+def _borderline_score(candidate: CandidateAddress) -> ScoreBreakdown:
+    return ScoreBreakdown(
+        address=candidate.address,
+        leader_score=39.0,
+        stage=CandidateStage.NEEDS_REVIEW,
+        reason="borderline_score",
+        components={"test": 39.0},
+        penalties={},
+    )
+
+
+def test_score_database_keeps_pending_borderline_wallet_out_of_manual_review(tmp_path, monkeypatch):
+    conn = connect(tmp_path / "robot.sqlite")
+    address = "0x" + "5" * 40
+    try:
+        run_migrations(conn)
+        upsert_candidate(conn, CandidateAddress(address=address, sources="test"))
+        _insert_pending_medium_state(conn, address)
+        conn.commit()
+        monkeypatch.setattr(
+            review_pipeline,
+            "score_candidate",
+            lambda candidate, _features, _policy: _borderline_score(candidate),
+        )
+
+        counts = score_database(conn, policy_path=POLICY_PATH)
+        latest = _latest_score(conn, address)
+        stage = conn.execute(
+            "SELECT candidate_stage FROM candidate_wallets WHERE address = ?",
+            (address,),
+        ).fetchone()["candidate_stage"]
+
+        assert counts["needs_data"] == 1
+        assert latest["leader_score"] == 39.0
+        assert latest["review_stage"] == CandidateStage.NEEDS_DATA.value
+        assert latest["review_reason"] == "evidence_refinement_pending:medium_pending"
+        assert stage == CandidateStage.NEEDS_DATA.value
+    finally:
+        conn.close()
+
+
+def test_score_database_parks_terminal_borderline_wallet_outside_manual_review(tmp_path, monkeypatch):
+    conn = connect(tmp_path / "robot.sqlite")
+    address = "0x" + "6" * 40
+    original_score_candidate = review_pipeline.score_candidate
+    try:
+        run_migrations(conn)
+        upsert_candidate(conn, CandidateAddress(address=address, sources="test"))
+        _insert_l2_state(conn, address)
+        conn.commit()
+        monkeypatch.setattr(
+            review_pipeline,
+            "score_candidate",
+            lambda candidate, _features, _policy: _borderline_score(candidate),
+        )
+
+        counts = score_database(conn, policy_path=POLICY_PATH)
+        latest = _latest_score(conn, address)
+        stage = conn.execute(
+            "SELECT candidate_stage FROM candidate_wallets WHERE address = ?",
+            (address,),
+        ).fetchone()["candidate_stage"]
+
+        assert counts["needs_data"] == 1
+        assert latest["leader_score"] == 39.0
+        assert latest["review_stage"] == CandidateStage.NEEDS_DATA.value
+        assert latest["review_reason"] == "score_below_watchlist_after_evidence"
+        assert stage == CandidateStage.NEEDS_DATA.value
+
+        monkeypatch.setattr(review_pipeline, "score_candidate", original_score_candidate)
+        upsert_wallet_feature(conn, _strong_features(address))
+        conn.execute(
+            """
+            UPDATE wallet_processing_state
+            SET discovery_tier = 'l3_deep', current_stage = 'deep_done',
+                updated_at = ?
+            WHERE wallet = ?
+            """,
+            (int(latest["scored_at"]) + 10, address),
+        )
+        conn.execute(
+            "UPDATE wallet_features SET updated_at = ? WHERE address = ?",
+            (int(latest["scored_at"]) + 10, address),
+        )
+        conn.commit()
+
+        promoted_counts = score_database(
+            conn,
+            policy_path=POLICY_PATH,
+            incremental=True,
+            limit=10,
+        )
+        promoted = _latest_score(conn, address)
+
+        assert promoted_counts["score_candidates_considered"] == 1
+        assert promoted["review_stage"] == CandidateStage.PAPER_APPROVED.value
+    finally:
+        conn.close()
+
+
+def test_score_database_keeps_validated_near_threshold_wallet_in_review(tmp_path, monkeypatch):
+    conn = connect(tmp_path / "robot.sqlite")
+    address = "0x" + "4" * 40
+    try:
+        run_migrations(conn)
+        upsert_candidate(conn, CandidateAddress(address=address, sources="test"))
+        _insert_l2_state(conn, address)
+        conn.commit()
+        monkeypatch.setattr(
+            review_pipeline,
+            "score_candidate",
+            lambda candidate, _features, _policy: ScoreBreakdown(
+                address=candidate.address,
+                leader_score=69.48,
+                stage=CandidateStage.NEEDS_REVIEW,
+                reason="validated_copy_stream_below_paper_score",
+                components={"test": 69.48},
+                penalties={},
+            ),
+        )
+
+        counts = score_database(conn, policy_path=POLICY_PATH)
+        latest = _latest_score(conn, address)
+
+        assert counts["needs_manual_review"] == 1
+        assert latest["review_stage"] == CandidateStage.NEEDS_REVIEW.value
+        assert latest["review_reason"] == "validated_copy_stream_below_paper_score"
+    finally:
+        conn.close()
+
+
+def test_incremental_scoring_repairs_stale_manual_borderline_lifecycle(tmp_path, monkeypatch):
+    conn = connect(tmp_path / "robot.sqlite")
+    address = "0x" + "3" * 40
+    try:
+        run_migrations(conn)
+        upsert_candidate(conn, CandidateAddress(address=address, sources="test"))
+        _insert_pending_medium_state(conn, address)
+        persist_score(conn, _borderline_score(CandidateAddress(address=address)), policy_version=_policy_version())
+        conn.commit()
+        monkeypatch.setattr(
+            review_pipeline,
+            "score_candidate",
+            lambda candidate, _features, _policy: _borderline_score(candidate),
+        )
+
+        counts = score_database(
+            conn,
+            policy_path=POLICY_PATH,
+            incremental=True,
+            limit=10,
+        )
+        latest = _latest_score(conn, address)
+        stage = conn.execute(
+            "SELECT candidate_stage FROM candidate_wallets WHERE address = ?",
+            (address,),
+        ).fetchone()["candidate_stage"]
+
+        assert counts["score_candidates_considered"] == 1
+        assert latest["review_stage"] == CandidateStage.NEEDS_DATA.value
+        assert latest["review_reason"] == "evidence_refinement_pending:medium_pending"
+        assert stage == CandidateStage.NEEDS_DATA.value
+    finally:
+        conn.close()
+
+
+def test_incremental_scoring_does_not_repeat_incomplete_borderline_repair_states(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    states = (
+        ("0x" + "1" * 40, "summary_ready", "light_pending", ""),
+        ("0x" + "2" * 40, "paused", "light_done", "score_wallet"),
+    )
+    try:
+        run_migrations(conn)
+        for address, evidence_status, current_stage, next_action in states:
+            upsert_candidate(conn, CandidateAddress(address=address, sources="test"))
+            conn.execute(
+                """
+                INSERT INTO wallet_processing_state(
+                    wallet, discovery_tier, evidence_status, evidence_depth,
+                    evidence_confidence, priority, current_stage, next_action,
+                    next_action_at, activity_count, updated_at
+                ) VALUES (?, 'l1_light', ?, 100, 0.4, 10, ?, ?, 0, 100, 50)
+                """,
+                (address, evidence_status, current_stage, next_action),
+            )
+            persist_score(
+                conn,
+                _borderline_score(CandidateAddress(address=address)),
+                policy_version=_policy_version(),
+            )
+        conn.commit()
+
+        first = score_database(
+            conn,
+            policy_path=POLICY_PATH,
+            incremental=True,
+            limit=10,
+        )
+        second = score_database(
+            conn,
+            policy_path=POLICY_PATH,
+            incremental=True,
+            limit=10,
+        )
+
+        assert first["score_candidates_considered"] == 0
+        assert second["score_candidates_considered"] == 0
+        for address, *_ in states:
+            latest = _latest_score(conn, address)
+            assert latest["review_stage"] == CandidateStage.NEEDS_REVIEW.value
+            assert latest["review_reason"] == "borderline_score"
+    finally:
+        conn.close()
 
 
 def test_score_database_keeps_paper_score_in_manual_review_until_l3_ready(tmp_path):

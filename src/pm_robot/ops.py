@@ -1864,36 +1864,64 @@ def prune_low_value_evidence(
         run_migrations(conn)
         if archive and not dry_run:
             ensure_archive_backend()
+            # Select and freeze a new archive scope while holding the only writer slot.
+            conn.execute("BEGIN IMMEDIATE")
             archive_run = resumable_archive_run(conn)
-        wallets = (
-            list(archive_run["wallets"])
-            if archive_run is not None
-            else _low_value_prune_wallets(
+            if archive_run is not None:
+                wallets = list(archive_run["wallets"])
+            else:
+                wallets = _low_value_prune_wallets(
+                    conn,
+                    limit=limit,
+                    max_activity_rows=max_activity_rows,
+                    include_archive_pending=True,
+                )
+            selected_activity_rows = _wallet_activity_count(conn, wallets)
+            if archive_run is None and wallets:
+                _materialize_wallet_registry(
+                    conn,
+                    limit=0,
+                    stages=(),
+                    addresses=tuple(wallets),
+                )
+                archive_run = create_archive_run(
+                    conn,
+                    wallets,
+                    keep_recent_activity=effective_keep_recent_activity,
+                )
+                _stage_wallet_registry_archive(
+                    conn,
+                    wallets,
+                    run_id=str(archive_run["run_id"]),
+                )
+                _cancel_wallet_evidence_backfill(conn, wallets)
+                capture_archive_scope(
+                    conn,
+                    str(archive_run["run_id"]),
+                    wallets,
+                    keep_recent_activity=effective_keep_recent_activity,
+                )
+            conn.commit()
+        elif archive:
+            archive_run = resumable_archive_run(conn)
+            wallets = (
+                list(archive_run["wallets"])
+                if archive_run is not None
+                else _low_value_prune_wallets(
+                    conn,
+                    limit=limit,
+                    max_activity_rows=max_activity_rows,
+                    include_archive_pending=True,
+                )
+            )
+            selected_activity_rows = _wallet_activity_count(conn, wallets)
+        else:
+            wallets = _low_value_prune_wallets(
                 conn,
                 limit=limit,
                 max_activity_rows=max_activity_rows,
             )
-        )
-        selected_activity_rows = _wallet_activity_count(conn, wallets)
-        if archive and not dry_run and archive_run is None and wallets:
-            _materialize_wallet_registry(conn, limit=0, stages=(), addresses=tuple(wallets))
-            archive_run = create_archive_run(
-                conn,
-                wallets,
-                keep_recent_activity=effective_keep_recent_activity,
-            )
-            _stage_wallet_registry_archive(conn, wallets, run_id=str(archive_run["run_id"]))
-            _cancel_wallet_evidence_backfill(conn, wallets)
-            capture_archive_scope(
-                conn,
-                str(archive_run["run_id"]),
-                wallets,
-                keep_recent_activity=effective_keep_recent_activity,
-            )
-            conn.commit()
-        elif not archive and not dry_run:
-            _materialize_wallet_registry(conn, limit=0, stages=(), addresses=tuple(wallets))
-            conn.commit()
+            selected_activity_rows = _wallet_activity_count(conn, wallets)
     finally:
         conn.close()
     if archive_run is not None:
@@ -1902,7 +1930,7 @@ def prune_low_value_evidence(
     archive_result: dict[str, Any] = {
         "enabled": archive,
         "status": "planned" if dry_run and archive else "disabled",
-        "run_id": "",
+        "run_id": str(archive_run.get("run_id") or "") if archive_run else "",
         "manifest_path": "",
         "row_count": 0,
         "file_count": 0,
@@ -1937,12 +1965,25 @@ def prune_low_value_evidence(
     try:
         run_migrations(conn)
         conn.execute("PRAGMA foreign_keys = OFF")
+        archive_run_id = str(archive_result.get("run_id") or "")
+        if not dry_run and not archive_run_id:
+            # Recheck policy under the writer lock so no newly active wallet is pruned.
+            conn.execute("BEGIN IMMEDIATE")
+            wallets = _revalidate_low_value_prune_wallets(conn, wallets)
+            selected_activity_rows = _wallet_activity_count(conn, wallets)
+            if wallets:
+                _materialize_wallet_registry(
+                    conn,
+                    limit=0,
+                    stages=(),
+                    addresses=tuple(wallets),
+                )
         deleted = _prune_wallet_evidence_batch(
             conn,
             wallets,
             keep_recent_activity=effective_keep_recent_activity,
             dry_run=dry_run,
-            archive_run_id=str(archive_result.get("run_id") or ""),
+            archive_run_id=archive_run_id,
         )
         if not dry_run:
             watermark_updated_at = int(time.time())
@@ -2841,11 +2882,16 @@ def _low_value_prune_wallets(
     *,
     limit: int,
     max_activity_rows: int = 0,
+    include_archive_pending: bool = False,
 ) -> list[str]:
     if limit <= 0:
         return []
     activity_budget = max(0, int(max_activity_rows))
-    terminal_rows = _terminal_low_value_wallet_rows(conn, limit=limit)
+    terminal_rows = _terminal_low_value_wallet_rows(
+        conn,
+        limit=limit,
+        include_archive_pending=include_archive_pending,
+    )
     wallets, selected_activity_rows, budget_exhausted = _select_prune_wallet_rows(
         conn,
         terminal_rows,
@@ -2859,7 +2905,11 @@ def _low_value_prune_wallets(
         return wallets
     if activity_budget and selected_activity_rows >= activity_budget:
         return wallets
-    needs_data_rows = _needs_data_low_value_wallet_rows(conn, limit=remaining)
+    needs_data_rows = _needs_data_low_value_wallet_rows(
+        conn,
+        limit=remaining,
+        include_archive_pending=include_archive_pending,
+    )
     needs_data_wallets, _, _ = _select_prune_wallet_rows(
         conn,
         needs_data_rows,
@@ -2888,13 +2938,45 @@ def _all_low_value_prune_wallets(conn: sqlite3.Connection) -> list[str]:
     return wallets
 
 
+def _revalidate_low_value_prune_wallets(
+    conn: sqlite3.Connection,
+    wallets: list[str],
+) -> list[str]:
+    """Keep only wallets that are still prune-eligible under the write lock."""
+
+    normalized = tuple(dict.fromkeys(wallet.lower() for wallet in wallets))
+    if not normalized:
+        return []
+    eligible = {
+        str(row["address"]).lower()
+        for row in (
+            *_terminal_low_value_wallet_rows(conn, limit=None, addresses=normalized),
+            *_needs_data_low_value_wallet_rows(conn, limit=None, addresses=normalized),
+        )
+    }
+    return [wallet for wallet in wallets if wallet.lower() in eligible]
+
+
 def _terminal_low_value_wallet_rows(
     conn: sqlite3.Connection,
     *,
     limit: int | None,
+    addresses: tuple[str, ...] = (),
+    include_archive_pending: bool = False,
 ) -> list[sqlite3.Row]:
     limit_sql = "" if limit is None else "LIMIT ?"
-    params: tuple[int, ...] = () if limit is None else (max(0, int(limit)),)
+    address_sql = ""
+    params: list[Any] = []
+    if addresses:
+        address_sql = f"AND cw.address IN ({', '.join('?' for _ in addresses)})"
+        params.extend(address.lower() for address in addresses)
+    archive_pending_sql = (
+        ""
+        if include_archive_pending
+        else "AND COALESCE(wr.registry_status, '') != 'archive_pending'"
+    )
+    if limit is not None:
+        params.append(max(0, int(limit)))
     return conn.execute(
         f"""
         SELECT cw.address
@@ -2903,6 +2985,20 @@ def _terminal_low_value_wallet_rows(
           ON wr.address = cw.address
         WHERE cw.candidate_stage IN ('rejected', 'blocked_hygiene', 'blocked_copyability')
           AND wr.raw_pruned_at IS NULL
+          {archive_pending_sql}
+          {address_sql}
+          AND NOT EXISTS (
+              SELECT 1
+              FROM pipeline_jobs pj
+              WHERE pj.wallet = cw.address
+                AND pj.status = 'running'
+          )
+          AND NOT EXISTS (
+              SELECT 1
+              FROM evidence_backfill_jobs ebj
+              WHERE ebj.wallet = cw.address
+                AND ebj.status = 'running'
+          )
           AND NOT EXISTS (
               SELECT 1
               FROM paper_wallet_quality pwq
@@ -2921,7 +3017,7 @@ def _terminal_low_value_wallet_rows(
           cw.address ASC
         {limit_sql}
         """,
-        params,
+        tuple(params),
     ).fetchall()
 
 
@@ -2929,9 +3025,27 @@ def _needs_data_low_value_wallet_rows(
     conn: sqlite3.Connection,
     *,
     limit: int | None,
+    addresses: tuple[str, ...] = (),
+    include_archive_pending: bool = False,
 ) -> list[sqlite3.Row]:
     limit_sql = "" if limit is None else "LIMIT ?"
-    params: tuple[int, ...] = () if limit is None else (max(0, int(limit)),)
+    address_sql = ""
+    params: list[Any] = []
+    if addresses:
+        address_sql = f"AND cw.address IN ({', '.join('?' for _ in addresses)})"
+        params.extend(address.lower() for address in addresses)
+    archive_pending_sql = (
+        ""
+        if include_archive_pending
+        else "AND COALESCE(wr.registry_status, '') != 'archive_pending'"
+    )
+    archive_resume_sql = (
+        "COALESCE(wr.registry_status, '') = 'archive_pending'"
+        if include_archive_pending
+        else "0"
+    )
+    if limit is not None:
+        params.append(max(0, int(limit)))
     return conn.execute(
         f"""
         SELECT cw.address
@@ -2942,19 +3056,53 @@ def _needs_data_low_value_wallet_rows(
           ON ls.address = cw.address
         LEFT JOIN evidence_backfill_budget ebb
           ON ebb.wallet = cw.address
+        LEFT JOIN wallet_processing_state wps
+          ON wps.wallet = cw.address
         LEFT JOIN wallet_registry wr
           ON wr.address = cw.address
         WHERE cw.candidate_stage = 'needs_data'
           AND wr.raw_pruned_at IS NULL
+          {archive_pending_sql}
+          {address_sql}
           AND ls.review_stage = 'needs_data'
           AND ls.leader_score = 0
-          AND instr(COALESCE(wf.extra_json, '{{}}'), 'feature_materializer_version') > 0
-          AND COALESCE(ebb.stage, '') IN (
-              '',
-              'light_done',
-              'medium_done',
-              'paused_fast_market_specialist',
-              'raw_pruned'
+          AND NOT EXISTS (
+              SELECT 1
+              FROM pipeline_jobs pj
+              WHERE pj.wallet = cw.address
+                AND pj.status = 'running'
+          )
+          AND NOT EXISTS (
+              SELECT 1
+              FROM evidence_backfill_jobs ebj
+              WHERE ebj.wallet = cw.address
+                AND ebj.status = 'running'
+          )
+          AND (
+              {archive_resume_sql}
+              OR (
+                  ls.scored_at > COALESCE(wf.updated_at, 0)
+                  AND ls.scored_at > COALESCE(wps.updated_at, 0)
+                  AND ls.scored_at > COALESCE(ebb.updated_at, 0)
+                  AND instr(
+                      COALESCE(wf.extra_json, '{{}}'),
+                      'feature_materializer_version'
+                  ) > 0
+                  AND COALESCE(ebb.stage, '') IN (
+                      '',
+                      'light_done',
+                      'medium_done',
+                      'deep_done',
+                      'paused_fast_market_specialist',
+                      'raw_pruned'
+                  )
+                  AND (
+                      ls.review_reason LIKE 'insufficient_total_volume_usdc:%'
+                      OR ls.review_reason LIKE 'insufficient_recent_30d_volume_usdc:%'
+                      OR ls.review_reason LIKE 'insufficient_net_pnl_usdc:%'
+                      OR ls.review_reason LIKE 'insufficient_copy_backtest_net_pnl_usdc:%'
+                  )
+              )
           )
           AND NOT EXISTS (
               SELECT 1
@@ -2979,7 +3127,7 @@ def _needs_data_low_value_wallet_rows(
           cw.address ASC
         {limit_sql}
         """,
-        params,
+        tuple(params),
     ).fetchall()
 
 

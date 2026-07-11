@@ -83,6 +83,11 @@ def test_prune_evidence_dry_run_and_execute_low_value_only(tmp_path):
         _seed_candidate(conn, low, materialized=True, roi=-0.2)
         _seed_candidate(conn, high, materialized=True, roi=0.5)
         _seed_candidate(conn, unmaterialized, materialized=False, roi=-0.2)
+        conn.execute(
+            "UPDATE candidate_wallets SET candidate_stage = 'blocked_hygiene' WHERE address = ?",
+            (low,),
+        )
+        conn.commit()
     finally:
         conn.close()
 
@@ -229,6 +234,52 @@ def test_prune_activity_budget_does_not_starve_one_oversized_wallet(tmp_path):
     assert result["wallets"] == [wallet]
     assert result["selected_activity_rows"] == 5
     assert result["activity_budget_exceeded"] is True
+
+
+def test_prune_skips_terminal_wallet_with_running_pipeline_job(tmp_path):
+    db_path = tmp_path / "robot.sqlite"
+    wallet = "0x" + "6" * 40
+    conn = connect(db_path)
+    try:
+        run_migrations(conn)
+        _seed_candidate(conn, wallet, materialized=True)
+        conn.execute(
+            "UPDATE candidate_wallets SET candidate_stage = 'blocked_hygiene' WHERE address = ?",
+            (wallet,),
+        )
+        enqueue_pipeline_job(
+            conn,
+            job_type="wallet_evidence_backfill",
+            wallet=wallet,
+            subject_key="deep_pending",
+            tier="l3_deep",
+            now=2000,
+        )
+        conn.execute(
+            "UPDATE pipeline_jobs SET status = 'running' WHERE wallet = ?",
+            (wallet,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    result = prune_low_value_evidence(_settings(db_path), limit=10, dry_run=False)
+
+    assert result["wallet_count"] == 0
+    conn = connect(db_path)
+    try:
+        remaining = conn.execute(
+            "SELECT COUNT(*) FROM wallet_activity WHERE address = ?",
+            (wallet,),
+        ).fetchone()[0]
+        job_status = conn.execute(
+            "SELECT status FROM pipeline_jobs WHERE wallet = ?",
+            (wallet,),
+        ).fetchone()["status"]
+    finally:
+        conn.close()
+    assert remaining == 5
+    assert job_status == "running"
 
 
 def test_prune_terminal_wallet_freezes_summary_and_stops_automatic_work(tmp_path):

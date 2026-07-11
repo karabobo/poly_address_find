@@ -1,4 +1,5 @@
 import json
+import sqlite3
 
 import duckdb
 import pytest
@@ -42,7 +43,12 @@ def _activity(idx: int) -> dict:
     }
 
 
-def _seed_low_value_wallet(settings: RobotSettings, wallet: str) -> None:
+def _seed_low_value_wallet(
+    settings: RobotSettings,
+    wallet: str,
+    *,
+    terminal: bool = True,
+) -> None:
     conn = connect(settings.db_path)
     try:
         run_migrations(conn)
@@ -76,8 +82,16 @@ def _seed_low_value_wallet(settings: RobotSettings, wallet: str) -> None:
             ScoreBreakdown(
                 address=wallet,
                 leader_score=0,
-                stage=CandidateStage.NEEDS_DATA,
-                reason="missing_required_score_components",
+                stage=(
+                    CandidateStage.BLOCKED_HYGIENE
+                    if terminal
+                    else CandidateStage.NEEDS_DATA
+                ),
+                reason=(
+                    "hygiene_hard_block"
+                    if terminal
+                    else "missing_required_score_components"
+                ),
                 components={},
                 penalties={},
             ),
@@ -156,6 +170,449 @@ def test_verified_parquet_archive_precedes_sqlite_prune(tmp_path):
         conn.close()
 
 
+def test_zero_score_deep_done_wallet_is_pruned_after_summary_materialization(tmp_path):
+    settings = _settings(tmp_path)
+    wallet = "0x" + "a" * 40
+    _seed_low_value_wallet(settings, wallet, terminal=False)
+    conn = connect(settings.db_path)
+    try:
+        conn.execute(
+            """
+            INSERT INTO evidence_backfill_budget(
+                wallet, source, priority, stage, target_depth, current_depth,
+                next_attempt_at, evidence_json, created_at, updated_at
+            ) VALUES (?, 'test', 10, 'deep_done', 3000, 5, 0, '{}', 2000, 2000)
+            """,
+            (wallet,),
+        )
+        persist_score(
+            conn,
+            ScoreBreakdown(
+                address=wallet,
+                leader_score=0,
+                stage=CandidateStage.NEEDS_DATA,
+                reason="insufficient_recent_30d_volume_usdc:100.00<500.00",
+                components={},
+                penalties={},
+            ),
+            policy_version="archive-test-materiality",
+        )
+        scored_at = conn.execute(
+            "SELECT scored_at FROM leader_latest_scores WHERE address = ?",
+            (wallet,),
+        ).fetchone()["scored_at"]
+        conn.execute(
+            "UPDATE wallet_features SET updated_at = ? WHERE address = ?",
+            (int(scored_at) - 1, wallet),
+        )
+        conn.execute(
+            "UPDATE evidence_backfill_budget SET updated_at = ? WHERE wallet = ?",
+            (int(scored_at) - 1, wallet),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    result = prune_low_value_evidence(
+        settings,
+        limit=5,
+        dry_run=False,
+        archive=False,
+    )
+
+    assert result["wallets"] == [wallet]
+    assert result["deleted"]["wallet_activity"] == 5
+
+
+def test_deep_done_wallet_with_score_older_than_features_is_not_pruned(tmp_path):
+    settings = _settings(tmp_path)
+    wallet = "0x" + "e" * 40
+    _seed_low_value_wallet(settings, wallet, terminal=False)
+    conn = connect(settings.db_path)
+    try:
+        conn.execute(
+            """
+            INSERT INTO evidence_backfill_budget(
+                wallet, source, priority, stage, target_depth, current_depth,
+                next_attempt_at, evidence_json, created_at, updated_at
+            ) VALUES (?, 'test', 10, 'deep_done', 3000, 5, 0, '{}', 2000, 2000)
+            """,
+            (wallet,),
+        )
+        persist_score(
+            conn,
+            ScoreBreakdown(
+                address=wallet,
+                leader_score=0,
+                stage=CandidateStage.NEEDS_DATA,
+                reason="insufficient_total_volume_usdc:100.00<500.00",
+                components={},
+                penalties={},
+            ),
+            policy_version="archive-test-stale-score",
+        )
+        scored_at = conn.execute(
+            "SELECT scored_at FROM leader_latest_scores WHERE address = ?",
+            (wallet,),
+        ).fetchone()["scored_at"]
+        conn.execute(
+            "UPDATE wallet_features SET updated_at = ? WHERE address = ?",
+            (int(scored_at) + 1, wallet),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    result = prune_low_value_evidence(
+        settings,
+        limit=5,
+        dry_run=False,
+        archive=False,
+    )
+
+    assert result["wallet_count"] == 0
+    conn = connect(settings.db_path)
+    try:
+        remaining = conn.execute(
+            "SELECT COUNT(*) FROM wallet_activity WHERE address = ?",
+            (wallet,),
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    assert remaining == 5
+
+
+def test_deep_done_wallet_with_same_timestamp_evidence_is_not_pruned(tmp_path):
+    settings = _settings(tmp_path)
+    wallet = "0x" + "7" * 40
+    _seed_low_value_wallet(settings, wallet, terminal=False)
+    conn = connect(settings.db_path)
+    try:
+        conn.execute(
+            """
+            INSERT INTO evidence_backfill_budget(
+                wallet, source, priority, stage, target_depth, current_depth,
+                next_attempt_at, evidence_json, created_at, updated_at
+            ) VALUES (?, 'test', 10, 'deep_done', 3000, 5, 0, '{}', 2000, 2000)
+            """,
+            (wallet,),
+        )
+        persist_score(
+            conn,
+            ScoreBreakdown(
+                address=wallet,
+                leader_score=0,
+                stage=CandidateStage.NEEDS_DATA,
+                reason="insufficient_total_volume_usdc:100.00<500.00",
+                components={},
+                penalties={},
+            ),
+            policy_version="archive-test-ambiguous-score-order",
+        )
+        scored_at = conn.execute(
+            "SELECT scored_at FROM leader_latest_scores WHERE address = ?",
+            (wallet,),
+        ).fetchone()["scored_at"]
+        conn.execute(
+            "UPDATE wallet_features SET updated_at = ? WHERE address = ?",
+            (scored_at, wallet),
+        )
+        conn.execute(
+            "UPDATE evidence_backfill_budget SET updated_at = ? WHERE wallet = ?",
+            (scored_at, wallet),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    result = prune_low_value_evidence(
+        settings,
+        limit=5,
+        dry_run=False,
+        archive=False,
+    )
+
+    assert result["wallet_count"] == 0
+    conn = connect(settings.db_path)
+    try:
+        remaining = conn.execute(
+            "SELECT COUNT(*) FROM wallet_activity WHERE address = ?",
+            (wallet,),
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    assert remaining == 5
+
+
+def test_execute_revalidates_wallet_stage_before_pruning(tmp_path, monkeypatch):
+    settings = _settings(tmp_path)
+    wallet = "0x" + "f" * 40
+    _seed_low_value_wallet(settings, wallet)
+    conn = connect(settings.db_path)
+    try:
+        conn.execute(
+            "UPDATE candidate_wallets SET candidate_stage = 'blocked_hygiene' WHERE address = ?",
+            (wallet,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    original_select = ops._low_value_prune_wallets
+
+    def select_then_promote(conn, **kwargs):
+        wallets = original_select(conn, **kwargs)
+        conn.execute(
+            "UPDATE candidate_wallets SET candidate_stage = 'paper_approved' WHERE address = ?",
+            (wallet,),
+        )
+        conn.commit()
+        return wallets
+
+    monkeypatch.setattr(ops, "_low_value_prune_wallets", select_then_promote)
+
+    result = prune_low_value_evidence(
+        settings,
+        limit=5,
+        dry_run=False,
+        archive=False,
+    )
+
+    assert result["wallet_count"] == 0
+    assert result["deleted"]["wallet_activity"] == 0
+    conn = connect(settings.db_path)
+    try:
+        remaining = conn.execute(
+            "SELECT COUNT(*) FROM wallet_activity WHERE address = ?",
+            (wallet,),
+        ).fetchone()[0]
+        registry_count = conn.execute(
+            "SELECT COUNT(*) FROM wallet_registry"
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    assert remaining == 5
+    assert registry_count == 0
+
+
+def test_legacy_archived_wallet_with_missing_components_keeps_residual_raw_rows(tmp_path):
+    settings = _settings(tmp_path)
+    wallet = "0x" + "b" * 40
+    _seed_low_value_wallet(settings, wallet, terminal=False)
+    conn = connect(settings.db_path)
+    try:
+        conn.execute(
+            "UPDATE wallet_features SET extra_json = '{}' WHERE address = ?",
+            (wallet,),
+        )
+        conn.execute(
+            """
+            INSERT INTO evidence_backfill_budget(
+                wallet, source, priority, stage, target_depth, current_depth,
+                next_attempt_at, evidence_json, created_at, updated_at
+            ) VALUES (?, 'legacy', 10, 'light_pending', 200, 5, 0, '{}', 2000, 2000)
+            """,
+            (wallet,),
+        )
+        ops._materialize_wallet_registry(conn, addresses=(wallet,))
+        conn.execute(
+            """
+            UPDATE wallet_registry
+            SET registry_status = 'archived_raw_pruned',
+                raw_retention_tier = 'summary_only',
+                raw_pruned_at = NULL
+            WHERE address = ?
+            """,
+            (wallet,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    result = prune_low_value_evidence(
+        settings,
+        limit=5,
+        dry_run=False,
+        archive=False,
+    )
+
+    assert result["wallet_count"] == 0
+    assert result["deleted"]["wallet_activity"] == 0
+    conn = connect(settings.db_path)
+    try:
+        registry = conn.execute(
+            "SELECT registry_status, raw_pruned_at FROM wallet_registry WHERE address = ?",
+            (wallet,),
+        ).fetchone()
+        budget = conn.execute(
+            "SELECT stage FROM evidence_backfill_budget WHERE wallet = ?",
+            (wallet,),
+        ).fetchone()
+    finally:
+        conn.close()
+    assert registry["registry_status"] == "archived_raw_pruned"
+    assert registry["raw_pruned_at"] is None
+    assert budget["stage"] == "light_pending"
+
+
+def test_deep_done_wallet_with_incomplete_hygiene_is_not_pruned(tmp_path):
+    settings = _settings(tmp_path)
+    wallet = "0x" + "d" * 40
+    _seed_low_value_wallet(settings, wallet, terminal=False)
+    conn = connect(settings.db_path)
+    try:
+        conn.execute(
+            """
+            INSERT INTO evidence_backfill_budget(
+                wallet, source, priority, stage, target_depth, current_depth,
+                next_attempt_at, evidence_json, created_at, updated_at
+            ) VALUES (?, 'test', 10, 'deep_done', 3000, 5, 0, '{}', 2000, 2000)
+            """,
+            (wallet,),
+        )
+        persist_score(
+            conn,
+            ScoreBreakdown(
+                address=wallet,
+                leader_score=0,
+                stage=CandidateStage.NEEDS_DATA,
+                reason="hygiene_evidence_incomplete",
+                components={},
+                penalties={},
+            ),
+            policy_version="archive-test-hygiene",
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    result = prune_low_value_evidence(
+        settings,
+        limit=5,
+        dry_run=False,
+        archive=False,
+    )
+
+    assert result["wallet_count"] == 0
+    conn = connect(settings.db_path)
+    try:
+        remaining = conn.execute(
+            "SELECT COUNT(*) FROM wallet_activity WHERE address = ?",
+            (wallet,),
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    assert remaining == 5
+
+
+def test_non_archived_pending_wallet_is_not_pruned_from_stale_summary_only_registry(tmp_path):
+    settings = _settings(tmp_path)
+    wallet = "0x" + "c" * 40
+    _seed_low_value_wallet(settings, wallet, terminal=False)
+    conn = connect(settings.db_path)
+    try:
+        conn.execute(
+            "UPDATE wallet_features SET extra_json = '{}' WHERE address = ?",
+            (wallet,),
+        )
+        conn.execute(
+            """
+            INSERT INTO evidence_backfill_budget(
+                wallet, source, priority, stage, target_depth, current_depth,
+                next_attempt_at, evidence_json, created_at, updated_at
+            ) VALUES (?, 'test', 10, 'light_pending', 200, 5, 0, '{}', 2000, 2000)
+            """,
+            (wallet,),
+        )
+        ops._materialize_wallet_registry(conn, addresses=(wallet,))
+        conn.execute(
+            """
+            UPDATE wallet_registry
+            SET registry_status = 'archive_low_value',
+                raw_retention_tier = 'summary_only',
+                raw_pruned_at = NULL
+            WHERE address = ?
+            """,
+            (wallet,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    result = prune_low_value_evidence(
+        settings,
+        limit=5,
+        dry_run=False,
+        archive=False,
+    )
+
+    assert result["wallet_count"] == 0
+    conn = connect(settings.db_path)
+    try:
+        remaining = conn.execute(
+            "SELECT COUNT(*) FROM wallet_activity WHERE address = ?",
+            (wallet,),
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    assert remaining == 5
+
+
+def test_materialized_wallet_with_missing_score_components_is_not_pruned(tmp_path):
+    settings = _settings(tmp_path)
+    wallet = "0x" + "8" * 40
+    _seed_low_value_wallet(settings, wallet, terminal=False)
+
+    result = prune_low_value_evidence(
+        settings,
+        limit=5,
+        dry_run=False,
+        archive=False,
+    )
+
+    assert result["wallet_count"] == 0
+    conn = connect(settings.db_path)
+    try:
+        remaining = conn.execute(
+            "SELECT COUNT(*) FROM wallet_activity WHERE address = ?",
+            (wallet,),
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    assert remaining == 5
+
+
+def test_new_archive_selects_wallets_under_writer_lock(tmp_path, monkeypatch):
+    settings = _settings(tmp_path)
+    wallet = "0x" + "9" * 40
+    _seed_low_value_wallet(settings, wallet)
+    original_select = ops._low_value_prune_wallets
+    observed_writer_lock = False
+
+    def assert_writer_lock(conn, **kwargs):
+        nonlocal observed_writer_lock
+        contender = sqlite3.connect(settings.db_path, timeout=0)
+        try:
+            with pytest.raises(sqlite3.OperationalError, match="locked"):
+                contender.execute("BEGIN IMMEDIATE")
+            observed_writer_lock = True
+        finally:
+            contender.close()
+        return original_select(conn, **kwargs)
+
+    monkeypatch.setattr(ops, "_low_value_prune_wallets", assert_writer_lock)
+
+    result = prune_low_value_evidence(
+        settings,
+        limit=5,
+        dry_run=False,
+        archive=True,
+    )
+
+    assert result["ok"] is True
+    assert observed_writer_lock is True
+
+
 def test_archive_failure_keeps_hot_rows_and_resumes_same_run(tmp_path, monkeypatch):
     settings = _settings(tmp_path)
     wallet = "0x" + "2" * 40
@@ -193,6 +650,32 @@ def test_archive_failure_keeps_hot_rows_and_resumes_same_run(tmp_path, monkeypat
     assert tuple(retention) == ("archive_pending", "summary_only")
     assert blocked_write == 0
 
+    archive_preview = prune_low_value_evidence(
+        settings,
+        limit=5,
+        dry_run=True,
+        archive=True,
+    )
+    assert archive_preview["wallets"] == [wallet]
+    assert archive_preview["archive"]["status"] == "planned"
+    assert archive_preview["archive"]["run_id"] == run["run_id"]
+
+    normal_prune = prune_low_value_evidence(
+        settings,
+        limit=5,
+        dry_run=False,
+        archive=False,
+    )
+    assert normal_prune["wallet_count"] == 0
+    conn = connect(settings.db_path)
+    try:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM wallet_activity WHERE address = ?",
+            (wallet,),
+        ).fetchone()[0] == 5
+    finally:
+        conn.close()
+
     monkeypatch.setattr(ops, "export_evidence_archive", real_export)
     recovered = prune_low_value_evidence(settings, limit=5, dry_run=False, archive=True)
     assert recovered["ok"] is True
@@ -206,6 +689,84 @@ def test_archive_failure_keeps_hot_rows_and_resumes_same_run(tmp_path, monkeypat
         ).fetchone()[0] == 0
     finally:
         conn.close()
+
+
+def test_needs_data_partial_archive_can_start_residual_archive(tmp_path):
+    settings = _settings(tmp_path)
+    wallet = "0x" + "0" * 40
+    _seed_low_value_wallet(settings, wallet, terminal=False)
+    conn = connect(settings.db_path)
+    try:
+        conn.execute(
+            """
+            INSERT INTO evidence_backfill_budget(
+                wallet, source, priority, stage, target_depth, current_depth,
+                next_attempt_at, evidence_json, created_at, updated_at
+            ) VALUES (?, 'test', 10, 'deep_done', 3000, 5, 0, '{}', 2000, 2000)
+            """,
+            (wallet,),
+        )
+        persist_score(
+            conn,
+            ScoreBreakdown(
+                address=wallet,
+                leader_score=0,
+                stage=CandidateStage.NEEDS_DATA,
+                reason="insufficient_total_volume_usdc:100.00<500.00",
+                components={},
+                penalties={},
+            ),
+            policy_version="archive-test-partial-resume",
+        )
+        scored_at = conn.execute(
+            "SELECT scored_at FROM leader_latest_scores WHERE address = ?",
+            (wallet,),
+        ).fetchone()["scored_at"]
+        ops._materialize_wallet_registry(conn, addresses=(wallet,))
+        conn.execute(
+            """
+            UPDATE wallet_registry
+            SET registry_status = 'archive_pending', raw_retention_tier = 'summary_only'
+            WHERE address = ?
+            """,
+            (wallet,),
+        )
+        conn.execute(
+            "UPDATE evidence_backfill_budget SET stage = 'raw_pruned', updated_at = ? WHERE wallet = ?",
+            (int(scored_at) + 1, wallet),
+        )
+        conn.execute(
+            """
+            INSERT INTO wallet_processing_state(
+                wallet, evidence_status, current_stage, next_action, updated_at
+            ) VALUES (?, 'summary_ready', 'deep_done', '', ?)
+            """,
+            (wallet, int(scored_at) + 1),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    preview = prune_low_value_evidence(
+        settings,
+        limit=5,
+        dry_run=True,
+        archive=True,
+    )
+    assert preview["wallets"] == [wallet]
+    assert preview["deleted"]["wallet_activity"] == 5
+
+    result = prune_low_value_evidence(
+        settings,
+        limit=5,
+        dry_run=False,
+        archive=True,
+    )
+
+    assert result["ok"] is True
+    assert result["wallets"] == [wallet]
+    assert result["archive"]["status"] == "pruned"
+    assert result["deleted"]["wallet_activity"] == 5
 
 
 def test_verified_archive_resume_reuses_original_keep_recent_scope(tmp_path, monkeypatch):
