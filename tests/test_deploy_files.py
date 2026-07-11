@@ -981,7 +981,8 @@ def test_nas_maintenance_loop_runs_lightweight_storage_and_queue_repair():
     assert "maintenance-up" in helper
     assert "maintenance-restart" in helper
     assert "PM_ROBOT_MAINTENANCE_INTERVAL=3600" in env
-    assert "PM_ROBOT_MAINTENANCE_WAL_CHECKPOINT=none" in env
+    assert "PM_ROBOT_MAINTENANCE_WAL_CHECKPOINT=passive" in env
+    assert "PM_ROBOT_MAINTENANCE_REPORT_PATH=/app/reports/maintenance_status.json" in env
     assert "PM_ROBOT_MAINTENANCE_STALE_INGEST_RUN_SECONDS=21600" in env
     assert "PM_ROBOT_MAINTENANCE_FAILED_JOB_COOLDOWN_SECONDS=21600" in env
     assert "PM_ROBOT_MAINTENANCE_RUNTIME_HEARTBEAT_DAYS=30" in env
@@ -994,7 +995,12 @@ def test_nas_maintenance_loop_runs_lightweight_storage_and_queue_repair():
     assert "--stale-ingest-run-seconds \"$STALE_INGEST_RUN_SECONDS\"" in loop
     assert "--runtime-heartbeat-days \"$RUNTIME_HEARTBEAT_DAYS\"" in loop
     assert "--wal-checkpoint \"$WAL_CHECKPOINT\"" in loop
-    assert "PM_ROBOT_MAINTENANCE_WAL_CHECKPOINT:-none" in loop
+    assert "PM_ROBOT_MAINTENANCE_WAL_CHECKPOINT:-passive" in loop
+    assert 'REPORT_PATH="${PM_ROBOT_MAINTENANCE_REPORT_PATH:-/app/reports/maintenance_status.json}"' in loop
+    assert 'REPORT_TMP="${REPORT_PATH}.tmp.$$"' in loop
+    assert 'if ! mkdir -p "$(dirname "$REPORT_PATH")"' in loop
+    assert 'elif ! mv "$REPORT_TMP" "$REPORT_PATH"' in loop
+    assert "could not publish checkpoint report" in loop
     assert "PM_ROBOT_MAINTENANCE_STALE_INGEST_RUN_SECONDS:-21600" in loop
     assert "PM_ROBOT_MAINTENANCE_FAILED_JOB_COOLDOWN_SECONDS:-21600" in loop
     assert "PM_ROBOT_MAINTENANCE_RUNTIME_HEARTBEAT_DAYS:-30" in loop

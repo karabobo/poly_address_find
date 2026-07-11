@@ -1637,16 +1637,17 @@ def _next_pipeline_action(
         activity_count >= 50 and fast_market_share >= 0.85
     ):
         return EvidenceStatus.PAUSED.value, "manual_review_fast_market"
+    if current_stage == EvidenceJobStage.LIGHT_DONE.value:
+        if distinct_markets >= 3 or non_fast_trade_count >= 10:
+            return EvidenceStatus.NEEDS_MEDIUM.value, EvidenceJobStage.MEDIUM_PENDING.value
+        # Light history was fetched successfully but did not justify another pass.
+        return EvidenceStatus.SUMMARY_READY.value, "score_wallet"
     if current_stage in {EvidenceJobStage.MEDIUM_DONE.value, EvidenceJobStage.DEEP_DONE.value}:
         return EvidenceStatus.SUMMARY_READY.value, "score_wallet"
     if evidence_tier == EvidenceTier.L3_DEEP.value:
         return EvidenceStatus.SUMMARY_READY.value, "score_wallet"
     if _pending_action_matches_evidence_tier(current_stage, evidence_tier):
         return EvidenceStatus.QUEUED.value, current_stage
-    if current_stage == EvidenceJobStage.LIGHT_DONE.value and (
-        distinct_markets >= 3 or non_fast_trade_count >= 10
-    ):
-        return EvidenceStatus.NEEDS_MEDIUM.value, EvidenceJobStage.MEDIUM_PENDING.value
     if evidence_tier == EvidenceTier.L0_DISCOVERED.value:
         return EvidenceStatus.NEEDS_LIGHT.value, EvidenceJobStage.LIGHT_PENDING.value
     if evidence_tier == EvidenceTier.L1_LIGHT.value:

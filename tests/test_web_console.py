@@ -1794,6 +1794,12 @@ def test_dashboard_evidence_pipeline_reports_l1_l2_l3_queue_progress(tmp_path, m
     assert pipeline["high_priority_pending_state_without_active_job"] == 0
     assert pipeline["pending_state_by_action"][0]["next_action"] == "deep_pending"
     assert pipeline["pending_state_by_action"][0]["count"] == 1
+    assert {row["job_action"] for row in pipeline["stage_progress"]} == {
+        "light_pending",
+        "medium_pending",
+        "deep_pending",
+    }
+    assert pipeline["projected_end_to_end_jobs"] >= pipeline["total_due_backlog"]
     assert pipeline["top_active_jobs"][0]["wallet"] == wallet
     assert pipeline["top_active_jobs"][0]["target_depth"] == 1000
     assert pipeline["recent_completed_jobs"][0]["wallet"] == done_wallet
@@ -1811,9 +1817,11 @@ def test_dashboard_evidence_pipeline_reports_l1_l2_l3_queue_progress(tmp_path, m
     assert "尝试耗尽" in html
     assert "维护循环将标记失败并释放水位" in html
     assert "执行队列前排" in html
-    assert "待调度候选" in html
-    assert "总到期待补" in html
-    assert "总 ETA" in html
+    assert "可调度库存" in html
+    assert "当前波次待补" in html
+    assert "当前波次 ETA" in html
+    assert "端到端粗估" in html
+    assert "分阶段工作量与派生" in html
     assert "最近完成证据任务" in html
 
 
@@ -2650,6 +2658,66 @@ def test_dashboard_ops_health_ignores_future_scheduled_evidence_state(tmp_path):
     assert pipeline["high_priority_pending_state_without_active_job"] == 0
 
 
+def test_evidence_backlog_matches_planner_actionability(tmp_path):
+    settings = _settings(tmp_path)
+    conn = connect(settings.db_path)
+    now = 1_800_000_000
+    summary_only_wallet = "0xabc0000000000000000000000000000000000101"
+    completed_wallet = "0xabc0000000000000000000000000000000000102"
+    try:
+        run_migrations(conn)
+        for wallet in (summary_only_wallet, completed_wallet):
+            conn.execute(
+                """
+                INSERT INTO candidate_wallets(
+                    address, sources, labels, notes, links, status,
+                    candidate_stage, first_seen_at, updated_at
+                ) VALUES (?, 'test', '', '', '', 'active', 'needs_data', ?, ?)
+                """,
+                (wallet, now, now),
+            )
+            conn.execute(
+                """
+                INSERT INTO wallet_processing_state(
+                    wallet, discovery_tier, evidence_status, evidence_depth,
+                    evidence_confidence, priority, current_stage, next_action,
+                    next_action_at, activity_count, distinct_markets,
+                    non_fast_trade_count, updated_at
+                ) VALUES (?, 'l1_light', 'needs_light', 12, 0.2, 20,
+                          'light_done', 'light_pending', 0, 12, 1, 4, ?)
+                """,
+                (wallet, now),
+            )
+        conn.execute(
+            """
+            INSERT INTO wallet_registry(
+                address, candidate_stage, registry_status, raw_retention_tier,
+                last_evaluated_at, updated_at
+            ) VALUES (?, 'needs_data', 'archived_raw_pruned', 'summary_only', ?, ?)
+            """,
+            (summary_only_wallet, now, now),
+        )
+        conn.execute(
+            """
+            INSERT INTO pipeline_jobs(
+                job_type, wallet, subject_key, tier, priority, shard, status,
+                lease_owner, lease_until, attempts, max_attempts, next_attempt_at,
+                input_json, output_json, last_error, created_at, updated_at, completed_at
+            ) VALUES ('wallet_evidence_backfill', ?, 'light_pending', 'l1_light',
+                      20, 0, 'done', NULL, 0, 1, 3, 0, '{}', '{}', '', ?, ?, ?)
+            """,
+            (completed_wallet, now - 60, now - 30, now - 30),
+        )
+        conn.commit()
+
+        backlog = web_module._pending_evidence_backlog_summary(conn, now=now)
+
+        assert backlog["pending_without_active_job"] == 0
+        assert backlog["by_action"] == []
+    finally:
+        conn.close()
+
+
 def test_wallet_table_filters_by_stage_and_source(tmp_path):
     settings = _settings(tmp_path)
     _seed(settings)
@@ -2685,6 +2753,179 @@ def test_storage_maintenance_summary_marks_large_wal_with_safe_commands(tmp_path
     assert "./pmrobot-nas.sh wal-truncate-when-idle 7200 900 30" in html
     assert "./pmrobot-nas.sh wal-truncate-window 900" in html
     assert "WAL truncate 会临时停止 research/scoring 服务" in html
+
+
+def test_storage_maintenance_treats_fresh_completed_checkpoint_as_reusable(tmp_path):
+    settings = RobotSettings(
+        db_path=tmp_path / "data" / "pm_robot.sqlite",
+        execution_mode="research",
+    )
+    settings.db_path.parent.mkdir(parents=True)
+    settings.db_path.write_bytes(b"db")
+    wal_path = Path(f"{settings.db_path}-wal")
+    wal_path.write_bytes(b"w" * 128)
+    report_path = tmp_path / "reports" / "maintenance_status.json"
+    report_path.parent.mkdir(parents=True)
+    report_path.write_text(
+        json.dumps(
+            {
+                "ok": True,
+                "wal_checkpoint": {
+                    "mode": "passive",
+                    "executed": True,
+                    "skipped_reason": "",
+                    "busy": 0,
+                    "log_frames": 1_213,
+                    "checkpointed_frames": 357,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    now = int(report_path.stat().st_mtime) + 60
+
+    summary = _storage_maintenance_summary(
+        settings,
+        now=now,
+        wal_warn_bytes=100,
+        wal_critical_bytes=1_000,
+        low_free_disk_bytes=1,
+        scheduled_backup_enabled=False,
+    )
+    html = _storage_maintenance_panel(summary)
+
+    assert summary["state"] == "ok"
+    assert summary["wal_reusable"] is True
+    assert summary["needs_wal_window"] is False
+    assert summary["wal_checkpoint"]["pending_frames"] == 856
+    assert "已 checkpoint，可继续复用" in html
+
+
+def test_storage_maintenance_keeps_large_wal_warning_when_checkpoint_report_is_stale(tmp_path):
+    settings = RobotSettings(
+        db_path=tmp_path / "data" / "pm_robot.sqlite",
+        execution_mode="research",
+    )
+    settings.db_path.parent.mkdir(parents=True)
+    settings.db_path.write_bytes(b"db")
+    Path(f"{settings.db_path}-wal").write_bytes(b"w" * 128)
+    report_path = tmp_path / "reports" / "maintenance_status.json"
+    report_path.parent.mkdir(parents=True)
+    report_path.write_text(
+        json.dumps(
+            {
+                "ok": True,
+                "wal_checkpoint": {
+                    "mode": "passive",
+                    "executed": True,
+                    "busy": 0,
+                    "log_frames": 10,
+                    "checkpointed_frames": 10,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    summary = _storage_maintenance_summary(
+        settings,
+        now=int(report_path.stat().st_mtime) + 8_000,
+        wal_warn_bytes=100,
+        wal_critical_bytes=1_000,
+        low_free_disk_bytes=1,
+        scheduled_backup_enabled=False,
+    )
+
+    assert summary["state"] == "wal_attention"
+    assert summary["wal_reusable"] is False
+    assert summary["needs_wal_window"] is True
+    assert summary["wal_checkpoint"]["fresh"] is False
+
+
+def test_storage_maintenance_warns_when_fresh_checkpoint_leaves_large_active_tail(tmp_path):
+    settings = RobotSettings(
+        db_path=tmp_path / "data" / "pm_robot.sqlite",
+        execution_mode="research",
+    )
+    settings.db_path.parent.mkdir(parents=True)
+    settings.db_path.write_bytes(b"db")
+    Path(f"{settings.db_path}-wal").write_bytes(b"w" * 128)
+    report_path = tmp_path / "reports" / "maintenance_status.json"
+    report_path.parent.mkdir(parents=True)
+    report_path.write_text(
+        json.dumps(
+            {
+                "ok": True,
+                "wal_checkpoint": {
+                    "mode": "passive",
+                    "executed": True,
+                    "busy": 0,
+                    "log_frames": 20_000,
+                    "checkpointed_frames": 1_000,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    summary = _storage_maintenance_summary(
+        settings,
+        now=int(report_path.stat().st_mtime) + 60,
+        wal_warn_bytes=100,
+        wal_critical_bytes=1_000,
+        low_free_disk_bytes=1,
+        scheduled_backup_enabled=False,
+    )
+
+    assert summary["state"] == "wal_attention"
+    assert summary["wal_reusable"] is False
+    assert summary["wal_checkpoint"]["pending_frames"] == 19_000
+    assert summary["wal_checkpoint"]["max_pending_frames"] == web_module.WAL_PENDING_FRAME_WARN
+
+
+def test_ops_health_does_not_warn_for_large_reusable_wal(tmp_path, monkeypatch):
+    settings = RobotSettings(
+        db_path=tmp_path / "data" / "pm_robot.sqlite",
+        execution_mode="research",
+    )
+    conn = connect(settings.db_path)
+    try:
+        run_migrations(conn)
+        conn.commit()
+    finally:
+        conn.close()
+    Path(f"{settings.db_path}-wal").write_bytes(b"w" * 128)
+    report_path = tmp_path / "reports" / "maintenance_status.json"
+    report_path.parent.mkdir(parents=True)
+    report_path.write_text(
+        json.dumps(
+            {
+                "ok": True,
+                "wal_checkpoint": {
+                    "mode": "passive",
+                    "executed": True,
+                    "busy": 0,
+                    "log_frames": 24,
+                    "checkpointed_frames": 24,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(web_module, "WAL_WARN_BYTES", 100)
+    monkeypatch.setattr(web_module, "WAL_CRITICAL_BYTES", 1_000)
+
+    conn = connect(settings.db_path)
+    try:
+        summary = web_module._ops_health_summary(conn, settings)
+    finally:
+        conn.close()
+    html = web_module._ops_health_panel(summary)
+
+    assert summary["health"] == "ok"
+    assert summary["storage"]["wal_reusable"] is True
+    assert summary["storage"]["wal_needs_attention"] is False
+    assert "checkpoint 完成" in html
 
 
 def test_storage_maintenance_summary_reports_missing_and_fresh_backups(tmp_path):
@@ -2851,11 +3092,16 @@ def test_dashboard_starts_with_operator_outcomes_and_pipeline(tmp_path):
 
     assert "NAS 研究与评分" in html
     assert "今日运行概览" in html
+    assert "当前结论" in html
+    assert "下一道关口" in html
+    assert "系统运行" in html
     assert "研究漏斗" in html
     assert "当前处理重点" in html
     assert "正式钱包" in html
     assert "24h 完成任务" in html
+    assert 'class="review-table"' in html
     assert html.index("今日运行概览") < html.index("高分待验证")
+    assert html.index("当前结论") < html.index("研究漏斗")
     assert html.index("研究漏斗") < html.index("生产收敛详情")
 
 
@@ -3007,6 +3253,7 @@ def test_wallet_workbench_places_candidate_queue_before_research_diagnostics(tmp
     assert "研究诊断" in html
     assert html.index("候选队列") < html.index("研究诊断")
     assert html.index("候选队列") < html.index("证据深度")
+    assert "当前显示 1 / 共 1 个钱包" in html
 
 
 def test_wallet_workbench_uses_operator_friendly_filters(tmp_path):

@@ -74,6 +74,8 @@ PAPER_RTDS_BRIDGE_RECENT_SEC = 86_400
 DASHBOARD_CACHE_TTL_SEC = 30
 WAL_WARN_BYTES = 1_000_000_000
 WAL_CRITICAL_BYTES = 3_000_000_000
+MAINTENANCE_REPORT_MAX_AGE_SEC = 7_500
+WAL_PENDING_FRAME_WARN = 8_192
 LOW_FREE_DISK_BYTES = 100_000_000_000
 BACKUP_MAX_AGE_SECONDS = 26 * 3_600
 _DASHBOARD_CACHE_LOCK = threading.Lock()
@@ -2893,11 +2895,12 @@ def _render_dashboard(settings: RobotSettings) -> str:
     readiness = data["production_readiness"]
     publish_gate = readiness.get("formal_publish_gate") or {}
     pipeline = data["evidence_pipeline"]
+    published_wallets = int(publish_gate.get("active_published_leaders") or 0)
     tiles = [
-        ("正式钱包", _fmt_int(publish_gate.get("active_published_leaders")), "当前可交接结果"),
-        ("Paper 研究池", _fmt_int(readiness.get("paper_stage_wallets")), "仅研究观察，不代表下单"),
-        ("近阈值观察", _fmt_int(readiness.get("manual_near_threshold")), "正在等待证据或新信号"),
-        ("24h 完成任务", _fmt_int(pipeline.get("completed_24h")), f"约 {_fmt_num(pipeline.get('recent_rate_per_hour'))}/小时"),
+        ("正式钱包", _fmt_int(published_wallets), "当前可交接结果", "positive" if published_wallets else "neutral"),
+        ("Paper 研究池", _fmt_int(readiness.get("paper_stage_wallets")), "仅研究观察，不代表下单", "research"),
+        ("近阈值观察", _fmt_int(readiness.get("manual_near_threshold")), "正在等待证据或新信号", "neutral"),
+        ("24h 完成任务", _fmt_int(pipeline.get("completed_24h")), f"约 {_fmt_num(pipeline.get('recent_rate_per_hour'))}/小时", "neutral"),
     ]
     body = [
         _top_nav("dashboard"),
@@ -2910,8 +2913,12 @@ def _render_dashboard(settings: RobotSettings) -> str:
         '<a class="button" href="/wallets">查看候选</a></div></section>',
         '<section class="section-head overview-heading"><div><h2>今日运行概览</h2>'
         '<p>先看结果、吞吐和当前瓶颈；技术明细已收进后续分区。</p></div></section>',
+        _research_decision_band(data),
         '<section class="metric-grid outcome-metrics">',
-        "".join(f'<div class="metric"><span>{_e(label)}</span><strong>{value}</strong><small>{_e(note)}</small></div>' for label, value, note in tiles),
+        "".join(
+            f'<div class="metric {state}"><span>{_e(label)}</span><strong>{value}</strong><small>{_e(note)}</small></div>'
+            for label, value, note, state in tiles
+        ),
         "</section>",
         _workspace_tabs(),
         '<section id="workspace-panel-overview" class="workspace-panel active" role="tabpanel" aria-labelledby="workspace-tab-overview" data-workspace-panel="overview">',
@@ -2995,7 +3002,7 @@ def _render_wallets(settings: RobotSettings, *, stage: str, source: str, query: 
         _funnel_steps(data["funnel"]),
         _wallet_filter_form(data, stage=stage, source=source, query=query, signal=signal),
         '<section class="section-head"><div><h2>候选队列</h2>'
-        f'<p>当前筛选返回 {_fmt_int(data["wallet_count"])} 个钱包，按综合发现优先级排序。</p></div></section>',
+        f'<p>当前显示 {_fmt_int(data["wallet_count"])} / 共 {_fmt_int(data["wallet_total_count"])} 个钱包，按综合发现优先级排序。</p></div></section>',
         _wallets_table(rows),
         '<details class="analysis-drawer"><summary><span>研究诊断</span><small>证据分布、来源质量与任务状态</small></summary><div class="analysis-content">',
         '<section class="grid three">',
@@ -3119,7 +3126,7 @@ def _workspace_tabs() -> str:
     tabs = (
         ("overview", "核心结论"),
         ("discovery", "发现与评分"),
-        ("paper", "Paper 与 Copy"),
+        ("paper", "Paper 观察"),
         ("operations", "运行维护"),
     )
     return (
@@ -3131,6 +3138,62 @@ def _workspace_tabs() -> str:
             for key, label in tabs
         )
         + "</div>"
+    )
+
+
+def _research_decision_band(data: dict[str, Any]) -> str:
+    readiness = data.get("production_readiness") or {}
+    publish_gate = readiness.get("formal_publish_gate") or {}
+    ops_health = data.get("ops_health") or {}
+    published = int(publish_gate.get("active_published_leaders") or 0)
+    paper_wallets = int(readiness.get("paper_stage_wallets") or 0)
+    near_threshold = int(readiness.get("manual_near_threshold") or 0)
+    operator_required = int(readiness.get("operator_review_wallets") or 0)
+
+    if published:
+        result_value = f"{_fmt_int(published)} 个正式钱包"
+        result_note = "已通过研究与交接门槛"
+        result_state = "positive"
+    elif paper_wallets:
+        result_value = f"{_fmt_int(paper_wallets)} 个 Paper 研究钱包"
+        result_note = "尚未形成正式可交接钱包"
+        result_state = "research"
+    elif near_threshold:
+        result_value = f"{_fmt_int(near_threshold)} 个近阈值钱包"
+        result_note = "继续补证据和等待新信号"
+        result_state = "attention"
+    else:
+        result_value = "尚无合格钱包"
+        result_note = "继续发现并筛选高质量地址"
+        result_state = "neutral"
+
+    blocker = str(readiness.get("top_blocker") or "").strip()
+    if operator_required:
+        gate_value = f"{_fmt_int(operator_required)} 个需要人工判断"
+        gate_note = blocker or str(readiness.get("next_action") or "")
+        gate_state = "attention"
+    else:
+        gate_value = blocker or "系统自动推进中"
+        gate_note = str(readiness.get("next_action") or "")
+        gate_state = "neutral"
+
+    health = str(ops_health.get("health") or "ok")
+    system_value = "运行正常" if health == "ok" else "需要关注"
+    system_note = str(ops_health.get("note") or "")
+    system_state = "positive" if health == "ok" else "attention"
+    items = (
+        ("当前结论", result_value, result_note, result_state),
+        ("下一道关口", gate_value, gate_note, gate_state),
+        ("系统运行", system_value, system_note, system_state),
+    )
+    return (
+        '<section class="decision-band" aria-label="研究结论">'
+        + "".join(
+            f'<div class="decision-item {state}"><span>{_e(label)}</span>'
+            f'<strong>{_e(value)}</strong><small>{_e(note)}</small></div>'
+            for label, value, note, state in items
+        )
+        + "</section>"
     )
 
 
@@ -3337,7 +3400,7 @@ def _discovery_status_strip(data: dict[str, Any]) -> str:
     return (
         f'<section class="status-strip {status}">'
         f'<strong>{_e(message)}</strong>'
-        f'<span>当前筛选 {_fmt_int(data.get("wallet_count"))} 个钱包 · 更新时间 {_fmt_ts(data.get("generated_at"))}</span>'
+        f'<span>显示 {_fmt_int(data.get("wallet_count"))} / 共 {_fmt_int(data.get("wallet_total_count"))} 个 · 更新时间 {_fmt_ts(data.get("generated_at"))}</span>'
         "</section>"
     )
 
@@ -3462,6 +3525,8 @@ def _storage_maintenance_panel(values: dict[str, Any]) -> str:
     state = str(values.get("state") or "ok")
     banner_state = "ok" if state == "ok" else "attention"
     wal_ratio = float(values.get("wal_to_db_ratio") or 0)
+    wal_reusable = bool(values.get("wal_reusable"))
+    wal_checkpoint = values.get("wal_checkpoint") or {}
     free_ratio = float(values.get("free_disk_ratio") or 0)
     archive = values.get("evidence_archive") or {}
     cards = [
@@ -3469,7 +3534,11 @@ def _storage_maintenance_panel(values: dict[str, Any]) -> str:
         (
             "WAL",
             _fmt_bytes(int(values.get("wal_bytes") or 0)),
-            f"{_fmt_pct(wal_ratio)} of DB",
+            (
+                f"已 checkpoint，可继续复用 · {_fmt_int(wal_checkpoint.get('log_frames'))} frames"
+                if wal_reusable
+                else f"{_fmt_pct(wal_ratio)} of DB"
+            ),
             "warn" if bool(values.get("needs_wal_window")) else "ok",
         ),
         ("SHM", _fmt_bytes(int(values.get("shm_bytes") or 0)), "共享内存索引", "ok"),
@@ -4010,6 +4079,18 @@ def _backfill_queue_tables(values: dict[str, Any]) -> str:
 def _ops_health_summary(conn: sqlite3.Connection, settings: RobotSettings) -> dict[str, Any]:
     now = int(time.time())
     storage = _storage_health(settings)
+    wal_checkpoint = _maintenance_checkpoint_summary(settings, now=now)
+    wal_reusable = bool(wal_checkpoint.get("reusable"))
+    wal_bytes = int(storage.get("wal_bytes") or 0)
+    wal_critical = wal_bytes >= WAL_CRITICAL_BYTES
+    wal_needs_attention = bool(wal_critical or (wal_bytes >= WAL_WARN_BYTES and not wal_reusable))
+    storage.update(
+        {
+            "wal_checkpoint": wal_checkpoint,
+            "wal_reusable": wal_reusable,
+            "wal_needs_attention": wal_needs_attention,
+        }
+    )
     address_quality = _address_quality_fast_report(conn)
     pipeline_backlog = _pending_evidence_backlog_summary(conn)
     runtime_loops = _runtime_loop_summary(conn, now=now)
@@ -4118,12 +4199,20 @@ def _ops_health_summary(conn: sqlite3.Connection, settings: RobotSettings) -> di
     elif int(status_totals.get("failed", 0)):
         health = "attention"
         note = "存在 failed 队列，需要查看 last_error。"
-    elif int(storage.get("wal_bytes") or 0) >= 1_000_000_000:
+    elif wal_needs_attention:
         health = "attention"
-        note = "WAL 已超过 1GB，建议安排 ./pmrobot-nas.sh wal-truncate-window。"
+        note = (
+            "WAL 已超过严重阈值，建议安排 ./pmrobot-nas.sh wal-truncate-window 900。"
+            if wal_critical
+            else "WAL 较大且缺少近期 checkpoint 完成证据，检查 maintenance-loop。"
+        )
     else:
         health = "ok"
-        note = "队列和 WAL 处于常规范围。"
+        note = (
+            "队列正常；WAL 已完成 checkpoint，当前文件空间可继续复用。"
+            if wal_bytes >= WAL_WARN_BYTES and wal_reusable
+            else "队列和 WAL 处于常规范围。"
+        )
     return {
         "health": health,
         "note": note,
@@ -4412,6 +4501,9 @@ def _pending_evidence_backlog_rows(conn: sqlite3.Connection, *, now: int) -> lis
         *BLOCKING_CANDIDATE_STAGES,
         PipelineJobType.WALLET_EVIDENCE_BACKFILL.value,
         *ACTIVE_JOB_STATUSES,
+        PipelineJobType.WALLET_EVIDENCE_BACKFILL.value,
+        now,
+        PipelineJobType.WALLET_EVIDENCE_BACKFILL.value,
     )
     return _rows(
         conn,
@@ -4425,10 +4517,13 @@ def _pending_evidence_backlog_rows(conn: sqlite3.Connection, *, now: int) -> lis
         FROM wallet_processing_state wps
         JOIN candidate_wallets cw
           ON cw.address = wps.wallet
+        LEFT JOIN wallet_registry wr
+          ON wr.address = wps.wallet
         WHERE wps.next_action_at <= ?
           AND wps.next_action IN ({action_placeholders})
           AND wps.evidence_status NOT IN ('paused', 'summary_ready')
           AND cw.candidate_stage NOT IN ({blocking_placeholders})
+          AND COALESCE(wr.raw_retention_tier, '') != 'summary_only'
           AND NOT EXISTS (
               SELECT 1
               FROM pipeline_jobs pj
@@ -4436,6 +4531,25 @@ def _pending_evidence_backlog_rows(conn: sqlite3.Connection, *, now: int) -> lis
                 AND pj.wallet = wps.wallet
                 AND pj.subject_key = wps.next_action
                 AND pj.status IN ({active_placeholders})
+          )
+          AND NOT EXISTS (
+              SELECT 1
+              FROM pipeline_jobs failed_job
+              WHERE failed_job.job_type = ?
+                AND failed_job.wallet = wps.wallet
+                AND failed_job.subject_key = wps.next_action
+                AND failed_job.tier = wps.discovery_tier
+                AND failed_job.status = 'failed'
+                AND failed_job.next_attempt_at > ?
+          )
+          AND NOT EXISTS (
+              SELECT 1
+              FROM pipeline_jobs completed_job
+              WHERE completed_job.job_type = ?
+                AND completed_job.wallet = wps.wallet
+                AND completed_job.subject_key = wps.next_action
+                AND completed_job.tier = wps.discovery_tier
+                AND completed_job.status = 'done'
           )
         GROUP BY wps.next_action
         ORDER BY high_priority_count DESC, count DESC, wps.next_action ASC
@@ -4461,6 +4575,9 @@ def _pending_evidence_backlog_samples(
         now,
         PipelineJobType.WALLET_EVIDENCE_BACKFILL.value,
         *ACTIVE_JOB_STATUSES,
+        PipelineJobType.WALLET_EVIDENCE_BACKFILL.value,
+        now,
+        PipelineJobType.WALLET_EVIDENCE_BACKFILL.value,
         limit,
     )
     return _rows(
@@ -4476,9 +4593,12 @@ def _pending_evidence_backlog_samples(
         FROM wallet_processing_state wps
         JOIN candidate_wallets cw
           ON cw.address = wps.wallet
+        LEFT JOIN wallet_registry wr
+          ON wr.address = wps.wallet
         WHERE wps.next_action IN ({action_placeholders})
           AND wps.evidence_status NOT IN ('paused', 'summary_ready')
           AND cw.candidate_stage NOT IN ({blocking_placeholders})
+          AND COALESCE(wr.raw_retention_tier, '') != 'summary_only'
           AND COALESCE(wps.priority, 100) <= ?
           AND wps.next_action_at <= ?
           AND NOT EXISTS (
@@ -4488,6 +4608,25 @@ def _pending_evidence_backlog_samples(
                 AND pj.wallet = wps.wallet
                 AND pj.subject_key = wps.next_action
                 AND pj.status IN ({active_placeholders})
+          )
+          AND NOT EXISTS (
+              SELECT 1
+              FROM pipeline_jobs failed_job
+              WHERE failed_job.job_type = ?
+                AND failed_job.wallet = wps.wallet
+                AND failed_job.subject_key = wps.next_action
+                AND failed_job.tier = wps.discovery_tier
+                AND failed_job.status = 'failed'
+                AND failed_job.next_attempt_at > ?
+          )
+          AND NOT EXISTS (
+              SELECT 1
+              FROM pipeline_jobs completed_job
+              WHERE completed_job.job_type = ?
+                AND completed_job.wallet = wps.wallet
+                AND completed_job.subject_key = wps.next_action
+                AND completed_job.tier = wps.discovery_tier
+                AND completed_job.status = 'done'
           )
         ORDER BY priority ASC, wps.updated_at ASC, wps.wallet ASC
         LIMIT ?
@@ -6210,6 +6349,114 @@ def _score_policy_freshness(
     }
 
 
+def _evidence_stage_progress(
+    conn: sqlite3.Connection,
+    *,
+    now: int,
+    job_type: str,
+    stage_schedule: list[dict[str, Any]],
+    pending_state_rows: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Estimate current and downstream work without changing queue state."""
+
+    completion_rows = _rows(
+        conn,
+        """
+        SELECT
+            subject_key AS job_action,
+            SUM(CASE WHEN completed_at >= ? THEN 1 ELSE 0 END) AS completed_1h,
+            SUM(CASE WHEN completed_at >= ? THEN 1 ELSE 0 END) AS completed_6h,
+            SUM(CASE WHEN completed_at >= ? THEN 1 ELSE 0 END) AS completed_24h,
+            SUM(
+                CASE
+                    WHEN completed_at >= ?
+                     AND json_extract(output_json, '$.next_stage') = 'medium_pending'
+                    THEN 1 ELSE 0
+                END
+            ) AS promoted_medium_24h,
+            SUM(
+                CASE
+                    WHEN completed_at >= ?
+                     AND json_extract(output_json, '$.next_stage') = 'deep_pending'
+                    THEN 1 ELSE 0
+                END
+            ) AS promoted_deep_24h
+        FROM pipeline_jobs
+        WHERE job_type = ?
+          AND status = 'done'
+          AND subject_key IN ('light_pending', 'medium_pending', 'deep_pending')
+        GROUP BY subject_key
+        """,
+        (now - 3_600, now - 21_600, now - 86_400, now - 86_400, now - 86_400, job_type),
+    )
+    completions = {str(row.get("job_action") or ""): row for row in completion_rows}
+    pending = {
+        str(row.get("next_action") or ""): int(row.get("count") or 0)
+        for row in pending_state_rows
+    }
+    scheduled = {str(row.get("job_action") or ""): row for row in stage_schedule}
+    stage_rows: list[dict[str, Any]] = []
+    for job_action in PENDING_EVIDENCE_ACTIONS:
+        recent = completions.get(job_action, {})
+        schedule = scheduled.get(job_action, {})
+        completed_6h = int(recent.get("completed_6h") or 0)
+        completed_24h = int(recent.get("completed_24h") or 0)
+        rate_per_hour = max(completed_6h / 6.0, completed_24h / 24.0)
+        current_due = (
+            int(pending.get(job_action) or 0)
+            + int(schedule.get("due_queued_count") or 0)
+            + int(schedule.get("running_count") or 0)
+        )
+        promoted_24h = 0
+        if job_action == EvidenceJobStage.LIGHT_PENDING.value:
+            promoted_24h = int(recent.get("promoted_medium_24h") or 0)
+        elif job_action == EvidenceJobStage.MEDIUM_PENDING.value:
+            promoted_24h = int(recent.get("promoted_deep_24h") or 0)
+        promotion_rate = promoted_24h / completed_24h if completed_24h else 0.0
+        stage_rows.append(
+            {
+                "job_action": job_action,
+                "stage_label": _EVIDENCE_ACTION_LABELS.get(job_action, job_action),
+                "pending_state_count": int(pending.get(job_action) or 0),
+                "active_due_count": int(schedule.get("due_queued_count") or 0)
+                + int(schedule.get("running_count") or 0),
+                "current_due_count": current_due,
+                "completed_1h": int(recent.get("completed_1h") or 0),
+                "completed_24h": completed_24h,
+                "rate_per_hour": round(rate_per_hour, 2),
+                "current_eta_label": (
+                    _fmt_duration_hours(current_due / rate_per_hour)
+                    if current_due and rate_per_hour > 0
+                    else ""
+                ),
+                "promotion_rate_24h": round(promotion_rate * 100.0, 1),
+            }
+        )
+
+    by_action = {str(row["job_action"]): row for row in stage_rows}
+    light_due = int(by_action.get(EvidenceJobStage.LIGHT_PENDING.value, {}).get("current_due_count") or 0)
+    medium_due = int(by_action.get(EvidenceJobStage.MEDIUM_PENDING.value, {}).get("current_due_count") or 0)
+    deep_due = int(by_action.get(EvidenceJobStage.DEEP_PENDING.value, {}).get("current_due_count") or 0)
+    light_promotion = float(
+        by_action.get(EvidenceJobStage.LIGHT_PENDING.value, {}).get("promotion_rate_24h") or 0
+    ) / 100.0
+    medium_promotion = float(
+        by_action.get(EvidenceJobStage.MEDIUM_PENDING.value, {}).get("promotion_rate_24h") or 0
+    ) / 100.0
+    projected_medium_jobs = round(light_due * light_promotion)
+    projected_deep_jobs = round((medium_due + projected_medium_jobs) * medium_promotion)
+    current_due_jobs = light_due + medium_due + deep_due
+    projected_downstream_jobs = projected_medium_jobs + projected_deep_jobs
+    return {
+        "rows": stage_rows,
+        "current_due_jobs": current_due_jobs,
+        "projected_medium_jobs": projected_medium_jobs,
+        "projected_deep_jobs": projected_deep_jobs,
+        "projected_downstream_jobs": projected_downstream_jobs,
+        "projected_end_to_end_jobs": current_due_jobs + projected_downstream_jobs,
+    }
+
+
 def _evidence_pipeline_summary(conn: sqlite3.Connection, *, limit: int = 10) -> dict[str, Any]:
     now = int(time.time())
     job_type = PipelineJobType.WALLET_EVIDENCE_BACKFILL.value
@@ -6274,6 +6521,19 @@ def _evidence_pipeline_summary(conn: sqlite3.Connection, *, limit: int = 10) -> 
     total_eta_label = (
         _fmt_duration_hours(total_due_backlog / recent_rate_per_hour)
         if total_due_backlog and recent_rate_per_hour > 0
+        else ""
+    )
+    stage_progress = _evidence_stage_progress(
+        conn,
+        now=now,
+        job_type=job_type,
+        stage_schedule=stage_schedule,
+        pending_state_rows=list(pending_state_backlog.get("by_action") or []),
+    )
+    end_to_end_jobs = int(stage_progress.get("projected_end_to_end_jobs") or 0)
+    end_to_end_eta_label = (
+        _fmt_duration_hours(end_to_end_jobs / recent_rate_per_hour)
+        if end_to_end_jobs and recent_rate_per_hour > 0
         else ""
     )
     state_by_tier = _rows(
@@ -6416,6 +6676,10 @@ def _evidence_pipeline_summary(conn: sqlite3.Connection, *, limit: int = 10) -> 
         "eta_label": queue_progress.get("eta_label", ""),
         "total_due_backlog": total_due_backlog,
         "total_eta_label": total_eta_label,
+        "stage_progress": stage_progress.get("rows", []),
+        "projected_downstream_jobs": stage_progress.get("projected_downstream_jobs", 0),
+        "projected_end_to_end_jobs": end_to_end_jobs,
+        "end_to_end_eta_label": end_to_end_eta_label,
         "latest_completed_at": queue_progress.get("latest_completed_at", 0),
         "priority_aging_seconds": schedule_status.get("priority_aging_seconds", 0),
         "priority_aging_label": _duration_label(schedule_status.get("priority_aging_seconds")),
@@ -6985,6 +7249,87 @@ def _storage_health(settings: RobotSettings) -> dict[str, Any]:
     return storage
 
 
+def _maintenance_checkpoint_summary(
+    settings: RobotSettings,
+    *,
+    now: int,
+    max_age_seconds: int = MAINTENANCE_REPORT_MAX_AGE_SEC,
+    max_pending_frames: int = WAL_PENDING_FRAME_WARN,
+) -> dict[str, Any]:
+    configured_path = os.environ.get("PM_ROBOT_MAINTENANCE_REPORT_PATH", "").strip()
+    report_path = Path(configured_path) if configured_path else _report_file_path(settings, "maintenance_status.json")
+    summary: dict[str, Any] = {
+        "report_path": str(report_path),
+        "available": False,
+        "fresh": False,
+        "age_seconds": None,
+        "max_age_seconds": int(max_age_seconds),
+        "max_pending_frames": int(max_pending_frames),
+        "mode": "",
+        "executed": False,
+        "busy": None,
+        "log_frames": None,
+        "checkpointed_frames": None,
+        "pending_frames": None,
+        "reusable": False,
+        "error": "",
+    }
+    try:
+        modified_at = int(report_path.stat().st_mtime)
+        payload = json.loads(report_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        summary["error"] = "maintenance_report_missing"
+        return summary
+    except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
+        summary["error"] = f"maintenance_report_invalid:{exc}"
+        return summary
+
+    checkpoint = payload.get("wal_checkpoint") if isinstance(payload, dict) else None
+    if not isinstance(checkpoint, dict):
+        summary["error"] = "wal_checkpoint_missing"
+        return summary
+    age_seconds = max(0, int(now) - modified_at)
+    fresh = age_seconds <= int(max_age_seconds)
+    busy = _optional_int(checkpoint.get("busy"))
+    log_frames = _optional_int(checkpoint.get("log_frames"))
+    checkpointed_frames = _optional_int(checkpoint.get("checkpointed_frames"))
+    pending_frames = (
+        max(0, log_frames - checkpointed_frames)
+        if log_frames is not None and checkpointed_frames is not None
+        else None
+    )
+    executed = bool(checkpoint.get("executed"))
+    reusable = bool(
+        fresh
+        and executed
+        and busy == 0
+        and pending_frames is not None
+        and pending_frames <= int(max_pending_frames)
+    )
+    summary.update(
+        {
+            "available": True,
+            "fresh": fresh,
+            "age_seconds": age_seconds,
+            "mode": str(checkpoint.get("mode") or ""),
+            "executed": executed,
+            "busy": busy,
+            "log_frames": log_frames,
+            "checkpointed_frames": checkpointed_frames,
+            "pending_frames": pending_frames,
+            "reusable": reusable,
+        }
+    )
+    return summary
+
+
+def _optional_int(value: Any) -> int | None:
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
 def _storage_maintenance_summary(
     settings: RobotSettings,
     *,
@@ -7003,8 +7348,17 @@ def _storage_maintenance_summary(
     total_disk_bytes = int(storage.get("total_disk_bytes") or 0)
     wal_to_db_ratio = round(wal_bytes / db_bytes, 4) if db_bytes > 0 else 0.0
     free_disk_ratio = round(free_disk_bytes / total_disk_bytes, 4) if total_disk_bytes > 0 else 0.0
-    needs_wal_window = wal_bytes >= int(wal_warn_bytes)
+    wal_checkpoint = _maintenance_checkpoint_summary(settings, now=now)
+    wal_reusable = bool(wal_checkpoint.get("reusable"))
     critical_wal = wal_bytes >= int(wal_critical_bytes)
+    needs_wal_window = wal_bytes >= int(wal_warn_bytes) and not wal_reusable
+    storage.update(
+        {
+            "wal_checkpoint": wal_checkpoint,
+            "wal_reusable": wal_reusable,
+            "wal_needs_attention": bool(critical_wal or needs_wal_window),
+        }
+    )
     low_free_disk = bool(free_disk_bytes and free_disk_bytes < int(low_free_disk_bytes))
     if scheduled_backup_enabled is None:
         scheduled_backup_enabled = os.environ.get(
@@ -7053,7 +7407,11 @@ def _storage_maintenance_summary(
         next_action = "最近数据库备份已过期，检查 backup-loop 并执行 ./pmrobot-nas.sh backup-now。"
     else:
         state = "ok"
-        next_action = "存储处于常规范围，继续由 maintenance-loop 做轻量维护。"
+        next_action = (
+            "WAL 已 checkpoint，可继续复用；仅在低峰期按需截断。"
+            if wal_bytes >= int(wal_warn_bytes) and wal_reusable
+            else "存储处于常规范围，继续由 maintenance-loop 做轻量维护。"
+        )
     return {
         "state": state,
         "next_action": next_action,
@@ -7064,6 +7422,8 @@ def _storage_maintenance_summary(
         "free_disk_bytes": free_disk_bytes,
         "total_disk_bytes": total_disk_bytes,
         "wal_to_db_ratio": wal_to_db_ratio,
+        "wal_checkpoint": wal_checkpoint,
+        "wal_reusable": wal_reusable,
         "free_disk_ratio": free_disk_ratio,
         "wal_warn_bytes": int(wal_warn_bytes),
         "wal_critical_bytes": int(wal_critical_bytes),
@@ -7170,20 +7530,24 @@ def _top_review_candidates_panel(rows: list[dict[str, Any]]) -> str:
         address = str(row.get("address") or "")
         body.append(
             "<tr>"
-            f'<td><a class="mono strong-link" href="/wallet/{_e(address)}">{_short(address)}</a>'
+            f'<td data-label="钱包"><a class="mono strong-link" href="/wallet/{_e(address)}">{_short(address)}</a>'
             f'<small>{_e(row.get("review_reason", ""))}</small></td>'
-            f'<td class="num">{_fmt_num(row.get("leader_score"))}</td>'
-            f'<td>{_badge(row.get("blocker_label") or "待确认")}<small>{_e(row.get("review_next_action") or "")}</small></td>'
-            f'<td>{_badge(row.get("review_handling_label") or "待确认")}<small>{"需要操作" if row.get("operator_required") else "无需操作"}</small></td>'
-            f'<td>{_badge(row.get("candidate_stage"))}<small>{_e(row.get("review_stage", ""))}</small></td>'
-            f'<td><div class="numline">{_fmt_int(row.get("activity_count"))} 条活动</div>'
+            f'<td class="num" data-label="分数">{_fmt_num(row.get("leader_score"))}</td>'
+            f'<td data-label="当前原因">{_badge(row.get("blocker_label") or "待确认")}<small>{_e(row.get("review_next_action") or "")}</small></td>'
+            f'<td data-label="处理方式">{_badge(row.get("review_handling_label") or "待确认")}<small>{"需要操作" if row.get("operator_required") else "无需操作"}</small></td>'
+            f'<td data-label="阶段">{_badge(row.get("candidate_stage"))}<small>{_e(row.get("review_stage", ""))}</small></td>'
+            f'<td data-label="历史证据"><div class="numline">{_fmt_int(row.get("activity_count"))} 条活动</div>'
             f'<small>{_e(_status_label(row.get("evidence_tier", "")))} · {_e(_status_label(row.get("next_action", "")))}</small></td>'
-            f'<td><div class="numline">{_fmt_int(row.get("qualified_follower_count"))} 个跟随者</div>'
+            f'<td data-label="跟随证据"><div class="numline">{_fmt_int(row.get("qualified_follower_count"))} 个跟随者</div>'
             f'<small>{_fmt_int(row.get("copy_event_count"))} 条关联 · {_fmt_pct(row.get("copy_backtest_roi"))}</small></td>'
-            f'<td>{_badge(row.get("copyability_status") or "none")}<small>{_e(_status_label(row.get("copyability_scan_mode") or "unknown"))} · 优先级 {_fmt_int(row.get("copyability_priority"))}</small></td>'
+            f'<td data-label="跟随队列">{_badge(row.get("copyability_status") or "none")}<small>{_e(_status_label(row.get("copyability_scan_mode") or "unknown"))} · 优先级 {_fmt_int(row.get("copyability_priority"))}</small></td>'
             "</tr>"
         )
-    return _table(["钱包", "分数", "当前原因", "处理方式", "阶段", "历史证据", "跟随证据", "跟随队列"], "".join(body))
+    return _table(
+        ["钱包", "分数", "当前原因", "处理方式", "阶段", "历史证据", "跟随证据", "跟随队列"],
+        "".join(body),
+        table_class="review-table",
+    )
 
 
 def _needs_data_reason_table(rows: list[dict[str, Any]]) -> str:
@@ -8051,9 +8415,9 @@ def _evidence_pipeline_panel(values: dict[str, Any]) -> str:
         ("尝试耗尽", _fmt_int(exhausted_queued), "不会被 worker 领取", "warn" if exhausted_queued else "ok"),
         ("运行", _fmt_int(running), "running jobs", "ok" if running else "warn" if queued else "ok"),
         (
-            "调度候选",
+            "可调度库存",
             _fmt_int(pending_state),
-            "等待 planner 并发槽位",
+            "已排除归档和已完成状态",
             "warn" if high_priority_pending_state else "ok",
         ),
         (
@@ -8063,10 +8427,16 @@ def _evidence_pipeline_panel(values: dict[str, Any]) -> str:
             "warn" if high_priority_pending_state else "ok",
         ),
         (
-            "总到期待补",
+            "当前波次待补",
             _fmt_int(values.get("total_due_backlog")),
-            "queued/running + 到期待派",
+            "当前任务，不含后续升级派生",
             "warn" if high_priority_pending_state or (queued and not running) else "ok",
+        ),
+        (
+            "预计后续派生",
+            _fmt_int(values.get("projected_downstream_jobs")),
+            "按近24h L1→L2→L3 升级率",
+            "ok",
         ),
         ("近1h完成", _fmt_int(values.get("completed_1h")), "done jobs", "ok"),
         ("24h完成", _fmt_int(values.get("completed_24h")), "done jobs", "ok"),
@@ -8084,10 +8454,16 @@ def _evidence_pipeline_panel(values: dict[str, Any]) -> str:
         ),
         ("估算/小时", _fmt_num(values.get("recent_rate_per_hour")), "recent throughput", "ok"),
         (
-            "总 ETA",
+            "当前波次 ETA",
             values.get("total_eta_label") or "未知",
-            "按到期总 backlog 估算",
+            "只计算目前已经存在的任务",
             "warn" if int(values.get("total_due_backlog") or 0) and not values.get("total_eta_label") else "ok",
+        ),
+        (
+            "端到端粗估",
+            values.get("end_to_end_eta_label") or "未知",
+            "含预计升级派生，按当前混合吞吐",
+            "warn" if int(values.get("projected_end_to_end_jobs") or 0) else "ok",
         ),
         ("队列 ETA", values.get("eta_label") or "未知", "仅 queued/running", "warn" if queued and not values.get("eta_label") else "ok"),
     ]
@@ -8100,6 +8476,23 @@ def _evidence_pipeline_panel(values: dict[str, Any]) -> str:
             for label, value, desc, state in cards
         )
         + "</div>"
+        + '<h3 class="subhead">分阶段工作量与派生</h3>'
+        + _simple_table(
+            values.get("stage_progress") or [],
+            [
+                "stage_label",
+                "pending_state_count",
+                "active_due_count",
+                "current_due_count",
+                "completed_1h",
+                "completed_24h",
+                "rate_per_hour",
+                "current_eta_label",
+                "promotion_rate_24h",
+            ],
+            ["证据动作", "待调度", "队列/运行", "当前波次", "近1h完成", "24h完成", "每小时", "本阶段 ETA", "升级率%"],
+            localized_keys={"stage_label"},
+        )
         + '<h3 class="subhead">钱包证据层级</h3>'
         + _simple_table(
             values.get("state_by_tier") or [],
@@ -8380,6 +8773,8 @@ def _ops_health_panel(values: dict[str, Any]) -> str:
     }.get(budget_storage, budget_storage)
     budget_coordination_error = str(upstream_request_budget.get("coordination_error") or "")
     budget_available = bool(upstream_request_budget.get("available", budget_storage == "main"))
+    wal_reusable = bool(storage.get("wal_reusable"))
+    wal_checkpoint = storage.get("wal_checkpoint") or {}
     runtime_label = f"v{package_version} / {source_fingerprint}" if package_version != "unknown" else source_fingerprint
     cards = [
         ("运行版本", runtime_label, f"{_fmt_int(runtime.get('source_file_count'))} 个源码文件", "ok"),
@@ -8397,7 +8792,16 @@ def _ops_health_panel(values: dict[str, Any]) -> str:
             "warn" if int(runtime_loops.get("attention_count") or 0) else "ok",
         ),
         ("数据库", _fmt_bytes(int(storage.get("db_bytes") or 0)), "SQLite 主文件", "ok"),
-        ("WAL", _fmt_bytes(int(storage.get("wal_bytes") or 0)), "写入日志", "warn" if int(storage.get("wal_bytes") or 0) >= 1_000_000_000 else "ok"),
+        (
+            "WAL",
+            _fmt_bytes(int(storage.get("wal_bytes") or 0)),
+            (
+                f"checkpoint 完成 · 待写 {_fmt_int(wal_checkpoint.get('pending_frames'))} frames"
+                if wal_reusable
+                else "写入日志"
+            ),
+            "warn" if bool(storage.get("wal_needs_attention")) else "ok",
+        ),
         ("地址质量", _fmt_int(invalid_address_rows), "非标准钱包地址", "warn" if invalid_address_rows else "ok"),
         ("过期队列", _fmt_int(values.get("stale_running_count")), "running lease 已过期", "warn" if int(values.get("stale_running_count") or 0) else "ok"),
         (
@@ -8833,6 +9237,9 @@ _JS = """
     });
   });
   activate(location.hash.slice(1) || 'overview', false);
+  window.setTimeout(() => {
+    if (document.visibilityState === 'visible') window.location.reload();
+  }, 60000);
 })();
 """
 
@@ -8983,7 +9390,44 @@ p { margin: 6px 0 0; color: var(--muted); }
 .metric span, .metric small { display: block; color: var(--muted); }
 .metric strong { display: block; margin: 7px 0 3px; font-size: 25px; line-height: 1.1; overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
 .overview-heading { margin-top: 4px; }
-.outcome-metrics .metric:first-child strong { color: var(--ok); }
+.outcome-metrics .metric.positive strong { color: var(--ok); }
+.outcome-metrics .metric.research strong { color: var(--blue); }
+.decision-band {
+  display: grid;
+  grid-template-columns: 1fr 1.35fr 1fr;
+  margin-bottom: 16px;
+  border-top: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
+  background: var(--surface);
+}
+.decision-item {
+  position: relative;
+  min-width: 0;
+  min-height: 108px;
+  padding: 16px 18px 15px 22px;
+  border-right: 1px solid var(--line-soft);
+}
+.decision-item:last-child { border-right: 0; }
+.decision-item::before {
+  position: absolute;
+  inset: 16px auto 16px 0;
+  width: 4px;
+  background: var(--line);
+  content: "";
+}
+.decision-item.positive::before { background: var(--ok); }
+.decision-item.research::before { background: var(--blue); }
+.decision-item.attention::before { background: var(--amber); }
+.decision-item span, .decision-item small { display: block; color: var(--muted); }
+.decision-item span { font-size: 12px; font-weight: 800; }
+.decision-item strong {
+  display: block;
+  margin: 7px 0 4px;
+  font-size: 18px;
+  line-height: 1.25;
+  overflow-wrap: anywhere;
+}
+.decision-item small { line-height: 1.4; }
 .overview-band {
   margin-bottom: 16px;
   padding: 18px 0;
@@ -9391,6 +9835,9 @@ input, select {
   .workspace-tabs { position: static; }
   .hero-actions { width: 100%; flex-wrap: wrap; }
   .metric-grid, .health-grid, .ops-columns, .grid.two, .grid.three, .filters { grid-template-columns: 1fr; }
+  .decision-band { grid-template-columns: 1fr; }
+  .decision-item { min-height: 92px; border-right: 0; border-bottom: 1px solid var(--line-soft); }
+  .decision-item:last-child { border-bottom: 0; }
   .research-flow { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .research-step { border-bottom: 1px solid var(--line-soft); }
   .research-step:nth-child(2n) { border-right: 0; }
@@ -9411,11 +9858,12 @@ input, select {
   .research-step, .research-step:nth-child(2n) { min-height: 92px; border-right: 0; }
   .focus-row { grid-template-columns: 10px 1fr; gap: 6px 10px; }
   .focus-row b, .focus-row small { grid-column: 2; }
-  .wallet-table, .wallet-table tbody, .wallet-table tr, .wallet-table td { display: block; width: 100%; }
-  .wallet-table thead { display: none; }
-  .wallet-table { min-width: 0 !important; }
-  .wallet-table tr { padding: 8px 12px; border-bottom: 1px solid var(--line); }
-  .wallet-table td {
+  .wallet-table, .wallet-table tbody, .wallet-table tr, .wallet-table td,
+  .review-table, .review-table tbody, .review-table tr, .review-table td { display: block; width: 100%; }
+  .wallet-table thead, .review-table thead { display: none; }
+  .wallet-table, .review-table { min-width: 0 !important; }
+  .wallet-table tr, .review-table tr { padding: 8px 12px; border-bottom: 1px solid var(--line); }
+  .wallet-table td, .review-table td {
     display: grid;
     grid-template-columns: 92px minmax(0, 1fr);
     gap: 10px;
@@ -9423,14 +9871,14 @@ input, select {
     padding: 9px 0;
     border-bottom: 1px solid var(--line-soft);
   }
-  .wallet-table td:last-child { border-bottom: 0; }
-  .wallet-table td::before {
+  .wallet-table td:last-child, .review-table td:last-child { border-bottom: 0; }
+  .wallet-table td::before, .review-table td::before {
     content: attr(data-label);
     color: var(--muted);
     font-size: 12px;
     font-weight: 800;
   }
-  .wallet-table td > * { min-width: 0; }
+  .wallet-table td > *, .review-table td > * { min-width: 0; }
   .wallet-table .actions { min-width: 0; }
 }
 """

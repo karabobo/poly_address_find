@@ -3,7 +3,8 @@ set -eu
 
 INTERVAL="${PM_ROBOT_MAINTENANCE_INTERVAL:-3600}"
 START_DELAY="${PM_ROBOT_MAINTENANCE_START_DELAY:-300}"
-WAL_CHECKPOINT="${PM_ROBOT_MAINTENANCE_WAL_CHECKPOINT:-none}"
+WAL_CHECKPOINT="${PM_ROBOT_MAINTENANCE_WAL_CHECKPOINT:-passive}"
+REPORT_PATH="${PM_ROBOT_MAINTENANCE_REPORT_PATH:-/app/reports/maintenance_status.json}"
 STALE_INGEST_RUN_SECONDS="${PM_ROBOT_MAINTENANCE_STALE_INGEST_RUN_SECONDS:-21600}"
 FAILED_JOB_COOLDOWN_SECONDS="${PM_ROBOT_MAINTENANCE_FAILED_JOB_COOLDOWN_SECONDS:-21600}"
 KEEP_BACKUPS="${PM_ROBOT_MAINTENANCE_KEEP_BACKUPS:-0}"
@@ -32,7 +33,14 @@ fi
 while true; do
   echo "$(date -Iseconds) maintenance loop: start"
   maintenance_ok=1
-  if ! python -m pm_robot.cli --env /app/.env maintenance \
+  REPORT_TMP="${REPORT_PATH}.tmp.$$"
+  report_dir_ready=1
+  if ! mkdir -p "$(dirname "$REPORT_PATH")"; then
+    echo "$(date -Iseconds) maintenance loop: report directory unavailable" >&2
+    maintenance_ok=0
+    report_dir_ready=0
+  fi
+  if [ "$report_dir_ready" -eq 1 ] && ! python -m pm_robot.cli --env /app/.env maintenance \
       --skip-cleanup \
       --reset-stale-jobs \
       --failed-job-cooldown-seconds "$FAILED_JOB_COOLDOWN_SECONDS" \
@@ -40,8 +48,19 @@ while true; do
       --stale-ingest-run-seconds "$STALE_INGEST_RUN_SECONDS" \
       --runtime-heartbeat-days "$RUNTIME_HEARTBEAT_DAYS" \
       --keep-backups "$KEEP_BACKUPS" \
-      --wal-checkpoint "$WAL_CHECKPOINT"; then
+      --wal-checkpoint "$WAL_CHECKPOINT" >"$REPORT_TMP"; then
     maintenance_ok=0
+    rm -f "$REPORT_TMP" || true
+  elif [ "$report_dir_ready" -eq 1 ]; then
+    if ! cat "$REPORT_TMP"; then
+      echo "$(date -Iseconds) maintenance loop: could not read checkpoint report" >&2
+      maintenance_ok=0
+      rm -f "$REPORT_TMP" || true
+    elif ! mv "$REPORT_TMP" "$REPORT_PATH"; then
+      echo "$(date -Iseconds) maintenance loop: could not publish checkpoint report" >&2
+      maintenance_ok=0
+      rm -f "$REPORT_TMP" || true
+    fi
   fi
   if [ "$maintenance_ok" -eq 1 ] && [ "$PRUNE_ENABLED" = "1" ]; then
     batch=0

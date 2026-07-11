@@ -854,6 +854,34 @@ def test_wallet_pipeline_tier_thresholds():
     assert wallet_pipeline_tier(240, 6, 20, 0.9) == "l1_light"
 
 
+def test_light_done_stops_when_light_evidence_does_not_justify_medium_history():
+    status, next_action = repository._next_pipeline_action(
+        evidence_tier=EvidenceTier.L1_LIGHT.value,
+        current_stage=EvidenceJobStage.LIGHT_DONE.value,
+        activity_count=12,
+        distinct_markets=1,
+        non_fast_trade_count=4,
+        fast_market_share=0.1,
+    )
+
+    assert status == EvidenceStatus.SUMMARY_READY.value
+    assert next_action == "score_wallet"
+
+
+def test_light_done_advances_when_light_evidence_justifies_medium_history():
+    status, next_action = repository._next_pipeline_action(
+        evidence_tier=EvidenceTier.L1_LIGHT.value,
+        current_stage=EvidenceJobStage.LIGHT_DONE.value,
+        activity_count=80,
+        distinct_markets=3,
+        non_fast_trade_count=8,
+        fast_market_share=0.1,
+    )
+
+    assert status == EvidenceStatus.NEEDS_MEDIUM.value
+    assert next_action == EvidenceJobStage.MEDIUM_PENDING.value
+
+
 def test_pipeline_terms_are_canonical_and_compatible():
     assert EVIDENCE_TIERS == (
         EvidenceTier.L0_DISCOVERED.value,
