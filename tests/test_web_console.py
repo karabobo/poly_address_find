@@ -2882,6 +2882,61 @@ def test_dashboard_and_startup_prewarm_use_lightweight_summary(tmp_path, monkeyp
     assert calls[1]["force_refresh"] is True
 
 
+def test_summary_api_reuses_lightweight_dashboard_snapshot(monkeypatch, tmp_path):
+    settings = _settings(tmp_path)
+    calls = []
+
+    def capture(_settings, **kwargs):
+        calls.append(kwargs)
+        return {"generated_at": 123, "total_candidates": 4}
+
+    monkeypatch.setattr(web_module, "_dashboard_data_cached", capture)
+
+    data = web_module.dashboard_summary_data(settings)
+
+    assert data["total_candidates"] == 4
+    assert calls == [
+        {
+            "include_pair_quality": False,
+            "include_heavy_audits": False,
+            "force_refresh": False,
+            "return_none_while_warming": True,
+        }
+    ]
+
+
+def test_summary_api_returns_warming_status_without_duplicate_queries(monkeypatch, tmp_path):
+    settings = _settings(tmp_path)
+    monkeypatch.setattr(web_module, "_dashboard_data_cached", lambda *args, **kwargs: None)
+
+    data = web_module.dashboard_summary_data(settings)
+
+    assert data["status"] == "warming"
+    assert data["retry_after_seconds"] == 2
+
+
+def test_summary_api_requires_explicit_full_detail_for_heavy_audits(monkeypatch, tmp_path):
+    settings = _settings(tmp_path)
+    calls = []
+
+    def capture(_settings, **kwargs):
+        calls.append(kwargs)
+        return {"generated_at": 123}
+
+    monkeypatch.setattr(web_module, "_dashboard_data_cached", capture)
+
+    web_module.dashboard_summary_data(settings, fresh=True, full=True)
+
+    assert calls == [
+        {
+            "include_pair_quality": True,
+            "include_heavy_audits": True,
+            "force_refresh": True,
+            "return_none_while_warming": True,
+        }
+    ]
+
+
 def test_dashboard_returns_immediate_warming_page_during_startup_prewarm(
     tmp_path,
     monkeypatch,

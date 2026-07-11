@@ -326,6 +326,31 @@ def _dashboard_data_cached(
     return data
 
 
+def dashboard_summary_data(
+    settings: RobotSettings,
+    *,
+    fresh: bool = False,
+    full: bool = False,
+) -> dict[str, Any]:
+    """Serve the UI snapshot by default; heavy diagnostics require an explicit request."""
+
+    data = _dashboard_data_cached(
+        settings,
+        include_pair_quality=full,
+        include_heavy_audits=full,
+        force_refresh=fresh,
+        return_none_while_warming=True,
+    )
+    if data is None:
+        return {
+            "status": "warming",
+            "summary_mode": "full" if full else "lightweight",
+            "generated_at": int(time.time()),
+            "retry_after_seconds": 2,
+        }
+    return data
+
+
 def _dashboard_cache_key(
     settings: RobotSettings,
     *,
@@ -598,9 +623,11 @@ def _handler_factory(config: WebConsoleConfig) -> type[BaseHTTPRequestHandler]:
             if parsed.path == "/api/summary":
                 params = parse_qs(parsed.query)
                 self._send_json(
-                    dashboard_data(config.settings)
-                    if _first(params, "fresh") == "1"
-                    else _dashboard_data_cached(config.settings)
+                    dashboard_summary_data(
+                        config.settings,
+                        fresh=_first(params, "fresh") == "1",
+                        full=_first(params, "detail").strip().lower() == "full",
+                    )
                 )
                 return
             if parsed.path == "/api/paper-handoff":
