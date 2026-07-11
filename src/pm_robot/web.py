@@ -74,8 +74,8 @@ WAL_CRITICAL_BYTES = 3_000_000_000
 LOW_FREE_DISK_BYTES = 100_000_000_000
 BACKUP_MAX_AGE_SECONDS = 26 * 3_600
 _DASHBOARD_CACHE_LOCK = threading.Lock()
-_DASHBOARD_CACHE: dict[tuple[str, bool], tuple[float, dict[str, Any]]] = {}
-_DASHBOARD_REFRESHING: set[tuple[str, bool]] = set()
+_DASHBOARD_CACHE: dict[tuple[str, bool, bool], tuple[float, dict[str, Any]]] = {}
+_DASHBOARD_REFRESHING: set[tuple[str, bool, bool]] = set()
 
 _CANDIDATE_STAGE_LABELS = {
     CandidateStage.IMPORTED.value: "已导入",
@@ -178,10 +178,20 @@ def run_web_console(config: WebConsoleConfig) -> None:
     server.serve_forever()
 
 
-def dashboard_data(settings: RobotSettings, *, include_pair_quality: bool = True) -> dict[str, Any]:
+def dashboard_data(
+    settings: RobotSettings,
+    *,
+    include_pair_quality: bool = True,
+    include_heavy_audits: bool = True,
+) -> dict[str, Any]:
     conn = connect_readonly(settings.db_path)
     try:
-        return _dashboard_data(conn, settings, include_pair_quality=include_pair_quality)
+        return _dashboard_data(
+            conn,
+            settings,
+            include_pair_quality=include_pair_quality,
+            include_heavy_audits=include_heavy_audits,
+        )
     finally:
         conn.close()
 
@@ -263,12 +273,17 @@ def _dashboard_data_cached(
     settings: RobotSettings,
     *,
     include_pair_quality: bool = True,
+    include_heavy_audits: bool = True,
     force_refresh: bool = False,
 ) -> dict[str, Any]:
     ttl = _dashboard_cache_ttl()
     if ttl <= 0:
-        return dashboard_data(settings, include_pair_quality=include_pair_quality)
-    key = (str(settings.db_path.resolve()), include_pair_quality)
+        return dashboard_data(
+            settings,
+            include_pair_quality=include_pair_quality,
+            include_heavy_audits=include_heavy_audits,
+        )
+    key = (str(settings.db_path.resolve()), include_pair_quality, include_heavy_audits)
     now = time.time()
     if not force_refresh:
         stale_data: dict[str, Any] | None = None
@@ -284,9 +299,18 @@ def _dashboard_data_cached(
                     should_refresh = True
         if stale_data is not None:
             if should_refresh:
-                _start_dashboard_cache_refresh(settings, include_pair_quality=include_pair_quality, key=key)
+                _start_dashboard_cache_refresh(
+                    settings,
+                    include_pair_quality=include_pair_quality,
+                    include_heavy_audits=include_heavy_audits,
+                    key=key,
+                )
             return stale_data
-    data = dashboard_data(settings, include_pair_quality=include_pair_quality)
+    data = dashboard_data(
+        settings,
+        include_pair_quality=include_pair_quality,
+        include_heavy_audits=include_heavy_audits,
+    )
     with _DASHBOARD_CACHE_LOCK:
         _DASHBOARD_CACHE[key] = (time.time(), data)
     return data
@@ -308,7 +332,12 @@ def _web_env_int(name: str, default: int) -> int:
 
 def _prewarm_dashboard_cache(settings: RobotSettings) -> None:
     try:
-        _dashboard_data_cached(settings, force_refresh=True)
+        _dashboard_data_cached(
+            settings,
+            include_pair_quality=False,
+            include_heavy_audits=False,
+            force_refresh=True,
+        )
     except Exception as exc:  # pragma: no cover - startup should continue if diagnostics fail.
         print(f"pm-robot web dashboard cache prewarm skipped: {type(exc).__name__}: {exc}")
 
@@ -328,11 +357,16 @@ def _start_dashboard_cache_refresh(
     settings: RobotSettings,
     *,
     include_pair_quality: bool,
-    key: tuple[str, bool],
+    include_heavy_audits: bool,
+    key: tuple[str, bool, bool],
 ) -> None:
     def refresh() -> None:
         try:
-            data = dashboard_data(settings, include_pair_quality=include_pair_quality)
+            data = dashboard_data(
+                settings,
+                include_pair_quality=include_pair_quality,
+                include_heavy_audits=include_heavy_audits,
+            )
             with _DASHBOARD_CACHE_LOCK:
                 _DASHBOARD_CACHE[key] = (time.time(), data)
         except Exception as exc:  # pragma: no cover - diagnostics should not block stale dashboard data.
@@ -731,6 +765,7 @@ def _dashboard_data(
     settings: RobotSettings,
     *,
     include_pair_quality: bool = True,
+    include_heavy_audits: bool = True,
 ) -> dict[str, Any]:
     paper_thresholds = _paper_candidate_thresholds(settings)
     paper_min_score = paper_thresholds["min_score"]
@@ -808,7 +843,11 @@ def _dashboard_data(
         "stage_counts": stage_rows,
         "score_stage_counts": score_rows,
         "source_counts": source_rows,
-        "discovery_freshness": _discovery_freshness_summary(conn),
+        "discovery_freshness": (
+            _discovery_freshness_summary(conn)
+            if include_heavy_audits
+            else _discovery_freshness_fast_summary(conn)
+        ),
         "source_quality": _source_quality_rows(conn),
         "activity_coverage": _activity_coverage_fast_summary(conn),
         "backfill_queue": evidence_backfill_summary(conn),
@@ -828,11 +867,15 @@ def _dashboard_data(
             lookback_sec=DEFAULT_ACTIVITY_LOOKBACK_SEC,
             limit=50,
         ),
-        "rtds_watch_audit": rtds_watch_audit_status(
-            conn,
-            min_score=DEFAULT_RTDS_WATCH_MIN_SCORE,
-            lookback_sec=DEFAULT_ACTIVITY_LOOKBACK_SEC,
-            limit=50,
+        "rtds_watch_audit": (
+            rtds_watch_audit_status(
+                conn,
+                min_score=DEFAULT_RTDS_WATCH_MIN_SCORE,
+                lookback_sec=DEFAULT_ACTIVITY_LOOKBACK_SEC,
+                limit=50,
+            )
+            if include_heavy_audits
+            else {"deferred": True}
         ),
         "paper_pool_expansion": _paper_pool_expansion_audit(
             conn,
@@ -1376,6 +1419,88 @@ def _discovery_freshness_summary(conn: sqlite3.Connection, *, limit: int = 12) -
         "stage_rows": recent_stage_rows,
         "paper_activity_pulse": _paper_stage_activity_pulse_summary(conn, now=now),
         "paper_rtds_bridge": _paper_rtds_bridge_summary(conn, now=now),
+    }
+
+
+def _discovery_freshness_fast_summary(conn: sqlite3.Connection) -> dict[str, Any]:
+    """Return first-screen discovery health without running grouped diagnostics."""
+
+    now = int(time.time())
+    since_24h = now - 86_400
+    since_72h = now - 259_200
+    candidate_row = _one(
+        conn,
+        """
+        SELECT
+            COUNT(*) AS total_candidates,
+            SUM(CASE WHEN first_seen_at >= ? THEN 1 ELSE 0 END) AS candidates_24h,
+            SUM(CASE WHEN first_seen_at >= ? THEN 1 ELSE 0 END) AS candidates_72h,
+            MAX(first_seen_at) AS latest_candidate_at
+        FROM candidate_wallets
+        """,
+        (since_24h, since_72h),
+    )
+    observed_row = _one(
+        conn,
+        """
+        SELECT
+            COUNT(*) AS observed_wallets,
+            SUM(CASE WHEN updated_at >= ? THEN 1 ELSE 0 END) AS observed_seen_24h,
+            SUM(CASE WHEN updated_at >= ? THEN 1 ELSE 0 END) AS observed_seen_72h,
+            SUM(CASE WHEN promoted_at IS NOT NULL THEN 1 ELSE 0 END) AS promoted_wallets,
+            SUM(CASE WHEN promoted_at >= ? THEN 1 ELSE 0 END) AS promoted_24h,
+            SUM(CASE WHEN promoted_at >= ? THEN 1 ELSE 0 END) AS promoted_72h,
+            MAX(updated_at) AS latest_observed_at,
+            MAX(promoted_at) AS latest_promoted_at
+        FROM observed_wallets
+        """,
+        (since_24h, since_72h, since_24h, since_72h),
+    )
+    source_row = _one(
+        conn,
+        """
+        SELECT
+            SUM(CASE WHEN latest_recorded_at >= ? THEN 1 ELSE 0 END) AS events_24h,
+            SUM(CASE WHEN latest_recorded_at >= ? THEN 1 ELSE 0 END) AS events_72h
+        FROM candidate_source_wallet_latest
+        """,
+        (since_24h, since_72h),
+    )
+    events_24h = int(source_row.get("events_24h") or 0)
+    candidates_24h = int(candidate_row.get("candidates_24h") or 0)
+    observed_seen_24h = int(observed_row.get("observed_seen_24h") or 0)
+    promoted_24h = int(observed_row.get("promoted_24h") or 0)
+    if events_24h or observed_seen_24h or candidates_24h:
+        state = "fresh"
+        next_action = "发现源有新鲜写入，继续观察晋级质量。"
+    else:
+        state = "stale"
+        next_action = "最近 24 小时没有发现活水，优先检查发现 loop、代理和 Polymarket 访问。"
+    return {
+        "summary_mode": "fast",
+        "source_metric_label": "来源钱包 24h",
+        "source_metric_note": "source-wallet pairs",
+        "state": state,
+        "next_action": next_action,
+        "source_events_24h": events_24h,
+        "source_events_72h": int(source_row.get("events_72h") or 0),
+        "candidate_wallets": int(candidate_row.get("total_candidates") or 0),
+        "candidates_24h": candidates_24h,
+        "candidates_72h": int(candidate_row.get("candidates_72h") or 0),
+        "latest_candidate_at": candidate_row.get("latest_candidate_at") or 0,
+        "observed_wallets": int(observed_row.get("observed_wallets") or 0),
+        "observed_seen_24h": observed_seen_24h,
+        "observed_seen_72h": int(observed_row.get("observed_seen_72h") or 0),
+        "promoted_wallets": int(observed_row.get("promoted_wallets") or 0),
+        "promoted_24h": promoted_24h,
+        "promoted_72h": int(observed_row.get("promoted_72h") or 0),
+        "latest_observed_at": observed_row.get("latest_observed_at") or 0,
+        "latest_promoted_at": observed_row.get("latest_promoted_at") or 0,
+        "source_rows": [],
+        "observed_sources": [],
+        "stage_rows": [],
+        "paper_activity_pulse": {},
+        "paper_rtds_bridge": {},
     }
 
 
@@ -2693,35 +2818,50 @@ def _wallet_detail_data(
 
 
 def _render_dashboard(settings: RobotSettings) -> str:
-    data = _dashboard_data_cached(settings)
+    # The operations page does not need the expensive pair-quality drilldown.
+    # Keep cold starts bounded and leave full diagnostics to explicit API calls.
+    data = _dashboard_data_cached(
+        settings,
+        include_pair_quality=False,
+        include_heavy_audits=False,
+    )
+    readiness = data["production_readiness"]
+    publish_gate = readiness.get("formal_publish_gate") or {}
+    pipeline = data["evidence_pipeline"]
     tiles = [
-        ("候选钱包", _fmt_int(data["total_candidates"]), "总候选地址库"),
-        ("活动事件", _fmt_int(data["activity_coverage"].get("total_events")), "已落库 wallet_activity"),
-        ("200+ 事件钱包", _fmt_int(data["activity_coverage"].get("wallets_ge_200")), "进入轻量证据层"),
-        ("数据库", _fmt_bytes(data["db_size_bytes"]), "SQLite 文件大小"),
+        ("正式钱包", _fmt_int(publish_gate.get("active_published_leaders")), "当前可交接结果"),
+        ("Paper 研究池", _fmt_int(readiness.get("paper_stage_wallets")), "仅研究观察，不代表下单"),
+        ("近阈值观察", _fmt_int(readiness.get("manual_near_threshold")), "正在等待证据或新信号"),
+        ("24h 完成任务", _fmt_int(pipeline.get("completed_24h")), f"约 {_fmt_num(pipeline.get('recent_rate_per_hour'))}/小时"),
     ]
     body = [
         _top_nav("dashboard"),
         '<main class="shell">',
-        '<section class="toolbar workspace-hero"><div><p class="eyebrow">Research / Scoring</p>'
-        '<h1>研究控制台</h1><p>发现、证据、评分和外部 paper 交接的统一工作台。</p></div>'
-        '<a class="button" href="/wallets">候选钱包</a></section>',
-        '<section class="metric-grid">',
+        '<section class="toolbar workspace-hero"><div><div class="hero-kicker">'
+        '<span class="mode-pill">NAS 研究与评分</span>'
+        f'<span>更新于 {_fmt_ts(data.get("generated_at"))}</span></div>'
+        '<h1>聪明钱包研究控制台</h1><p>持续发现、补足证据并筛出值得进入 Paper 研究的钱包。</p></div>'
+        '<div class="hero-actions"><a class="button secondary" href="/">刷新</a>'
+        '<a class="button" href="/wallets">查看候选</a></div></section>',
+        '<section class="section-head overview-heading"><div><h2>今日运行概览</h2>'
+        '<p>先看结果、吞吐和当前瓶颈；技术明细已收进后续分区。</p></div></section>',
+        '<section class="metric-grid outcome-metrics">',
         "".join(f'<div class="metric"><span>{_e(label)}</span><strong>{value}</strong><small>{_e(note)}</small></div>' for label, value, note in tiles),
         "</section>",
         _workspace_tabs(),
         '<section id="workspace-panel-overview" class="workspace-panel active" role="tabpanel" aria-labelledby="workspace-tab-overview" data-workspace-panel="overview">',
-        _panel("生产收敛摘要", _production_readiness_panel(data["production_readiness"])),
-        '<section class="grid two">',
-        _panel("发现活水", _discovery_freshness_panel(data["discovery_freshness"])),
-        _panel("L1/L2/L3 证据流水线", _evidence_pipeline_panel(data["evidence_pipeline"])),
-        "</section>",
+        _research_funnel_band(data),
+        _operator_focus_band(data),
         _panel("高分待验证", _top_review_candidates_panel(data["top_review_candidates"])),
         "</section>",
         '<section id="workspace-panel-discovery" class="workspace-panel" role="tabpanel" aria-labelledby="workspace-tab-discovery" data-workspace-panel="discovery" hidden>',
         '<section class="grid two">',
-        _panel("候选阶段", _simple_table(data["stage_counts"], ["name", "count"], ["阶段", "数量"])),
-        _panel("评分阶段", _simple_table(data["score_stage_counts"], ["name", "count", "avg_score", "max_score"], ["阶段", "数量", "均分", "最高分"])),
+        _panel("发现活水", _discovery_freshness_panel(data["discovery_freshness"])),
+        _panel("L1/L2/L3 证据流水线", _evidence_pipeline_panel(data["evidence_pipeline"])),
+        "</section>",
+        '<section class="grid two">',
+        _panel("候选阶段", _simple_table(data["stage_counts"], ["name", "count"], ["阶段", "数量"], localized_keys={"name"})),
+        _panel("评分阶段", _simple_table(data["score_stage_counts"], ["name", "count", "avg_score", "max_score"], ["阶段", "数量", "均分", "最高分"], localized_keys={"name"})),
         "</section>",
         '<section class="grid two">',
         _panel("发现来源", _simple_table(data["source_counts"], ["name", "count", "latest_at"], ["来源", "钱包数", "最近记录"])),
@@ -2735,6 +2875,7 @@ def _render_dashboard(settings: RobotSettings) -> str:
         _panel("高分阻塞分布", _simple_table(data["top_review_blockers"], ["blocker", "count", "max_score", "next_action", "example"], ["主阻塞", "数量", "最高分", "下一步", "例子"])),
         "</section>",
         '<section id="workspace-panel-paper" class="workspace-panel" role="tabpanel" aria-labelledby="workspace-tab-paper" data-workspace-panel="paper" hidden>',
+        _panel("生产收敛详情", _production_readiness_panel(data["production_readiness"])),
         _panel("Execution Preflight 执行前检查", _execution_preflight_panel(data["execution_preflight"])),
         _panel("Paper 实时钱包审计", _paper_realtime_audit_panel(data["paper_realtime_audit"])),
         _panel("RTDS Watch 近 Paper 审计", _rtds_watch_audit_panel(data["rtds_watch_audit"])),
@@ -2763,23 +2904,14 @@ def _render_wallets(settings: RobotSettings, *, stage: str, source: str, query: 
     body = [
         _top_nav("wallets"),
         '<main class="shell">',
-        '<section class="toolbar discovery-hero"><div><p class="eyebrow">Wallet Discovery</p>'
+        '<section class="toolbar discovery-hero"><div><p class="eyebrow">智能钱包研究</p>'
         '<h1>钱包发现工作台</h1><p>从公开活动、排行榜、Copy 结构和研究评分线索里筛出值得继续补历史的钱包。</p></div>'
         f'<div class="hero-actions"><a class="button secondary" href="/api/discovery?{_e(urlencode({"stage": stage, "source": source, "q": query, "signal": signal, "limit": "150"}))}">JSON</a>'
         '<a class="button" href="/">总览</a></div></section>',
         _discovery_status_strip(data),
         _discovery_summary_tiles(data),
         _funnel_steps(data["funnel"]),
-        f"""
-        <form class="filters sticky-filters" method="get" action="/wallets">
-          <label>阶段<input name="stage" value="{_e(stage)}" placeholder="needs_manual_review"></label>
-          <label>来源<input name="source" value="{_e(source)}" placeholder="trades_global"></label>
-          <label>搜索<input name="q" value="{_e(query)}" placeholder="地址 / 标签 / 备注"></label>
-          <input type="hidden" name="signal" value="{_e(signal)}">
-          <button type="submit">筛选</button>
-          <a class="button secondary" href="/wallets">清空</a>
-        </form>
-        """,
+        _wallet_filter_form(data, stage=stage, source=source, query=query, signal=signal),
         '<section class="section-head"><div><h2>候选队列</h2>'
         f'<p>当前筛选返回 {_fmt_int(data["wallet_count"])} 个钱包，按综合发现优先级排序。</p></div></section>',
         _wallets_table(rows),
@@ -2920,6 +3052,144 @@ def _workspace_tabs() -> str:
     )
 
 
+def _research_funnel_band(data: dict[str, Any]) -> str:
+    readiness = data.get("production_readiness") or {}
+    publish_gate = readiness.get("formal_publish_gate") or {}
+    pipeline = data.get("evidence_pipeline") or {}
+    discovery = data.get("discovery_freshness") or {}
+    scored = sum(int(row.get("count") or 0) for row in data.get("score_stage_counts") or [])
+    steps = [
+        ("候选总库", int(data.get("total_candidates") or 0), f"24h 新增 {_fmt_int(discovery.get('candidates_24h'))}"),
+        ("证据摘要就绪", int(pipeline.get("summary_ready_wallets") or 0), "L1/L2/L3 已形成摘要"),
+        ("已完成评分", scored, "已有最新评分结论"),
+        (
+            "自动复核与观察",
+            int(readiness.get("automatic_review_wallets") or 0) + int(readiness.get("watch_review_wallets") or 0),
+            f"真正需人工 {_fmt_int(readiness.get('operator_review_wallets'))}",
+        ),
+        ("Paper 研究池", int(readiness.get("paper_stage_wallets") or 0), "仅研究观察，不执行下单"),
+        ("正式钱包", int(publish_gate.get("active_published_leaders") or 0), "最终可交接结果"),
+    ]
+    total = max(steps[0][1], 1)
+    body = []
+    for index, (label, count, note) in enumerate(steps, start=1):
+        share = count / total
+        body.append(
+            '<div class="research-step">'
+            f'<span class="step-index">{index}</span><div><small>{_e(label)}</small>'
+            f'<strong>{_fmt_int(count)}</strong><span>{_e(note)}</span></div>'
+            f'<i style="width:{max(1.5, share * 100):.1f}%"></i></div>'
+        )
+    return (
+        '<section class="overview-band"><div class="band-heading"><div><h2>研究漏斗</h2>'
+        '<p>候选阶段和证据层级分开统计，避免把“已评分”误读成“可跟单”。</p></div>'
+        '<a href="/wallets">查看钱包明细</a></div>'
+        '<div class="research-flow">' + "".join(body) + "</div></section>"
+    )
+
+
+def _operator_focus_band(data: dict[str, Any]) -> str:
+    readiness = data.get("production_readiness") or {}
+    pipeline = data.get("evidence_pipeline") or {}
+    storage = data.get("storage_maintenance") or {}
+    archive = storage.get("evidence_archive") or {}
+    running = int(pipeline.get("running") or 0)
+    queued = int(pipeline.get("queued") or 0)
+    evidence_state = "正在处理" if running else "等待 worker" if queued else "队列空闲"
+    rows = [
+        (
+            "历史证据",
+            evidence_state,
+            f"{_fmt_int(pipeline.get('total_due_backlog'))} 个待处理 · ETA {pipeline.get('total_eta_label') or '待估算'}",
+            "ok" if running or not queued else "warn",
+        ),
+        (
+            "候选复核",
+            f"自动推进 {_fmt_int(readiness.get('automatic_review_wallets'))}",
+            f"自动观察 {_fmt_int(readiness.get('watch_review_wallets'))} · 真正需人工 {_fmt_int(readiness.get('operator_review_wallets'))}",
+            "warn" if int(readiness.get("operator_review_wallets") or 0) else "ok",
+        ),
+        (
+            "跟随证据",
+            f"待补 {_fmt_int(readiness.get('copyability_pending'))}",
+            "独立队列，不改变 L1/L2/L3 证据层级",
+            "warn" if int(readiness.get("copyability_pending") or 0) else "ok",
+        ),
+        (
+            "数据维护",
+            _fmt_bytes(int(storage.get("db_bytes") or 0)),
+            f"Parquet 已归档 {_fmt_int(archive.get('wallet_count'))} 个钱包 · {storage.get('next_action') or ''}",
+            "ok" if str(storage.get("state") or "ok") == "ok" else "warn",
+        ),
+    ]
+    body = "".join(
+        '<div class="focus-row">'
+        f'<span class="focus-state {state}"></span><strong>{_e(label)}</strong>'
+        f'<b>{_e(value)}</b><small>{_e(note)}</small></div>'
+        for label, value, note, state in rows
+    )
+    return (
+        '<section class="overview-band"><div class="band-heading"><div><h2>当前处理重点</h2>'
+        '<p>只列出需要关注的运行面；完整调度和存储细节在“运行维护”。</p></div></div>'
+        f'<div class="focus-list">{body}</div></section>'
+    )
+
+
+def _wallet_filter_form(
+    data: dict[str, Any],
+    *,
+    stage: str,
+    source: str,
+    query: str,
+    signal: str,
+) -> str:
+    stage_counts = {str(row.get("stage") or ""): int(row.get("count") or 0) for row in data.get("stage_counts") or []}
+    stage_values = list(_CANDIDATE_STAGE_LABELS)
+    if stage and stage not in stage_values:
+        stage_values.append(stage)
+    stage_options = ['<option value="">全部阶段</option>']
+    for value in stage_values:
+        selected = " selected" if value == stage else ""
+        count = stage_counts.get(value)
+        suffix = f" ({_fmt_int(count)})" if count is not None else ""
+        stage_options.append(
+            f'<option value="{_e(value)}"{selected}>{_e(_status_label(value) + suffix)}</option>'
+        )
+
+    source_values = sorted(
+        {str(row.get("source") or "") for row in data.get("source_quality") or [] if row.get("source")}
+    )
+    if source and source not in source_values:
+        source_values.append(source)
+        source_values.sort()
+    source_options = ['<option value="">全部来源</option>']
+    source_options.extend(
+        f'<option value="{_e(value)}"{" selected" if value == source else ""}>{_e(value)}</option>'
+        for value in source_values
+    )
+
+    shortcuts = [
+        ("", "全部"),
+        (CandidateStage.NEEDS_DATA.value, "待补证据"),
+        (CandidateStage.NEEDS_REVIEW.value, "自动复核中"),
+        (CandidateStage.PAPER_CANDIDATE.value, "Paper 候选"),
+        (CandidateStage.BLOCKED_HYGIENE.value, "风险阻断"),
+    ]
+    shortcut_links = "".join(
+        f'<a class="chip {"active" if stage == value else ""}" href="{_filter_href(stage=value, source=source, query=query, signal=signal)}">{_e(label)}</a>'
+        for value, label in shortcuts
+    )
+    return (
+        '<section class="filter-shell"><form class="filters sticky-filters" method="get" action="/wallets">'
+        '<label>候选阶段<select name="stage">' + "".join(stage_options) + "</select></label>"
+        '<label>发现来源<select name="source">' + "".join(source_options) + "</select></label>"
+        f'<label>搜索<input name="q" value="{_e(query)}" placeholder="输入地址、标签或备注"></label>'
+        f'<input type="hidden" name="signal" value="{_e(signal)}">'
+        '<button type="submit">应用筛选</button><a class="button secondary" href="/wallets">清空</a>'
+        '</form><div class="filter-shortcuts"><span>快捷查看</span>' + shortcut_links + "</div></section>"
+    )
+
+
 def _top_nav(active: str) -> str:
     dashboard = "active" if active == "dashboard" else ""
     wallets = "active" if active == "wallets" else ""
@@ -2946,22 +3216,22 @@ def _wallets_table(rows: list[dict[str, Any]]) -> str:
         link = row.get("links") or f"https://polymarket.com/profile/{address}"
         body.append(
             "<tr>"
-            f'<td class="priority-cell"><strong>{_fmt_num(row.get("discovery_priority"))}</strong>{_score_bar(row.get("discovery_priority"), 100)}</td>'
-            f'<td><a class="mono strong-link" href="/wallet/{_e(address)}">{_short(address)}</a>'
+            f'<td class="priority-cell" data-label="优先级"><strong>{_fmt_num(row.get("discovery_priority"))}</strong>{_score_bar(row.get("discovery_priority"), 100)}</td>'
+            f'<td data-label="钱包"><a class="mono strong-link" href="/wallet/{_e(address)}">{_short(address)}</a>'
             f'<div class="muted-line">{_e(row.get("review_reason", ""))}</div></td>'
-            f'<td>{_badge(row.get("candidate_stage"))}<div class="stacked-pills">{_source_pill(row.get("latest_source") or row.get("sources"))}{_badge(row.get("hygiene_status") or "hygiene?")}</div></td>'
-            f'<td><div class="numline">{_fmt_int(row.get("activity_count"))} events</div>{_depth_badge(row.get("evidence_depth_label"))}'
+            f'<td data-label="阶段">{_badge(row.get("candidate_stage"))}<div class="stacked-pills">{_source_pill(row.get("latest_source") or row.get("sources"))}{_badge(row.get("hygiene_status") or "hygiene?")}</div></td>'
+            f'<td data-label="历史证据"><div class="numline">{_fmt_int(row.get("activity_count"))} 条活动</div>{_depth_badge(row.get("evidence_depth_label"))}'
             f'{_progress_bar(row.get("activity_count"), 200, label="200")}</td>'
-            f'<td><div class="numline">{_fmt_int(row.get("qualified_follower_count"))} followers</div>'
-            f'<small>{_fmt_int(row.get("leader_copy_events"))} links · {_fmt_pct(row.get("copy_backtest_net_roi"))} · {_e(row.get("copyability_status") or "no job")} · {_e(row.get("copyability_scan_mode") or "unknown")}</small></td>'
-            f'<td><div class="numline">{_fmt_int(row.get("paper_orders"))} orders</div><small>{_fmt_pct(row.get("paper_total_roi"))} ROI · {_fmt_int(row.get("paper_settled_positions"))} settled</small></td>'
-            f'<td><div class="numline">{_e(row.get("backfill_stage", "") or "none")}</div>'
+            f'<td data-label="跟随证据"><div class="numline">{_fmt_int(row.get("qualified_follower_count"))} 个跟随者</div>'
+            f'<small>{_fmt_int(row.get("leader_copy_events"))} 条关联 · {_fmt_pct(row.get("copy_backtest_net_roi"))} · {_e(_status_label(row.get("copyability_status") or "no job"))} · {_e(_status_label(row.get("copyability_scan_mode") or "unknown"))}</small></td>'
+            f'<td data-label="Paper 研究"><div class="numline">{_fmt_int(row.get("paper_orders"))} 笔记录</div><small>{_fmt_pct(row.get("paper_total_roi"))} ROI · {_fmt_int(row.get("paper_settled_positions"))} 已结算</small></td>'
+            f'<td data-label="补证据"><div class="numline">{_e(_status_label(row.get("backfill_stage", "") or "none"))}</div>'
             f'{_progress_bar(row.get("current_depth"), row.get("target_depth"), label=str(row.get("target_depth") or ""))}</td>'
-            f'<td class="actions"><a class="icon-button" title="查看详情" href="/wallet/{_e(address)}">↗</a>'
+            f'<td class="actions" data-label="操作"><a class="icon-button" title="查看详情" href="/wallet/{_e(address)}">↗</a>'
             f'{_external_link(link)}</td>'
             "</tr>"
         )
-    return '<section class="panel table-panel">' + _table(header, "".join(body)) + "</section>"
+    return '<section class="panel table-panel">' + _table(header, "".join(body), table_class="wallet-table") + "</section>"
 
 
 def _discovery_status_strip(data: dict[str, Any]) -> str:
@@ -3182,13 +3452,30 @@ def _discovery_freshness_panel(values: dict[str, Any]) -> str:
     bridge_state = str(bridge.get("state") or "")
     bridge_banner_state = "ok" if bridge_state == "fresh_buy_activity" else "attention"
     cards = [
-        ("来源事件 24h", _fmt_int(values.get("source_events_24h")), "candidate_source_events", "ok" if int(values.get("source_events_24h") or 0) else "warn"),
+        (
+            values.get("source_metric_label") or "来源事件 24h",
+            _fmt_int(values.get("source_events_24h")),
+            values.get("source_metric_note") or "candidate_source_events",
+            "ok" if int(values.get("source_events_24h") or 0) else "warn",
+        ),
         ("新候选 24h", _fmt_int(values.get("candidates_24h")), f"总 {_fmt_int(values.get('candidate_wallets'))}", "ok" if int(values.get("candidates_24h") or 0) else "warn"),
         ("观察池活跃 24h", _fmt_int(values.get("observed_seen_24h")), f"总 {_fmt_int(values.get('observed_wallets'))}", "ok" if int(values.get("observed_seen_24h") or 0) else "warn"),
         ("观察池晋级 24h", _fmt_int(values.get("promoted_24h")), f"总 {_fmt_int(values.get('promoted_wallets'))}", "ok" if int(values.get("promoted_24h") or 0) else "warn"),
         ("最近候选", _fmt_ts(values.get("latest_candidate_at")) or "无", "first_seen_at", "ok" if values.get("latest_candidate_at") else "warn"),
         ("最近晋级", _fmt_ts(values.get("latest_promoted_at")) or "无", "promoted_at", "ok" if values.get("latest_promoted_at") else "warn"),
     ]
+    if values.get("summary_mode") == "fast":
+        return (
+            f'<div class="health-banner {banner_state}"><strong>{_e(values.get("next_action"))}</strong>'
+            '<span>首屏仅展示最近 24/72 小时关键指标，避免重型诊断阻塞页面。</span></div>'
+            '<div class="health-grid">'
+            + "".join(
+                f'<div class="health-card {card_state}"><span>{_e(label)}</span><strong>{_e(value)}</strong><small>{_e(note)}</small></div>'
+                for label, value, note, card_state in cards
+            )
+            + "</div>"
+            + '<p class="muted">更细的来源、晋级和钱包证据分布可在 <a href="/wallets">候选钱包</a> 中查看。</p>'
+        )
     bridge_cards = [
         ("Paper 钱包", _fmt_int(bridge.get("paper_stage_wallets")), "paper_candidate+", "ok" if int(bridge.get("paper_stage_wallets") or 0) else "warn"),
         ("RTDS 桥接事件", _fmt_int(bridge.get("rtds_activity_events")), f"{_fmt_int(bridge.get('rtds_activity_wallets'))} 个钱包", "ok" if int(bridge.get("rtds_activity_events") or 0) else "warn"),
@@ -3370,7 +3657,7 @@ def _source_pill(value: Any) -> str:
 
 def _depth_badge(value: Any) -> str:
     text = str(value or "none")
-    labels = {"none": "none", "starter": "starter", "light": "light", "ready": "ready", "deep": "deep"}
+    labels = {"none": "无历史", "starter": "历史起步", "light": "轻量历史", "ready": "证据足量", "deep": "深度历史"}
     return f'<span class="depth-badge {_e(text)}">{_e(labels.get(text, text))}</span>'
 
 
@@ -3402,12 +3689,17 @@ def _simple_table(
     labels: list[str],
     *,
     table_class: str = "",
+    localized_keys: set[str] | None = None,
 ) -> str:
     if not rows:
         return '<p class="empty">暂无数据。</p>'
+    localized = localized_keys or set()
     body = []
     for row in rows:
-        cells = "".join(f"<td>{_format_cell(row.get(key))}</td>" for key in keys)
+        cells = "".join(
+            f"<td>{_localized_cell(row.get(key)) if key in localized else _format_cell(row.get(key))}</td>"
+            for key in keys
+        )
         body.append(f"<tr>{cells}</tr>")
     return _table(labels, "".join(body), table_class=table_class)
 
@@ -6788,14 +7080,14 @@ def _top_review_candidates_panel(rows: list[dict[str, Any]]) -> str:
             f'<td>{_badge(row.get("blocker_label") or "待确认")}<small>{_e(row.get("review_next_action") or "")}</small></td>'
             f'<td>{_badge(row.get("review_handling_label") or "待确认")}<small>{"需要操作" if row.get("operator_required") else "无需操作"}</small></td>'
             f'<td>{_badge(row.get("candidate_stage"))}<small>{_e(row.get("review_stage", ""))}</small></td>'
-            f'<td><div class="numline">{_fmt_int(row.get("activity_count"))} events</div>'
-            f'<small>{_e(row.get("evidence_tier", ""))} · {_e(row.get("next_action", ""))}</small></td>'
-            f'<td><div class="numline">{_fmt_int(row.get("qualified_follower_count"))} followers</div>'
-            f'<small>{_fmt_int(row.get("copy_event_count"))} links · {_fmt_pct(row.get("copy_backtest_roi"))}</small></td>'
-            f'<td>{_badge(row.get("copyability_status") or "none")}<small>{_e(row.get("copyability_scan_mode") or "unknown")} · p{_fmt_int(row.get("copyability_priority"))}</small></td>'
+            f'<td><div class="numline">{_fmt_int(row.get("activity_count"))} 条活动</div>'
+            f'<small>{_e(_status_label(row.get("evidence_tier", "")))} · {_e(_status_label(row.get("next_action", "")))}</small></td>'
+            f'<td><div class="numline">{_fmt_int(row.get("qualified_follower_count"))} 个跟随者</div>'
+            f'<small>{_fmt_int(row.get("copy_event_count"))} 条关联 · {_fmt_pct(row.get("copy_backtest_roi"))}</small></td>'
+            f'<td>{_badge(row.get("copyability_status") or "none")}<small>{_e(_status_label(row.get("copyability_scan_mode") or "unknown"))} · 优先级 {_fmt_int(row.get("copyability_priority"))}</small></td>'
             "</tr>"
         )
-    return _table(["钱包", "分数", "当前原因", "处理方式", "阶段", "历史证据", "Copy 证据", "Copy 队列"], "".join(body))
+    return _table(["钱包", "分数", "当前原因", "处理方式", "阶段", "历史证据", "跟随证据", "跟随队列"], "".join(body))
 
 
 def _needs_data_reason_table(rows: list[dict[str, Any]]) -> str:
@@ -7019,6 +7311,13 @@ def _paper_realtime_audit_panel(values: dict[str, Any]) -> str:
 def _rtds_watch_audit_panel(values: dict[str, Any]) -> str:
     if not values:
         return '<p class="empty">暂无 RTDS watch 数据。</p>'
+    if values.get("deferred"):
+        return (
+            '<div class="health-banner"><strong>重型实时审计已从首屏延后。</strong>'
+            '<span>需要排查近 Paper 钱包的实时命中时再按需运行，避免影响日常控制台加载。</span></div>'
+            '<p class="muted"><a class="button secondary" href="/api/rtds-watch-audit">打开 RTDS Watch 审计</a>'
+            ' · research-only，不会升级 Paper 或发布。</p>'
+        )
     wallets = values.get("wallets") or []
     scope = values.get("scope") or {}
     state_counts = values.get("state_counts") or []
@@ -7709,6 +8008,7 @@ def _evidence_pipeline_panel(values: dict[str, Any]) -> str:
                 "latest_updated_at",
             ],
             ["证据层级", "证据状态", "下一动作", "钱包数", "最高优先级", "平均事件", "最大事件", "最近更新"],
+            localized_keys={"evidence_tier", "evidence_status", "next_action"},
         )
         + '<h3 class="subhead">分层调度状态</h3>'
         + _simple_table(
@@ -7729,18 +8029,21 @@ def _evidence_pipeline_panel(values: dict[str, Any]) -> str:
             ],
             ["证据动作", "调度权重", "排队", "到期", "退避", "耗尽", "运行", "活跃/权重", "老化排队", "最久等待", "游标权重", "最近选择"],
             table_class="scheduler-table",
+            localized_keys={"stage_label"},
         )
         + '<h3 class="subhead">执行队列分布</h3>'
         + _simple_table(
             values.get("active_by_action") or [],
             ["job_action", "job_scope", "status", "count", "min_priority", "oldest_created_at", "latest_updated_at"],
             ["任务动作", "队列范围", "状态", "数量", "最高优先级", "最早创建", "最近更新"],
+            localized_keys={"job_action", "job_scope", "status"},
         )
         + '<h3 class="subhead">状态待派断点</h3>'
         + _simple_table(
             values.get("pending_state_by_action") or [],
             ["next_action", "count", "high_priority_count", "min_priority", "latest_updated_at"],
             ["下一动作", "钱包数", "高优先级", "最高优先级", "最近更新"],
+            localized_keys={"next_action"},
         )
         + '<h3 class="subhead">执行队列前排</h3>'
         + _evidence_active_jobs_table(values.get("top_active_jobs") or [])
@@ -8234,6 +8537,13 @@ def _format_cell(value: Any) -> str:
     return _e(text)
 
 
+def _localized_cell(value: Any) -> str:
+    text = str(value or "")
+    label = _status_label(text)
+    title = f' title="{_e(text)}"' if label != text else ""
+    return f'<span{title}>{_e(label)}</span>'
+
+
 def _fmt_ts(value: Any) -> str:
     if not value:
         return ""
@@ -8320,7 +8630,39 @@ def _badge(value: Any) -> str:
         style = " attention"
     elif text in {"rejected", "blocked_hygiene", "blocked_copyability", "failed"}:
         style = " blocked"
-    return f'<span class="badge{style}">{_e(text)}</span>'
+    label = _status_label(text)
+    title = f' title="{_e(text)}"' if label != text else ""
+    return f'<span class="badge{style}"{title}>{_e(label)}</span>'
+
+
+def _status_label(value: Any) -> str:
+    text = str(value or "")
+    for labels in (
+        _CANDIDATE_STAGE_LABELS,
+        _EVIDENCE_TIER_LABELS,
+        _EVIDENCE_STATUS_LABELS,
+        _EVIDENCE_ACTION_LABELS,
+        _PIPELINE_JOB_TYPE_LABELS,
+        _JOB_STATUS_LABELS,
+    ):
+        if text in labels:
+            return labels[text]
+    labels = {
+        "ok": "正常",
+        "screened": "已筛选",
+        "incomplete": "证据不足",
+        "pending": "待处理",
+        "active": "活跃",
+        "paused": "已暂停",
+        "none": "无",
+        "unknown": "未知",
+        "no job": "未排队",
+        "hygiene?": "风险待评估",
+        "light": "轻量",
+        "deep": "深度",
+        "default": "标准",
+    }
+    return labels.get(text, text)
 
 
 def _e(value: Any) -> str:
@@ -8446,6 +8788,25 @@ nav a.active, .button, button {
   padding: 4px 0 2px;
 }
 .hero-actions { display: flex; gap: 8px; align-items: center; }
+.hero-kicker {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 8px;
+  color: var(--muted);
+  font-size: 12px;
+}
+.mode-pill {
+  display: inline-flex;
+  align-items: center;
+  min-height: 24px;
+  padding: 0 8px;
+  border: 1px solid #99d5cd;
+  border-radius: 999px;
+  background: var(--accent-soft);
+  color: var(--accent-strong);
+  font-weight: 800;
+}
 .eyebrow {
   margin: 0 0 6px;
   color: var(--accent-strong);
@@ -8493,6 +8854,81 @@ p { margin: 6px 0 0; color: var(--muted); }
 .metric { padding: 15px 16px; min-height: 92px; }
 .metric span, .metric small { display: block; color: var(--muted); }
 .metric strong { display: block; margin: 7px 0 3px; font-size: 25px; line-height: 1.1; overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
+.overview-heading { margin-top: 4px; }
+.outcome-metrics .metric:first-child strong { color: var(--ok); }
+.overview-band {
+  margin-bottom: 16px;
+  padding: 18px 0;
+  border-top: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
+  background: transparent;
+}
+.band-heading {
+  display: flex;
+  align-items: end;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 14px;
+}
+.band-heading h2 { margin-bottom: 2px; }
+.band-heading a { font-weight: 700; white-space: nowrap; }
+.research-flow {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  overflow: hidden;
+}
+.research-step {
+  position: relative;
+  display: grid;
+  grid-template-columns: 28px minmax(0, 1fr);
+  gap: 10px;
+  min-height: 116px;
+  padding: 14px 12px 17px;
+  border-right: 1px solid var(--line-soft);
+}
+.research-step:last-child { border-right: 0; }
+.research-step > div { min-width: 0; }
+.research-step small, .research-step span { display: block; color: var(--muted); }
+.research-step strong {
+  display: block;
+  margin: 6px 0 5px;
+  font-size: 24px;
+  font-variant-numeric: tabular-nums;
+}
+.research-step > i {
+  position: absolute;
+  left: 0;
+  bottom: 0;
+  height: 4px;
+  max-width: 100%;
+  background: var(--accent);
+}
+.step-index {
+  display: grid !important;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  background: var(--surface-soft);
+  color: var(--text) !important;
+  font-weight: 800;
+}
+.focus-list { border-top: 1px solid var(--line-soft); }
+.focus-row {
+  display: grid;
+  grid-template-columns: 10px minmax(120px, 0.65fr) minmax(120px, 0.8fr) minmax(240px, 2fr);
+  gap: 12px;
+  align-items: center;
+  min-height: 54px;
+  border-bottom: 1px solid var(--line-soft);
+}
+.focus-row b { font-variant-numeric: tabular-nums; }
+.focus-row small { color: var(--muted); }
+.focus-state { width: 8px; height: 8px; border-radius: 50%; background: var(--ok); }
+.focus-state.warn { background: var(--amber); }
 .workspace-tabs {
   position: sticky;
   top: 56px;
@@ -8753,6 +9189,21 @@ tbody tr:hover { background: #fbfcfb; }
   border-radius: 8px;
   box-shadow: var(--shadow);
 }
+.filter-shell { margin-bottom: 16px; }
+.filter-shell .filters { margin-bottom: 0; }
+.filter-shortcuts {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 14px;
+  border: 1px solid var(--line);
+  border-top: 0;
+  border-radius: 0 0 8px 8px;
+  background: var(--surface-soft);
+}
+.filter-shortcuts > span { margin-right: 2px; color: var(--muted); font-size: 12px; font-weight: 800; }
+.filter-shortcuts .chip { min-height: 28px; }
 .sticky-filters { position: sticky; top: 64px; z-index: 3; }
 .analysis-drawer {
   margin-top: 18px;
@@ -8777,7 +9228,7 @@ tbody tr:hover { background: #fbfcfb; }
 .analysis-content { padding: 0 0 4px; }
 .analysis-content > .panel { margin-bottom: 16px; }
 label { display: grid; gap: 5px; color: var(--muted); font-size: 12px; font-weight: 700; }
-input {
+input, select {
   width: 100%;
   min-height: 36px;
   border: 1px solid var(--line);
@@ -8812,6 +9263,11 @@ input {
   .workspace-tabs { position: static; }
   .hero-actions { width: 100%; flex-wrap: wrap; }
   .metric-grid, .health-grid, .ops-columns, .grid.two, .grid.three, .filters { grid-template-columns: 1fr; }
+  .research-flow { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .research-step { border-bottom: 1px solid var(--line-soft); }
+  .research-step:nth-child(2n) { border-right: 0; }
+  .focus-row { grid-template-columns: 10px minmax(100px, 0.7fr) minmax(120px, 1fr); padding: 10px 0; }
+  .focus-row small { grid-column: 2 / -1; }
   .status-strip { align-items: flex-start; flex-direction: column; }
   .status-strip span, .health-banner span { white-space: normal; }
   .funnel-grid { grid-template-columns: repeat(2, minmax(140px, 1fr)); }
@@ -8819,5 +9275,34 @@ input {
   .sticky-filters { position: static; }
   .analysis-drawer > summary { align-items: flex-start; }
   .analysis-drawer > summary small { max-width: 60%; text-align: right; }
+}
+@media (max-width: 680px) {
+  .top nav a[href="/api/summary"] { display: none; }
+  .band-heading { align-items: flex-start; flex-direction: column; }
+  .research-flow { grid-template-columns: 1fr; }
+  .research-step, .research-step:nth-child(2n) { min-height: 92px; border-right: 0; }
+  .focus-row { grid-template-columns: 10px 1fr; gap: 6px 10px; }
+  .focus-row b, .focus-row small { grid-column: 2; }
+  .wallet-table, .wallet-table tbody, .wallet-table tr, .wallet-table td { display: block; width: 100%; }
+  .wallet-table thead { display: none; }
+  .wallet-table { min-width: 0 !important; }
+  .wallet-table tr { padding: 8px 12px; border-bottom: 1px solid var(--line); }
+  .wallet-table td {
+    display: grid;
+    grid-template-columns: 92px minmax(0, 1fr);
+    gap: 10px;
+    max-width: none;
+    padding: 9px 0;
+    border-bottom: 1px solid var(--line-soft);
+  }
+  .wallet-table td:last-child { border-bottom: 0; }
+  .wallet-table td::before {
+    content: attr(data-label);
+    color: var(--muted);
+    font-size: 12px;
+    font-weight: 800;
+  }
+  .wallet-table td > * { min-width: 0; }
+  .wallet-table .actions { min-width: 0; }
 }
 """

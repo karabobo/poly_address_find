@@ -8,13 +8,16 @@ import pm_robot.web as web_module
 from pm_robot.config import RobotSettings
 from pm_robot.storage.db import connect, run_migrations
 from pm_robot.web import (
+    _badge,
     _copyability_lane_panel,
+    _localized_cell,
     _render_dashboard,
     _render_wallet_detail,
     _render_wallets,
     _paper_candidate_thresholds,
     _paper_pool_expansion_panel,
     _paper_pool_expansion_state,
+    _format_cell,
     _runtime_build_info,
     _storage_maintenance_panel,
     _storage_maintenance_summary,
@@ -1574,6 +1577,7 @@ def test_dashboard_discovery_freshness_reports_recent_source_and_observed_flow(t
     data = dashboard_data(settings)
     freshness = data["discovery_freshness"]
     html = _render_dashboard(settings)
+    detailed_html = web_module._discovery_freshness_panel(freshness)
     sources = {row["source"]: row for row in freshness["source_rows"]}
     observed_sources = {row["source"]: row for row in freshness["observed_sources"]}
     stages = {row["candidate_stage"]: row for row in freshness["stage_rows"]}
@@ -1621,16 +1625,17 @@ def test_dashboard_discovery_freshness_reports_recent_source_and_observed_flow(t
     assert pulse_sources["wallet_activity_poll"]["buy_events_24h"] == 1
     assert pulse["wallet_rows"][0]["latest_source"] == "wallet_activity_poll"
     assert "发现活水" in html
-    assert "Paper-stage 活动脉冲" in html
-    assert "可及时 BUY" in html
-    assert "Paper 活动来源" in html
-    assert "RTDS→Paper 实时桥接" in html
-    assert "RTDS BUY" in html
-    assert "最大入库延迟" in html
-    assert "Paper RTDS阈值" in html
-    assert "wallet_activity" in html
-    assert "来源事件新鲜度" in html
-    assert "观察池晋级" in html
+    assert "首屏仅展示最近 24/72 小时关键指标" in html
+    assert "Paper-stage 活动脉冲" in detailed_html
+    assert "可及时 BUY" in detailed_html
+    assert "Paper 活动来源" in detailed_html
+    assert "RTDS→Paper 实时桥接" in detailed_html
+    assert "RTDS BUY" in detailed_html
+    assert "最大入库延迟" in detailed_html
+    assert "Paper RTDS阈值" in detailed_html
+    assert "wallet_activity" in detailed_html
+    assert "来源事件新鲜度" in detailed_html
+    assert "观察池晋级" in detailed_html
 
 
 def test_dashboard_evidence_pipeline_reports_l1_l2_l3_queue_progress(tmp_path, monkeypatch):
@@ -2420,7 +2425,7 @@ def test_dashboard_ops_health_reports_stale_and_active_pipeline_jobs(tmp_path):
     assert "运行版本" in html
     assert "源码装载" in html
     assert runtime["source_fingerprint"] in html
-    assert "生产收敛摘要" in html
+    assert "生产收敛详情" in html
     assert "Paper 候选" in html
     assert "复核处置分布" in html
     assert "高分阻塞分布" in html
@@ -2802,7 +2807,75 @@ def test_dashboard_groups_secondary_sections_into_workspace_tabs(tmp_path):
     assert 'data-workspace-tab="operations"' in html
     assert 'data-workspace-panel="overview"' in html
     assert 'data-workspace-panel="discovery" hidden' in html
-    assert html.index("生产收敛摘要") < html.index("候选阶段")
+    assert html.index("研究漏斗") < html.index("候选阶段")
+
+
+def test_dashboard_starts_with_operator_outcomes_and_pipeline(tmp_path):
+    settings = _settings(tmp_path)
+    _seed(settings)
+
+    html = _render_dashboard(settings)
+
+    assert "NAS 研究与评分" in html
+    assert "今日运行概览" in html
+    assert "研究漏斗" in html
+    assert "当前处理重点" in html
+    assert "正式钱包" in html
+    assert "24h 完成任务" in html
+    assert html.index("今日运行概览") < html.index("高分待验证")
+    assert html.index("研究漏斗") < html.index("生产收敛详情")
+
+
+def test_dashboard_and_startup_prewarm_use_lightweight_summary(tmp_path, monkeypatch):
+    settings = _settings(tmp_path)
+    _seed(settings)
+    original = web_module._dashboard_data_cached
+    calls = []
+
+    def capture(_settings, **kwargs):
+        calls.append(kwargs)
+        return original(_settings, **kwargs)
+
+    monkeypatch.setattr(web_module, "_dashboard_data_cached", capture)
+
+    _render_dashboard(settings)
+    web_module._prewarm_dashboard_cache(settings)
+
+    assert calls[0]["include_pair_quality"] is False
+    assert calls[0]["include_heavy_audits"] is False
+    assert calls[1]["include_pair_quality"] is False
+    assert calls[1]["include_heavy_audits"] is False
+    assert calls[1]["force_refresh"] is True
+
+
+def test_lightweight_dashboard_defers_heavy_discovery_and_rtds_audits(tmp_path):
+    settings = _settings(tmp_path)
+    _seed(settings)
+
+    data = web_module.dashboard_data(
+        settings,
+        include_pair_quality=False,
+        include_heavy_audits=False,
+    )
+    html = _render_dashboard(settings)
+
+    assert data["discovery_freshness"]["summary_mode"] == "fast"
+    assert data["rtds_watch_audit"]["deferred"] is True
+    assert "重型实时审计已从首屏延后" in html
+    assert "打开 RTDS Watch 审计" in html
+
+
+def test_dashboard_localizes_internal_status_badges(tmp_path):
+    settings = _settings(tmp_path)
+    _seed(settings)
+
+    html = _render_dashboard(settings)
+
+    assert ">自动复核中<" in html
+    assert ">L3 深度证据<" in _localized_cell("l3_deep")
+    assert ">证据摘要就绪<" in _localized_cell("summary_ready")
+    assert ">Paper 候选<" in _badge("paper_candidate")
+    assert _format_cell("active") == "active"
 
 
 def test_wallet_workbench_places_candidate_queue_before_research_diagnostics(tmp_path):
@@ -2815,6 +2888,20 @@ def test_wallet_workbench_places_candidate_queue_before_research_diagnostics(tmp
     assert "研究诊断" in html
     assert html.index("候选队列") < html.index("研究诊断")
     assert html.index("候选队列") < html.index("证据深度")
+
+
+def test_wallet_workbench_uses_operator_friendly_filters(tmp_path):
+    settings = _settings(tmp_path)
+    _seed(settings)
+
+    html = _render_wallets(settings, stage="needs_manual_review", source="", query="", signal="")
+
+    assert '<select name="stage"' in html
+    assert '<select name="source"' in html
+    assert 'value="needs_manual_review" selected' in html
+    assert "自动复核中" in html
+    assert "输入地址、标签或备注" in html
+    assert 'class="wallet-table"' in html
 
 
 def test_source_filtered_discovery_includes_focus_diagnostics(tmp_path):
