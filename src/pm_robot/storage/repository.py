@@ -22,6 +22,8 @@ from pm_robot.pipeline_terms import (
     EvidenceStatus,
     EvidenceTier,
     PAPER_ELIGIBLE_CANDIDATE_STAGES,
+    evidence_promotion_approval_snapshot,
+    evidence_promotion_is_approved,
 )
 from pm_robot.storage.db import retry_sqlite_locked
 
@@ -521,6 +523,8 @@ def list_evidence_backfill_targets(
     stage: str,
     limit: int,
     now: int | None = None,
+    expected_policy_version: str | None = None,
+    expected_materializer_version: str | None = None,
 ) -> list[dict[str, Any]]:
     ts = now or int(time.time())
     rows = conn.execute(
@@ -539,15 +543,112 @@ def list_evidence_backfill_targets(
           ON wa.address = ebb.wallet
         WHERE ebb.stage = ?
           AND ebb.next_attempt_at <= ?
+          AND (
+                ebb.stage = 'light_pending'
+                OR ebb.stop_reason LIKE 'promotion_approved:' || ebb.stage || ':%'
+          )
           AND cw.candidate_stage NOT IN ('rejected', 'blocked_hygiene', 'blocked_copyability')
           AND COALESCE(wr.raw_retention_tier, '') != 'summary_only'
         GROUP BY ebb.wallet
         ORDER BY ebb.priority ASC, ebb.updated_at ASC, ebb.wallet ASC
         LIMIT ?
         """,
-        (stage, ts, limit),
+        (stage, ts, max(limit * 16, limit + 100)),
     ).fetchall()
-    return [dict(row) for row in rows]
+    return [
+        dict(row)
+        for row in rows
+        if stage == EvidenceJobStage.LIGHT_PENDING.value
+        or evidence_promotion_approval_is_current(
+            conn,
+            wallet=str(row["wallet"]),
+            job_action=stage,
+            expected_policy_version=expected_policy_version,
+            expected_materializer_version=expected_materializer_version,
+        )
+    ][:limit]
+
+
+def evidence_promotion_approval_is_current(
+    conn: sqlite3.Connection,
+    *,
+    wallet: str,
+    job_action: str,
+    expected_policy_version: str | None = None,
+    expected_materializer_version: str | None = None,
+) -> bool:
+    """Verify that a depth approval still matches policy, features, and raw activity."""
+
+    if job_action == EvidenceJobStage.LIGHT_PENDING.value:
+        return True
+    row = conn.execute(
+        """
+        SELECT
+            ebb.stop_reason,
+            ebb.evidence_json,
+            wf.updated_at AS feature_updated_at,
+            wf.extra_json AS feature_extra_json,
+            COALESCE(ls.policy_version, '') AS latest_score_policy_version,
+            (
+                SELECT COUNT(*)
+                FROM wallet_activity wa
+                WHERE wa.address = ebb.wallet
+                  AND wa.type = 'TRADE'
+            ) AS raw_activity_count
+        FROM evidence_backfill_budget ebb
+        LEFT JOIN wallet_features wf
+          ON wf.address = ebb.wallet
+        LEFT JOIN leader_latest_scores ls
+          ON ls.address = ebb.wallet
+        WHERE ebb.wallet = ?
+        """,
+        (wallet.lower(),),
+    ).fetchone()
+    if row is None or row["feature_updated_at"] is None:
+        return False
+    snapshot = evidence_promotion_approval_snapshot(
+        str(row["stop_reason"] or ""),
+        job_action,
+    )
+    if snapshot is None:
+        return False
+    policy_version = str(snapshot["policy_version"])
+    if expected_policy_version is not None and policy_version != expected_policy_version:
+        return False
+    latest_score_policy = str(row["latest_score_policy_version"] or "")
+    if (
+        job_action == EvidenceJobStage.DEEP_PENDING.value
+        and policy_version != latest_score_policy
+    ):
+        return False
+    evidence = _json_object(row["evidence_json"])
+    promotion = evidence.get("promotion")
+    if not isinstance(promotion, dict) or not bool(promotion.get("approved")):
+        return False
+    feature_extra = _json_object(row["feature_extra_json"])
+    promotion_materializer = str(promotion.get("materializer_version") or "")
+    feature_materializer = str(
+        feature_extra.get("feature_materializer_version") or ""
+    )
+    return (
+        str(promotion.get("job_action") or "") == job_action
+        and str(promotion.get("policy_version") or "") == policy_version
+        and int(promotion.get("feature_updated_at") or 0)
+        == int(row["feature_updated_at"] or 0)
+        == int(snapshot["feature_updated_at"])
+        and int(
+            promotion["activity_count"]
+            if promotion.get("activity_count") is not None
+            else -1
+        )
+        == int(row["raw_activity_count"] or 0)
+        == int(snapshot["activity_count"])
+        and promotion_materializer == feature_materializer
+        and (
+            expected_materializer_version is None
+            or promotion_materializer == expected_materializer_version
+        )
+    )
 
 
 def update_evidence_backfill_budget(
@@ -733,6 +834,32 @@ def complete_evidence_backfill_job(
         WHERE job_id = ?
         """,
         (ts, ts, job_id),
+    )
+
+
+def supersede_evidence_backfill_job(
+    conn: sqlite3.Connection,
+    *,
+    job_id: int,
+    reason: str,
+    now: int | None = None,
+) -> None:
+    """Close a claimed legacy job that no longer has valid depth approval."""
+
+    ts = now or int(time.time())
+    conn.execute(
+        """
+        UPDATE evidence_backfill_jobs
+        SET status = 'superseded',
+            lease_owner = NULL,
+            lease_until = 0,
+            last_error = ?,
+            completed_at = ?,
+            updated_at = ?
+        WHERE job_id = ?
+          AND status = 'running'
+        """,
+        (reason[:1000], ts, ts, job_id),
     )
 
 
@@ -1015,7 +1142,9 @@ def sync_wallet_processing_state(
     wallet = wallet.lower()
     budget = conn.execute(
         """
-        SELECT stage, target_depth, current_depth, priority, next_attempt_at, last_attempt_at
+        SELECT
+            stage, target_depth, current_depth, priority, next_attempt_at,
+            last_attempt_at, stop_reason, evidence_json
         FROM evidence_backfill_budget
         WHERE wallet = ?
         """,
@@ -1059,9 +1188,17 @@ def sync_wallet_processing_state(
     budget_depth = int(budget["current_depth"] if budget else 0)
     priority = int(budget["priority"] if budget else 100)
     next_action_at = int(budget["next_attempt_at"] if budget else 0)
+    stop_reason = str(budget["stop_reason"] if budget else "")
+    if stop_reason and not evidence_promotion_approval_is_current(
+        conn,
+        wallet=wallet,
+        job_action=current_stage,
+    ):
+        stop_reason = ""
     evidence_status, next_action = _next_pipeline_action(
         evidence_tier=evidence_tier,
         current_stage=current_stage,
+        stop_reason=stop_reason,
         activity_count=activity_count,
         distinct_markets=distinct_markets,
         non_fast_trade_count=non_fast_trade_count,
@@ -1470,6 +1607,41 @@ def complete_pipeline_job(
     return bool(updated)
 
 
+def supersede_pipeline_job(
+    conn: sqlite3.Connection,
+    *,
+    job_id: int,
+    reason: str,
+    worker_id: str | None = None,
+    now: int | None = None,
+) -> bool:
+    """Close obsolete queued work, optionally requiring the active worker lease."""
+
+    ts = now or int(time.time())
+    params: list[Any] = [reason[:1000], ts, ts, int(job_id)]
+    lease_clause = ""
+    if worker_id is not None:
+        lease_clause = "AND status = 'running' AND lease_owner = ?"
+        params.append(worker_id)
+    else:
+        lease_clause = "AND status = 'queued'"
+    updated = conn.execute(
+        f"""
+        UPDATE pipeline_jobs
+        SET status = 'superseded',
+            lease_owner = NULL,
+            lease_until = 0,
+            last_error = ?,
+            completed_at = ?,
+            updated_at = ?
+        WHERE job_id = ?
+          {lease_clause}
+        """,
+        tuple(params),
+    ).rowcount
+    return bool(updated)
+
+
 def retry_pipeline_job(
     conn: sqlite3.Connection,
     *,
@@ -1627,47 +1799,39 @@ def _next_pipeline_action(
     *,
     evidence_tier: str,
     current_stage: str,
+    stop_reason: str = "",
     activity_count: int,
     distinct_markets: int,
     non_fast_trade_count: int,
     fast_market_share: float,
 ) -> tuple[str, str]:
-    """Map evidence tier and legacy job stage to the next queue action."""
+    """Map evidence truth to queue work without deciding depth promotion policy."""
     if current_stage == "paused_fast_market_specialist" or (
         activity_count >= 50 and fast_market_share >= 0.85
     ):
         return EvidenceStatus.PAUSED.value, "manual_review_fast_market"
-    if current_stage == EvidenceJobStage.LIGHT_DONE.value:
-        if distinct_markets >= 3 or non_fast_trade_count >= 10:
-            return EvidenceStatus.NEEDS_MEDIUM.value, EvidenceJobStage.MEDIUM_PENDING.value
-        # Light history was fetched successfully but did not justify another pass.
-        return EvidenceStatus.SUMMARY_READY.value, "score_wallet"
-    if current_stage in {EvidenceJobStage.MEDIUM_DONE.value, EvidenceJobStage.DEEP_DONE.value}:
+    if current_stage in {
+        EvidenceJobStage.LIGHT_DONE.value,
+        EvidenceJobStage.MEDIUM_DONE.value,
+        EvidenceJobStage.DEEP_DONE.value,
+    }:
         return EvidenceStatus.SUMMARY_READY.value, "score_wallet"
     if evidence_tier == EvidenceTier.L3_DEEP.value:
         return EvidenceStatus.SUMMARY_READY.value, "score_wallet"
-    if _pending_action_matches_evidence_tier(current_stage, evidence_tier):
-        return EvidenceStatus.QUEUED.value, current_stage
-    if evidence_tier == EvidenceTier.L0_DISCOVERED.value:
+    if current_stage == EvidenceJobStage.LIGHT_PENDING.value:
+        if activity_count < 25:
+            return EvidenceStatus.QUEUED.value, current_stage
+        return EvidenceStatus.SUMMARY_READY.value, "score_wallet"
+    if current_stage in {
+        EvidenceJobStage.MEDIUM_PENDING.value,
+        EvidenceJobStage.DEEP_PENDING.value,
+    }:
+        if evidence_promotion_is_approved(stop_reason, current_stage):
+            return EvidenceStatus.QUEUED.value, current_stage
+        return EvidenceStatus.SUMMARY_READY.value, "score_wallet"
+    if evidence_tier == EvidenceTier.L0_DISCOVERED.value or activity_count < 25:
         return EvidenceStatus.NEEDS_LIGHT.value, EvidenceJobStage.LIGHT_PENDING.value
-    if evidence_tier == EvidenceTier.L1_LIGHT.value:
-        return (
-            EvidenceStatus.NEEDS_MEDIUM.value if activity_count >= 25 else EvidenceStatus.NEEDS_LIGHT.value,
-            EvidenceJobStage.MEDIUM_PENDING.value if activity_count >= 25 else EvidenceJobStage.LIGHT_PENDING.value,
-        )
-    if evidence_tier == EvidenceTier.L2_MEDIUM.value:
-        return EvidenceStatus.NEEDS_DEEP.value, EvidenceJobStage.DEEP_PENDING.value
     return EvidenceStatus.SUMMARY_READY.value, "score_wallet"
-
-
-def _pending_action_matches_evidence_tier(current_stage: str, evidence_tier: str) -> bool:
-    """Keep a queued job only when it still matches the evidence tier truth."""
-
-    return (
-        (current_stage == EvidenceJobStage.LIGHT_PENDING.value and evidence_tier == EvidenceTier.L0_DISCOVERED.value)
-        or (current_stage == EvidenceJobStage.MEDIUM_PENDING.value and evidence_tier == EvidenceTier.L1_LIGHT.value)
-        or (current_stage == EvidenceJobStage.DEEP_PENDING.value and evidence_tier == EvidenceTier.L2_MEDIUM.value)
-    )
 
 
 def _wallet_processing_state_ready(conn: sqlite3.Connection) -> bool:

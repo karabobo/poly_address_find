@@ -19,6 +19,7 @@ from pm_robot.orchestration.evidence_backfill import (
     _fetch_activity_history,
     summarize_wallet_evidence,
 )
+from pm_robot.orchestration.feature_materializer import MATERIALIZER_VERSION
 from pm_robot.orchestration.retry_policy import (
     is_upstream_scheduling_error,
     upstream_aware_retry_at,
@@ -35,6 +36,7 @@ from pm_robot.storage.repository import (
     PipelineJobLeaseLost,
     claim_pipeline_job,
     complete_pipeline_job,
+    evidence_promotion_approval_is_current,
     finish_ingest_run,
     enqueue_pipeline_job,
     persist_wallet_activity,
@@ -45,6 +47,7 @@ from pm_robot.storage.repository import (
     retry_pipeline_job,
     start_ingest_run,
     sync_wallet_processing_state,
+    supersede_pipeline_job,
     update_evidence_backfill_budget,
     upsert_wallet_evidence_summary,
 )
@@ -94,6 +97,7 @@ class WalletPipelineWorkerSummary:
 def plan_wallet_pipeline_jobs(
     conn: sqlite3.Connection,
     *,
+    policy_version: str = "",
     light_limit: int = DEFAULT_PIPELINE_STAGE_WEIGHTS[EvidenceJobStage.LIGHT_PENDING.value],
     medium_limit: int = DEFAULT_PIPELINE_STAGE_WEIGHTS[EvidenceJobStage.MEDIUM_PENDING.value],
     deep_limit: int = DEFAULT_PIPELINE_STAGE_WEIGHTS[EvidenceJobStage.DEEP_PENDING.value],
@@ -111,6 +115,7 @@ def plan_wallet_pipeline_jobs(
         ts = now or int(time.time())
         prefetched_targets = _prefetch_pipeline_targets(
             conn,
+            policy_version=policy_version,
             light_limit=light_limit,
             medium_limit=medium_limit,
             deep_limit=deep_limit,
@@ -120,6 +125,7 @@ def plan_wallet_pipeline_jobs(
         try:
             summary = _plan_wallet_pipeline_jobs_once(
                 conn,
+                policy_version=policy_version,
                 light_limit=light_limit,
                 medium_limit=medium_limit,
                 deep_limit=deep_limit,
@@ -145,6 +151,7 @@ def plan_wallet_pipeline_jobs(
 def _plan_wallet_pipeline_jobs_once(
     conn: sqlite3.Connection,
     *,
+    policy_version: str,
     light_limit: int,
     medium_limit: int,
     deep_limit: int,
@@ -173,6 +180,7 @@ def _plan_wallet_pipeline_jobs_once(
     )
     targets = _select_pipeline_targets(
         conn,
+        policy_version=policy_version,
         light_limit=light_limit,
         medium_limit=medium_limit,
         deep_limit=deep_limit,
@@ -219,6 +227,7 @@ def _plan_wallet_pipeline_jobs_once(
 def run_wallet_pipeline_worker(
     conn: sqlite3.Connection,
     *,
+    policy_version: str = "",
     shard_index: int,
     shard_count: int,
     limit: int = 8,
@@ -281,6 +290,21 @@ def run_wallet_pipeline_worker(
             wallet = str(job["wallet"]).lower()
             input_data = _json_object(job.get("input_json"))
             stage, target_depth = _job_stage_depth(job, input_data)
+            if stage != EvidenceJobStage.LIGHT_PENDING.value and not _promotion_approved(
+                conn,
+                wallet=wallet,
+                job_action=stage,
+                policy_version=policy_version,
+            ):
+                supersede_pipeline_job(
+                    conn,
+                    job_id=int(job["job_id"]),
+                    worker_id=worker_id,
+                    reason="evidence_depth_not_approved",
+                )
+                conn.commit()
+                stage_updates["promotion_guarded"] = stage_updates.get("promotion_guarded", 0) + 1
+                continue
             try:
                 for write_attempt in range(LOCK_RETRY_ATTEMPTS):
                     try:
@@ -729,6 +753,7 @@ def _active_wallet_pipeline_jobs(conn: sqlite3.Connection) -> int:
 def _select_pipeline_targets(
     conn: sqlite3.Connection,
     *,
+    policy_version: str,
     light_limit: int,
     medium_limit: int,
     deep_limit: int,
@@ -744,6 +769,7 @@ def _select_pipeline_targets(
     targets_by_stage = (
         _prefetch_pipeline_targets(
             conn,
+            policy_version=policy_version,
             light_limit=light_limit,
             medium_limit=medium_limit,
             deep_limit=deep_limit,
@@ -756,7 +782,12 @@ def _select_pipeline_targets(
             if limit > 0
         }
     )
-    targets_by_stage = _revalidate_pipeline_targets(conn, targets_by_stage, now=now)
+    targets_by_stage = _revalidate_pipeline_targets(
+        conn,
+        targets_by_stage,
+        policy_version=policy_version,
+        now=now,
+    )
     target_count = sum(len(stage_targets) for stage_targets in targets_by_stage.values())
     selection_limit = target_count if max_targets is None else min(max_targets, target_count)
     if selection_limit <= 0:
@@ -819,6 +850,7 @@ def _select_pipeline_targets(
 def _prefetch_pipeline_targets(
     conn: sqlite3.Connection,
     *,
+    policy_version: str,
     light_limit: int,
     medium_limit: int,
     deep_limit: int,
@@ -832,7 +864,13 @@ def _prefetch_pipeline_targets(
         (EvidenceJobStage.DEEP_PENDING.value, deep_limit),
     )
     return {
-        evidence_job_stage: _targets_for_action(conn, evidence_job_stage, limit, now)
+        evidence_job_stage: _targets_for_action(
+            conn,
+            evidence_job_stage,
+            limit,
+            now,
+            policy_version=policy_version,
+        )
         for evidence_job_stage, limit in stage_limits
         if limit > 0
     }
@@ -842,6 +880,7 @@ def _revalidate_pipeline_targets(
     conn: sqlite3.Connection,
     targets_by_stage: dict[str, list[dict[str, Any]]],
     *,
+    policy_version: str,
     now: int,
 ) -> dict[str, list[dict[str, Any]]]:
     """Recheck mutable eligibility and dedupe state while queue capacity is reserved."""
@@ -859,10 +898,13 @@ def _revalidate_pipeline_targets(
             wps.evidence_status,
             wps.next_action,
             wps.next_action_at,
+            COALESCE(ebb.stop_reason, '') AS stop_reason,
             cw.candidate_stage
         FROM wallet_processing_state wps
         JOIN candidate_wallets cw
           ON cw.address = wps.wallet
+        LEFT JOIN evidence_backfill_budget ebb
+          ON ebb.wallet = wps.wallet
         LEFT JOIN wallet_registry wr
           ON wr.address = wps.wallet
         WHERE wps.wallet IN ({placeholders})
@@ -899,6 +941,16 @@ def _revalidate_pipeline_targets(
                 or str(state["evidence_status"] or "") in {"paused", "summary_ready"}
                 or str(state["candidate_stage"] or "") in blocked_stages
                 or str(state["discovery_tier"] or "") != job_scope
+                or (
+                    evidence_job_stage != EvidenceJobStage.LIGHT_PENDING.value
+                    and not evidence_promotion_approval_is_current(
+                        conn,
+                        wallet=wallet,
+                        job_action=evidence_job_stage,
+                        expected_policy_version=policy_version,
+                        expected_materializer_version=MATERIALIZER_VERSION,
+                    )
+                )
             ):
                 continue
             conflict = False
@@ -997,9 +1049,12 @@ def _targets_for_action(
     evidence_job_stage: str,
     limit: int,
     now: int,
+    *,
+    policy_version: str,
 ) -> list[dict[str, Any]]:
+    approval_sql = _planner_promotion_approval_sql()
     rows = conn.execute(
-        """
+        f"""
         SELECT
             wps.wallet,
             wps.discovery_tier,
@@ -1013,11 +1068,21 @@ def _targets_for_action(
         FROM wallet_processing_state wps
         JOIN candidate_wallets cw
           ON cw.address = wps.wallet
+        LEFT JOIN evidence_backfill_budget ebb
+          ON ebb.wallet = wps.wallet
+        LEFT JOIN wallet_features wf
+          ON wf.address = wps.wallet
+        LEFT JOIN leader_latest_scores ls
+          ON ls.address = wps.wallet
         LEFT JOIN wallet_registry wr
           ON wr.address = wps.wallet
         WHERE wps.next_action = ?
           AND wps.next_action_at <= ?
           AND wps.evidence_status NOT IN ('paused', 'summary_ready')
+          AND (
+                wps.next_action = 'light_pending'
+                OR {approval_sql}
+          )
           AND cw.candidate_stage NOT IN ('rejected', 'blocked_hygiene', 'blocked_copyability')
           AND COALESCE(wr.raw_retention_tier, '') != 'summary_only'
           AND NOT EXISTS (
@@ -1058,6 +1123,7 @@ def _targets_for_action(
         (
             evidence_job_stage,
             now,
+            policy_version,
             JOB_TYPE,
             evidence_job_stage,
             JOB_TYPE,
@@ -1069,6 +1135,66 @@ def _targets_for_action(
         ),
     ).fetchall()
     return [dict(row) for row in rows]
+
+
+def _planner_promotion_approval_sql() -> str:
+    """Mirror the worker's snapshot guard before reserving queue capacity."""
+
+    materializer_version = MATERIALIZER_VERSION.replace("'", "''")
+    return f"""
+        (
+            COALESCE(CAST(json_extract(
+                ebb.evidence_json,
+                '$.promotion.approved'
+            ) AS INTEGER), 0) = 1
+            AND COALESCE(json_extract(
+                ebb.evidence_json,
+                '$.promotion.job_action'
+            ), '') = wps.next_action
+            AND COALESCE(json_extract(
+                ebb.evidence_json,
+                '$.promotion.policy_version'
+            ), '') = ?
+            AND COALESCE(CAST(json_extract(
+                ebb.evidence_json,
+                '$.promotion.feature_updated_at'
+            ) AS INTEGER), 0) = COALESCE(wf.updated_at, 0)
+            AND COALESCE(CAST(json_extract(
+                ebb.evidence_json,
+                '$.promotion.activity_count'
+            ) AS INTEGER), -1) = (
+                SELECT COUNT(*)
+                FROM wallet_activity wa
+                WHERE wa.address = wps.wallet AND wa.type = 'TRADE'
+            )
+            AND COALESCE(json_extract(
+                ebb.evidence_json,
+                '$.promotion.materializer_version'
+            ), '') = '{materializer_version}'
+            AND COALESCE(json_extract(
+                wf.extra_json,
+                '$.feature_materializer_version'
+            ), '') = '{materializer_version}'
+            AND (
+                wps.next_action = 'medium_pending'
+                OR COALESCE(ls.policy_version, '') = COALESCE(json_extract(
+                    ebb.evidence_json,
+                    '$.promotion.policy_version'
+                ), '')
+            )
+            AND COALESCE(ebb.stop_reason, '') =
+                'promotion_approved:' || wps.next_action || ':' ||
+                COALESCE(json_extract(
+                    ebb.evidence_json,
+                    '$.promotion.policy_version'
+                ), '') || ':' || CAST(COALESCE(wf.updated_at, 0) AS TEXT) || ':' ||
+                CAST((
+                    SELECT COUNT(*)
+                    FROM wallet_activity wa
+                    WHERE wa.address = wps.wallet AND wa.type = 'TRADE'
+                ) AS TEXT)
+        )
+    """
 
 
 def _stage_depth(job_action: str) -> tuple[str, int]:
@@ -1090,6 +1216,24 @@ def _job_stage_depth(job: dict[str, Any], input_data: dict[str, Any]) -> tuple[s
     except (TypeError, ValueError):
         target_depth = default_depth
     return evidence_job_stage, target_depth
+
+
+def _promotion_approved(
+    conn: sqlite3.Connection,
+    *,
+    wallet: str,
+    job_action: str,
+    policy_version: str,
+) -> bool:
+    """Protect network work from legacy pending states that bypassed policy admission."""
+
+    return evidence_promotion_approval_is_current(
+        conn,
+        wallet=wallet,
+        job_action=job_action,
+        expected_policy_version=policy_version,
+        expected_materializer_version=MATERIALIZER_VERSION,
+    )
 
 
 def _ensure_evidence_budget(

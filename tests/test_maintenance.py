@@ -87,6 +87,169 @@ def test_maintenance_skip_cleanup_avoids_cleanup_scan(tmp_path, monkeypatch):
     assert result["deleted"] == {}
 
 
+def test_maintenance_cleanup_batch_limit_bounds_each_retention_table(tmp_path):
+    settings = _settings(tmp_path)
+    initialize_database(settings.db_path)
+    now = int(time.time())
+    old = now - 8 * 86_400
+    conn = connect(settings.db_path)
+    try:
+        run_migrations(conn)
+        conn.executemany(
+            """
+            INSERT INTO api_request_log(
+                ts, base_url, endpoint, status_code, latency_ms,
+                retry_count, error_type, ok
+            ) VALUES (?, 'https://example.test', '/data', 200, 10, 0, '', 1)
+            """,
+            [(old - 2,), (old - 1,), (old,), (now,)],
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    result = maintenance(settings, api_log_days=7, cleanup_batch_limit=2)
+
+    assert result["cleanup_batch_limit"] == 2
+    assert result["optimize"] is False
+    assert result["deleted"]["api_request_log"] == 2
+    conn = connect(settings.db_path)
+    try:
+        old_count = conn.execute(
+            "SELECT COUNT(*) FROM api_request_log WHERE ts < ?",
+            (now - 7 * 86_400,),
+        ).fetchone()[0]
+        current_count = conn.execute(
+            "SELECT COUNT(*) FROM api_request_log WHERE ts >= ?",
+            (now - 7 * 86_400,),
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    assert old_count == 1
+    assert current_count == 1
+
+
+def test_retention_timestamp_indexes_are_installed(tmp_path):
+    settings = _settings(tmp_path)
+    initialize_database(settings.db_path)
+    conn = connect(settings.db_path)
+    try:
+        run_migrations(conn)
+        indexes = {
+            str(row[0])
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index'"
+            ).fetchall()
+        }
+    finally:
+        conn.close()
+
+    assert {
+        "idx_wallet_positions_captured_at",
+        "idx_leader_scores_scored_at",
+        "idx_review_events_created_at",
+        "idx_ingest_runs_started_at",
+    } <= indexes
+    assert {
+        "idx_paper_marks_marked_at",
+        "idx_paper_readiness_observations_observed_at",
+    }.isdisjoint(indexes)
+
+
+def test_maintenance_retains_each_wallet_latest_score_summary(tmp_path):
+    settings = _settings(tmp_path)
+    initialize_database(settings.db_path)
+    wallet = "0x" + "a" * 40
+    old = int(time.time()) - 31 * 86_400
+    conn = connect(settings.db_path)
+    try:
+        run_migrations(conn)
+        upsert_candidate(conn, CandidateAddress(address=wallet, sources="maintenance-test"))
+        conn.executemany(
+            """
+            INSERT INTO leader_scores(
+                address, leader_score, review_stage, review_reason,
+                components_json, penalties_json, policy_version, scored_at
+            ) VALUES (?, ?, 'needs_data', 'test', '{}', '{}', 'test-v1', ?)
+            """,
+            [(wallet, 10.0, old - 1), (wallet, 20.0, old)],
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    result = maintenance(settings, scores_days=30, cleanup_batch_limit=10)
+
+    assert result["deleted"]["leader_scores"] == 1
+    conn = connect(settings.db_path)
+    try:
+        scores = conn.execute(
+            "SELECT leader_score FROM leader_scores WHERE address = ? ORDER BY score_id",
+            (wallet,),
+        ).fetchall()
+        latest = conn.execute(
+            "SELECT leader_score FROM leader_latest_scores WHERE address = ?",
+            (wallet,),
+        ).fetchone()
+    finally:
+        conn.close()
+    assert [float(row[0]) for row in scores] == [20.0]
+    assert float(latest[0]) == 20.0
+
+
+def test_unbounded_manual_maintenance_keeps_sqlite_optimize(tmp_path):
+    settings = _settings(tmp_path)
+    initialize_database(settings.db_path)
+
+    result = maintenance(settings)
+
+    assert result["cleanup_batch_limit"] == 0
+    assert result["optimize"] is True
+
+
+def test_generic_ttl_cleanup_never_deletes_paper_evidence(tmp_path):
+    settings = _settings(tmp_path)
+    initialize_database(settings.db_path)
+    old = int(time.time()) - 120 * 86_400
+    wallet = "0x" + "b" * 40
+    conn = connect(settings.db_path)
+    try:
+        run_migrations(conn)
+        conn.execute(
+            """
+            INSERT INTO paper_marks(
+                wallet, market_slug, asset_id, mark_price, mark_source, marked_at
+            ) VALUES (?, 'market', 'asset', 0.5, 'gamma', ?)
+            """,
+            (wallet, old),
+        )
+        conn.execute(
+            """
+            INSERT INTO paper_readiness_observations(
+                wallet, observed_at, orders, settled_positions, mark_coverage,
+                settled_roi, total_roi, production_ready, blockers_json
+            ) VALUES (?, ?, 10, 2, 1.0, 0.1, 0.1, 1, '[]')
+            """,
+            (wallet, old),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    result = maintenance(settings, cleanup_batch_limit=500)
+
+    assert result["deleted"]["paper_marks"] == 0
+    assert result["deleted"]["paper_readiness_observations"] == 0
+    conn = connect(settings.db_path)
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM paper_marks").fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT COUNT(*) FROM paper_readiness_observations"
+        ).fetchone()[0] == 1
+    finally:
+        conn.close()
+
+
 def test_maintenance_skip_cleanup_prunes_only_old_runtime_heartbeats(tmp_path):
     settings = _settings(tmp_path)
     initialize_database(settings.db_path)

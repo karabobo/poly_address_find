@@ -420,6 +420,12 @@ def main() -> int:
     cycle_cmd.add_argument("--copyability-rescan-seconds", type=int, default=21_600)
     cycle_cmd.add_argument("--feature-limit", type=int, default=10)
     cycle_cmd.add_argument("--feature-min-activity-events", type=int, default=25)
+    cycle_cmd.add_argument(
+        "--evidence-promotion-limit",
+        type=int,
+        default=100,
+        help="Maximum fresh wallets evaluated locally for L1/L2 depth promotion",
+    )
     cycle_cmd.add_argument("--score-limit", type=int, default=0)
     cycle_cmd.add_argument("--policy", default=str(DEFAULT_POLICY_PATH))
     cycle_cmd.add_argument("--no-score", action="store_true", help="Skip local incremental scoring in execute mode")
@@ -695,6 +701,12 @@ def main() -> int:
         help="Skip cleanup scans; useful for lightweight storage/WAL maintenance",
     )
     maintenance_cmd.add_argument(
+        "--cleanup-batch-limit",
+        type=int,
+        default=0,
+        help="Maximum expired rows deleted per retention table; 0 keeps the unbounded CLI behavior",
+    )
+    maintenance_cmd.add_argument(
         "--wal-checkpoint",
         choices=("none", "passive", "truncate"),
         default="none",
@@ -726,6 +738,15 @@ def main() -> int:
     prune_cmd = sub.add_parser("prune-evidence", help="Prune low-value raw wallet evidence after materialization")
     prune_cmd.add_argument("--db", dest="command_db", default=None, help="SQLite database path")
     prune_cmd.add_argument("--limit", type=int, default=20)
+    prune_cmd.add_argument(
+        "--max-activity-rows",
+        type=int,
+        default=0,
+        help=(
+            "Exact wallet_activity row budget for one prune batch; 0 disables it. "
+            "One oversized oldest wallet may exceed the budget to avoid starvation"
+        ),
+    )
     prune_cmd.add_argument("--keep-recent-activity", type=int, default=0)
     prune_cmd.add_argument("--execute", action="store_true", help="Actually delete rows; default is dry-run")
     prune_cmd.add_argument("--vacuum", action="store_true")
@@ -1009,6 +1030,7 @@ def main() -> int:
             run_migrations(conn)
             summary = run_evidence_backfill(
                 conn,
+                policy_version=str(load_policy(settings.policy_path).get("version") or ""),
                 light_limit=args.light_limit,
                 medium_limit=args.medium_limit,
                 deep_limit=args.deep_limit,
@@ -1034,6 +1056,7 @@ def main() -> int:
             run_migrations(conn)
             summary = plan_queued_evidence_backfill(
                 conn,
+                policy_version=str(load_policy(settings.policy_path).get("version") or ""),
                 light_limit=args.light_limit,
                 medium_limit=args.medium_limit,
                 deep_limit=args.deep_limit,
@@ -1049,6 +1072,7 @@ def main() -> int:
             run_migrations(conn)
             summary = run_queued_evidence_backfill_worker(
                 conn,
+                policy_version=str(load_policy(settings.policy_path).get("version") or ""),
                 shard_index=args.shard_index,
                 shard_count=args.shard_count,
                 limit=args.limit,
@@ -1095,6 +1119,7 @@ def main() -> int:
             run_migrations(conn)
             summary = plan_wallet_pipeline_jobs(
                 conn,
+                policy_version=str(load_policy(settings.policy_path).get("version") or ""),
                 light_limit=args.light_limit,
                 medium_limit=args.medium_limit,
                 deep_limit=args.deep_limit,
@@ -1111,6 +1136,7 @@ def main() -> int:
             run_migrations(conn)
             summary = run_wallet_pipeline_worker(
                 conn,
+                policy_version=str(load_policy(settings.policy_path).get("version") or ""),
                 shard_index=args.shard_index,
                 shard_count=args.shard_count,
                 limit=args.limit,
@@ -1205,6 +1231,7 @@ def main() -> int:
                 top=args.top,
                 min_score=args.min_score,
                 paper_min_score=float(paper_min_score),
+                policy_version=str(load_policy(settings.policy_path).get("version") or ""),
             )
         finally:
             conn.close()
@@ -1262,6 +1289,7 @@ def main() -> int:
                     planner_lock_sleep_seconds=max(0.0, args.planner_lock_sleep_seconds),
                     feature_limit=args.feature_limit,
                     feature_min_activity_events=args.feature_min_activity_events,
+                    evidence_promotion_limit=args.evidence_promotion_limit,
                     score_limit=args.score_limit,
                     run_scoring=not args.no_score,
                     policy_path=Path(args.policy),
@@ -1561,6 +1589,7 @@ def main() -> int:
             vacuum=args.vacuum,
             wal_checkpoint=args.wal_checkpoint,
             skip_cleanup=args.skip_cleanup,
+            cleanup_batch_limit=args.cleanup_batch_limit,
             reset_stale_jobs=args.reset_stale_jobs,
             failed_job_cooldown_seconds=args.failed_job_cooldown_seconds,
             reset_stale_ingest_runs=args.reset_stale_ingest_runs,
@@ -1572,6 +1601,7 @@ def main() -> int:
         data = prune_low_value_evidence(
             settings,
             limit=args.limit,
+            max_activity_rows=args.max_activity_rows,
             keep_recent_activity=args.keep_recent_activity,
             dry_run=not args.execute,
             vacuum=args.vacuum,

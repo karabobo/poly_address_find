@@ -1,7 +1,7 @@
 #!/usr/bin/env sh
 set -eu
 
-INTERVAL="${PM_ROBOT_MAINTENANCE_INTERVAL:-3600}"
+INTERVAL="${PM_ROBOT_MAINTENANCE_INTERVAL:-900}"
 START_DELAY="${PM_ROBOT_MAINTENANCE_START_DELAY:-300}"
 WAL_CHECKPOINT="${PM_ROBOT_MAINTENANCE_WAL_CHECKPOINT:-passive}"
 REPORT_PATH="${PM_ROBOT_MAINTENANCE_REPORT_PATH:-/app/reports/maintenance_status.json}"
@@ -9,11 +9,15 @@ STALE_INGEST_RUN_SECONDS="${PM_ROBOT_MAINTENANCE_STALE_INGEST_RUN_SECONDS:-21600
 FAILED_JOB_COOLDOWN_SECONDS="${PM_ROBOT_MAINTENANCE_FAILED_JOB_COOLDOWN_SECONDS:-21600}"
 KEEP_BACKUPS="${PM_ROBOT_MAINTENANCE_KEEP_BACKUPS:-0}"
 RUNTIME_HEARTBEAT_DAYS="${PM_ROBOT_MAINTENANCE_RUNTIME_HEARTBEAT_DAYS:-30}"
+CLEANUP_BATCH_LIMIT="${PM_ROBOT_MAINTENANCE_CLEANUP_BATCH_LIMIT:-500}"
 PRUNE_ENABLED="${PM_ROBOT_RETENTION_PRUNE_ENABLED:-1}"
 PRUNE_BATCHES="${PM_ROBOT_RETENTION_PRUNE_BATCHES:-1}"
-PRUNE_LIMIT="${PM_ROBOT_RETENTION_PRUNE_LIMIT:-5}"
+PRUNE_LIMIT="${PM_ROBOT_RETENTION_PRUNE_LIMIT:-20}"
+PRUNE_MAX_ACTIVITY_ROWS="${PM_ROBOT_RETENTION_PRUNE_MAX_ACTIVITY_ROWS:-5000}"
+PRUNE_BATCH_DELAY="${PM_ROBOT_RETENTION_PRUNE_BATCH_DELAY:-10}"
 PRUNE_KEEP_RECENT_ACTIVITY="${PM_ROBOT_RETENTION_KEEP_RECENT_ACTIVITY:-0}"
 PRUNE_ARCHIVE_ENABLED="${PM_ROBOT_RETENTION_ARCHIVE_ENABLED:-1}"
+PRUNE_REPORT_PATH="${PM_ROBOT_RETENTION_PRUNE_REPORT_PATH:-/app/reports/retention_prune_status.json}"
 
 runtime_heartbeat() {
   name="$1"
@@ -41,7 +45,7 @@ while true; do
     report_dir_ready=0
   fi
   if [ "$report_dir_ready" -eq 1 ] && ! python -m pm_robot.cli --env /app/.env maintenance \
-      --skip-cleanup \
+      --cleanup-batch-limit "$CLEANUP_BATCH_LIMIT" \
       --reset-stale-jobs \
       --failed-job-cooldown-seconds "$FAILED_JOB_COOLDOWN_SECONDS" \
       --reset-stale-ingest-runs \
@@ -69,15 +73,31 @@ while true; do
       if [ "$PRUNE_ARCHIVE_ENABLED" = "1" ]; then
         archive_args="--archive"
       fi
-      if ! python -m pm_robot.cli --env /app/.env prune-evidence \
+      if ! prune_output="$(python -m pm_robot.cli --env /app/.env prune-evidence \
           --execute \
           "$archive_args" \
           --limit "$PRUNE_LIMIT" \
-          --keep-recent-activity "$PRUNE_KEEP_RECENT_ACTIVITY"; then
+          --max-activity-rows "$PRUNE_MAX_ACTIVITY_ROWS" \
+          --keep-recent-activity "$PRUNE_KEEP_RECENT_ACTIVITY")"; then
+        maintenance_ok=0
+        break
+      fi
+      printf '%s\n' "$prune_output"
+      PRUNE_REPORT_TMP="${PRUNE_REPORT_PATH}.tmp.$$"
+      if mkdir -p "$(dirname "$PRUNE_REPORT_PATH")" \
+          && printf '%s\n' "$prune_output" >"$PRUNE_REPORT_TMP" \
+          && mv "$PRUNE_REPORT_TMP" "$PRUNE_REPORT_PATH"; then
+        :
+      else
+        echo "$(date -Iseconds) maintenance loop: could not publish prune report" >&2
+        rm -f "$PRUNE_REPORT_TMP" || true
         maintenance_ok=0
         break
       fi
       batch=$((batch + 1))
+      if [ "$batch" -lt "$PRUNE_BATCHES" ] && [ "$PRUNE_BATCH_DELAY" -gt 0 ]; then
+        sleep "$PRUNE_BATCH_DELAY"
+      fi
     done
   fi
   if [ "$maintenance_ok" -eq 1 ]; then

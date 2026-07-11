@@ -1,6 +1,8 @@
+import json
 import sqlite3
 
 from pm_robot.models import CandidateAddress, WalletFeatures
+from pm_robot.orchestration.feature_materializer import MATERIALIZER_VERSION
 from pm_robot.orchestration.pipeline_audit import pipeline_audit_report
 from pm_robot.storage.db import connect, run_migrations
 from pm_robot.storage.repository import (
@@ -77,7 +79,7 @@ def test_pipeline_audit_finds_pending_evidence_without_active_job(tmp_path):
     try:
         run_migrations(conn)
         upsert_candidate(conn, CandidateAddress(address=wallet, sources="test_source"))
-        persist_wallet_activity(conn, wallet, [_event(wallet, idx) for idx in range(80)], ingested_at=20_000)
+        persist_wallet_activity(conn, wallet, [_event(wallet, idx) for idx in range(10)], ingested_at=20_000)
         materialize_wallet_processing_state(conn, limit=10, source="test")
         conn.commit()
 
@@ -95,10 +97,10 @@ def test_pipeline_audit_finds_pending_evidence_without_active_job(tmp_path):
 
         enqueue_pipeline_job(
             conn,
-            job_type="wallet_evidence_backfill",
-            wallet=wallet,
-            subject_key="medium_pending",
-            tier="l1_light",
+                job_type="wallet_evidence_backfill",
+                wallet=wallet,
+                subject_key="light_pending",
+                tier="l1_light",
             priority=10,
             shard=0,
             input_data={},
@@ -112,13 +114,108 @@ def test_pipeline_audit_finds_pending_evidence_without_active_job(tmp_path):
         conn.close()
 
 
+def test_pipeline_audit_excludes_prefix_only_and_stale_policy_promotions(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    current_wallet = "0x" + "1" * 40
+    old_policy_wallet = "0x" + "2" * 40
+    prefix_only_wallet = "0x" + "3" * 40
+    try:
+        run_migrations(conn)
+        for index, (wallet, policy_version, prefix_only) in enumerate(
+            (
+                (current_wallet, "current-policy", False),
+                (old_policy_wallet, "old-policy", False),
+                (prefix_only_wallet, "current-policy", True),
+            )
+        ):
+            updated_at = 20_000 + index
+            upsert_candidate(conn, CandidateAddress(address=wallet, sources="test_source"))
+            persist_wallet_activity(
+                conn,
+                wallet,
+                [_event(wallet, event_index) for event_index in range(10)],
+                ingested_at=updated_at,
+            )
+            conn.execute(
+                """
+                INSERT INTO wallet_processing_state(
+                    wallet, discovery_tier, evidence_status, evidence_depth,
+                    evidence_confidence, priority, current_stage, next_action,
+                    next_action_at, activity_count, distinct_markets,
+                    non_fast_trade_count, updated_at
+                ) VALUES (?, 'l1_light', 'queued', 200, 0.7, 20, 'light_done',
+                          'medium_pending', 0, 10, 5, 10, ?)
+                """,
+                (wallet, updated_at),
+            )
+            conn.execute(
+                "INSERT INTO wallet_features(address, extra_json, updated_at) VALUES (?, ?, ?)",
+                (
+                    wallet,
+                    json.dumps(
+                        {
+                            "feature_materializer_version": MATERIALIZER_VERSION,
+                            "feature_materializer_activity_count": 10,
+                        }
+                    ),
+                    updated_at,
+                ),
+            )
+            stop_reason = (
+                "promotion_approved:medium_pending:current-policy"
+                if prefix_only
+                else f"promotion_approved:medium_pending:{policy_version}:{updated_at}:10"
+            )
+            conn.execute(
+                """
+                INSERT INTO evidence_backfill_budget(
+                    wallet, source, priority, stage, target_depth, current_depth,
+                    next_attempt_at, stop_reason, evidence_json, created_at, updated_at
+                ) VALUES (?, 'test', 20, 'medium_pending', 1000, 10, 0, ?, ?, ?, ?)
+                """,
+                (
+                    wallet,
+                    stop_reason,
+                    json.dumps(
+                        {
+                            "promotion": {
+                                "approved": True,
+                                "job_action": "medium_pending",
+                                "policy_version": policy_version,
+                                "feature_updated_at": updated_at,
+                                "activity_count": 10,
+                                "materializer_version": MATERIALIZER_VERSION,
+                            }
+                        }
+                    ),
+                    updated_at,
+                    updated_at,
+                ),
+            )
+        conn.commit()
+
+        report = pipeline_audit_report(
+            conn,
+            top=5,
+            policy_version="current-policy",
+            now=50_000,
+        )
+
+        assert report["funnel"]["evidence"]["pending_without_active_job"] == 1
+        assert [
+            row["wallet"] for row in report["samples"]["pending_without_active_job"]
+        ] == [current_wallet]
+    finally:
+        conn.close()
+
+
 def test_pipeline_audit_warns_on_high_priority_pending_without_job(tmp_path):
     conn = connect(tmp_path / "robot.sqlite")
     wallet = "0x" + "6" * 40
     try:
         run_migrations(conn)
         upsert_candidate(conn, CandidateAddress(address=wallet, sources="test_source"))
-        persist_wallet_activity(conn, wallet, [_event(wallet, idx) for idx in range(80)], ingested_at=20_000)
+        persist_wallet_activity(conn, wallet, [_event(wallet, idx) for idx in range(10)], ingested_at=20_000)
         materialize_wallet_processing_state(conn, limit=10, source="test")
         conn.execute("UPDATE wallet_processing_state SET priority = 5 WHERE wallet = ?", (wallet,))
         conn.commit()

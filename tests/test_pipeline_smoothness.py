@@ -113,7 +113,7 @@ def test_pipeline_smoothness_reports_eligibility_blockers_and_backlog(tmp_path):
         assert report["eligibility"]["action_counts"]["wallet_evidence_backfill"] == 1
         assert report["eligibility"]["action_counts"]["copyability_evidence"] == 1
         assert report["queues"]["wallet_pipeline"]["statuses"] == [
-            {"job_type": "wallet_evidence_backfill", "status": "queued", "count": 2}
+            {"job_type": "wallet_evidence_backfill", "status": "queued", "count": 1}
         ]
         assert report["queues"]["copyability"]["statuses"] == [
             {"job_type": "copyability_evidence", "status": "queued", "count": 2}

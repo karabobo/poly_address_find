@@ -68,6 +68,78 @@ PIPELINE_JOB_TYPES = tuple(job_type.value for job_type in PipelineJobType)
 EVIDENCE_STATUSES = tuple(status.value for status in EvidenceStatus)
 CANDIDATE_STAGES = tuple(stage.value for stage in CandidateStage)
 
+EVIDENCE_PROMOTION_APPROVAL_PREFIX = "promotion_approved"
+EVIDENCE_PROMOTION_DEFERRED_PREFIX = "promotion_deferred"
+
+
+def evidence_promotion_approval_reason(
+    job_action: str,
+    policy_version: str,
+    *,
+    feature_updated_at: int | None = None,
+    activity_count: int | None = None,
+) -> str:
+    """Build the durable approval marker required by medium/deep queue work."""
+
+    base = f"{EVIDENCE_PROMOTION_APPROVAL_PREFIX}:{job_action}:{policy_version}"
+    if feature_updated_at is None or activity_count is None:
+        return base
+    return f"{base}:{int(feature_updated_at)}:{int(activity_count)}"
+
+
+def evidence_promotion_deferred_reason(
+    job_action: str,
+    policy_version: str,
+    reason: str,
+) -> str:
+    """Build a compact, policy-versioned reason for keeping a wallet at its current depth."""
+
+    compact_reason = str(reason or "policy_gate").replace(":", "_")
+    return f"{EVIDENCE_PROMOTION_DEFERRED_PREFIX}:{job_action}:{policy_version}:{compact_reason}"
+
+
+def evidence_promotion_is_approved(stop_reason: str, job_action: str) -> bool:
+    """Return whether a budget explicitly admits the requested network depth."""
+
+    return str(stop_reason or "").startswith(
+        f"{EVIDENCE_PROMOTION_APPROVAL_PREFIX}:{job_action}:"
+    )
+
+
+def evidence_promotion_approval_snapshot(
+    stop_reason: str,
+    job_action: str,
+) -> dict[str, int | str] | None:
+    """Parse a snapshot-bound approval; legacy prefix-only markers are stale."""
+
+    parts = str(stop_reason or "").split(":")
+    if len(parts) != 5:
+        return None
+    prefix, approved_action, policy_version, feature_updated_at, activity_count = parts
+    if prefix != EVIDENCE_PROMOTION_APPROVAL_PREFIX or approved_action != job_action:
+        return None
+    try:
+        return {
+            "job_action": approved_action,
+            "policy_version": policy_version,
+            "feature_updated_at": int(feature_updated_at),
+            "activity_count": int(activity_count),
+        }
+    except ValueError:
+        return None
+
+
+def evidence_promotion_is_deferred(
+    stop_reason: str,
+    job_action: str,
+    policy_version: str,
+) -> bool:
+    """Return whether the same policy already deferred this promotion decision."""
+
+    return str(stop_reason or "").startswith(
+        f"{EVIDENCE_PROMOTION_DEFERRED_PREFIX}:{job_action}:{policy_version}:"
+    )
+
 # Candidate stages that still belong to the review/paper compatibility funnel.
 # The string values are persisted in SQLite, so keep these constants as aliases
 # over the historical storage terms rather than renaming database values.

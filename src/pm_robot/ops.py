@@ -528,6 +528,7 @@ def maintenance(
     vacuum: bool = False,
     wal_checkpoint: str = "none",
     skip_cleanup: bool = False,
+    cleanup_batch_limit: int = 0,
     reset_stale_jobs: bool = False,
     failed_job_cooldown_seconds: int = DEFAULT_FAILED_JOB_COOLDOWN_SECONDS,
     reset_stale_ingest_runs: bool = False,
@@ -536,6 +537,7 @@ def maintenance(
     wal_checkpoint = wal_checkpoint.lower()
     if wal_checkpoint not in WAL_CHECKPOINT_MODES:
         raise ValueError(f"wal_checkpoint must be one of: {', '.join(WAL_CHECKPOINT_MODES)}")
+    optimize = bool(not dry_run and not skip_cleanup and int(cleanup_batch_limit) <= 0)
     storage_before = storage_report(settings)
     conn = connect(settings.db_path)
     try:
@@ -555,6 +557,7 @@ def maintenance(
                 scores_days=scores_days,
                 review_events_days=review_events_days,
                 ingest_runs_days=ingest_runs_days,
+                batch_limit=cleanup_batch_limit,
                 dry_run=dry_run,
             )
             runtime_heartbeat_cleanup = _cleanup_runtime_heartbeats(
@@ -563,7 +566,7 @@ def maintenance(
                 dry_run=dry_run,
             )
         if not dry_run:
-            if not skip_cleanup:
+            if optimize:
                 conn.execute("PRAGMA optimize")
             if vacuum:
                 conn.execute("VACUUM")
@@ -596,7 +599,9 @@ def maintenance(
         "ok": True,
         "dry_run": dry_run,
         "vacuum": vacuum and not dry_run,
+        "optimize": optimize,
         "cleanup_skipped": skip_cleanup,
+        "cleanup_batch_limit": max(0, int(cleanup_batch_limit)),
         "failed_job_cooldown_seconds": max(0, int(failed_job_cooldown_seconds)),
         "wal_checkpoint": wal_checkpoint_report,
         "stale_jobs": stale_jobs,
@@ -967,6 +972,7 @@ def prune_low_value_evidence(
     settings: RobotSettings,
     *,
     limit: int = 20,
+    max_activity_rows: int = 0,
     keep_recent_activity: int = 0,
     dry_run: bool = True,
     vacuum: bool = False,
@@ -992,8 +998,13 @@ def prune_low_value_evidence(
         wallets = (
             list(archive_run["wallets"])
             if archive_run is not None
-            else _low_value_prune_wallets(conn, limit=limit)
+            else _low_value_prune_wallets(
+                conn,
+                limit=limit,
+                max_activity_rows=max_activity_rows,
+            )
         )
+        selected_activity_rows = _wallet_activity_count(conn, wallets)
         if archive and not dry_run and archive_run is None and wallets:
             _materialize_wallet_registry(conn, limit=0, stages=(), addresses=tuple(wallets))
             archive_run = create_archive_run(
@@ -1041,6 +1052,12 @@ def prune_low_value_evidence(
                 "vacuum": False,
                 "wallets": wallets,
                 "wallet_count": len(wallets),
+                "selected_activity_rows": selected_activity_rows,
+                "max_activity_rows": max(0, int(max_activity_rows)),
+                "activity_budget_exceeded": bool(
+                    int(max_activity_rows) > 0
+                    and selected_activity_rows > int(max_activity_rows)
+                ),
                 "deleted": _empty_evidence_delete_counts(),
                 "archive": archive_result,
                 "storage": storage_report(settings),
@@ -1098,6 +1115,12 @@ def prune_low_value_evidence(
         "vacuum": vacuum and not dry_run,
         "wallets": wallets,
         "wallet_count": len(wallets),
+        "selected_activity_rows": selected_activity_rows,
+        "max_activity_rows": max(0, int(max_activity_rows)),
+        "activity_budget_exceeded": bool(
+            int(max_activity_rows) > 0
+            and selected_activity_rows > int(max_activity_rows)
+        ),
         "deleted": deleted,
         "archive": archive_result,
         "storage": storage_report(settings),
@@ -1846,41 +1869,96 @@ def _cleanup_database(
     scores_days: int,
     review_events_days: int,
     ingest_runs_days: int,
+    batch_limit: int,
     dry_run: bool,
 ) -> dict[str, int]:
     now = int(time.time())
     specs = {
-        "api_request_log": ("ts", now - api_log_days * DAY_SECONDS),
-        "wallet_positions": ("captured_at", now - positions_days * DAY_SECONDS),
-        "leader_scores": ("scored_at", now - scores_days * DAY_SECONDS),
-        "review_events": ("created_at", now - review_events_days * DAY_SECONDS),
-        "ingest_runs": ("started_at", now - ingest_runs_days * DAY_SECONDS),
-        "paper_marks": ("marked_at", now - 30 * DAY_SECONDS),
-        "paper_readiness_observations": ("observed_at", now - 90 * DAY_SECONDS),
+        "api_request_log": ("ts", now - api_log_days * DAY_SECONDS, ""),
+        "wallet_positions": ("captured_at", now - positions_days * DAY_SECONDS, ""),
+        "leader_scores": (
+            "scored_at",
+            now - scores_days * DAY_SECONDS,
+            "score_id NOT IN (SELECT score_id FROM leader_latest_scores)",
+        ),
+        "review_events": ("created_at", now - review_events_days * DAY_SECONDS, ""),
+        "ingest_runs": ("started_at", now - ingest_runs_days * DAY_SECONDS, ""),
     }
     tables = {
         row[0]
         for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
     }
     deleted: dict[str, int] = {}
-    for table, (column, cutoff) in specs.items():
+    bounded_limit = max(0, int(batch_limit))
+    for table, (column, cutoff, extra_predicate) in specs.items():
         if table not in tables:
             deleted[table] = 0
             continue
-        count = int(
-            conn.execute(f"SELECT COUNT(*) FROM {table} WHERE {column} < ?", (cutoff,)).fetchone()[0]
-        )
+        where_sql = f"{column} < ?"
+        if extra_predicate:
+            where_sql += f" AND {extra_predicate}"
+        if bounded_limit:
+            count = int(
+                conn.execute(
+                    f"""
+                    SELECT COUNT(*)
+                    FROM (
+                        SELECT rowid
+                        FROM {table}
+                        WHERE {where_sql}
+                        ORDER BY {column} ASC, rowid ASC
+                        LIMIT ?
+                    )
+                    """,
+                    (cutoff, bounded_limit),
+                ).fetchone()[0]
+            )
+        else:
+            count = int(
+                conn.execute(
+                    f"SELECT COUNT(*) FROM {table} WHERE {where_sql}",
+                    (cutoff,),
+                ).fetchone()[0]
+            )
         deleted[table] = count
         if count and not dry_run:
-            conn.execute(f"DELETE FROM {table} WHERE {column} < ?", (cutoff,))
-    if not dry_run:
-        conn.commit()
+            if bounded_limit:
+                changes_before = conn.total_changes
+                conn.execute(
+                    f"""
+                    DELETE FROM {table}
+                    WHERE rowid IN (
+                        SELECT rowid
+                        FROM {table}
+                        WHERE {where_sql}
+                        ORDER BY {column} ASC, rowid ASC
+                        LIMIT ?
+                    )
+                    """,
+                    (cutoff, bounded_limit),
+                )
+                deleted[table] = conn.total_changes - changes_before
+            else:
+                changes_before = conn.total_changes
+                conn.execute(f"DELETE FROM {table} WHERE {where_sql}", (cutoff,))
+                deleted[table] = conn.total_changes - changes_before
+            # Release the single SQLite writer between retention classes.
+            conn.commit()
+    # Paper evidence is wallet-scoped and must pass the archive/prune guards.
+    deleted["paper_marks"] = 0
+    deleted["paper_readiness_observations"] = 0
     return deleted
 
 
-def _low_value_prune_wallets(conn: sqlite3.Connection, *, limit: int) -> list[str]:
+def _low_value_prune_wallets(
+    conn: sqlite3.Connection,
+    *,
+    limit: int,
+    max_activity_rows: int = 0,
+) -> list[str]:
     if limit <= 0:
         return []
+    activity_budget = max(0, int(max_activity_rows))
     terminal_rows = conn.execute(
         """
         SELECT cw.address
@@ -1909,9 +1987,18 @@ def _low_value_prune_wallets(conn: sqlite3.Connection, *, limit: int) -> list[st
         """,
         (limit,),
     ).fetchall()
-    wallets = [str(row["address"]) for row in terminal_rows]
+    wallets, selected_activity_rows, budget_exhausted = _select_prune_wallet_rows(
+        conn,
+        terminal_rows,
+        limit=limit,
+        max_activity_rows=activity_budget,
+    )
+    if budget_exhausted:
+        return wallets
     remaining = limit - len(wallets)
     if remaining <= 0:
+        return wallets
+    if activity_budget and selected_activity_rows >= activity_budget:
         return wallets
     needs_data_rows = conn.execute(
         """
@@ -1962,8 +2049,76 @@ def _low_value_prune_wallets(conn: sqlite3.Connection, *, limit: int) -> list[st
         """,
         (remaining,),
     ).fetchall()
-    wallets.extend(str(row["address"]) for row in needs_data_rows)
+    needs_data_wallets, _, _ = _select_prune_wallet_rows(
+        conn,
+        needs_data_rows,
+        limit=remaining,
+        max_activity_rows=max(0, activity_budget - selected_activity_rows),
+        allow_first_over_budget=not wallets,
+    )
+    wallets.extend(needs_data_wallets)
     return wallets
+
+
+def _select_prune_wallet_rows(
+    conn: sqlite3.Connection,
+    rows: list[sqlite3.Row],
+    *,
+    limit: int,
+    max_activity_rows: int,
+    allow_first_over_budget: bool = True,
+) -> tuple[list[str], int, bool]:
+    """Apply an exact row budget without starving one oversized oldest wallet."""
+
+    wallets: list[str] = []
+    selected_activity_rows = 0
+    bounded_limit = max(0, int(limit))
+    activity_budget = max(0, int(max_activity_rows))
+    activity_counts = _wallet_activity_counts(
+        conn,
+        [str(row["address"]) for row in rows[:bounded_limit]],
+    )
+    for row in rows:
+        if len(wallets) >= bounded_limit:
+            break
+        address = str(row["address"])
+        estimate = activity_counts.get(address.lower(), 0)
+        exceeds_budget = bool(
+            activity_budget
+            and selected_activity_rows + estimate > activity_budget
+        )
+        if exceeds_budget and (wallets or not allow_first_over_budget):
+            return wallets, selected_activity_rows, True
+        wallets.append(address)
+        selected_activity_rows += estimate
+    return wallets, selected_activity_rows, False
+
+
+def _wallet_activity_count(conn: sqlite3.Connection, wallets: list[str]) -> int:
+    return sum(_wallet_activity_counts(conn, wallets).values())
+
+
+def _wallet_activity_counts(
+    conn: sqlite3.Connection,
+    wallets: list[str],
+) -> dict[str, int]:
+    if not wallets:
+        return {}
+    placeholders = ", ".join("?" for _ in wallets)
+    normalized = [wallet.lower() for wallet in wallets]
+    counts = {wallet: 0 for wallet in normalized}
+    rows = conn.execute(
+        f"""
+        SELECT address, COUNT(*) AS activity_rows
+        FROM wallet_activity
+        WHERE address IN ({placeholders})
+        GROUP BY address
+        """,
+        tuple(normalized),
+    ).fetchall()
+    for row in rows:
+        counts[str(row["address"]).lower()] = int(row["activity_rows"] or 0)
+    return counts
 
 
 def _prune_wallet_evidence_batch(

@@ -152,10 +152,11 @@ def test_pipeline_cycle_routes_repairs_through_canonical_planners(tmp_path):
         assert steps["eligibility_repair_prepare"]["data"]["wallet_repairs_prepared"] == 1
         assert steps["eligibility_repair_prepare"]["data"]["copyability_repairs_ready"] == 1
         assert step_names.index("eligibility_repair_prepare") < step_names.index("wallet_pipeline_state_materialize")
-        assert step_names.index("wallet_pipeline_state_materialize") < step_names.index("wallet_pipeline_plan")
-        assert step_names.index("wallet_pipeline_plan") < step_names.index("copyability_plan")
-        assert step_names.index("copyability_plan") < step_names.index("materialize_features")
+        assert step_names.index("wallet_pipeline_state_materialize") < step_names.index("materialize_features")
         assert step_names.index("materialize_features") < step_names.index("incremental_score")
+        assert step_names.index("incremental_score") < step_names.index("evidence_promotion")
+        assert step_names.index("evidence_promotion") < step_names.index("wallet_pipeline_plan")
+        assert step_names.index("wallet_pipeline_plan") < step_names.index("copyability_plan")
         assert runs == []
         assert report["after"]["queues"]["wallet_pipeline"]["statuses"]
         assert report["after"]["queues"]["copyability"]["statuses"] == [
@@ -241,10 +242,11 @@ def test_pipeline_cycle_isolates_failed_phase_and_continues_committed_work(tmp_p
         assert [step["name"] for step in reported_steps] == [
             "eligibility_repair_prepare",
             "wallet_pipeline_state_materialize",
-            "wallet_pipeline_plan",
-            "copyability_plan",
             "materialize_features",
             "incremental_score",
+            "evidence_promotion",
+            "wallet_pipeline_plan",
+            "copyability_plan",
         ]
         assert all(int(step["finished_at"]) >= int(step["started_at"]) for step in reported_steps)
         assert all(float(step["duration_ms"]) >= 0 for step in reported_steps)

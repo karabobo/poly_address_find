@@ -19,6 +19,7 @@ COPYABILITY_SHARD_COUNT="${PM_ROBOT_COPYABILITY_SHARD_COUNT:-1}"
 COPYABILITY_RESCAN_SECONDS="${PM_ROBOT_COPYABILITY_RESCAN_SECONDS:-21600}"
 FEATURE_LIMIT="${PM_ROBOT_SCORE_FEATURE_LIMIT:-80}"
 FEATURE_MIN_ACTIVITY_EVENTS="${PM_ROBOT_SCORE_MIN_ACTIVITY_EVENTS:-25}"
+EVIDENCE_PROMOTION_LIMIT="${PM_ROBOT_EVIDENCE_PROMOTION_LIMIT:-80}"
 SCORE_LIMIT="${PM_ROBOT_SCORE_LIMIT:-300}"
 POLICY_PATH="${PM_ROBOT_POLICY_PATH:-/app/config/leader_scoring_policy.json}"
 PAPER_HANDOFF_LIMIT="${PM_ROBOT_PAPER_HANDOFF_LIMIT:-250}"
@@ -63,6 +64,7 @@ while true; do
       --copyability-rescan-seconds "$COPYABILITY_RESCAN_SECONDS" \
       --feature-limit "$FEATURE_LIMIT" \
       --feature-min-activity-events "$FEATURE_MIN_ACTIVITY_EVENTS" \
+      --evidence-promotion-limit "$EVIDENCE_PROMOTION_LIMIT" \
       --score-limit "$SCORE_LIMIT" \
       --policy "$POLICY_PATH"; then
     echo "$(date -Iseconds) research control: ordered cycle ok"

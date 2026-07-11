@@ -14,7 +14,8 @@ from pm_robot.storage.db import retry_sqlite_locked
 from pm_robot.storage.repository import _feature_from_row, upsert_wallet_feature
 
 
-MATERIALIZER_VERSION = "2026-07-08-copy-validation-v1"
+MATERIALIZER_VERSION = "2026-07-11-evidence-refresh-v2"
+MATERIALIZER_REFRESH_SECONDS = 86_400
 COPY_CANDIDATE_MIN_EVENTS = 10
 COPY_CANDIDATE_MIN_MARKETS = 2
 COPY_CANDIDATE_MIN_CONTAINMENT = 0.45
@@ -37,7 +38,12 @@ def materialize_wallet_features(
     now: int | None = None,
 ) -> FeatureMaterializeSummary:
     ts = now or int(time.time())
-    targets = _list_targets(conn, limit=limit, min_activity_events=min_activity_events)
+    targets = _list_targets(
+        conn,
+        limit=limit,
+        min_activity_events=min_activity_events,
+        now=ts,
+    )
     updated = 0
     error = ""
     status = "ok"
@@ -139,21 +145,29 @@ def _write_with_retry(conn: sqlite3.Connection, operation, *, commit: bool = Tru
     retry_sqlite_locked(_operation, rollback=conn.rollback, attempts=4, sleep_seconds=2.0)
 
 
-def _list_targets(conn: sqlite3.Connection, *, limit: int, min_activity_events: int) -> list[str]:
+def _list_targets(
+    conn: sqlite3.Connection,
+    *,
+    limit: int,
+    min_activity_events: int,
+    now: int,
+) -> list[str]:
     rows = conn.execute(
         """
-        WITH candidate_targets AS (
+        WITH activity_counts AS (
+            SELECT address, COUNT(activity_id) AS activity_count
+            FROM wallet_activity
+            WHERE type = 'TRADE'
+            GROUP BY address
+        ), candidate_targets AS (
             SELECT
                 cw.address,
                 COALESCE(ls.review_reason, '') AS review_reason,
-                COALESCE(
-                    NULLIF(wps.activity_count, 0),
-                    NULLIF(ebb.current_depth, 0),
-                    0
-                ) AS wallet_activity_count,
+                COALESCE(ac.activity_count, 0) AS wallet_activity_count,
                 COALESCE(pwq.total_roi, -999.0) AS paper_roi,
                 COALESCE(pwq.orders, 0) AS paper_orders,
                 COALESCE(pwq.settled_positions, 0) AS settled_positions,
+                COALESCE(pwq.updated_at, 0) AS paper_updated_at,
                 COALESCE(wps.evidence_status, '') AS evidence_status,
                 COALESCE(wps.current_stage, '') AS current_stage,
                 COALESCE(wps.next_action, '') AS next_action,
@@ -180,6 +194,8 @@ def _list_targets(conn: sqlite3.Connection, *, limit: int, min_activity_events: 
               ON wps.wallet = cw.address
             LEFT JOIN evidence_backfill_budget ebb
               ON ebb.wallet = cw.address
+            LEFT JOIN activity_counts ac
+              ON ac.address = cw.address
             LEFT JOIN wallet_registry wr
               ON wr.address = cw.address
             WHERE cw.candidate_stage NOT IN ('rejected', 'blocked_hygiene', 'blocked_copyability')
@@ -204,7 +220,19 @@ def _list_targets(conn: sqlite3.Connection, *, limit: int, min_activity_events: 
             OR copy_stream_roi IS NULL
             OR single_market_pnl_share IS NULL
             OR net_to_gross_exposure IS NULL
-            OR instr(COALESCE(extra_json, '{}'), 'paper_roi_after_slippage') = 0
+            OR instr(COALESCE(extra_json, '{}'), 'paper_materializer_checked_at') = 0
+            OR paper_updated_at > COALESCE(
+                CAST(json_extract(extra_json, '$.feature_materialized_at') AS INTEGER),
+                0
+            )
+            OR COALESCE(
+                CAST(json_extract(extra_json, '$.feature_materializer_activity_count') AS INTEGER),
+                -1
+            ) != wallet_activity_count
+            OR COALESCE(
+                CAST(json_extract(extra_json, '$.feature_materialized_at') AS INTEGER),
+                0
+            ) <= ?
            )
         ORDER BY
             CASE
@@ -245,75 +273,12 @@ def _list_targets(conn: sqlite3.Connection, *, limit: int, min_activity_events: 
             address ASC
         LIMIT ?
         """,
-        (min_activity_events, MATERIALIZER_VERSION, limit),
-    ).fetchall()
-    targets = [str(row["address"]) for row in rows]
-    if limit <= 0 or len(targets) >= limit:
-        return targets
-    targets.extend(
-        _list_raw_activity_fallback_targets(
-            conn,
-            exclude=targets,
-            limit=limit - len(targets),
-            min_activity_events=min_activity_events,
-        )
-    )
-    return targets
-
-
-def _list_raw_activity_fallback_targets(
-    conn: sqlite3.Connection,
-    *,
-    exclude: list[str],
-    limit: int,
-    min_activity_events: int,
-) -> list[str]:
-    """Find legacy raw-activity targets only when canonical state cannot fill a batch."""
-
-    if limit <= 0:
-        return []
-    excluded_sql = ""
-    params: list[Any] = [MATERIALIZER_VERSION]
-    if exclude:
-        placeholders = ",".join("?" for _ in exclude)
-        excluded_sql = f"AND cw.address NOT IN ({placeholders})"
-        params.extend(exclude)
-    params.extend((min_activity_events, limit))
-    rows = conn.execute(
-        f"""
-        SELECT cw.address
-        FROM candidate_wallets cw
-        JOIN wallet_activity wa
-          ON wa.address = cw.address
-         AND wa.type = 'TRADE'
-        LEFT JOIN wallet_features wf
-          ON wf.address = cw.address
-        LEFT JOIN wallet_processing_state wps
-          ON wps.wallet = cw.address
-        LEFT JOIN evidence_backfill_budget ebb
-          ON ebb.wallet = cw.address
-        LEFT JOIN wallet_registry wr
-          ON wr.address = cw.address
-        WHERE cw.candidate_stage NOT IN ('rejected', 'blocked_hygiene', 'blocked_copyability')
-          AND COALESCE(wr.raw_retention_tier, '') != 'summary_only'
-          AND COALESCE(NULLIF(wps.activity_count, 0), NULLIF(ebb.current_depth, 0), 0) = 0
-          AND (
-               (wf.maker_fraction IS NULL AND instr(COALESCE(wf.extra_json, '{{}}'), ?) = 0)
-            OR wf.leader_in_degree IS NULL
-            OR wf.copy_event_count IS NULL
-            OR wf.copy_market_count IS NULL
-            OR wf.copy_stream_roi IS NULL
-            OR wf.single_market_pnl_share IS NULL
-            OR wf.net_to_gross_exposure IS NULL
-            OR instr(COALESCE(wf.extra_json, '{{}}'), 'paper_roi_after_slippage') = 0
-          )
-          {excluded_sql}
-        GROUP BY cw.address
-        HAVING COUNT(wa.activity_id) >= ?
-        ORDER BY COUNT(wa.activity_id) DESC, COALESCE(cw.updated_at, 0) DESC, cw.address ASC
-        LIMIT ?
-        """,
-        tuple(params),
+        (
+            min_activity_events,
+            MATERIALIZER_VERSION,
+            now - MATERIALIZER_REFRESH_SECONDS,
+            limit,
+        ),
     ).fetchall()
     return [str(row["address"]) for row in rows]
 
@@ -322,12 +287,42 @@ def _materialize_wallet(conn: sqlite3.Connection, wallet: str, *, now: int) -> W
     wallet = wallet.lower()
     existing_row = conn.execute("SELECT * FROM wallet_features WHERE address = ?", (wallet,)).fetchone()
     base = _feature_from_row(existing_row) if existing_row else WalletFeatures(address=wallet)
-    activity = _activity_stats(conn, wallet)
+    activity = _activity_stats(conn, wallet, now=now)
     if not activity:
         return None
     episodes = _episode_stats(conn, wallet)
     copy = _copy_stats(conn, wallet)
     paper = _paper_stats(conn, wallet)
+    previous_values = base.extra.get("feature_materializer_values")
+    if not isinstance(previous_values, dict):
+        previous_values = {}
+    computed_values = {
+        "cumulative_win_rate": _first_not_none(
+            episodes.get("event_win_rate"),
+            episodes.get("trade_win_rate"),
+        ),
+        "recent_30d_volume_usdc": activity["recent_30d_volume_usdc"],
+        "net_pnl_usdc": episodes.get("net_pnl_usdc"),
+        "total_volume_usdc": _max_not_none(
+            activity["total_volume_usdc"],
+            episodes.get("total_volume_usdc"),
+        ),
+        "event_win_rate": episodes.get("event_win_rate"),
+        "trade_win_rate": episodes.get("trade_win_rate"),
+        "avg_dca_entries": episodes.get("avg_dca_entries"),
+        "sell_pct": activity["sell_pct"],
+        "bot_score": activity["bot_score"],
+        "trades_per_day": activity["trades_per_day"],
+        "median_gap_sec": activity["median_gap_sec"],
+        "leader_in_degree": copy["leader_in_degree"],
+        "copy_event_count": copy["copy_event_count"],
+        "copy_market_count": copy["copy_market_count"],
+        "containment_pct_median": copy["containment_pct_median"],
+        "copy_stream_roi": copy["copy_stream_roi"],
+        "single_market_pnl_share": episodes.get("single_market_pnl_share"),
+        "net_to_gross_exposure": episodes.get("net_to_gross_exposure"),
+        "last_active_days_ago": activity["last_active_days_ago"],
+    }
     extra = {
         **base.extra,
         "feature_materializer_version": MATERIALIZER_VERSION,
@@ -336,6 +331,8 @@ def _materialize_wallet(conn: sqlite3.Connection, wallet: str, *, now: int) -> W
         "feature_materializer_distinct_markets": activity["distinct_markets"],
         "feature_materializer_non_fast_trade_count": activity["non_fast_trade_count"],
         "feature_materializer_fast_market_share": activity["fast_market_share"],
+        "feature_materializer_values": computed_values,
+        "paper_materializer_checked_at": now,
     }
     if paper:
         extra["paper_roi_after_slippage"] = paper["paper_roi_after_slippage"]
@@ -363,42 +360,137 @@ def _materialize_wallet(conn: sqlite3.Connection, wallet: str, *, now: int) -> W
     if activity.get("maker_fraction_source") and not official_role_evidence:
         extra["maker_fraction_source"] = activity["maker_fraction_source"]
 
-    event_win_rate = _first_not_none(base.event_win_rate, episodes.get("event_win_rate"))
-    trade_win_rate = _first_not_none(base.trade_win_rate, episodes.get("trade_win_rate"), event_win_rate)
+    event_win_rate = _refresh_materializer_value(
+        "event_win_rate",
+        base.event_win_rate,
+        computed_values["event_win_rate"],
+        previous_values,
+    )
+    trade_win_rate = _refresh_materializer_value(
+        "trade_win_rate",
+        base.trade_win_rate,
+        _first_not_none(computed_values["trade_win_rate"], event_win_rate),
+        previous_values,
+    )
     return WalletFeatures(
         address=wallet,
-        cumulative_win_rate=_first_not_none(base.cumulative_win_rate, event_win_rate, trade_win_rate),
-        recent_30d_volume_usdc=_first_not_none(base.recent_30d_volume_usdc, activity["recent_30d_volume_usdc"]),
-        net_pnl_usdc=_first_not_none(base.net_pnl_usdc, episodes.get("net_pnl_usdc")),
-        total_volume_usdc=_first_not_none(base.total_volume_usdc, activity["total_volume_usdc"], episodes.get("total_volume_usdc")),
+        cumulative_win_rate=_refresh_materializer_value(
+            "cumulative_win_rate",
+            base.cumulative_win_rate,
+            _first_not_none(computed_values["cumulative_win_rate"], event_win_rate, trade_win_rate),
+            previous_values,
+        ),
+        recent_30d_volume_usdc=_refresh_materializer_value(
+            "recent_30d_volume_usdc",
+            base.recent_30d_volume_usdc,
+            computed_values["recent_30d_volume_usdc"],
+            previous_values,
+        ),
+        net_pnl_usdc=_refresh_materializer_value(
+            "net_pnl_usdc",
+            base.net_pnl_usdc,
+            computed_values["net_pnl_usdc"],
+            previous_values,
+        ),
+        total_volume_usdc=_refresh_materializer_value(
+            "total_volume_usdc",
+            base.total_volume_usdc,
+            computed_values["total_volume_usdc"],
+            previous_values,
+        ),
         event_win_rate=event_win_rate,
         trade_win_rate=trade_win_rate,
-        avg_dca_entries=_first_not_none(base.avg_dca_entries, episodes.get("avg_dca_entries")),
-        sell_pct=_first_not_none(base.sell_pct, activity["sell_pct"]),
-        bot_score=_first_not_none(base.bot_score, activity["bot_score"]),
-        trades_per_day=_first_not_none(base.trades_per_day, activity["trades_per_day"]),
-        median_gap_sec=_first_not_none(base.median_gap_sec, activity["median_gap_sec"]),
+        avg_dca_entries=_refresh_materializer_value(
+            "avg_dca_entries",
+            base.avg_dca_entries,
+            computed_values["avg_dca_entries"],
+            previous_values,
+        ),
+        sell_pct=_refresh_materializer_value(
+            "sell_pct",
+            base.sell_pct,
+            computed_values["sell_pct"],
+            previous_values,
+        ),
+        bot_score=_refresh_materializer_value(
+            "bot_score",
+            base.bot_score,
+            computed_values["bot_score"],
+            previous_values,
+        ),
+        trades_per_day=_refresh_materializer_value(
+            "trades_per_day",
+            base.trades_per_day,
+            computed_values["trades_per_day"],
+            previous_values,
+        ),
+        median_gap_sec=_refresh_materializer_value(
+            "median_gap_sec",
+            base.median_gap_sec,
+            computed_values["median_gap_sec"],
+            previous_values,
+        ),
         maker_fraction=(
             base.maker_fraction if official_role_evidence else activity["maker_fraction"]
         ),
-        leader_in_degree=_first_not_none(base.leader_in_degree, copy["leader_in_degree"]),
-        copy_event_count=_first_not_none(base.copy_event_count, copy["copy_event_count"]),
-        copy_market_count=_first_not_none(base.copy_market_count, copy["copy_market_count"]),
-        containment_pct_median=_first_not_none(base.containment_pct_median, copy["containment_pct_median"]),
-        copy_stream_roi=_first_not_none(base.copy_stream_roi, copy["copy_stream_roi"]),
+        leader_in_degree=_refresh_materializer_value(
+            "leader_in_degree",
+            base.leader_in_degree,
+            computed_values["leader_in_degree"],
+            previous_values,
+        ),
+        copy_event_count=_refresh_materializer_value(
+            "copy_event_count",
+            base.copy_event_count,
+            computed_values["copy_event_count"],
+            previous_values,
+        ),
+        copy_market_count=_refresh_materializer_value(
+            "copy_market_count",
+            base.copy_market_count,
+            computed_values["copy_market_count"],
+            previous_values,
+        ),
+        containment_pct_median=_refresh_materializer_value(
+            "containment_pct_median",
+            base.containment_pct_median,
+            computed_values["containment_pct_median"],
+            previous_values,
+        ),
+        copy_stream_roi=_refresh_materializer_value(
+            "copy_stream_roi",
+            base.copy_stream_roi,
+            computed_values["copy_stream_roi"],
+            previous_values,
+        ),
         edge_retention_pct=base.edge_retention_pct,
         walk_forward_consistency_pct=base.walk_forward_consistency_pct,
         survival_score=base.survival_score,
-        single_market_pnl_share=_first_not_none(base.single_market_pnl_share, episodes.get("single_market_pnl_share")),
-        net_to_gross_exposure=_first_not_none(base.net_to_gross_exposure, episodes.get("net_to_gross_exposure")),
+        single_market_pnl_share=_refresh_materializer_value(
+            "single_market_pnl_share",
+            base.single_market_pnl_share,
+            computed_values["single_market_pnl_share"],
+            previous_values,
+        ),
+        net_to_gross_exposure=_refresh_materializer_value(
+            "net_to_gross_exposure",
+            base.net_to_gross_exposure,
+            computed_values["net_to_gross_exposure"],
+            previous_values,
+        ),
         hygiene_status=_hygiene_status(base, activity),
         primary_category=base.primary_category,
-        last_active_days_ago=_first_not_none(base.last_active_days_ago, activity["last_active_days_ago"]),
+        last_active_days_ago=_refresh_materializer_value(
+            "last_active_days_ago",
+            base.last_active_days_ago,
+            computed_values["last_active_days_ago"],
+            previous_values,
+        ),
         extra=extra,
     )
 
 
-def _activity_stats(conn: sqlite3.Connection, wallet: str) -> dict[str, Any]:
+def _activity_stats(conn: sqlite3.Connection, wallet: str, *, now: int) -> dict[str, Any]:
     rows = conn.execute(
         """
         SELECT timestamp, side, usdc_size, raw_json, market_slug
@@ -413,7 +505,7 @@ def _activity_stats(conn: sqlite3.Connection, wallet: str) -> dict[str, Any]:
     timestamps = [int(row["timestamp"] or 0) for row in rows if int(row["timestamp"] or 0) > 0]
     latest = max(timestamps) if timestamps else 0
     oldest = min(timestamps) if timestamps else latest
-    recent_cutoff = latest - 30 * 86_400
+    recent_cutoff = now - 30 * 86_400
     total_volume = sum(float(row["usdc_size"] or 0.0) for row in rows)
     recent_volume = sum(
         float(row["usdc_size"] or 0.0)
@@ -445,7 +537,7 @@ def _activity_stats(conn: sqlite3.Connection, wallet: str) -> dict[str, Any]:
         "bot_score": bot_score,
         "maker_fraction": maker_fraction,
         "maker_fraction_source": maker_source,
-        "last_active_days_ago": 0.0,
+        "last_active_days_ago": max(0.0, (now - latest) / 86_400) if latest else None,
     }
 
 
@@ -715,3 +807,34 @@ def _first_not_none(*values: Any) -> Any:
         if value is not None:
             return value
     return None
+
+
+def _max_not_none(*values: Any) -> float | None:
+    numeric = [float(value) for value in values if value is not None]
+    return max(numeric) if numeric else None
+
+
+def _refresh_materializer_value(
+    field: str,
+    existing: Any,
+    computed: Any,
+    previous_values: dict[str, Any],
+) -> Any:
+    """Refresh only fields still owned by the previous materializer snapshot."""
+
+    if existing is None:
+        return computed
+    if field not in previous_values:
+        return existing
+    if _materializer_values_equal(existing, previous_values.get(field)):
+        return computed
+    return existing
+
+
+def _materializer_values_equal(left: Any, right: Any) -> bool:
+    if left is None or right is None:
+        return left is right
+    try:
+        return abs(float(left) - float(right)) <= 1e-9
+    except (TypeError, ValueError):
+        return left == right

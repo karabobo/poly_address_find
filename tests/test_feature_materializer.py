@@ -252,3 +252,126 @@ def test_materialize_wallet_features_retries_locked_feature_write(tmp_path, monk
         assert features[wallet].copy_event_count == 12.0
     finally:
         conn.close()
+
+
+def test_materializer_refreshes_owned_values_but_preserves_external_override(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    wallet = "0x" + "a" * 40
+    try:
+        run_migrations(conn)
+        _seed_wallet(conn, wallet)
+        first = materialize_wallet_features(conn, limit=1, min_activity_events=25, now=30_000)
+        assert first.wallets_updated == 1
+
+        persist_wallet_activity(conn, wallet, [_activity(50_000, usdc=25)], ingested_at=30_100)
+        conn.execute(
+            "UPDATE wallet_episodes SET realized_pnl_est = 25 WHERE address = ?",
+            (wallet,),
+        )
+        conn.commit()
+        second = materialize_wallet_features(conn, limit=1, min_activity_events=25, now=30_200)
+        refreshed = get_wallet_features(conn)[wallet]
+
+        assert second.wallets_updated == 1
+        assert refreshed.net_pnl_usdc == 125
+
+        conn.execute(
+            "UPDATE wallet_features SET net_pnl_usdc = 777 WHERE address = ?",
+            (wallet,),
+        )
+        persist_wallet_activity(conn, wallet, [_activity(60_000, usdc=30)], ingested_at=30_300)
+        conn.execute(
+            "UPDATE wallet_episodes SET realized_pnl_est = 50 WHERE address = ?",
+            (wallet,),
+        )
+        conn.commit()
+        third = materialize_wallet_features(conn, limit=1, min_activity_events=25, now=30_400)
+        preserved = get_wallet_features(conn)[wallet]
+
+        assert third.wallets_updated == 1
+        assert preserved.net_pnl_usdc == 777
+    finally:
+        conn.close()
+
+
+def test_materializer_refresh_uses_raw_activity_count_when_pipeline_state_is_stale(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    wallet = "0x" + "b" * 40
+    try:
+        run_migrations(conn)
+        _seed_wallet(conn, wallet)
+        first = materialize_wallet_features(conn, limit=1, min_activity_events=25, now=30_000)
+        conn.execute(
+            """
+            INSERT INTO wallet_processing_state(
+                wallet, discovery_tier, evidence_status, evidence_depth,
+                evidence_confidence, priority, current_stage, next_action,
+                next_action_at, activity_count, updated_at
+            ) VALUES (?, 'l1_light', 'summary_ready', 40, 0.5, 20,
+                      'light_done', 'score_wallet', 0, 40, 30000)
+            """,
+            (wallet,),
+        )
+        persist_wallet_activity(
+            conn,
+            wallet,
+            [_activity(70_000, usdc=25)],
+            ingested_at=30_100,
+        )
+        conn.commit()
+
+        second = materialize_wallet_features(conn, limit=1, min_activity_events=25, now=30_200)
+        refreshed = get_wallet_features(conn)[wallet]
+
+        assert first.wallets_updated == 1
+        assert second.wallets_updated == 1
+        assert refreshed.extra["feature_materializer_activity_count"] == 41
+    finally:
+        conn.close()
+
+
+def test_materializer_refreshes_rolling_30_day_volume(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    wallet = "0x" + "c" * 40
+    first_now = 100_000
+    try:
+        run_migrations(conn)
+        upsert_candidate(conn, CandidateAddress(address=wallet, sources="test"))
+        persist_wallet_activity(
+            conn,
+            wallet,
+            [_activity(idx, usdc=10) for idx in range(25)],
+            ingested_at=first_now,
+        )
+        rebuild_wallet_episodes(conn, wallet)
+        conn.commit()
+
+        first = materialize_wallet_features(
+            conn,
+            limit=1,
+            min_activity_events=25,
+            now=first_now,
+        )
+        initial = get_wallet_features(conn)[wallet]
+        unchanged = materialize_wallet_features(
+            conn,
+            limit=1,
+            min_activity_events=25,
+            now=first_now + 100,
+        )
+        second = materialize_wallet_features(
+            conn,
+            limit=1,
+            min_activity_events=25,
+            now=first_now + 31 * 86_400,
+        )
+        refreshed = get_wallet_features(conn)[wallet]
+
+        assert first.wallets_updated == 1
+        assert initial.recent_30d_volume_usdc == 250
+        assert unchanged.wallets_attempted == 0
+        assert second.wallets_updated == 1
+        assert refreshed.recent_30d_volume_usdc == 0
+        assert refreshed.last_active_days_ago > 30
+    finally:
+        conn.close()

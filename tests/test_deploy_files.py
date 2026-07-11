@@ -92,10 +92,20 @@ def test_nas_retention_prune_is_bounded_and_staggered():
     assert "PM_ROBOT_MAINTENANCE_START_DELAY=300" in env
     assert 'START_DELAY="${PM_ROBOT_MAINTENANCE_START_DELAY:-300}"' in loop
     assert 'sleep "$START_DELAY"' in loop
+    assert "PM_ROBOT_MAINTENANCE_CLEANUP_BATCH_LIMIT=500" in env
     assert "PM_ROBOT_RETENTION_PRUNE_BATCHES=1" in env
-    assert "PM_ROBOT_RETENTION_PRUNE_LIMIT=5" in env
+    assert "PM_ROBOT_RETENTION_PRUNE_LIMIT=20" in env
+    assert "PM_ROBOT_RETENTION_PRUNE_MAX_ACTIVITY_ROWS=5000" in env
+    assert "PM_ROBOT_RETENTION_PRUNE_BATCH_DELAY=10" in env
+    assert 'CLEANUP_BATCH_LIMIT="${PM_ROBOT_MAINTENANCE_CLEANUP_BATCH_LIMIT:-500}"' in loop
     assert 'PRUNE_BATCHES="${PM_ROBOT_RETENTION_PRUNE_BATCHES:-1}"' in loop
-    assert 'PRUNE_LIMIT="${PM_ROBOT_RETENTION_PRUNE_LIMIT:-5}"' in loop
+    assert 'PRUNE_LIMIT="${PM_ROBOT_RETENTION_PRUNE_LIMIT:-20}"' in loop
+    assert 'PRUNE_MAX_ACTIVITY_ROWS="${PM_ROBOT_RETENTION_PRUNE_MAX_ACTIVITY_ROWS:-5000}"' in loop
+    assert 'PRUNE_BATCH_DELAY="${PM_ROBOT_RETENTION_PRUNE_BATCH_DELAY:-10}"' in loop
+    assert '--cleanup-batch-limit "$CLEANUP_BATCH_LIMIT"' in loop
+    assert '--max-activity-rows "$PRUNE_MAX_ACTIVITY_ROWS"' in loop
+    assert 'sleep "$PRUNE_BATCH_DELAY"' in loop
+    assert "--skip-cleanup" not in loop
 
 
 def test_canonical_docs_describe_current_research_pipeline_only():
@@ -980,7 +990,7 @@ def test_nas_maintenance_loop_runs_lightweight_storage_and_queue_repair():
     assert "MAINTENANCE_SERVICES=\"maintenance-loop\"" in helper
     assert "maintenance-up" in helper
     assert "maintenance-restart" in helper
-    assert "PM_ROBOT_MAINTENANCE_INTERVAL=3600" in env
+    assert "PM_ROBOT_MAINTENANCE_INTERVAL=900" in env
     assert "PM_ROBOT_MAINTENANCE_WAL_CHECKPOINT=passive" in env
     assert "PM_ROBOT_MAINTENANCE_REPORT_PATH=/app/reports/maintenance_status.json" in env
     assert "PM_ROBOT_MAINTENANCE_STALE_INGEST_RUN_SECONDS=21600" in env
@@ -988,7 +998,9 @@ def test_nas_maintenance_loop_runs_lightweight_storage_and_queue_repair():
     assert "PM_ROBOT_MAINTENANCE_RUNTIME_HEARTBEAT_DAYS=30" in env
     assert "PM_ROBOT_RETENTION_ARCHIVE_ENABLED=1" in env
     assert "PM_ROBOT_ARCHIVE_DIR=/app/data/parquet" in env
-    assert "--skip-cleanup" in loop
+    assert "PM_ROBOT_MAINTENANCE_CLEANUP_BATCH_LIMIT=500" in env
+    assert "--cleanup-batch-limit \"$CLEANUP_BATCH_LIMIT\"" in loop
+    assert "--skip-cleanup" not in loop
     assert "--reset-stale-jobs" in loop
     assert "--failed-job-cooldown-seconds \"$FAILED_JOB_COOLDOWN_SECONDS\"" in loop
     assert "--reset-stale-ingest-runs" in loop

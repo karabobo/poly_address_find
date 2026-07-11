@@ -5,7 +5,7 @@ from pathlib import Path
 import time
 
 import pm_robot.web as web_module
-from pm_robot.config import RobotSettings
+from pm_robot.config import RobotSettings, load_policy
 from pm_robot.storage.db import connect, run_migrations
 from pm_robot.web import (
     _badge,
@@ -35,6 +35,9 @@ from pm_robot.web import (
     wallet_detail_data,
     wallet_table_rows,
 )
+
+
+POLICY_VERSION = str(load_policy(Path("config/leader_scoring_policy.json"))["version"])
 
 
 def _settings(tmp_path):
@@ -73,6 +76,106 @@ def _insert_l3_evidence(conn, wallet: str, *, updated_at: int) -> None:
                   'score_wallet', 0, 1000, 20, 200, ?)
         """,
         (wallet, updated_at),
+    )
+
+
+def _approve_evidence_promotion(
+    conn,
+    wallet: str,
+    *,
+    job_action: str,
+    current_depth: int,
+    updated_at: int,
+) -> None:
+    target_depth = 1000 if job_action == "medium_pending" else 3000
+    materializer_version = web_module.MATERIALIZER_VERSION
+    conn.execute("DELETE FROM wallet_activity WHERE address = ?", (wallet,))
+    conn.execute(
+        """
+        WITH RECURSIVE sequence(value) AS (
+            SELECT 1
+            UNION ALL
+            SELECT value + 1 FROM sequence WHERE value < ?
+        )
+        INSERT INTO wallet_activity(
+            address, timestamp, condition_id, event_slug, market_slug,
+            asset_id, outcome, type, side, price, size, usdc_size,
+            transaction_hash, raw_json, ingested_at
+        )
+        SELECT
+            ?, ? + value, 'condition-' || value, 'event-' || value,
+            'market-' || value, 'asset-' || value, 'YES', 'TRADE',
+            'BUY', 0.5, 1, 0.5, printf('0x%064x', value), '{}', ?
+        FROM sequence
+        """,
+        (current_depth, wallet, updated_at, updated_at),
+    )
+    feature_extra = json.dumps(
+        {
+            "feature_materializer_version": materializer_version,
+            "feature_materializer_activity_count": current_depth,
+        }
+    )
+    conn.execute(
+        """
+        INSERT INTO wallet_features(address, extra_json, updated_at)
+        VALUES (?, ?, ?)
+        ON CONFLICT(address) DO UPDATE SET
+            extra_json = json_patch(wallet_features.extra_json, excluded.extra_json),
+            updated_at = excluded.updated_at
+        """,
+        (wallet, feature_extra, updated_at),
+    )
+    if job_action == "deep_pending":
+        conn.execute(
+            """
+            INSERT INTO leader_scores(
+                address, leader_score, review_stage, review_reason,
+                components_json, penalties_json, policy_version, scored_at
+            ) VALUES (?, 50, 'needs_manual_review', 'test', '{}', '{}', ?, ?)
+            """,
+            (wallet, POLICY_VERSION, updated_at),
+        )
+    evidence_json = json.dumps(
+        {
+            "promotion": {
+                "approved": True,
+                "job_action": job_action,
+                "policy_version": POLICY_VERSION,
+                "feature_updated_at": updated_at,
+                "activity_count": current_depth,
+                "materializer_version": materializer_version,
+            }
+        }
+    )
+    conn.execute(
+        """
+        INSERT INTO evidence_backfill_budget(
+            wallet, source, priority, stage, target_depth, current_depth,
+            next_attempt_at, stop_reason, evidence_json, created_at, updated_at
+        ) VALUES (?, 'test', 10, ?, ?, ?, 0, ?, ?, ?, ?)
+        ON CONFLICT(wallet) DO UPDATE SET
+            stage = excluded.stage,
+            target_depth = excluded.target_depth,
+            current_depth = excluded.current_depth,
+            next_attempt_at = 0,
+            stop_reason = excluded.stop_reason,
+            evidence_json = excluded.evidence_json,
+            updated_at = excluded.updated_at
+        """,
+        (
+            wallet,
+            job_action,
+            target_depth,
+            current_depth,
+            (
+                f"promotion_approved:{job_action}:{POLICY_VERSION}:"
+                f"{updated_at}:{current_depth}"
+            ),
+            evidence_json,
+            updated_at,
+            updated_at,
+        ),
     )
 
 
@@ -1696,6 +1799,20 @@ def test_dashboard_evidence_pipeline_reports_l1_l2_l3_queue_progress(tmp_path, m
             """,
             (stalled_wallet, now - 60),
         )
+        _approve_evidence_promotion(
+            conn,
+            wallet,
+            job_action="medium_pending",
+            current_depth=240,
+            updated_at=now,
+        )
+        _approve_evidence_promotion(
+            conn,
+            stalled_wallet,
+            job_action="deep_pending",
+            current_depth=820,
+            updated_at=now - 60,
+        )
         conn.execute(
             """
             INSERT INTO pipeline_jobs(
@@ -1820,8 +1937,9 @@ def test_dashboard_evidence_pipeline_reports_l1_l2_l3_queue_progress(tmp_path, m
     assert "可调度库存" in html
     assert "当前波次待补" in html
     assert "当前波次 ETA" in html
-    assert "端到端粗估" in html
-    assert "分阶段工作量与派生" in html
+    assert "端到端粗估" not in html
+    assert "分阶段当前工作量" in html
+    assert "待本地升层评估" in html
     assert "最近完成证据任务" in html
 
 
@@ -2553,6 +2671,13 @@ def test_dashboard_ops_health_distinguishes_normal_backlog_from_high_priority_ga
             """,
             (wallet, now),
         )
+        _approve_evidence_promotion(
+            conn,
+            wallet,
+            job_action="medium_pending",
+            current_depth=120,
+            updated_at=now,
+        )
         conn.commit()
     finally:
         conn.close()
@@ -2714,6 +2839,64 @@ def test_evidence_backlog_matches_planner_actionability(tmp_path):
 
         assert backlog["pending_without_active_job"] == 0
         assert backlog["by_action"] == []
+    finally:
+        conn.close()
+
+
+def test_evidence_backlog_rejects_legacy_prefix_only_depth_approval(tmp_path):
+    settings = _settings(tmp_path)
+    conn = connect(settings.db_path)
+    wallet = "0xabc0000000000000000000000000000000000103"
+    now = 1_800_000_000
+    try:
+        run_migrations(conn)
+        conn.execute(
+            """
+            INSERT INTO candidate_wallets(
+                address, sources, labels, notes, links, status,
+                candidate_stage, first_seen_at, updated_at
+            ) VALUES (?, 'test', '', '', '', 'active', 'needs_data', ?, ?)
+            """,
+            (wallet, now, now),
+        )
+        conn.execute(
+            """
+            INSERT INTO wallet_processing_state(
+                wallet, discovery_tier, evidence_status, evidence_depth,
+                evidence_confidence, priority, current_stage, next_action,
+                next_action_at, activity_count, distinct_markets,
+                non_fast_trade_count, updated_at
+            ) VALUES (?, 'l1_light', 'queued', 80, 0.5, 10,
+                      'light_done', 'medium_pending', 0, 80, 4, 60, ?)
+            """,
+            (wallet, now),
+        )
+        conn.execute(
+            """
+            INSERT INTO evidence_backfill_budget(
+                wallet, source, priority, stage, target_depth, current_depth,
+                next_attempt_at, stop_reason, evidence_json, created_at, updated_at
+            ) VALUES (?, 'test', 10, 'medium_pending', 1000, 80, 0,
+                      'promotion_approved:medium_pending:legacy', '{}', ?, ?)
+            """,
+            (wallet, now, now),
+        )
+        conn.commit()
+
+        backlog = web_module._pending_evidence_backlog_summary(
+            conn,
+            now=now,
+            policy_version=POLICY_VERSION,
+        )
+        promotion = web_module._evidence_promotion_gate_summary(
+            conn,
+            policy_version=POLICY_VERSION,
+        )
+
+        assert backlog["pending_without_active_job"] == 0
+        assert promotion["approved_pending"] == 0
+        assert promotion["awaiting_gate"] == 1
+        assert promotion["waiting_for_features"] == 1
     finally:
         conn.close()
 

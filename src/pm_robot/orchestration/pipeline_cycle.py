@@ -14,8 +14,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
+from pm_robot.config import load_policy
 from pm_robot.orchestration.copyability_evidence import plan_copyability_evidence_jobs
 from pm_robot.orchestration.eligibility_repair import prepare_eligibility_repairs
+from pm_robot.orchestration.evidence_promotion import promote_wallet_evidence
 from pm_robot.orchestration.feature_materializer import materialize_wallet_features
 from pm_robot.orchestration.pipeline_smoothness import pipeline_smoothness_report
 from pm_robot.orchestration.review_pipeline import score_database
@@ -46,6 +48,7 @@ class PipelineCycleOptions:
     planner_lock_sleep_seconds: float = 3.0
     feature_limit: int = 10
     feature_min_activity_events: int = 25
+    evidence_promotion_limit: int = 100
     score_limit: int = 0
     run_scoring: bool = True
     policy_path: Path | None = None
@@ -67,8 +70,13 @@ def run_pipeline_cycle(
     dry_run = not options.execute_plan
     steps: list[dict[str, Any]] = []
     policy_path = options.policy_path
-    if options.execute_plan and options.run_scoring and policy_path is None:
-        raise ValueError("policy_path is required when run_scoring is enabled")
+    if options.execute_plan and policy_path is None:
+        raise ValueError("policy_path is required for policy-bound evidence planning")
+    policy_version = (
+        str(load_policy(policy_path).get("version") or "")
+        if policy_path is not None
+        else ""
+    )
     before = (
         pipeline_smoothness_report(
             conn,
@@ -157,43 +165,6 @@ def run_pipeline_cycle(
     _run_isolated_step(
         conn,
         steps,
-        "wallet_pipeline_plan",
-        lambda: plan_wallet_pipeline_jobs(
-            conn,
-            light_limit=options.wallet_light_limit,
-            medium_limit=options.wallet_medium_limit,
-            deep_limit=options.wallet_deep_limit,
-            shard_count=options.wallet_shard_count,
-            max_active_jobs=options.wallet_max_active_jobs,
-            lock_retry_attempts=options.planner_lock_attempts,
-            lock_retry_sleep_seconds=options.planner_lock_sleep_seconds,
-        ),
-        continue_on_error=options.continue_on_error,
-        step_reporter=step_reporter,
-    )
-
-    _run_isolated_step(
-        conn,
-        steps,
-        "copyability_plan",
-        lambda: plan_copyability_evidence_jobs(
-            conn,
-            limit=options.copyability_limit,
-            max_active_jobs=options.copyability_max_active_jobs,
-            min_score=options.min_score,
-            min_activity_events=options.copyability_min_activity_events,
-            shard_count=options.copyability_shard_count,
-            rescan_seconds=options.copyability_rescan_seconds,
-            lock_retry_attempts=options.planner_lock_attempts,
-            lock_retry_sleep_seconds=options.planner_lock_sleep_seconds,
-        ),
-        continue_on_error=options.continue_on_error,
-        step_reporter=step_reporter,
-    )
-
-    _run_isolated_step(
-        conn,
-        steps,
         "materialize_features",
         lambda: materialize_wallet_features(
             conn,
@@ -226,6 +197,65 @@ def run_pipeline_cycle(
             _step("incremental_score", "skipped", {"reason": "run_scoring_disabled"}),
             step_reporter=step_reporter,
         )
+
+    if options.evidence_promotion_limit > 0:
+        assert policy_path is not None
+        _run_isolated_step(
+            conn,
+            steps,
+            "evidence_promotion",
+            lambda: promote_wallet_evidence(
+                conn,
+                policy_path=policy_path,
+                limit=options.evidence_promotion_limit,
+            ),
+            continue_on_error=options.continue_on_error,
+            step_reporter=step_reporter,
+        )
+    else:
+        _append_step(
+            steps,
+            _step("evidence_promotion", "skipped", {"reason": "limit_is_zero"}),
+            step_reporter=step_reporter,
+        )
+
+    _run_isolated_step(
+        conn,
+        steps,
+        "wallet_pipeline_plan",
+        lambda: plan_wallet_pipeline_jobs(
+            conn,
+            policy_version=policy_version,
+            light_limit=options.wallet_light_limit,
+            medium_limit=options.wallet_medium_limit,
+            deep_limit=options.wallet_deep_limit,
+            shard_count=options.wallet_shard_count,
+            max_active_jobs=options.wallet_max_active_jobs,
+            lock_retry_attempts=options.planner_lock_attempts,
+            lock_retry_sleep_seconds=options.planner_lock_sleep_seconds,
+        ),
+        continue_on_error=options.continue_on_error,
+        step_reporter=step_reporter,
+    )
+
+    _run_isolated_step(
+        conn,
+        steps,
+        "copyability_plan",
+        lambda: plan_copyability_evidence_jobs(
+            conn,
+            limit=options.copyability_limit,
+            max_active_jobs=options.copyability_max_active_jobs,
+            min_score=options.min_score,
+            min_activity_events=options.copyability_min_activity_events,
+            shard_count=options.copyability_shard_count,
+            rescan_seconds=options.copyability_rescan_seconds,
+            lock_retry_attempts=options.planner_lock_attempts,
+            lock_retry_sleep_seconds=options.planner_lock_sleep_seconds,
+        ),
+        continue_on_error=options.continue_on_error,
+        step_reporter=step_reporter,
+    )
 
     after = {}
     if options.include_diagnostics:
@@ -272,6 +302,24 @@ def _dry_run_steps(options: PipelineCycleOptions) -> list[dict[str, Any]]:
             },
         ),
         _step(
+            "materialize_features",
+            "would_execute",
+            {
+                "limit": options.feature_limit,
+                "min_activity_events": options.feature_min_activity_events,
+            },
+        ),
+        _step(
+            "incremental_score",
+            "would_execute" if options.run_scoring else "skipped",
+            {"limit": options.score_limit, "incremental": True},
+        ),
+        _step(
+            "evidence_promotion",
+            "would_execute" if options.evidence_promotion_limit > 0 else "skipped",
+            {"limit": options.evidence_promotion_limit},
+        ),
+        _step(
             "wallet_pipeline_plan",
             "would_execute",
             {
@@ -297,19 +345,6 @@ def _dry_run_steps(options: PipelineCycleOptions) -> list[dict[str, Any]]:
                 "lock_retry_attempts": options.planner_lock_attempts,
                 "lock_retry_sleep_seconds": options.planner_lock_sleep_seconds,
             },
-        ),
-        _step(
-            "materialize_features",
-            "would_execute",
-            {
-                "limit": options.feature_limit,
-                "min_activity_events": options.feature_min_activity_events,
-            },
-        ),
-        _step(
-            "incremental_score",
-            "would_execute" if options.run_scoring else "skipped",
-            {"limit": options.score_limit, "incremental": True},
         ),
         _step("pipeline_smoothness_after", "would_observe", {"top": options.top}),
     ]

@@ -15,6 +15,7 @@ from pm_robot.orchestration.retry_policy import (
     is_upstream_scheduling_error,
     upstream_aware_retry_at,
 )
+from pm_robot.orchestration.feature_materializer import MATERIALIZER_VERSION
 from pm_robot.pipeline_terms import (
     DEFAULT_EVIDENCE_JOB_STAGE,
     EvidenceJobStage,
@@ -23,6 +24,7 @@ from pm_robot.pipeline_terms import (
 from pm_robot.storage.repository import (
     claim_evidence_backfill_job,
     complete_evidence_backfill_job,
+    evidence_promotion_approval_is_current,
     enqueue_evidence_backfill_job,
     finish_ingest_run,
     evidence_backfill_job_summary,
@@ -33,6 +35,7 @@ from pm_robot.storage.repository import (
     retry_evidence_backfill_job,
     seed_missing_evidence_backfill_budgets,
     start_ingest_run,
+    supersede_evidence_backfill_job,
     sync_wallet_processing_state,
     update_evidence_backfill_budget,
     upsert_wallet_evidence_summary,
@@ -110,6 +113,7 @@ def prioritize_backfill_from_scores(
                 address,
                 leader_score,
                 review_stage,
+                policy_version,
                 ROW_NUMBER() OVER (
                     PARTITION BY address
                     ORDER BY scored_at DESC, score_id DESC
@@ -125,6 +129,7 @@ def prioritize_backfill_from_scores(
             cw.address,
             latest.leader_score,
             latest.review_stage,
+            latest.policy_version,
             COALESCE(ac.activity_count, 0) AS activity_count,
             COALESCE(ebb.stage, '') AS existing_stage
         FROM latest
@@ -156,12 +161,16 @@ def prioritize_backfill_from_scores(
             "previous_stage": str(row["existing_stage"] or ""),
             "prioritized_at": ts,
         }
+        request_reason = (
+            f"promotion_requested:{target_stage}:"
+            f"{str(row['policy_version'] or 'score_priority')}"
+        )
         conn.execute(
             """
             INSERT INTO evidence_backfill_budget(
                 wallet, source, priority, stage, target_depth, current_depth,
-                next_attempt_at, evidence_json, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
+                next_attempt_at, stop_reason, evidence_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)
             ON CONFLICT(wallet) DO UPDATE SET
                 source = CASE
                     WHEN evidence_backfill_budget.source = '' THEN excluded.source
@@ -179,6 +188,11 @@ def prioritize_backfill_from_scores(
                 target_depth = MAX(evidence_backfill_budget.target_depth, excluded.target_depth),
                 current_depth = excluded.current_depth,
                 next_attempt_at = 0,
+                stop_reason = CASE
+                    WHEN evidence_backfill_budget.stage IN ('deep_done', 'paused_fast_market_specialist')
+                        THEN evidence_backfill_budget.stop_reason
+                    ELSE excluded.stop_reason
+                END,
                 evidence_json = excluded.evidence_json,
                 updated_at = excluded.updated_at
             """,
@@ -189,6 +203,7 @@ def prioritize_backfill_from_scores(
                 target_stage,
                 target_depth,
                 int(row["activity_count"] or 0),
+                request_reason,
                 json.dumps(evidence, ensure_ascii=False, sort_keys=True),
                 ts,
                 ts,
@@ -208,6 +223,7 @@ def prioritize_backfill_from_scores(
 def plan_queued_evidence_backfill(
     conn: sqlite3.Connection,
     *,
+    policy_version: str = "",
     light_limit: int = 30,
     medium_limit: int = 20,
     deep_limit: int = 3,
@@ -220,6 +236,7 @@ def plan_queued_evidence_backfill(
     seeded = seed_missing_evidence_backfill_budgets(conn)
     targets = _select_targets(
         conn,
+        policy_version=policy_version,
         light_limit=light_limit,
         medium_limit=medium_limit,
         deep_limit=deep_limit,
@@ -249,6 +266,7 @@ def plan_queued_evidence_backfill(
 def run_queued_evidence_backfill_worker(
     conn: sqlite3.Connection,
     *,
+    policy_version: str = "",
     shard_index: int,
     shard_count: int,
     limit: int = 8,
@@ -288,6 +306,24 @@ def run_queued_evidence_backfill_worker(
                 break
             attempted += 1
             wallet = str(job["wallet"]).lower()
+            job_action = str(job["stage"] or "")
+            if (
+                job_action != EvidenceJobStage.LIGHT_PENDING.value
+                and not evidence_promotion_approval_is_current(
+                    conn,
+                    wallet=wallet,
+                    job_action=job_action,
+                    expected_policy_version=policy_version,
+                    expected_materializer_version=MATERIALIZER_VERSION,
+                )
+            ):
+                supersede_evidence_backfill_job(
+                    conn,
+                    job_id=int(job["job_id"]),
+                    reason="evidence_depth_not_approved",
+                )
+                conn.commit()
+                continue
             target_depth = int(job["target_depth"] or LIGHT_DEPTH)
             try:
                 events = _fetch_activity_history(
@@ -416,6 +452,7 @@ def queued_evidence_backfill_status(conn: sqlite3.Connection) -> dict[str, Any]:
 def run_evidence_backfill(
     conn: sqlite3.Connection,
     *,
+    policy_version: str = "",
     light_limit: int = 10,
     medium_limit: int = 3,
     deep_limit: int = 1,
@@ -428,6 +465,7 @@ def run_evidence_backfill(
     seeded = seed_missing_evidence_backfill_budgets(conn)
     targets = _select_targets(
         conn,
+        policy_version=policy_version,
         light_limit=light_limit,
         medium_limit=medium_limit,
         deep_limit=deep_limit,
@@ -605,20 +643,41 @@ def summarize_wallet_evidence(conn: sqlite3.Connection, wallet: str) -> dict[str
 def _select_targets(
     conn: sqlite3.Connection,
     *,
+    policy_version: str,
     light_limit: int,
     medium_limit: int,
     deep_limit: int,
 ) -> list[dict[str, Any]]:
     targets: list[dict[str, Any]] = []
     if light_limit > 0:
-        targets.extend(list_evidence_backfill_targets(conn, stage=DEFAULT_EVIDENCE_JOB_STAGE, limit=light_limit))
+        targets.extend(
+            list_evidence_backfill_targets(
+                conn,
+                stage=DEFAULT_EVIDENCE_JOB_STAGE,
+                limit=light_limit,
+                expected_policy_version=policy_version,
+                expected_materializer_version=MATERIALIZER_VERSION,
+            )
+        )
     if medium_limit > 0:
         targets.extend(
-            list_evidence_backfill_targets(conn, stage=EvidenceJobStage.MEDIUM_PENDING.value, limit=medium_limit)
+            list_evidence_backfill_targets(
+                conn,
+                stage=EvidenceJobStage.MEDIUM_PENDING.value,
+                limit=medium_limit,
+                expected_policy_version=policy_version,
+                expected_materializer_version=MATERIALIZER_VERSION,
+            )
         )
     if deep_limit > 0:
         targets.extend(
-            list_evidence_backfill_targets(conn, stage=EvidenceJobStage.DEEP_PENDING.value, limit=deep_limit)
+            list_evidence_backfill_targets(
+                conn,
+                stage=EvidenceJobStage.DEEP_PENDING.value,
+                limit=deep_limit,
+                expected_policy_version=policy_version,
+                expected_materializer_version=MATERIALIZER_VERSION,
+            )
         )
     return targets
 
@@ -665,12 +724,12 @@ def _classify_next_step(
     if current_stage == EvidenceJobStage.LIGHT_PENDING.value:
         if activity_count < 25:
             return EvidenceJobStage.LIGHT_DONE.value, LIGHT_DEPTH, "insufficient_public_activity_depth", 0
-        if distinct_markets >= 3 or non_fast_trades >= 10 or non_fast_markets >= 2:
-            return EvidenceJobStage.MEDIUM_PENDING.value, MEDIUM_DEPTH, "", now + 60
-        return EvidenceJobStage.LIGHT_DONE.value, LIGHT_DEPTH, "thin_or_low_diversity_activity", 0
+        if distinct_markets < 3 and non_fast_trades < 10 and non_fast_markets < 2:
+            return EvidenceJobStage.LIGHT_DONE.value, LIGHT_DEPTH, "thin_or_low_diversity_activity", 0
+        # Network workers finish one evidence depth at a time. A local policy
+        # gate decides whether the wallet is worth another network pass.
+        return EvidenceJobStage.LIGHT_DONE.value, LIGHT_DEPTH, "light_evidence_collected", 0
     if current_stage == EvidenceJobStage.MEDIUM_PENDING.value:
-        if activity_count >= min(target_depth, 300) and distinct_markets >= 10 and non_fast_trades >= 50:
-            return EvidenceJobStage.DEEP_PENDING.value, DEEP_DEPTH, "", now + 120
         return EvidenceJobStage.MEDIUM_DONE.value, MEDIUM_DEPTH, "medium_evidence_collected", 0
     if current_stage == EvidenceJobStage.DEEP_PENDING.value:
         return EvidenceJobStage.DEEP_DONE.value, DEEP_DEPTH, "deep_evidence_collected", 0

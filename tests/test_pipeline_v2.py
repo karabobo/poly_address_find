@@ -6,12 +6,15 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import Barrier
 
+import pytest
+
 from pm_robot.clients.http import HttpClientError
 from pm_robot.models import CandidateAddress, CandidateStage
 import pm_robot.orchestration.wallet_pipeline as wallet_pipeline
 import pm_robot.storage.repository as repository
 from pm_robot.orchestration.copyability_evidence import JOB_TYPE as COPYABILITY_JOB_TYPE
 from pm_robot.orchestration.evidence_backfill import summarize_wallet_evidence
+from pm_robot.orchestration.feature_materializer import MATERIALIZER_VERSION
 from pm_robot.orchestration.wallet_pipeline import (
     JOB_TYPE as WALLET_EVIDENCE_JOB_TYPE,
     plan_wallet_pipeline_jobs,
@@ -37,6 +40,10 @@ from pm_robot.pipeline_terms import (
     EvidenceStatus,
     EvidenceTier,
     PipelineJobType,
+    evidence_promotion_approval_reason,
+    evidence_promotion_deferred_reason,
+    evidence_promotion_is_approved,
+    evidence_promotion_is_deferred,
 )
 from pm_robot.storage.db import connect, run_migrations
 from pm_robot.storage.repository import (
@@ -649,6 +656,7 @@ def _seed_pending_state(
     evidence_tier: str,
     evidence_status: str,
     evidence_job_stage: str,
+    promotion_policy_version: str = "test",
     priority: int = 50,
     now: int = 30_000,
 ) -> None:
@@ -664,6 +672,68 @@ def _seed_pending_state(
         """,
         (wallet, evidence_tier, evidence_status, priority, evidence_job_stage, now),
     )
+    if evidence_job_stage in {
+        EvidenceJobStage.MEDIUM_PENDING.value,
+        EvidenceJobStage.DEEP_PENDING.value,
+    }:
+        materializer_version = MATERIALIZER_VERSION
+        seed_evidence_backfill_budget(conn, wallet, source="test", priority=priority)
+        conn.execute(
+            """
+            INSERT INTO wallet_features(address, extra_json, updated_at)
+            VALUES (?, ?, ?)
+            """,
+            (
+                wallet,
+                json.dumps(
+                    {
+                        "feature_materializer_version": materializer_version,
+                        "feature_materializer_activity_count": 0,
+                    }
+                ),
+                now,
+            ),
+        )
+        conn.execute(
+            """
+            UPDATE evidence_backfill_budget
+            SET stage = ?, target_depth = ?, stop_reason = ?, evidence_json = ?
+            WHERE wallet = ?
+            """,
+            (
+                evidence_job_stage,
+                1_000 if evidence_job_stage == EvidenceJobStage.MEDIUM_PENDING.value else 3_000,
+                evidence_promotion_approval_reason(
+                    evidence_job_stage,
+                    promotion_policy_version,
+                    feature_updated_at=now,
+                    activity_count=0,
+                ),
+                json.dumps(
+                    {
+                        "promotion": {
+                            "approved": True,
+                            "job_action": evidence_job_stage,
+                            "policy_version": promotion_policy_version,
+                            "feature_updated_at": now,
+                            "activity_count": 0,
+                            "materializer_version": materializer_version,
+                        }
+                    }
+                ),
+                wallet,
+            ),
+        )
+        if evidence_job_stage == EvidenceJobStage.DEEP_PENDING.value:
+            conn.execute(
+                """
+                INSERT INTO leader_scores(
+                    address, leader_score, review_stage, review_reason,
+                    components_json, penalties_json, policy_version, scored_at
+                ) VALUES (?, 50, 'needs_manual_review', 'test', '{}', '{}', ?, ?)
+                """,
+                (wallet, promotion_policy_version, now),
+            )
 
 
 def _seed_light_pending_state(conn, wallet: str, *, priority: int = 50, now: int = 30_000) -> None:
@@ -697,6 +767,7 @@ def test_wallet_pipeline_planner_does_not_revive_summary_only_wallet(tmp_path):
 
         plan = plan_wallet_pipeline_jobs(
             conn,
+            policy_version="test",
             light_limit=1,
             medium_limit=0,
             deep_limit=0,
@@ -868,17 +939,21 @@ def test_light_done_stops_when_light_evidence_does_not_justify_medium_history():
     assert next_action == "score_wallet"
 
 
-def test_light_done_advances_when_light_evidence_justifies_medium_history():
+def test_medium_pending_requires_explicit_policy_promotion_approval():
     status, next_action = repository._next_pipeline_action(
         evidence_tier=EvidenceTier.L1_LIGHT.value,
-        current_stage=EvidenceJobStage.LIGHT_DONE.value,
+        current_stage=EvidenceJobStage.MEDIUM_PENDING.value,
+        stop_reason=evidence_promotion_approval_reason(
+            EvidenceJobStage.MEDIUM_PENDING.value,
+            "test",
+        ),
         activity_count=80,
         distinct_markets=3,
         non_fast_trade_count=8,
         fast_market_share=0.1,
     )
 
-    assert status == EvidenceStatus.NEEDS_MEDIUM.value
+    assert status == EvidenceStatus.QUEUED.value
     assert next_action == EvidenceJobStage.MEDIUM_PENDING.value
 
 
@@ -947,6 +1022,15 @@ def test_pipeline_terms_are_canonical_and_compatible():
         CandidateStage.PAPER_CANDIDATE.value,
         CandidateStage.NEEDS_REVIEW.value,
     )
+    approval = evidence_promotion_approval_reason("medium_pending", "policy-v1")
+    deferred = evidence_promotion_deferred_reason(
+        "deep_pending",
+        "policy-v1",
+        "medium_score_below:40",
+    )
+    assert evidence_promotion_is_approved(approval, "medium_pending") is True
+    assert evidence_promotion_is_approved(approval, "deep_pending") is False
+    assert evidence_promotion_is_deferred(deferred, "deep_pending", "policy-v1") is True
 
 
 def test_pipeline_job_enqueue_calls_have_only_canonical_planner_owners():
@@ -1021,8 +1105,8 @@ def test_wallet_evidence_summary_and_state_are_idempotent(tmp_path):
         assert copyability["usable_for_copyability"] is True
         assert "usable_for_paper" not in copyability
         assert state_row["priority"] == 12
-        assert state_row["evidence_status"] == "needs_deep"
-        assert state_row["next_action"] == "deep_pending"
+        assert state_row["evidence_status"] == "summary_ready"
+        assert state_row["next_action"] == "score_wallet"
         assert len(artifacts) == 1
     finally:
         conn.close()
@@ -1079,13 +1163,209 @@ def test_wallet_pipeline_plans_and_runs_v2_backfill_job(tmp_path):
         assert summary.jobs_succeeded == 1
         assert summary.activity_events_written == 80
         assert summary.positions_written == 1
-        assert budget["stage"] == "medium_pending"
-        assert budget["target_depth"] == 1000
-        assert state["next_action"] == "medium_pending"
+        assert budget["stage"] == "light_done"
+        assert budget["target_depth"] == 200
+        assert state["next_action"] == "score_wallet"
         assert evidence["activity_count"] == 80
         assert after["statuses"] == [
             {"job_type": "wallet_evidence_backfill", "status": "done", "count": 1}
         ]
+    finally:
+        conn.close()
+
+
+def test_wallet_pipeline_worker_supersedes_unapproved_medium_job_without_network(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    wallet = "0x" + "b" * 40
+    try:
+        run_migrations(conn)
+        upsert_candidate(conn, CandidateAddress(address=wallet, sources="legacy"))
+        seed_evidence_backfill_budget(conn, wallet, source="legacy", priority=10)
+        conn.execute(
+            """
+            UPDATE evidence_backfill_budget
+            SET stage = 'medium_pending', target_depth = 1000,
+                stop_reason = 'legacy_auto_promotion'
+            WHERE wallet = ?
+            """,
+            (wallet,),
+        )
+        assert enqueue_pipeline_job(
+            conn,
+            job_type=WALLET_EVIDENCE_JOB_TYPE,
+            wallet=wallet,
+            subject_key=EvidenceJobStage.MEDIUM_PENDING.value,
+            tier=EvidenceTier.L1_LIGHT.value,
+            priority=10,
+            shard=0,
+            input_data={"stage": EvidenceJobStage.MEDIUM_PENDING.value, "target_depth": 1000},
+            now=30_000,
+        )
+        conn.commit()
+        client = FakePipelineClient({wallet: []}, {wallet: []})
+
+        summary = run_wallet_pipeline_worker(
+            conn,
+            shard_index=0,
+            shard_count=1,
+            limit=1,
+            sleep_seconds=0,
+            client=client,
+            worker_id="promotion-guard-worker",
+        )
+        job = conn.execute(
+            "SELECT status, last_error FROM pipeline_jobs WHERE wallet = ?",
+            (wallet,),
+        ).fetchone()
+
+        assert summary.stage_updates == {"promotion_guarded": 1}
+        assert client.activity_calls == []
+        assert client.position_calls == []
+        assert job["status"] == "superseded"
+        assert job["last_error"] == "evidence_depth_not_approved"
+    finally:
+        conn.close()
+
+
+def test_wallet_pipeline_rejects_stale_policy_approval_before_network(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    wallet = "0x" + "c" * 40
+    try:
+        run_migrations(conn)
+        _seed_pending_state(
+            conn,
+            wallet,
+            evidence_tier=EvidenceTier.L1_LIGHT.value,
+            evidence_status=EvidenceStatus.NEEDS_MEDIUM.value,
+            evidence_job_stage=EvidenceJobStage.MEDIUM_PENDING.value,
+            promotion_policy_version="old-policy",
+        )
+        conn.commit()
+
+        plan = plan_wallet_pipeline_jobs(
+            conn,
+            policy_version="current-policy",
+            light_limit=0,
+            medium_limit=1,
+            deep_limit=0,
+            shard_count=1,
+            now=40_000,
+        )
+        assert plan.jobs_enqueued == 0
+
+        assert enqueue_pipeline_job(
+            conn,
+            job_type=WALLET_EVIDENCE_JOB_TYPE,
+            wallet=wallet,
+            subject_key=EvidenceJobStage.MEDIUM_PENDING.value,
+            tier=EvidenceTier.L1_LIGHT.value,
+            priority=10,
+            shard=0,
+            input_data={"stage": EvidenceJobStage.MEDIUM_PENDING.value},
+            now=40_001,
+        )
+        conn.commit()
+        client = FakePipelineClient({wallet: []}, {wallet: []})
+
+        summary = run_wallet_pipeline_worker(
+            conn,
+            policy_version="current-policy",
+            shard_index=0,
+            shard_count=1,
+            limit=1,
+            sleep_seconds=0,
+            client=client,
+            worker_id="stale-policy-guard-worker",
+        )
+        job = conn.execute(
+            "SELECT status, last_error FROM pipeline_jobs WHERE wallet = ?",
+            (wallet,),
+        ).fetchone()
+
+        assert summary.stage_updates == {"promotion_guarded": 1}
+        assert client.activity_calls == []
+        assert client.position_calls == []
+        assert dict(job) == {
+            "status": "superseded",
+            "last_error": "evidence_depth_not_approved",
+        }
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("stale_snapshot", ("materializer_version", "activity_count"))
+def test_wallet_pipeline_rejects_stale_approval_snapshot_before_network(
+    tmp_path,
+    stale_snapshot,
+):
+    conn = connect(tmp_path / "robot.sqlite")
+    wallet = "0x" + "d" * 40
+    try:
+        run_migrations(conn)
+        _seed_pending_state(
+            conn,
+            wallet,
+            evidence_tier=EvidenceTier.L1_LIGHT.value,
+            evidence_status=EvidenceStatus.NEEDS_MEDIUM.value,
+            evidence_job_stage=EvidenceJobStage.MEDIUM_PENDING.value,
+            promotion_policy_version="test",
+        )
+        if stale_snapshot == "materializer_version":
+            conn.execute(
+                """
+                UPDATE wallet_features
+                SET extra_json = json_set(
+                    extra_json,
+                    '$.feature_materializer_version',
+                    'stale-materializer'
+                )
+                WHERE address = ?
+                """,
+                (wallet,),
+            )
+        else:
+            persist_wallet_activity(
+                conn,
+                wallet,
+                [_event(wallet, 999, market="new-evidence")],
+                ingested_at=40_000,
+            )
+        assert enqueue_pipeline_job(
+            conn,
+            job_type=WALLET_EVIDENCE_JOB_TYPE,
+            wallet=wallet,
+            subject_key=EvidenceJobStage.MEDIUM_PENDING.value,
+            tier=EvidenceTier.L1_LIGHT.value,
+            priority=10,
+            shard=0,
+            input_data={"stage": EvidenceJobStage.MEDIUM_PENDING.value},
+            now=40_001,
+        )
+        conn.commit()
+        client = FakePipelineClient({wallet: []}, {wallet: []})
+
+        summary = run_wallet_pipeline_worker(
+            conn,
+            policy_version="test",
+            shard_index=0,
+            shard_count=1,
+            limit=1,
+            sleep_seconds=0,
+            client=client,
+            worker_id=f"stale-{stale_snapshot}-worker",
+        )
+        job = conn.execute(
+            "SELECT status, last_error FROM pipeline_jobs WHERE wallet = ?",
+            (wallet,),
+        ).fetchone()
+
+        assert summary.stage_updates == {"promotion_guarded": 1}
+        assert client.activity_calls == []
+        assert client.position_calls == []
+        assert dict(job) == {
+            "status": "superseded",
+            "last_error": "evidence_depth_not_approved",
+        }
     finally:
         conn.close()
 
@@ -1609,6 +1889,7 @@ def test_wallet_pipeline_planner_preserves_deep_capacity_at_high_waterline(tmp_p
 
         plan = plan_wallet_pipeline_jobs(
             conn,
+            policy_version="test",
             light_limit=1,
             medium_limit=1,
             deep_limit=1,
@@ -1668,6 +1949,7 @@ def test_wallet_pipeline_planner_persists_fairness_across_drained_cycles(tmp_pat
         for cycle in range(3):
             plan = plan_wallet_pipeline_jobs(
                 conn,
+                policy_version="test",
                 light_limit=1,
                 medium_limit=1,
                 deep_limit=1,
@@ -1755,9 +2037,15 @@ def test_wallet_planner_prefetches_candidates_before_write_transaction(tmp_path,
     observed_transactions: list[bool] = []
     real_targets_for_action = wallet_pipeline._targets_for_action
 
-    def observing_targets(conn_arg, evidence_job_stage, limit, now):
+    def observing_targets(conn_arg, evidence_job_stage, limit, now, *, policy_version):
         observed_transactions.append(conn_arg.in_transaction)
-        return real_targets_for_action(conn_arg, evidence_job_stage, limit, now)
+        return real_targets_for_action(
+            conn_arg,
+            evidence_job_stage,
+            limit,
+            now,
+            policy_version=policy_version,
+        )
 
     try:
         run_migrations(conn)
@@ -1882,7 +2170,7 @@ def test_materialize_wallet_processing_state_from_existing_activity(tmp_path):
         assert result["wallets_seen"] == 1
         assert result["wallets_materialized"] == 1
         assert state_row["discovery_tier"] == "l1_light"
-        assert state_row["next_action"] == "medium_pending"
+        assert state_row["next_action"] == "score_wallet"
     finally:
         conn.close()
 

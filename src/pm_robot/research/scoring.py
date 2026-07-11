@@ -64,7 +64,7 @@ def score_candidate(
     if h_reason in INCOMPLETE_HYGIENE_REASONS:
         return ScoreBreakdown(address, 0.0, CandidateStage.NEEDS_DATA, h_reason, {}, {})
 
-    materiality_reason = _economic_materiality_reason(features, policy)
+    materiality_reason = economic_materiality_reason(features, policy)
     if materiality_reason:
         return ScoreBreakdown(
             address=address,
@@ -197,7 +197,8 @@ def _penalties(features: WalletFeatures, policy: dict[str, Any]) -> dict[str, fl
     return out
 
 
-def _economic_materiality_reason(features: WalletFeatures, policy: dict[str, Any]) -> str | None:
+def economic_materiality_reason(features: WalletFeatures, policy: dict[str, Any]) -> str | None:
+    """Return the shared policy reason that blocks economically immaterial wallets."""
     total_volume = features.total_volume_usdc
     if total_volume is None:
         return "missing_economic_materiality:total_volume_usdc"

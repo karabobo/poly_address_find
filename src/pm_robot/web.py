@@ -39,6 +39,7 @@ from pm_robot.orchestration.pipeline_audit import (
 )
 from pm_robot.orchestration.paper_runner import preview_paper_observer
 from pm_robot.orchestration.evidence_readiness import paper_evidence_ready, paper_evidence_ready_sql
+from pm_robot.orchestration.feature_materializer import MATERIALIZER_VERSION
 from pm_robot.orchestration.review_disposition import review_disposition
 from pm_robot.orchestration.wallet_pipeline import (
     DEFAULT_PIPELINE_PRIORITY_AGING_SECONDS,
@@ -128,6 +129,7 @@ _JOB_STATUS_LABELS = {
     "done": "已完成",
     "failed": "已失败",
     "cancelled": "已取消",
+    "superseded": "已替换",
 }
 
 
@@ -915,7 +917,10 @@ def _dashboard_data(
         "source_quality": _source_quality_rows(conn),
         "activity_coverage": _activity_coverage_fast_summary(conn),
         "backfill_queue": evidence_backfill_summary(conn),
-        "evidence_pipeline": _evidence_pipeline_summary(conn),
+        "evidence_pipeline": _evidence_pipeline_summary(
+            conn,
+            policy_version=str(score_policy.get("current_policy_version") or ""),
+        ),
         "storage_maintenance": _storage_maintenance_summary(settings),
         "ops_health": _ops_health_summary(conn, settings),
         "production_readiness": readiness,
@@ -4092,7 +4097,11 @@ def _ops_health_summary(conn: sqlite3.Connection, settings: RobotSettings) -> di
         }
     )
     address_quality = _address_quality_fast_report(conn)
-    pipeline_backlog = _pending_evidence_backlog_summary(conn)
+    policy_version = str(_load_policy_for_dashboard(settings).get("version") or "")
+    pipeline_backlog = _pending_evidence_backlog_summary(
+        conn,
+        policy_version=policy_version,
+    )
     runtime_loops = _runtime_loop_summary(conn, now=now)
     research_control_steps = _research_control_step_summary(conn, now=now)
     if settings.rate_limit_db_path is not None:
@@ -4470,11 +4479,20 @@ def _invalid_evm_address_count(conn: sqlite3.Connection, table: str, column: str
     )
 
 
-def _pending_evidence_backlog_summary(conn: sqlite3.Connection, *, now: int | None = None) -> dict[str, Any]:
+def _pending_evidence_backlog_summary(
+    conn: sqlite3.Connection,
+    *,
+    now: int | None = None,
+    policy_version: str = "",
+) -> dict[str, Any]:
     """Summarize evidence states that should have active wallet backfill jobs."""
 
     now_ts = int(now or time.time())
-    by_action = _pending_evidence_backlog_rows(conn, now=now_ts)
+    by_action = _pending_evidence_backlog_rows(
+        conn,
+        now=now_ts,
+        policy_version=policy_version,
+    )
     total = sum(int(row.get("count") or 0) for row in by_action)
     high_priority = sum(int(row.get("high_priority_count") or 0) for row in by_action)
     return {
@@ -4486,15 +4504,278 @@ def _pending_evidence_backlog_summary(conn: sqlite3.Connection, *, now: int | No
             conn,
             priority_ceiling=HIGH_PRIORITY_PENDING_JOB_PRIORITY,
             now=now_ts,
+            policy_version=policy_version,
         ),
     }
 
 
-def _pending_evidence_backlog_rows(conn: sqlite3.Connection, *, now: int) -> list[dict[str, Any]]:
+def _evidence_promotion_gate_summary(
+    conn: sqlite3.Connection,
+    *,
+    policy_version: str = "",
+) -> dict[str, int]:
+    """Separate local depth admission work from network worker backlog."""
+
+    row = conn.execute(
+        """
+        WITH runtime_config AS (
+            SELECT ? AS policy_version, ? AS materializer_version
+        ), promotion_rows AS (
+            SELECT
+                ebb.stage,
+                COALESCE(ebb.stop_reason, '') AS stop_reason,
+                ebb.current_depth,
+                ebb.updated_at AS budget_updated_at,
+                (
+                    SELECT COUNT(*)
+                    FROM wallet_activity wa INDEXED BY idx_wallet_activity_trade_address_time
+                    WHERE wa.type = 'TRADE' AND wa.address = ebb.wallet
+                ) AS activity_count,
+                COALESCE(wf.updated_at, 0) AS feature_updated_at,
+                COALESCE(
+                    json_extract(wf.extra_json, '$.feature_materializer_version'),
+                    ''
+                ) AS materializer_version,
+                COALESCE(
+                    CAST(json_extract(
+                        wf.extra_json,
+                        '$.feature_materializer_activity_count'
+                    ) AS INTEGER),
+                    -1
+                ) AS materialized_activity_count,
+                COALESCE(
+                    CAST(json_extract(
+                        ebb.evidence_json,
+                        '$.promotion.approved'
+                    ) AS INTEGER),
+                    0
+                ) AS promotion_approved,
+                COALESCE(
+                    json_extract(ebb.evidence_json, '$.promotion.job_action'),
+                    ''
+                ) AS promotion_action,
+                COALESCE(
+                    json_extract(ebb.evidence_json, '$.promotion.policy_version'),
+                    ''
+                ) AS promotion_policy_version,
+                COALESCE(
+                    CAST(json_extract(
+                        ebb.evidence_json,
+                        '$.promotion.feature_updated_at'
+                    ) AS INTEGER),
+                    0
+                ) AS promotion_feature_updated_at,
+                COALESCE(
+                    CAST(json_extract(
+                        ebb.evidence_json,
+                        '$.promotion.activity_count'
+                    ) AS INTEGER),
+                    -1
+                ) AS promotion_activity_count,
+                COALESCE(
+                    json_extract(
+                        ebb.evidence_json,
+                        '$.promotion.materializer_version'
+                    ),
+                    ''
+                ) AS promotion_materializer_version,
+                COALESCE(ls.policy_version, '') AS latest_score_policy_version,
+                rc.policy_version AS current_policy_version,
+                rc.materializer_version AS current_materializer_version
+            FROM evidence_backfill_budget ebb
+            JOIN candidate_wallets cw
+              ON cw.address = ebb.wallet
+            CROSS JOIN runtime_config rc
+            LEFT JOIN wallet_features wf
+              ON wf.address = ebb.wallet
+            LEFT JOIN leader_latest_scores ls
+              ON ls.address = ebb.wallet
+            LEFT JOIN wallet_registry wr
+              ON wr.address = ebb.wallet
+            WHERE ebb.stage IN (
+                'light_pending', 'light_done', 'medium_pending', 'medium_done', 'deep_pending'
+            )
+              AND cw.candidate_stage NOT IN (
+                'rejected', 'blocked_hygiene', 'blocked_copyability'
+              )
+              AND COALESCE(wr.raw_retention_tier, '') != 'summary_only'
+        ), classified AS (
+            SELECT *,
+                CASE
+                    WHEN stage IN ('medium_pending', 'deep_pending')
+                         AND promotion_approved = 1
+                         AND promotion_action = stage
+                         AND promotion_policy_version = current_policy_version
+                         AND promotion_feature_updated_at = feature_updated_at
+                         AND promotion_activity_count = activity_count
+                         AND promotion_materializer_version = current_materializer_version
+                         AND materializer_version = current_materializer_version
+                         AND materialized_activity_count = activity_count
+                         AND (
+                            stage = 'medium_pending'
+                            OR latest_score_policy_version = promotion_policy_version
+                         )
+                         AND stop_reason =
+                            'promotion_approved:' || stage || ':' ||
+                            promotion_policy_version || ':' ||
+                            CAST(feature_updated_at AS TEXT) || ':' ||
+                            CAST(activity_count AS TEXT)
+                    THEN 1 ELSE 0
+                END AS approved,
+                CASE
+                    WHEN stage = 'light_done'
+                         AND (
+                            current_policy_version = ''
+                            OR stop_reason LIKE
+                                'promotion_deferred:medium_pending:' ||
+                                current_policy_version || ':%'
+                         )
+                         AND stop_reason LIKE 'promotion_deferred:medium_pending:%'
+                         AND activity_count = current_depth
+                         AND feature_updated_at <= budget_updated_at
+                    THEN 1
+                    WHEN stage = 'medium_done'
+                         AND (
+                            current_policy_version = ''
+                            OR stop_reason LIKE
+                                'promotion_deferred:deep_pending:' ||
+                                current_policy_version || ':%'
+                         )
+                         AND stop_reason LIKE 'promotion_deferred:deep_pending:%'
+                         AND activity_count = current_depth
+                         AND feature_updated_at <= budget_updated_at
+                    THEN 1 ELSE 0
+                END AS deferred,
+                CASE
+                    WHEN materializer_version = current_materializer_version
+                         AND materialized_activity_count = activity_count
+                    THEN 1 ELSE 0
+                END AS feature_fresh
+            FROM promotion_rows
+        ), gate_rows AS (
+            SELECT *,
+                CASE
+                    WHEN stage IN ('light_done', 'medium_done') AND deferred = 0 THEN 1
+                    WHEN stage IN ('medium_pending', 'deep_pending') AND approved = 0
+                    THEN 1
+                    ELSE 0
+                END AS needs_gate
+            FROM classified
+        )
+        SELECT
+            SUM(approved) AS approved_pending,
+            SUM(deferred) AS policy_deferred,
+            SUM(CASE WHEN needs_gate = 1 AND deferred = 0 THEN 1 ELSE 0 END) AS awaiting_gate,
+            SUM(
+                CASE
+                    WHEN needs_gate = 1 AND deferred = 0 AND feature_fresh = 0 THEN 1
+                    ELSE 0
+                END
+            ) AS waiting_for_features,
+            SUM(
+                CASE
+                    WHEN needs_gate = 1 AND deferred = 0 AND feature_fresh = 1 THEN 1
+                    ELSE 0
+                END
+            ) AS ready_for_evaluation
+        FROM gate_rows
+        """,
+        (policy_version, MATERIALIZER_VERSION),
+    ).fetchone()
+    if row is None:
+        return {
+            "approved_pending": 0,
+            "policy_deferred": 0,
+            "awaiting_gate": 0,
+            "waiting_for_features": 0,
+            "ready_for_evaluation": 0,
+        }
+    return {key: int(row[key] or 0) for key in row.keys()}
+
+
+def _current_evidence_approval_sql() -> str:
+    """Return the snapshot-bound approval predicate used by read-only backlog views."""
+
+    return """
+        (
+            COALESCE(
+                CAST(json_extract(
+                    ebb.evidence_json,
+                    '$.promotion.approved'
+                ) AS INTEGER),
+                0
+            ) = 1
+            AND COALESCE(
+                json_extract(ebb.evidence_json, '$.promotion.job_action'),
+                ''
+            ) = wps.next_action
+            AND COALESCE(
+                json_extract(ebb.evidence_json, '$.promotion.policy_version'),
+                ''
+            ) = rc.policy_version
+            AND COALESCE(
+                CAST(json_extract(
+                    ebb.evidence_json,
+                    '$.promotion.feature_updated_at'
+                ) AS INTEGER),
+                0
+            ) = COALESCE(wf.updated_at, 0)
+            AND COALESCE(
+                CAST(json_extract(
+                    ebb.evidence_json,
+                    '$.promotion.activity_count'
+                ) AS INTEGER),
+                -1
+            ) = COALESCE(wps.raw_activity_count, 0)
+            AND COALESCE(
+                json_extract(
+                    ebb.evidence_json,
+                    '$.promotion.materializer_version'
+                ),
+                ''
+            ) = rc.materializer_version
+            AND COALESCE(
+                json_extract(wf.extra_json, '$.feature_materializer_version'),
+                ''
+            ) = rc.materializer_version
+            AND COALESCE(
+                CAST(json_extract(
+                    wf.extra_json,
+                    '$.feature_materializer_activity_count'
+                ) AS INTEGER),
+                -1
+            ) = COALESCE(wps.raw_activity_count, 0)
+            AND (
+                wps.next_action = 'medium_pending'
+                OR COALESCE(ls.policy_version, '') = COALESCE(
+                    json_extract(ebb.evidence_json, '$.promotion.policy_version'),
+                    ''
+                )
+            )
+            AND COALESCE(ebb.stop_reason, '') =
+                'promotion_approved:' || wps.next_action || ':' ||
+                COALESCE(
+                    json_extract(ebb.evidence_json, '$.promotion.policy_version'),
+                    ''
+                ) || ':' || CAST(COALESCE(wf.updated_at, 0) AS TEXT) || ':' ||
+                CAST(COALESCE(wps.raw_activity_count, 0) AS TEXT)
+        )
+    """
+
+
+def _pending_evidence_backlog_rows(
+    conn: sqlite3.Connection,
+    *,
+    now: int,
+    policy_version: str = "",
+) -> list[dict[str, Any]]:
     action_placeholders = ",".join("?" for _ in PENDING_EVIDENCE_ACTIONS)
     active_placeholders = ",".join("?" for _ in ACTIVE_JOB_STATUSES)
     blocking_placeholders = ",".join("?" for _ in BLOCKING_CANDIDATE_STAGES)
+    approval_sql = _current_evidence_approval_sql()
     params: tuple[Any, ...] = (
+        policy_version,
+        MATERIALIZER_VERSION,
         HIGH_PRIORITY_PENDING_JOB_PRIORITY,
         now,
         *PENDING_EVIDENCE_ACTIONS,
@@ -4508,20 +4789,45 @@ def _pending_evidence_backlog_rows(conn: sqlite3.Connection, *, now: int) -> lis
     return _rows(
         conn,
         f"""
+        WITH runtime_config AS (
+            SELECT ? AS policy_version, ? AS materializer_version
+        ), pending_states AS (
+            SELECT
+                wps.*,
+                (
+                    SELECT COUNT(*)
+                    FROM wallet_activity wa INDEXED BY idx_wallet_activity_trade_address_time
+                    WHERE wa.type = 'TRADE' AND wa.address = wps.wallet
+                ) AS raw_activity_count
+            FROM wallet_processing_state wps
+            WHERE wps.next_action IN ('light_pending', 'medium_pending', 'deep_pending')
+              AND wps.evidence_status NOT IN ('paused', 'summary_ready')
+        )
         SELECT
             wps.next_action,
             COUNT(*) AS count,
             SUM(CASE WHEN COALESCE(wps.priority, 100) <= ? THEN 1 ELSE 0 END) AS high_priority_count,
             MIN(COALESCE(wps.priority, 100)) AS min_priority,
             MAX(COALESCE(wps.updated_at, 0)) AS latest_updated_at
-        FROM wallet_processing_state wps
+        FROM pending_states wps
         JOIN candidate_wallets cw
           ON cw.address = wps.wallet
+        CROSS JOIN runtime_config rc
+        LEFT JOIN evidence_backfill_budget ebb
+          ON ebb.wallet = wps.wallet
+        LEFT JOIN wallet_features wf
+          ON wf.address = wps.wallet
+        LEFT JOIN leader_latest_scores ls
+          ON ls.address = wps.wallet
         LEFT JOIN wallet_registry wr
           ON wr.address = wps.wallet
         WHERE wps.next_action_at <= ?
           AND wps.next_action IN ({action_placeholders})
           AND wps.evidence_status NOT IN ('paused', 'summary_ready')
+          AND (
+                wps.next_action = 'light_pending'
+                OR {approval_sql}
+          )
           AND cw.candidate_stage NOT IN ({blocking_placeholders})
           AND COALESCE(wr.raw_retention_tier, '') != 'summary_only'
           AND NOT EXISTS (
@@ -4563,12 +4869,16 @@ def _pending_evidence_backlog_samples(
     *,
     priority_ceiling: int,
     now: int,
+    policy_version: str = "",
     limit: int = 6,
 ) -> list[dict[str, Any]]:
     action_placeholders = ",".join("?" for _ in PENDING_EVIDENCE_ACTIONS)
     active_placeholders = ",".join("?" for _ in ACTIVE_JOB_STATUSES)
     blocking_placeholders = ",".join("?" for _ in BLOCKING_CANDIDATE_STAGES)
+    approval_sql = _current_evidence_approval_sql()
     params: tuple[Any, ...] = (
+        policy_version,
+        MATERIALIZER_VERSION,
         *PENDING_EVIDENCE_ACTIONS,
         *BLOCKING_CANDIDATE_STAGES,
         priority_ceiling,
@@ -4583,6 +4893,20 @@ def _pending_evidence_backlog_samples(
     return _rows(
         conn,
         f"""
+        WITH runtime_config AS (
+            SELECT ? AS policy_version, ? AS materializer_version
+        ), pending_states AS (
+            SELECT
+                wps.*,
+                (
+                    SELECT COUNT(*)
+                    FROM wallet_activity wa INDEXED BY idx_wallet_activity_trade_address_time
+                    WHERE wa.type = 'TRADE' AND wa.address = wps.wallet
+                ) AS raw_activity_count
+            FROM wallet_processing_state wps
+            WHERE wps.next_action IN ('light_pending', 'medium_pending', 'deep_pending')
+              AND wps.evidence_status NOT IN ('paused', 'summary_ready')
+        )
         SELECT
             wps.wallet,
             wps.discovery_tier AS evidence_tier,
@@ -4590,13 +4914,24 @@ def _pending_evidence_backlog_samples(
             wps.next_action,
             COALESCE(wps.priority, 100) AS priority,
             wps.updated_at
-        FROM wallet_processing_state wps
+        FROM pending_states wps
         JOIN candidate_wallets cw
           ON cw.address = wps.wallet
+        CROSS JOIN runtime_config rc
+        LEFT JOIN evidence_backfill_budget ebb
+          ON ebb.wallet = wps.wallet
+        LEFT JOIN wallet_features wf
+          ON wf.address = wps.wallet
+        LEFT JOIN leader_latest_scores ls
+          ON ls.address = wps.wallet
         LEFT JOIN wallet_registry wr
           ON wr.address = wps.wallet
         WHERE wps.next_action IN ({action_placeholders})
           AND wps.evidence_status NOT IN ('paused', 'summary_ready')
+          AND (
+                wps.next_action = 'light_pending'
+                OR {approval_sql}
+          )
           AND cw.candidate_stage NOT IN ({blocking_placeholders})
           AND COALESCE(wr.raw_retention_tier, '') != 'summary_only'
           AND COALESCE(wps.priority, 100) <= ?
@@ -5839,7 +6174,11 @@ def _production_readiness_summary(
         queue_counts.get(("wallet_evidence_backfill", "running"), 0)
     )
     evidence_state_pending = int(
-        _pending_evidence_backlog_summary(conn).get("pending_without_active_job") or 0
+        _pending_evidence_backlog_summary(
+            conn,
+            policy_version=str(_load_policy_for_dashboard(settings).get("version") or ""),
+        ).get("pending_without_active_job")
+        or 0
     )
     evidence_pending = evidence_active_pending + evidence_state_pending
     copyability_pending = int(queue_counts.get(("copyability_evidence", "queued"), 0)) + int(queue_counts.get(("copyability_evidence", "running"), 0))
@@ -6357,7 +6696,7 @@ def _evidence_stage_progress(
     stage_schedule: list[dict[str, Any]],
     pending_state_rows: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    """Estimate current and downstream work without changing queue state."""
+    """Summarize current network work without predicting policy-gated promotion."""
 
     completion_rows = _rows(
         conn,
@@ -6366,28 +6705,14 @@ def _evidence_stage_progress(
             subject_key AS job_action,
             SUM(CASE WHEN completed_at >= ? THEN 1 ELSE 0 END) AS completed_1h,
             SUM(CASE WHEN completed_at >= ? THEN 1 ELSE 0 END) AS completed_6h,
-            SUM(CASE WHEN completed_at >= ? THEN 1 ELSE 0 END) AS completed_24h,
-            SUM(
-                CASE
-                    WHEN completed_at >= ?
-                     AND json_extract(output_json, '$.next_stage') = 'medium_pending'
-                    THEN 1 ELSE 0
-                END
-            ) AS promoted_medium_24h,
-            SUM(
-                CASE
-                    WHEN completed_at >= ?
-                     AND json_extract(output_json, '$.next_stage') = 'deep_pending'
-                    THEN 1 ELSE 0
-                END
-            ) AS promoted_deep_24h
+            SUM(CASE WHEN completed_at >= ? THEN 1 ELSE 0 END) AS completed_24h
         FROM pipeline_jobs
         WHERE job_type = ?
           AND status = 'done'
           AND subject_key IN ('light_pending', 'medium_pending', 'deep_pending')
         GROUP BY subject_key
         """,
-        (now - 3_600, now - 21_600, now - 86_400, now - 86_400, now - 86_400, job_type),
+        (now - 3_600, now - 21_600, now - 86_400, job_type),
     )
     completions = {str(row.get("job_action") or ""): row for row in completion_rows}
     pending = {
@@ -6407,12 +6732,6 @@ def _evidence_stage_progress(
             + int(schedule.get("due_queued_count") or 0)
             + int(schedule.get("running_count") or 0)
         )
-        promoted_24h = 0
-        if job_action == EvidenceJobStage.LIGHT_PENDING.value:
-            promoted_24h = int(recent.get("promoted_medium_24h") or 0)
-        elif job_action == EvidenceJobStage.MEDIUM_PENDING.value:
-            promoted_24h = int(recent.get("promoted_deep_24h") or 0)
-        promotion_rate = promoted_24h / completed_24h if completed_24h else 0.0
         stage_rows.append(
             {
                 "job_action": job_action,
@@ -6429,7 +6748,6 @@ def _evidence_stage_progress(
                     if current_due and rate_per_hour > 0
                     else ""
                 ),
-                "promotion_rate_24h": round(promotion_rate * 100.0, 1),
             }
         )
 
@@ -6437,27 +6755,23 @@ def _evidence_stage_progress(
     light_due = int(by_action.get(EvidenceJobStage.LIGHT_PENDING.value, {}).get("current_due_count") or 0)
     medium_due = int(by_action.get(EvidenceJobStage.MEDIUM_PENDING.value, {}).get("current_due_count") or 0)
     deep_due = int(by_action.get(EvidenceJobStage.DEEP_PENDING.value, {}).get("current_due_count") or 0)
-    light_promotion = float(
-        by_action.get(EvidenceJobStage.LIGHT_PENDING.value, {}).get("promotion_rate_24h") or 0
-    ) / 100.0
-    medium_promotion = float(
-        by_action.get(EvidenceJobStage.MEDIUM_PENDING.value, {}).get("promotion_rate_24h") or 0
-    ) / 100.0
-    projected_medium_jobs = round(light_due * light_promotion)
-    projected_deep_jobs = round((medium_due + projected_medium_jobs) * medium_promotion)
     current_due_jobs = light_due + medium_due + deep_due
-    projected_downstream_jobs = projected_medium_jobs + projected_deep_jobs
     return {
         "rows": stage_rows,
         "current_due_jobs": current_due_jobs,
-        "projected_medium_jobs": projected_medium_jobs,
-        "projected_deep_jobs": projected_deep_jobs,
-        "projected_downstream_jobs": projected_downstream_jobs,
-        "projected_end_to_end_jobs": current_due_jobs + projected_downstream_jobs,
+        "projected_medium_jobs": 0,
+        "projected_deep_jobs": 0,
+        "projected_downstream_jobs": 0,
+        "projected_end_to_end_jobs": current_due_jobs,
     }
 
 
-def _evidence_pipeline_summary(conn: sqlite3.Connection, *, limit: int = 10) -> dict[str, Any]:
+def _evidence_pipeline_summary(
+    conn: sqlite3.Connection,
+    *,
+    limit: int = 10,
+    policy_version: str = "",
+) -> dict[str, Any]:
     now = int(time.time())
     job_type = PipelineJobType.WALLET_EVIDENCE_BACKFILL.value
     schedule_status = wallet_pipeline_schedule_status(
@@ -6496,7 +6810,15 @@ def _evidence_pipeline_summary(conn: sqlite3.Connection, *, limit: int = 10) -> 
         )
         stage_schedule.append(row)
     queue_progress = _queue_progress_for_job_type(conn, job_type, now=now)
-    pending_state_backlog = _pending_evidence_backlog_summary(conn, now=now)
+    pending_state_backlog = _pending_evidence_backlog_summary(
+        conn,
+        now=now,
+        policy_version=policy_version,
+    )
+    promotion_gate = _evidence_promotion_gate_summary(
+        conn,
+        policy_version=policy_version,
+    )
     status_counts = _rows(
         conn,
         """
@@ -6703,6 +7025,7 @@ def _evidence_pipeline_summary(conn: sqlite3.Connection, *, limit: int = 10) -> 
         ),
         "pending_state_by_action": pending_state_backlog.get("by_action", []),
         "pending_state_high_priority_samples": pending_state_backlog.get("high_priority_samples", []),
+        "promotion_gate": promotion_gate,
         "top_active_jobs": top_active_jobs,
         "recent_completed_jobs": recent_completed_jobs,
     }
@@ -8380,6 +8703,8 @@ def _evidence_pipeline_panel(values: dict[str, Any]) -> str:
     deferred_queued = int(values.get("deferred_queued_jobs") or 0)
     exhausted_queued = int(values.get("exhausted_queued_jobs") or 0)
     aged_queued = int(values.get("aged_queued_jobs") or 0)
+    promotion_gate = values.get("promotion_gate") or {}
+    awaiting_gate = int(promotion_gate.get("awaiting_gate") or 0)
     if exhausted_queued:
         banner_state = "attention"
         note = "有排队任务已经耗尽尝试次数，worker 不会再领取；维护循环将标记失败并释放水位。"
@@ -8402,6 +8727,9 @@ def _evidence_pipeline_panel(values: dict[str, Any]) -> str:
     elif pending_state:
         banner_state = "ok"
         note = "低优先级候选等待 planner 按并发水位分批派发，属于受控背压。"
+    elif awaiting_gate:
+        banner_state = "ok"
+        note = "已完成本层历史的钱包正在本地刷新特征和评分，合格后才会进入下一层网络任务。"
     else:
         banner_state = "ok"
         note = "历史证据队列当前为空。"
@@ -8409,6 +8737,24 @@ def _evidence_pipeline_panel(values: dict[str, Any]) -> str:
         ("状态钱包", _fmt_int(values.get("state_wallets")), "wallet_processing_state", "ok"),
         ("L3 深证据", _fmt_int(values.get("l3_wallets")), "l3_deep", "ok"),
         ("摘要就绪", _fmt_int(values.get("summary_ready_wallets")), "summary_ready", "ok"),
+        (
+            "待本地升层评估",
+            _fmt_int(awaiting_gate),
+            "不占历史网络 worker",
+            "ok",
+        ),
+        (
+            "等特征刷新",
+            _fmt_int(promotion_gate.get("waiting_for_features")),
+            "本地 materialize 后再判断",
+            "ok",
+        ),
+        (
+            "已批准升层",
+            _fmt_int(promotion_gate.get("approved_pending")),
+            "允许进入 L2/L3 网络队列",
+            "ok",
+        ),
         ("排队", _fmt_int(queued), "queued jobs", "warn" if queued else "ok"),
         ("到期排队", _fmt_int(due_queued), "当前可领取", "warn" if due_queued and not running else "ok"),
         ("退避排队", _fmt_int(deferred_queued), "等待 next_attempt_at", "ok"),
@@ -8432,12 +8778,6 @@ def _evidence_pipeline_panel(values: dict[str, Any]) -> str:
             "当前任务，不含后续升级派生",
             "warn" if high_priority_pending_state or (queued and not running) else "ok",
         ),
-        (
-            "预计后续派生",
-            _fmt_int(values.get("projected_downstream_jobs")),
-            "按近24h L1→L2→L3 升级率",
-            "ok",
-        ),
         ("近1h完成", _fmt_int(values.get("completed_1h")), "done jobs", "ok"),
         ("24h完成", _fmt_int(values.get("completed_24h")), "done jobs", "ok"),
         (
@@ -8459,12 +8799,6 @@ def _evidence_pipeline_panel(values: dict[str, Any]) -> str:
             "只计算目前已经存在的任务",
             "warn" if int(values.get("total_due_backlog") or 0) and not values.get("total_eta_label") else "ok",
         ),
-        (
-            "端到端粗估",
-            values.get("end_to_end_eta_label") or "未知",
-            "含预计升级派生，按当前混合吞吐",
-            "warn" if int(values.get("projected_end_to_end_jobs") or 0) else "ok",
-        ),
         ("队列 ETA", values.get("eta_label") or "未知", "仅 queued/running", "warn" if queued and not values.get("eta_label") else "ok"),
     ]
     return (
@@ -8476,7 +8810,7 @@ def _evidence_pipeline_panel(values: dict[str, Any]) -> str:
             for label, value, desc, state in cards
         )
         + "</div>"
-        + '<h3 class="subhead">分阶段工作量与派生</h3>'
+        + '<h3 class="subhead">分阶段当前工作量</h3>'
         + _simple_table(
             values.get("stage_progress") or [],
             [
@@ -8488,9 +8822,8 @@ def _evidence_pipeline_panel(values: dict[str, Any]) -> str:
                 "completed_24h",
                 "rate_per_hour",
                 "current_eta_label",
-                "promotion_rate_24h",
             ],
-            ["证据动作", "待调度", "队列/运行", "当前波次", "近1h完成", "24h完成", "每小时", "本阶段 ETA", "升级率%"],
+            ["证据动作", "待调度", "队列/运行", "当前波次", "近1h完成", "24h完成", "每小时", "本阶段 ETA"],
             localized_keys={"stage_label"},
         )
         + '<h3 class="subhead">钱包证据层级</h3>'

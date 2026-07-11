@@ -7,6 +7,7 @@ import time
 from typing import Any
 
 from pm_robot.orchestration.evidence_readiness import paper_evidence_ready_sql
+from pm_robot.orchestration.feature_materializer import MATERIALIZER_VERSION
 from pm_robot.pipeline_terms import (
     EvidenceJobStage,
     PipelineJobType,
@@ -47,6 +48,7 @@ def pipeline_audit_report(
     top: int = 20,
     min_score: float = 40.0,
     paper_min_score: float = 70.0,
+    policy_version: str = "",
     now: int | None = None,
 ) -> dict[str, Any]:
     """Return a read-only funnel report from observation through research export."""
@@ -62,7 +64,12 @@ def pipeline_audit_report(
         observation = _observation_report(conn, tables)
         candidates = _candidate_report(conn, tables)
         address_quality = address_quality_report(conn, tables=tables)
-        evidence = _evidence_report(conn, tables, now=generated_at)
+        evidence = _evidence_report(
+            conn,
+            tables,
+            policy_version=policy_version,
+            now=generated_at,
+        )
         queues = _queue_report(conn, tables, now=generated_at)
         scoring = _scoring_report(
             conn,
@@ -98,7 +105,13 @@ def pipeline_audit_report(
                 "research_export": export,
             },
             "issues": issues,
-            "samples": _samples(conn, tables, top=top, now=generated_at),
+            "samples": _samples(
+                conn,
+                tables,
+                top=top,
+                policy_version=policy_version,
+                now=generated_at,
+            ),
             "next_steps": _next_steps(issues),
         }
         return report
@@ -222,12 +235,25 @@ def address_quality_report(
     }
 
 
-def _evidence_report(conn: sqlite3.Connection, tables: set[str], *, now: int) -> dict[str, Any]:
+def _evidence_report(
+    conn: sqlite3.Connection,
+    tables: set[str],
+    *,
+    policy_version: str,
+    now: int,
+) -> dict[str, Any]:
     if "wallet_processing_state" not in tables:
         return {"available": False}
-    pending_without_job = _pending_without_active_job_count(conn, tables)
+    pending_without_job = _pending_without_active_job_count(
+        conn,
+        tables,
+        policy_version=policy_version,
+    )
     high_priority_pending_without_job = _pending_without_active_job_count(
-        conn, tables, priority_ceiling=HIGH_PRIORITY_PENDING_JOB_PRIORITY
+        conn,
+        tables,
+        policy_version=policy_version,
+        priority_ceiling=HIGH_PRIORITY_PENDING_JOB_PRIORITY,
     )
     return {
         "available": True,
@@ -450,13 +476,29 @@ def _issues(
     return issues
 
 
-def _samples(conn: sqlite3.Connection, tables: set[str], *, top: int, now: int) -> dict[str, Any]:
+def _samples(
+    conn: sqlite3.Connection,
+    tables: set[str],
+    *,
+    top: int,
+    policy_version: str,
+    now: int,
+) -> dict[str, Any]:
     return {
         "invalid_address_rows": _invalid_address_samples(conn, tables, top),
         "promoted_missing_candidate": _promoted_missing_candidate_samples(conn, tables, top),
-        "pending_without_active_job": _pending_without_active_job_samples(conn, tables, top),
+        "pending_without_active_job": _pending_without_active_job_samples(
+            conn,
+            tables,
+            top,
+            policy_version=policy_version,
+        ),
         "high_priority_pending_without_active_job": _pending_without_active_job_samples(
-            conn, tables, top, priority_ceiling=HIGH_PRIORITY_PENDING_JOB_PRIORITY
+            conn,
+            tables,
+            top,
+            policy_version=policy_version,
+            priority_ceiling=HIGH_PRIORITY_PENDING_JOB_PRIORITY,
         ),
         "summary_ready_without_recent_score": _summary_ready_without_recent_score_samples(
             conn, tables, top, now=now
@@ -655,6 +697,7 @@ def _pending_without_active_job_count(
     conn: sqlite3.Connection,
     tables: set[str],
     *,
+    policy_version: str,
     priority_ceiling: int | None = None,
 ) -> int:
     if not {"wallet_processing_state", "pipeline_jobs"}.issubset(tables):
@@ -662,6 +705,15 @@ def _pending_without_active_job_count(
     placeholders = ",".join("?" for _ in PENDING_EVIDENCE_ACTIONS)
     active_placeholders = ",".join("?" for _ in ACTIVE_JOB_STATUSES)
     join_candidate = "JOIN candidate_wallets cw ON cw.address = wps.wallet" if "candidate_wallets" in tables else ""
+    join_budget = (
+        "LEFT JOIN evidence_backfill_budget ebb ON ebb.wallet = wps.wallet"
+        if "evidence_backfill_budget" in tables
+        else ""
+    )
+    approval_join, promotion_filter = _evidence_promotion_audit_sql(
+        tables,
+        policy_version=policy_version,
+    )
     candidate_filter = ""
     params: list[Any] = [*PENDING_EVIDENCE_ACTIONS]
     if "candidate_wallets" in tables:
@@ -679,8 +731,11 @@ def _pending_without_active_job_count(
         SELECT COUNT(*)
         FROM wallet_processing_state wps
         {join_candidate}
+        {join_budget}
+        {approval_join}
         WHERE wps.next_action IN ({placeholders})
           AND wps.evidence_status NOT IN ('paused', 'summary_ready')
+          {promotion_filter}
           {candidate_filter}
           {priority_filter}
           AND NOT EXISTS (
@@ -891,6 +946,7 @@ def _pending_without_active_job_samples(
     tables: set[str],
     top: int,
     *,
+    policy_version: str,
     priority_ceiling: int | None = None,
 ) -> list[dict[str, Any]]:
     if not {"wallet_processing_state", "pipeline_jobs"}.issubset(tables):
@@ -898,6 +954,15 @@ def _pending_without_active_job_samples(
     placeholders = ",".join("?" for _ in PENDING_EVIDENCE_ACTIONS)
     active_placeholders = ",".join("?" for _ in ACTIVE_JOB_STATUSES)
     join_candidate = "JOIN candidate_wallets cw ON cw.address = wps.wallet" if "candidate_wallets" in tables else ""
+    join_budget = (
+        "LEFT JOIN evidence_backfill_budget ebb ON ebb.wallet = wps.wallet"
+        if "evidence_backfill_budget" in tables
+        else ""
+    )
+    approval_join, promotion_filter = _evidence_promotion_audit_sql(
+        tables,
+        policy_version=policy_version,
+    )
     candidate_filter = ""
     params: list[Any] = [*PENDING_EVIDENCE_ACTIONS]
     if "candidate_wallets" in tables:
@@ -915,8 +980,11 @@ def _pending_without_active_job_samples(
                wps.next_action, wps.priority, wps.updated_at
         FROM wallet_processing_state wps
         {join_candidate}
+        {join_budget}
+        {approval_join}
         WHERE wps.next_action IN ({placeholders})
           AND wps.evidence_status NOT IN ('paused', 'summary_ready')
+          {promotion_filter}
           {candidate_filter}
           {priority_filter}
           AND NOT EXISTS (
@@ -933,6 +1001,87 @@ def _pending_without_active_job_samples(
         tuple(params),
     ).fetchall()
     return [dict(row) for row in rows]
+
+
+def _evidence_promotion_audit_sql(
+    tables: set[str],
+    *,
+    policy_version: str,
+) -> tuple[str, str]:
+    """Keep audit backlog semantics aligned with the network worker guard."""
+
+    required = {
+        "evidence_backfill_budget",
+        "leader_scores",
+        "wallet_features",
+        "wallet_activity",
+    }
+    if not required.issubset(tables):
+        return "", "AND wps.next_action = 'light_pending'"
+    materializer_version = MATERIALIZER_VERSION.replace("'", "''")
+    current_policy_version = policy_version.replace("'", "''")
+    join_sql = "LEFT JOIN wallet_features wf ON wf.address = wps.wallet"
+    predicate = f"""
+        AND (
+            wps.next_action = 'light_pending'
+            OR (
+                COALESCE(CAST(json_extract(
+                    ebb.evidence_json,
+                    '$.promotion.approved'
+                ) AS INTEGER), 0) = 1
+                AND COALESCE(json_extract(
+                    ebb.evidence_json,
+                    '$.promotion.job_action'
+                ), '') = wps.next_action
+                AND COALESCE(json_extract(
+                    ebb.evidence_json,
+                    '$.promotion.policy_version'
+                ), '') = '{current_policy_version}'
+                AND COALESCE(CAST(json_extract(
+                    ebb.evidence_json,
+                    '$.promotion.feature_updated_at'
+                ) AS INTEGER), 0) = COALESCE(wf.updated_at, 0)
+                AND COALESCE(CAST(json_extract(
+                    ebb.evidence_json,
+                    '$.promotion.activity_count'
+                ) AS INTEGER), -1) = (
+                    SELECT COUNT(*)
+                    FROM wallet_activity wa
+                    WHERE wa.address = wps.wallet AND wa.type = 'TRADE'
+                )
+                AND COALESCE(json_extract(
+                    ebb.evidence_json,
+                    '$.promotion.materializer_version'
+                ), '') = '{materializer_version}'
+                AND COALESCE(json_extract(
+                    wf.extra_json,
+                    '$.feature_materializer_version'
+                ), '') = '{materializer_version}'
+                AND (
+                    wps.next_action = 'medium_pending'
+                    OR COALESCE((
+                        SELECT ls.policy_version
+                        FROM leader_scores ls
+                        WHERE ls.address = wps.wallet
+                        ORDER BY ls.scored_at DESC, ls.score_id DESC
+                        LIMIT 1
+                    ), '') = '{current_policy_version}'
+                )
+                AND COALESCE(ebb.stop_reason, '') =
+                    'promotion_approved:' || wps.next_action || ':' ||
+                    COALESCE(json_extract(
+                        ebb.evidence_json,
+                        '$.promotion.policy_version'
+                    ), '') || ':' || CAST(COALESCE(wf.updated_at, 0) AS TEXT) || ':' ||
+                    CAST((
+                        SELECT COUNT(*)
+                        FROM wallet_activity wa
+                        WHERE wa.address = wps.wallet AND wa.type = 'TRADE'
+                    ) AS TEXT)
+            )
+        )
+    """
+    return join_sql, predicate
 
 
 def _summary_ready_without_recent_score_samples(

@@ -166,6 +166,67 @@ def test_execute_prune_counts_sqlite_changes_without_precount_scan(tmp_path):
         conn.close()
 
 
+def test_prune_selection_is_bounded_by_activity_rows(tmp_path):
+    db_path = tmp_path / "robot.sqlite"
+    wallets = ["0x" + digit * 40 for digit in ("1", "2", "3")]
+    conn = connect(db_path)
+    try:
+        run_migrations(conn)
+        for wallet in wallets:
+            _seed_candidate(conn, wallet, materialized=True)
+            conn.execute(
+                "UPDATE candidate_wallets SET candidate_stage = 'blocked_hygiene' WHERE address = ?",
+                (wallet,),
+            )
+            conn.execute(
+                "INSERT INTO wallet_processing_state(wallet, activity_count) VALUES (?, 1)",
+                (wallet,),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+    result = prune_low_value_evidence(
+        _settings(db_path),
+        limit=10,
+        max_activity_rows=6,
+        dry_run=True,
+    )
+
+    assert result["wallets"] == [wallets[0]]
+    assert result["wallet_count"] == 1
+    assert result["selected_activity_rows"] == 5
+    assert result["max_activity_rows"] == 6
+    assert result["activity_budget_exceeded"] is False
+
+
+def test_prune_activity_budget_does_not_starve_one_oversized_wallet(tmp_path):
+    db_path = tmp_path / "robot.sqlite"
+    wallet = "0x" + "8" * 40
+    conn = connect(db_path)
+    try:
+        run_migrations(conn)
+        _seed_candidate(conn, wallet, materialized=True)
+        conn.execute(
+            "UPDATE candidate_wallets SET candidate_stage = 'blocked_hygiene' WHERE address = ?",
+            (wallet,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    result = prune_low_value_evidence(
+        _settings(db_path),
+        limit=10,
+        max_activity_rows=3,
+        dry_run=True,
+    )
+
+    assert result["wallets"] == [wallet]
+    assert result["selected_activity_rows"] == 5
+    assert result["activity_budget_exceeded"] is True
+
+
 def test_prune_terminal_wallet_freezes_summary_and_stops_automatic_work(tmp_path):
     db_path = tmp_path / "robot.sqlite"
     wallet = "0x" + "4" * 40
