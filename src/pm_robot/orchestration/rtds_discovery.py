@@ -10,7 +10,17 @@ from typing import Any, Protocol
 
 from pm_robot.clients.websocket import SimpleWebSocketClient
 from pm_robot.orchestration.activity_discovery import ActivityDiscoverySummary, process_activity_rows
-from pm_robot.pipeline_terms import PAPER_ELIGIBLE_CANDIDATE_STAGES, PROVISIONAL_CANDIDATE_STAGES
+from pm_robot.orchestration.review_disposition import (
+    has_copyability_signal,
+    has_copyability_validation,
+    is_deep_copyability_scan,
+    review_disposition,
+)
+from pm_robot.pipeline_terms import (
+    PAPER_ELIGIBLE_CANDIDATE_STAGES,
+    PROVISIONAL_CANDIDATE_STAGES,
+    PipelineJobType,
+)
 from pm_robot.storage.repository import persist_wallet_activity, record_runtime_heartbeat
 
 
@@ -706,32 +716,7 @@ def _persist_watch_scope_activity(
     result["rows_seen"] = len(rows)
     if not rows or min_score <= 0:
         return result
-    placeholders = ",".join("?" for _ in PROVISIONAL_CANDIDATE_STAGES)
-    eligible = {
-        str(row["address"]).lower()
-        for row in conn.execute(
-            f"""
-            WITH latest AS (
-                SELECT ls.address, ls.leader_score
-                FROM leader_scores ls
-                JOIN (
-                    SELECT address, MAX(score_id) AS score_id
-                    FROM leader_scores
-                    GROUP BY address
-                ) x
-                  ON x.address = ls.address
-                 AND x.score_id = ls.score_id
-            )
-            SELECT cw.address
-            FROM candidate_wallets cw
-            JOIN latest
-              ON latest.address = cw.address
-            WHERE cw.candidate_stage IN ({placeholders})
-              AND latest.leader_score >= ?
-            """,
-            (*PROVISIONAL_CANDIDATE_STAGES, float(min_score)),
-        ).fetchall()
-    }
+    eligible = _rtds_watch_wallets(conn, min_score=min_score)
     result["eligible_wallets"] = len(eligible)
     if not eligible:
         return result
@@ -758,6 +743,90 @@ def _persist_watch_scope_activity(
     result["wallets"] = set(grouped)
     result["events_written"] = events_written
     return result
+
+
+def _rtds_watch_wallets(conn: sqlite3.Connection, *, min_score: float) -> set[str]:
+    """Select high-score wallets plus deep-scan near misses for realtime evidence."""
+
+    placeholders = ",".join("?" for _ in PROVISIONAL_CANDIDATE_STAGES)
+    rows = conn.execute(
+        f"""
+        WITH latest_copy_job AS (
+            SELECT pj.*
+            FROM pipeline_jobs pj
+            JOIN (
+                SELECT wallet, MAX(job_id) AS job_id
+                FROM pipeline_jobs
+                WHERE job_type = ?
+                GROUP BY wallet
+            ) x
+              ON x.job_id = pj.job_id
+        )
+        SELECT
+            cw.address,
+            cw.candidate_stage,
+            latest_score.leader_score,
+            latest_score.review_reason,
+            COALESCE(wps.activity_count, 0) AS activity_count,
+            COALESCE(wps.discovery_tier, '') AS evidence_tier,
+            COALESCE(wps.evidence_status, '') AS evidence_status,
+            COALESCE(wps.next_action, '') AS next_action,
+            COALESCE(latest_copy_job.status, '') AS copyability_status,
+            COALESCE(
+                json_extract(latest_copy_job.output_json, '$.graph_scan_mode'),
+                json_extract(latest_copy_job.input_json, '$.graph_scan_mode'),
+                ''
+            ) AS copyability_scan_mode,
+            CASE
+                WHEN COALESCE(wf.copy_event_count, 0) > 0 THEN COALESCE(wf.copy_event_count, 0)
+                ELSE COALESCE(json_extract(wf.extra_json, '$.copy_candidate_event_count'), 0)
+            END AS feature_copy_event_count,
+            CASE
+                WHEN COALESCE(wf.copy_market_count, 0) > 0 THEN COALESCE(wf.copy_market_count, 0)
+                ELSE COALESCE(json_extract(wf.extra_json, '$.copy_candidate_market_count'), 0)
+            END AS feature_copy_market_count,
+            COALESCE(cls.copy_event_count, 0) AS leader_copy_events,
+            COALESCE(cls.copy_market_count, 0) AS leader_copy_markets,
+            COALESCE(cls.qualified_follower_count, 0) AS qualified_follower_count,
+            COALESCE(clp.backtest_trade_count, 0) AS backtest_trade_count,
+            COALESCE(wf.edge_retention_pct, 0) AS edge_retention_pct,
+            COALESCE(wf.walk_forward_consistency_pct, 0) AS walk_forward_consistency_pct
+        FROM candidate_wallets cw
+        JOIN leader_latest_scores latest_score
+          ON latest_score.address = cw.address
+        LEFT JOIN wallet_processing_state wps
+          ON wps.wallet = cw.address
+        LEFT JOIN wallet_features wf
+          ON wf.address = cw.address
+        LEFT JOIN copy_leader_stats cls
+          ON cls.leader_wallet = cw.address
+        LEFT JOIN copy_leader_performance clp
+          ON clp.leader_wallet = cw.address
+        LEFT JOIN latest_copy_job
+          ON latest_copy_job.wallet = cw.address
+        WHERE cw.candidate_stage IN ({placeholders})
+        """,
+        (PipelineJobType.COPYABILITY_EVIDENCE.value, *PROVISIONAL_CANDIDATE_STAGES),
+    ).fetchall()
+    eligible: set[str] = set()
+    for row in rows:
+        facts = dict(row)
+        if float(row["leader_score"] or 0) >= float(min_score):
+            eligible.add(str(row["address"]).lower())
+            continue
+        disposition = review_disposition(facts)
+        if disposition.key == "copyability_near_miss" or _active_deep_copyability_watch(facts):
+            eligible.add(str(row["address"]).lower())
+    return eligible
+
+
+def _active_deep_copyability_watch(facts: dict[str, Any]) -> bool:
+    return (
+        str(facts.get("copyability_status") or "") in {"queued", "running"}
+        and is_deep_copyability_scan(facts)
+        and has_copyability_signal(facts)
+        and not has_copyability_validation(facts)
+    )
 
 
 def _wallet_from_activity_row(row: dict[str, Any]) -> str:

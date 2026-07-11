@@ -359,6 +359,167 @@ def test_rtds_persists_near_paper_watch_activity_without_stage_promotion(tmp_pat
         conn.close()
 
 
+def test_rtds_persists_low_score_deep_copyability_near_miss_activity(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    wallet = "0x" + "5" * 40
+    ws = FakeWebSocket([_rtds_message(wallet, "0xnear-miss", size=100, price=0.5)])
+    try:
+        run_migrations(conn)
+        conn.execute(
+            """
+            INSERT INTO candidate_wallets(
+                address, sources, labels, notes, links, status,
+                candidate_stage, first_seen_at, updated_at
+            ) VALUES (?, 'test', '', '', '', 'active', 'needs_manual_review', 1, 1)
+            """,
+            (wallet,),
+        )
+        conn.execute(
+            """
+            INSERT INTO leader_scores(
+                address, leader_score, review_stage, review_reason,
+                components_json, penalties_json, policy_version, scored_at
+            ) VALUES (?, 50, 'needs_manual_review', 'watchlist_score',
+                      '{}', '{}', 'test', 1)
+            """,
+            (wallet,),
+        )
+        conn.execute(
+            """
+            INSERT INTO wallet_processing_state(
+                wallet, discovery_tier, evidence_status, evidence_depth,
+                evidence_confidence, priority, current_stage, next_action,
+                next_action_at, activity_count, non_fast_trade_count,
+                distinct_markets, updated_at
+            ) VALUES (?, 'l3_deep', 'summary_ready', 1000, 1.0, 10,
+                      'deep_done', 'score_wallet', 0, 1000, 500, 20, 1)
+            """,
+            (wallet,),
+        )
+        conn.execute(
+            """
+            INSERT INTO wallet_features(address, extra_json, updated_at)
+            VALUES (?, '{"copy_candidate_event_count":12,"copy_candidate_market_count":3}', 1)
+            """,
+            (wallet,),
+        )
+        conn.execute(
+            """
+            INSERT INTO pipeline_jobs(
+                job_type, wallet, subject_key, tier, priority, shard, status,
+                lease_owner, lease_until, attempts, max_attempts, next_attempt_at,
+                input_json, output_json, last_error, created_at, updated_at, completed_at
+            ) VALUES ('copyability_evidence', ?, 'copyability', 'copyability', 10, 0, 'done',
+                      NULL, 0, 1, 3, 0, '{"graph_scan_mode":"deep"}',
+                      '{"graph_scan_mode":"deep"}', '', 1, 1, 1)
+            """,
+            (wallet,),
+        )
+        conn.commit()
+
+        summary = run_rtds_activity_discovery(
+            conn,
+            min_trade_usdc=500,
+            paper_min_trade_usdc=0,
+            watch_min_score=65,
+            batch_size=1,
+            max_messages=1,
+            reconnect_sleep=0,
+            websocket_factory=lambda endpoint: ws,
+        )
+
+        activity = conn.execute(
+            "SELECT raw_json FROM wallet_activity WHERE address = ?",
+            (wallet,),
+        ).fetchone()
+
+        assert summary.trades_selected == 0
+        assert summary.watch_activity_wallets == 1
+        assert summary.watch_activity_events_written == 1
+        assert summary.watch_activity_matches == 1
+        assert summary.watch_eligible_wallets == 1
+        assert activity is not None
+        assert "polymarket_rtds_watch_activity" in activity["raw_json"]
+    finally:
+        conn.close()
+
+
+def test_rtds_keeps_low_score_deep_rescan_wallet_in_watch_scope(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    wallet = "0x" + "4" * 40
+    ws = FakeWebSocket([_rtds_message(wallet, "0xactive-rescan", size=100, price=0.5)])
+    try:
+        run_migrations(conn)
+        conn.execute(
+            """
+            INSERT INTO candidate_wallets(
+                address, sources, labels, notes, links, status,
+                candidate_stage, first_seen_at, updated_at
+            ) VALUES (?, 'test', '', '', '', 'active', 'needs_manual_review', 1, 1)
+            """,
+            (wallet,),
+        )
+        conn.execute(
+            """
+            INSERT INTO leader_scores(
+                address, leader_score, review_stage, review_reason,
+                components_json, penalties_json, policy_version, scored_at
+            ) VALUES (?, 50, 'needs_manual_review', 'watchlist_score',
+                      '{}', '{}', 'test', 1)
+            """,
+            (wallet,),
+        )
+        conn.execute(
+            """
+            INSERT INTO wallet_processing_state(
+                wallet, discovery_tier, evidence_status, evidence_depth,
+                evidence_confidence, priority, current_stage, next_action,
+                next_action_at, activity_count, non_fast_trade_count,
+                distinct_markets, updated_at
+            ) VALUES (?, 'l3_deep', 'summary_ready', 1000, 1.0, 10,
+                      'deep_done', 'score_wallet', 0, 1000, 500, 20, 1)
+            """,
+            (wallet,),
+        )
+        conn.execute(
+            """
+            INSERT INTO wallet_features(address, extra_json, updated_at)
+            VALUES (?, '{"copy_candidate_event_count":12,"copy_candidate_market_count":3}', 1)
+            """,
+            (wallet,),
+        )
+        conn.execute(
+            """
+            INSERT INTO pipeline_jobs(
+                job_type, wallet, subject_key, tier, priority, shard, status,
+                lease_owner, lease_until, attempts, max_attempts, next_attempt_at,
+                input_json, output_json, last_error, created_at, updated_at, completed_at
+            ) VALUES ('copyability_evidence', ?, 'copyability', 'copyability', 10, 0, 'queued',
+                      NULL, 0, 0, 3, 0, '{"graph_scan_mode":"deep"}',
+                      '{}', '', 1, 1, NULL)
+            """,
+            (wallet,),
+        )
+        conn.commit()
+
+        summary = run_rtds_activity_discovery(
+            conn,
+            min_trade_usdc=500,
+            paper_min_trade_usdc=0,
+            watch_min_score=65,
+            batch_size=1,
+            max_messages=1,
+            reconnect_sleep=0,
+            websocket_factory=lambda endpoint: ws,
+        )
+
+        assert summary.watch_activity_wallets == 1
+        assert summary.watch_activity_events_written == 1
+        assert summary.watch_eligible_wallets == 1
+    finally:
+        conn.close()
+
+
 def test_rtds_paper_diagnostics_count_unmatched_wallet_fields(tmp_path):
     conn = connect(tmp_path / "robot.sqlite")
     paper_wallet = "0x" + "8" * 40

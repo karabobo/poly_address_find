@@ -535,7 +535,7 @@ def test_copyability_planner_queues_manual_review_wallets_missing_copyability(tm
         conn.close()
 
 
-def test_copyability_planner_uses_available_capacity_for_stale_done_rescans(tmp_path):
+def test_copyability_planner_requires_new_activity_for_stale_deep_rescan(tmp_path):
     conn = connect(tmp_path / "robot.sqlite")
     stale_done = "0x" + "7" * 40
     active_backlog = "0x" + "8" * 40
@@ -574,12 +574,48 @@ def test_copyability_planner_uses_available_capacity_for_stale_done_rescans(tmp_
                 lease_owner, lease_until, attempts, max_attempts, next_attempt_at,
                 input_json, output_json, last_error, created_at, updated_at, completed_at
             ) VALUES (?, ?, 'copyability', 'copyability', 10, 0, ?,
-                NULL, 0, 1, 3, 0, '{}', '{}', '', 100, 100, ?)
+                NULL, 0, 1, 3, 0, ?, ?, '', 100, 100, ?)
             """,
             [
-                (JOB_TYPE, stale_done, "done", 100),
-                (JOB_TYPE, active_backlog, "queued", None),
+                (
+                    JOB_TYPE,
+                    stale_done,
+                    "done",
+                    json.dumps({"graph_scan_mode": "deep"}),
+                    json.dumps({"graph_scan_mode": "deep"}),
+                    100,
+                ),
+                (JOB_TYPE, active_backlog, "queued", "{}", "{}", None),
             ],
+        )
+        conn.commit()
+
+        quiet_summary = plan_copyability_evidence_jobs(
+            conn,
+            limit=10,
+            max_active_jobs=2,
+            min_score=40,
+            min_activity_events=25,
+            shard_count=1,
+            rescan_seconds=100,
+            now=10_000,
+        )
+        quiet_status = conn.execute(
+            "SELECT status FROM pipeline_jobs WHERE job_type = ? AND wallet = ?",
+            (JOB_TYPE, stale_done),
+        ).fetchone()["status"]
+
+        assert quiet_summary.targets_seen == 0
+        assert quiet_summary.jobs_enqueued == 0
+        assert quiet_status == "done"
+
+        conn.execute(
+            """
+            INSERT INTO wallet_activity_watermarks(
+                address, newest_timestamp, newest_activity_key, updated_at
+            ) VALUES (?, 1234, 'new-event', 200)
+            """,
+            (stale_done,),
         )
         conn.commit()
 
@@ -594,15 +630,18 @@ def test_copyability_planner_uses_available_capacity_for_stale_done_rescans(tmp_
             now=10_000,
         )
         status = conn.execute(
-            "SELECT status FROM pipeline_jobs WHERE job_type = ? AND wallet = ?",
+            "SELECT status, input_json FROM pipeline_jobs WHERE job_type = ? AND wallet = ?",
             (JOB_TYPE, stale_done),
-        ).fetchone()["status"]
+        ).fetchone()
+        input_data = json.loads(status["input_json"])
 
         assert summary.targets_seen == 1
         assert summary.jobs_enqueued == 1
         assert summary.active_jobs == 1
         assert summary.available_slots == 1
-        assert status == "queued"
+        assert status["status"] == "queued"
+        assert input_data["planner_reason"] == "new_activity_after_deep_scan"
+        assert input_data["activity_newest_timestamp"] == 1234
     finally:
         conn.close()
 

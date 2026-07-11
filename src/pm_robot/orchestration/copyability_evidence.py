@@ -22,6 +22,7 @@ from pm_robot.storage.db import retry_sqlite_locked
 from pm_robot.storage.repository import (
     PipelineJobLeaseLost,
     _feature_from_row,
+    activity_watermark,
     apply_copyability_no_signal_blocks,
     complete_pipeline_job,
     enqueue_pipeline_job,
@@ -43,6 +44,7 @@ MISSING_COPYABILITY_PLANNER_REASON = "missing_copyability_components"
 MANUAL_MISSING_COPYABILITY_PLANNER_REASON = "manual_missing_copyability"
 SCORE_REVIEW_PLANNER_REASON = "score_review"
 LIGHT_NO_SIGNAL_DEEP_RESCAN_PLANNER_REASON = "light_no_signal_deep_rescan"
+NEW_ACTIVITY_DEEP_RESCAN_PLANNER_REASON = "new_activity_after_deep_scan"
 LIGHT_NO_SIGNAL_DEEP_RESCAN_MIN_SCORE = 55.0
 LIGHT_SCAN_MAX_LEADER_EVENTS = 600
 LIGHT_SCAN_MAX_FOLLOWERS_PER_EVENT = 80
@@ -212,6 +214,7 @@ def _plan_copyability_evidence_jobs_once(
                 "candidate_stage": target["candidate_stage"],
                 "distinct_markets": int(target["distinct_markets"] or 0),
                 "non_fast_trade_count": int(target["non_fast_trade_count"] or 0),
+                "activity_newest_timestamp": int(target["current_activity_newest_timestamp"] or 0),
                 **scan_input,
             },
             max_attempts=3,
@@ -302,6 +305,7 @@ def run_copyability_evidence_worker(
             )
             try:
                 now = int(time.time())
+                scan_watermark = activity_watermark(conn, wallet)
                 _require_copyability_job_lease(
                     conn,
                     job_id=int(job["job_id"]),
@@ -387,6 +391,8 @@ def run_copyability_evidence_worker(
                         "graph_scan_mode": graph_scan_mode,
                         "graph_max_leader_events": effective_max_leader_events,
                         "graph_max_followers_per_event": effective_max_followers_per_event,
+                        "activity_newest_timestamp": int(scan_watermark.get("newest_timestamp") or 0),
+                        "activity_newest_key": str(scan_watermark.get("newest_activity_key") or ""),
                     },
                     now=now,
                 )
@@ -716,16 +722,9 @@ def _select_copyability_targets(
     return conn.execute(
         f"""
         WITH latest AS (
-            SELECT ls.*
-            FROM leader_scores ls
-            JOIN (
-                SELECT address, MAX(score_id) AS max_id
-                FROM leader_scores
-                {latest_address_filter}
-                GROUP BY address
-            ) latest_id
-              ON latest_id.address = ls.address
-             AND latest_id.max_id = ls.score_id
+            SELECT *
+            FROM leader_latest_scores
+            {latest_address_filter}
         ),
         candidate_base AS (
             SELECT
@@ -758,6 +757,13 @@ def _select_copyability_targets(
                     json_extract(pj.input_json, '$.graph_scan_mode'),
                     ''
                 ) AS existing_scan_mode,
+                COALESCE(
+                    json_extract(pj.output_json, '$.activity_newest_timestamp'),
+                    json_extract(pj.input_json, '$.activity_newest_timestamp'),
+                    0
+                ) AS existing_activity_newest_timestamp,
+                COALESCE(waw.newest_timestamp, 0) AS current_activity_newest_timestamp,
+                COALESCE(waw.updated_at, 0) AS current_activity_watermark_updated_at,
                 COALESCE(wf.leader_in_degree, 0) AS feature_leader_in_degree,
                 COALESCE(wf.copy_event_count, 0) AS feature_copy_event_count,
                 COALESCE(wf.copy_market_count, 0) AS feature_copy_market_count,
@@ -774,6 +780,8 @@ def _select_copyability_targets(
               ON wf.address = cw.address
             LEFT JOIN wallet_registry wr
               ON wr.address = cw.address
+            LEFT JOIN wallet_activity_watermarks waw
+              ON waw.address = cw.address
             LEFT JOIN pipeline_jobs pj
               ON pj.job_type = ?
              AND pj.wallet = cw.address
@@ -864,6 +872,22 @@ def _select_copyability_targets(
                  OR (
                         existing_job_status = 'done'
                     AND existing_completed_at <= ?
+                    AND (
+                           existing_scan_mode NOT IN ('', 'default', 'deep')
+                        OR (
+                               existing_scan_mode IN ('', 'default', 'deep')
+                           AND (
+                                  (
+                                      existing_activity_newest_timestamp > 0
+                                      AND current_activity_newest_timestamp > existing_activity_newest_timestamp
+                                  )
+                               OR (
+                                      existing_activity_newest_timestamp <= 0
+                                  AND current_activity_watermark_updated_at > existing_completed_at
+                               )
+                           )
+                        )
+                    )
                  )
                  OR (
                         candidate_stage = 'needs_manual_review'
@@ -913,11 +937,14 @@ def _select_copyability_targets(
                  AND review_stage = 'needs_manual_review'
                  AND existing_job_status = 'done'
                  AND existing_scan_mode NOT IN ('', 'default', 'deep')
-                THEN 'light_no_signal_deep_rescan'
+                THEN '{LIGHT_NO_SIGNAL_DEEP_RESCAN_PLANNER_REASON}'
+                WHEN existing_job_status = 'done'
+                 AND existing_scan_mode IN ('', 'default', 'deep')
+                THEN '{NEW_ACTIVITY_DEEP_RESCAN_PLANNER_REASON}'
                 WHEN candidate_stage = 'needs_manual_review'
                  AND review_stage = 'needs_manual_review'
                  AND existing_job_id IS NULL
-                THEN 'manual_missing_copyability'
+                THEN '{MANUAL_MISSING_COPYABILITY_PLANNER_REASON}'
                 WHEN review_stage = 'needs_data'
                  AND review_reason LIKE 'missing_required_score_components:%'
                  AND (
@@ -926,8 +953,8 @@ def _select_copyability_targets(
                      OR review_reason LIKE '%copy_market_count%'
                      OR review_reason LIKE '%copy_stream_roi%'
                  )
-                THEN 'missing_copyability_components'
-                ELSE 'score_review'
+                THEN '{MISSING_COPYABILITY_PLANNER_REASON}'
+                ELSE '{SCORE_REVIEW_PLANNER_REASON}'
             END AS planner_reason
         FROM base
         ORDER BY
