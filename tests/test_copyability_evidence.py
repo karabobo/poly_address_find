@@ -322,9 +322,47 @@ def test_copyability_claim_requeues_owned_running_leftovers(tmp_path):
         assert rows[old_running]["status"] == "running"
         assert rows[old_running]["lease_until"] == 9_200
         assert rows[old_running]["attempts"] == 2
-        assert rows[old_running]["last_error"] == "superseded_running_owner_requeued_by_worker"
+        assert claimed["last_error"] == ""
+        assert rows[old_running]["last_error"] == ""
         assert rows[queued]["status"] == "queued"
         assert rows[queued]["lease_owner"] is None
+    finally:
+        conn.close()
+
+
+def test_copyability_claim_recovers_expired_running_job_before_queued_work(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    expired_wallet = "0x" + "3" * 40
+    queued_wallet = "0x" + "4" * 40
+    try:
+        run_migrations(conn)
+        conn.executemany(
+            """
+            INSERT INTO pipeline_jobs(
+                job_type, wallet, subject_key, tier, priority, shard, status,
+                lease_owner, lease_until, attempts, max_attempts, next_attempt_at,
+                input_json, output_json, last_error, created_at, updated_at
+            ) VALUES (?, ?, 'copyability', 'copyability', ?, 0, ?,
+                ?, ?, 1, 3, 0, '{}', '{}', ?, 100, ?)
+            """,
+            [
+                (JOB_TYPE, expired_wallet, 100, "running", "expired-worker", 1_000, "expired attempt", 2_000),
+                (JOB_TYPE, queued_wallet, 1, "queued", None, 0, "", 1_000),
+            ],
+        )
+        conn.commit()
+
+        claimed = _claim_copyability_job(
+            conn,
+            shard=0,
+            worker_id="recovery-worker",
+            lease_seconds=7_200,
+            now=2_500,
+        )
+
+        assert claimed is not None
+        assert claimed["wallet"] == expired_wallet
+        assert claimed["last_error"] == ""
     finally:
         conn.close()
 

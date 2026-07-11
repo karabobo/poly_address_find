@@ -1368,6 +1368,7 @@ def claim_pipeline_job(
                 OR (status = 'running' AND lease_until <= ?)
           )
         ORDER BY
+            CASE WHEN status = 'running' AND lease_until <= ? THEN 0 ELSE 1 END ASC,
             CASE WHEN ? > 0 AND updated_at <= ? THEN 0 ELSE 1 END ASC,
             CASE WHEN ? > 0 AND updated_at <= ? THEN updated_at END ASC,
             priority ASC,
@@ -1378,6 +1379,7 @@ def claim_pipeline_job(
         (
             job_type,
             shard,
+            ts,
             ts,
             ts,
             aging_seconds,
@@ -1396,6 +1398,7 @@ def claim_pipeline_job(
             lease_owner = ?,
             lease_until = ?,
             attempts = attempts + 1,
+            last_error = '',
             updated_at = ?
         WHERE job_id = ?
         """,
@@ -1406,6 +1409,7 @@ def claim_pipeline_job(
     out["attempts"] = int(out.get("attempts") or 0) + 1
     out["lease_owner"] = worker_id
     out["lease_until"] = ts + lease_seconds
+    out["last_error"] = ""
     return out
 
 

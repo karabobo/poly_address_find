@@ -592,6 +592,7 @@ def _claim_copyability_job(
             lease_owner = ?,
             lease_until = ?,
             attempts = attempts + 1,
+            last_error = '',
             updated_at = ?
         WHERE job_id = ?
         """,
@@ -602,6 +603,7 @@ def _claim_copyability_job(
     out["attempts"] = int(out.get("attempts") or 0) + 1
     out["lease_owner"] = worker_id
     out["lease_until"] = ts + lease_seconds
+    out["last_error"] = ""
     return out
 
 
@@ -667,6 +669,7 @@ def _select_claimable_copyability_job(
           )
         """
         params.extend(_scan_mode_like_patterns(prefer_scan_mode))
+    params.append(int(now))
     return conn.execute(
         f"""
         SELECT *
@@ -680,7 +683,11 @@ def _select_claimable_copyability_job(
                 OR (status = 'running' AND lease_until <= ?)
           )
           {scan_filter}
-        ORDER BY priority ASC, updated_at ASC, job_id ASC
+        ORDER BY
+            CASE WHEN status = 'running' AND lease_until <= ? THEN 0 ELSE 1 END ASC,
+            priority ASC,
+            updated_at ASC,
+            job_id ASC
         LIMIT 1
         """,
         tuple(params),

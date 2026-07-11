@@ -368,6 +368,59 @@ def test_pipeline_claim_promotes_old_job_after_aging_threshold(tmp_path):
         conn.close()
 
 
+def test_pipeline_claim_recovers_expired_running_job_before_queued_work(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    expired_wallet = "0x" + "a" * 40
+    queued_wallet = "0x" + "b" * 40
+    try:
+        run_migrations(conn)
+        assert enqueue_pipeline_job(
+            conn,
+            job_type=WALLET_EVIDENCE_JOB_TYPE,
+            wallet=expired_wallet,
+            subject_key=EvidenceJobStage.MEDIUM_PENDING.value,
+            tier=EvidenceTier.L1_LIGHT.value,
+            priority=100,
+            shard=0,
+            now=2_000,
+        )
+        assert enqueue_pipeline_job(
+            conn,
+            job_type=WALLET_EVIDENCE_JOB_TYPE,
+            wallet=queued_wallet,
+            subject_key=EvidenceJobStage.LIGHT_PENDING.value,
+            tier=EvidenceTier.L0_DISCOVERED.value,
+            priority=1,
+            shard=0,
+            now=1_000,
+        )
+        conn.execute(
+            """
+            UPDATE pipeline_jobs
+            SET status = 'running', lease_owner = 'expired-worker',
+                lease_until = 3000, last_error = 'expired attempt'
+            WHERE wallet = ?
+            """,
+            (expired_wallet,),
+        )
+        conn.commit()
+
+        job = claim_pipeline_job(
+            conn,
+            job_type=WALLET_EVIDENCE_JOB_TYPE,
+            shard=0,
+            worker_id="recovery-worker",
+            lease_seconds=60,
+            now=4_000,
+        )
+
+        assert job is not None
+        assert job["wallet"] == expired_wallet
+        assert job["last_error"] == ""
+    finally:
+        conn.close()
+
+
 def test_wallet_pipeline_status_reports_stage_backlog_and_scheduler_cursor(tmp_path):
     conn = connect(tmp_path / "robot.sqlite")
     try:
@@ -1838,6 +1891,46 @@ def test_materialize_wallet_processing_state_retries_locked_batch(tmp_path, monk
         assert calls == [wallets[0], wallets[1], wallets[0], wallets[1]]
         assert conn.execute("SELECT COUNT(*) FROM wallet_evidence_summary").fetchone()[0] == 2
         assert conn.execute("SELECT COUNT(*) FROM wallet_processing_state").fetchone()[0] == 2
+    finally:
+        conn.close()
+
+
+def test_pipeline_job_claim_clears_previous_attempt_error(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    wallet = "0x" + "e" * 40
+    try:
+        run_migrations(conn)
+        assert enqueue_pipeline_job(
+            conn,
+            job_type=WALLET_EVIDENCE_JOB_TYPE,
+            wallet=wallet,
+            subject_key=DEFAULT_EVIDENCE_JOB_STAGE,
+            tier=EvidenceTier.L1_LIGHT.value,
+            shard=0,
+            now=10_000,
+        )
+        conn.execute(
+            "UPDATE pipeline_jobs SET last_error = 'previous transient failure' WHERE wallet = ?",
+            (wallet,),
+        )
+        conn.commit()
+
+        job = claim_pipeline_job(
+            conn,
+            job_type=WALLET_EVIDENCE_JOB_TYPE,
+            shard=0,
+            worker_id="worker-a",
+            lease_seconds=60,
+            now=10_001,
+        )
+        row = conn.execute(
+            "SELECT status, last_error FROM pipeline_jobs WHERE wallet = ?",
+            (wallet,),
+        ).fetchone()
+
+        assert job is not None
+        assert job["last_error"] == ""
+        assert dict(row) == {"status": "running", "last_error": ""}
     finally:
         conn.close()
 
