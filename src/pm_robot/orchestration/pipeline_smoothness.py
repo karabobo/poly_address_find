@@ -13,6 +13,7 @@ from collections import Counter
 from typing import Any
 
 from pm_robot.orchestration.copyability_evidence import JOB_TYPE as COPYABILITY_JOB_TYPE
+from pm_robot.orchestration.evidence_readiness import paper_evidence_ready
 from pm_robot.orchestration.eligibility_repair import (
     ACTION_COPYABILITY,
     ACTION_FEATURE_MATERIALIZE,
@@ -20,6 +21,7 @@ from pm_robot.orchestration.eligibility_repair import (
     ACTION_WALLET_EVIDENCE,
     _actions_for_reasons,
 )
+from pm_robot.orchestration.review_disposition import review_disposition
 from pm_robot.orchestration.wallet_pipeline import JOB_TYPE as WALLET_PIPELINE_JOB_TYPE
 from pm_robot.pipeline_terms import REVIEW_FUNNEL_CANDIDATE_STAGES
 from pm_robot.risk.eligibility import (
@@ -49,6 +51,7 @@ def pipeline_smoothness_report(
     rows = _eligibility_rows(conn, min_score=min_score)
     reason_counts: Counter[str] = Counter()
     action_counts: Counter[str] = Counter()
+    disposition_counts: Counter[str] = Counter()
     paper_eligible = 0
     publish_eligible = 0
     winner_eligible = 0
@@ -57,6 +60,7 @@ def pipeline_smoothness_report(
     for row in rows:
         wallet = str(row["address"]).lower()
         facts = dict(row)
+        facts["paper_evidence_ready"] = paper_evidence_ready(facts)
         paper = paper_eligibility_status(conn, wallet, facts=facts)
         publish = publish_eligibility_status(conn, wallet, facts=facts)
         # Winner-library eligibility currently has the same gate as publish.
@@ -72,8 +76,12 @@ def pipeline_smoothness_report(
             trade_events=int(row["trade_events"] or 0),
             min_copyability_activity_events=min_copyability_activity_events,
         )
+        disposition = review_disposition(facts)
+        if disposition.key in {"copyability_near_miss", "copyability_no_signal"}:
+            actions = tuple(action for action in actions if action != ACTION_COPYABILITY)
         reason_counts.update(reasons)
         action_counts.update(actions)
+        disposition_counts.update((disposition.key,))
         stuck.append(
             {
                 "wallet": wallet,
@@ -83,6 +91,12 @@ def pipeline_smoothness_report(
                 "trade_events": int(row["trade_events"] or 0),
                 "paper_reasons": list(reasons),
                 "recommended_actions": list(actions),
+                "review_disposition": disposition.key,
+                "review_disposition_label": disposition.label,
+                "review_handling": disposition.handling,
+                "review_handling_label": disposition.handling_label,
+                "operator_required": disposition.operator_required,
+                "disposition_next_action": disposition.next_action,
                 "wallet_pipeline_status": row["wallet_pipeline_status"] or "",
                 "copyability_status": row["copyability_status"] or "",
                 "next_action": row["next_action"] or "",
@@ -108,6 +122,7 @@ def pipeline_smoothness_report(
         "winner_library_eligible": winner_eligible,
         "reason_counts": dict(sorted(reason_counts.items(), key=lambda item: (-item[1], item[0]))),
         "action_counts": dict(sorted(action_counts.items(), key=lambda item: (-item[1], item[0]))),
+        "disposition_counts": dict(sorted(disposition_counts.items(), key=lambda item: (-item[1], item[0]))),
     }
     return {
         "ok": True,
@@ -142,6 +157,17 @@ def _eligibility_rows(conn: sqlite3.Connection, *, min_score: float) -> list[sql
             FROM pipeline_jobs
             WHERE status IN ('queued', 'running', 'failed')
             GROUP BY wallet, job_type
+        ),
+        latest_copy_job AS (
+            SELECT pj.*
+            FROM pipeline_jobs pj
+            JOIN (
+                SELECT wallet, MAX(job_id) AS job_id
+                FROM pipeline_jobs
+                WHERE job_type = ?
+                GROUP BY wallet
+            ) latest
+              ON latest.job_id = pj.job_id
         )
         SELECT
             cw.address,
@@ -161,6 +187,18 @@ def _eligibility_rows(conn: sqlite3.Connection, *, min_score: float) -> list[sql
                   AND wa.type = 'TRADE'
             ), 0) AS trade_events,
             COALESCE(wf.copy_event_count, 0) AS copy_event_count,
+            CASE
+                WHEN COALESCE(wf.copy_event_count, 0) > 0 THEN COALESCE(wf.copy_event_count, 0)
+                ELSE COALESCE(json_extract(wf.extra_json, '$.copy_candidate_event_count'), 0)
+            END AS feature_copy_event_count,
+            CASE
+                WHEN COALESCE(wf.copy_market_count, 0) > 0 THEN COALESCE(wf.copy_market_count, 0)
+                ELSE COALESCE(json_extract(wf.extra_json, '$.copy_candidate_market_count'), 0)
+            END AS feature_copy_market_count,
+            COALESCE(cls.qualified_follower_count, 0) AS qualified_follower_count,
+            COALESCE(cls.copy_event_count, 0) AS leader_copy_events,
+            COALESCE(cls.copy_market_count, 0) AS leader_copy_markets,
+            COALESCE(clp.backtest_trade_count, 0) AS backtest_trade_count,
             COALESCE(wf.hygiene_status, '') AS hygiene_status,
             wf.maker_fraction,
             COALESCE(wf.edge_retention_pct, 0) AS edge_retention_pct,
@@ -176,12 +214,22 @@ def _eligibility_rows(conn: sqlite3.Connection, *, min_score: float) -> list[sql
             COALESCE(wps.non_fast_trade_count, 0) AS non_fast_trade_count,
             COALESCE(wps.next_action, '') AS next_action,
             COALESCE(wallet_job.statuses, '') AS wallet_pipeline_status,
-            COALESCE(copy_job.statuses, '') AS copyability_status
+            COALESCE(NULLIF(copy_job.statuses, ''), latest_copy_job.status, '') AS copyability_status,
+            COALESCE(
+                json_extract(latest_copy_job.output_json, '$.graph_scan_mode'),
+                json_extract(latest_copy_job.input_json, '$.graph_scan_mode'),
+                ''
+            ) AS copyability_scan_mode,
+            COALESCE(latest_copy_job.completed_at, 0) AS copyability_completed_at
         FROM candidate_wallets cw
         LEFT JOIN leader_latest_scores ls
           ON ls.address = cw.address
         LEFT JOIN wallet_features wf
           ON wf.address = cw.address
+        LEFT JOIN copy_leader_stats cls
+          ON cls.leader_wallet = cw.address
+        LEFT JOIN copy_leader_performance clp
+          ON clp.leader_wallet = cw.address
         LEFT JOIN paper_wallet_quality pwq
           ON pwq.wallet = cw.address
         LEFT JOIN wallet_processing_state wps
@@ -192,6 +240,8 @@ def _eligibility_rows(conn: sqlite3.Connection, *, min_score: float) -> list[sql
         LEFT JOIN active_jobs copy_job
           ON copy_job.job_type = ?
          AND copy_job.wallet = cw.address
+        LEFT JOIN latest_copy_job
+          ON latest_copy_job.wallet = cw.address
         WHERE cw.candidate_stage IN ({",".join("?" for _ in SMOOTHNESS_STAGES)})
           AND COALESCE(ls.leader_score, 0) >= ?
         ORDER BY
@@ -207,7 +257,13 @@ def _eligibility_rows(conn: sqlite3.Connection, *, min_score: float) -> list[sql
             cw.updated_at DESC,
             cw.address ASC
         """,
-        (WALLET_PIPELINE_JOB_TYPE, COPYABILITY_JOB_TYPE, *SMOOTHNESS_STAGES, min_score),
+        (
+            COPYABILITY_JOB_TYPE,
+            WALLET_PIPELINE_JOB_TYPE,
+            COPYABILITY_JOB_TYPE,
+            *SMOOTHNESS_STAGES,
+            min_score,
+        ),
     ).fetchall()
 
 

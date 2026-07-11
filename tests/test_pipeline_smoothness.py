@@ -157,6 +157,56 @@ def test_pipeline_smoothness_scopes_trade_counts_to_selected_wallets(tmp_path):
         conn.close()
 
 
+def test_pipeline_smoothness_does_not_requeue_completed_deep_near_miss(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    wallet = "0x" + "5" * 40
+    try:
+        run_migrations(conn)
+        upsert_candidate(conn, CandidateAddress(address=wallet, sources="test_source"))
+        upsert_wallet_feature(
+            conn,
+            WalletFeatures(address=wallet, hygiene_status="clean", copy_event_count=0),
+        )
+        _score(conn, wallet, score=68, stage=CandidateStage.NEEDS_REVIEW, reason="watchlist_score")
+        persist_wallet_activity(conn, wallet, _trade_events(wallet, 120), ingested_at=20_000)
+        _insert_l3_evidence(conn, wallet)
+        conn.execute(
+            """
+            INSERT INTO copy_leader_stats(
+                leader_wallet, leader_in_degree, copy_event_count, copy_market_count,
+                containment_pct_median, median_lag_seconds, qualified_follower_count,
+                last_copy_event_at, updated_at
+            ) VALUES (?, 1, 12, 3, 0.4, 20, 0, 50000, 50000)
+            """,
+            (wallet,),
+        )
+        conn.execute(
+            """
+            INSERT INTO pipeline_jobs(
+                job_type, wallet, subject_key, tier, priority, shard, status,
+                lease_owner, lease_until, attempts, max_attempts, next_attempt_at,
+                input_json, output_json, last_error, created_at, updated_at, completed_at
+            ) VALUES ('copyability_evidence', ?, 'copyability', 'copyability', 3, 0,
+                      'done', NULL, 0, 1, 3, 0, '{"graph_scan_mode":"deep"}',
+                      '{"graph_scan_mode":"deep"}', '', 50000, 50000, 50000)
+            """,
+            (wallet,),
+        )
+        conn.commit()
+
+        report = pipeline_smoothness_report(conn, top=10, min_score=40, now=50_100)
+
+        row = next(item for item in report["top_stuck_wallets"] if item["wallet"] == wallet)
+        assert row["review_disposition"] == "copyability_near_miss"
+        assert row["review_handling"] == "watch"
+        assert row["operator_required"] is False
+        assert "copyability_evidence" not in row["recommended_actions"]
+        assert report["eligibility"]["disposition_counts"] == {"copyability_near_miss": 1}
+        assert report["eligibility"]["action_counts"] == {}
+    finally:
+        conn.close()
+
+
 def _insert_l3_evidence(conn, wallet: str) -> None:
     conn.execute(
         """

@@ -1997,7 +1997,7 @@ def test_dashboard_surfaces_blocked_copyability_no_signal_watchlist(tmp_path):
     assert "copyability_scan_no_signal" in html
 
 
-def test_dashboard_distinguishes_unvalidated_copyability_signal(tmp_path):
+def test_dashboard_distinguishes_completed_deep_copyability_near_miss(tmp_path):
     settings = _settings(tmp_path)
     _seed(settings)
     wallet = "0xabc0000000000000000000000000000000000001"
@@ -2036,7 +2036,8 @@ def test_dashboard_distinguishes_unvalidated_copyability_signal(tmp_path):
                 lease_owner, lease_until, attempts, max_attempts, next_attempt_at,
                 input_json, output_json, last_error, created_at, updated_at, completed_at
             ) VALUES ('copyability_evidence', ?, 'copyability', 'copyability', 3, 0,
-                      'done', NULL, 0, 1, 3, 0, '{}', '{}', '', 1800000000,
+                      'done', NULL, 0, 1, 3, 0,
+                      '{"graph_scan_mode":"deep"}', '{"graph_scan_mode":"deep"}', '', 1800000000,
                       1800000100, 1800000100)
             """,
             (wallet,),
@@ -2046,19 +2047,75 @@ def test_dashboard_distinguishes_unvalidated_copyability_signal(tmp_path):
         conn.close()
 
     data = dashboard_data(settings)
-    rows = wallet_table_rows(settings, signal="review_copy_unvalidated")
+    rows = wallet_table_rows(settings, signal="review_copy_near_miss")
     discovery = discovery_data(settings)
     signal_counts = {row["signal"]: row["count"] for row in discovery["signal_counts"]}
 
-    assert data["top_review_candidates"][0]["blocker_key"] == "copyability_unvalidated"
-    assert data["top_review_candidates"][0]["blocker_label"] == "copyability 线索未通过验证"
-    assert data["production_readiness"]["state"] == "near_threshold_copyability_unvalidated"
-    assert data["production_readiness"]["top_blocker_key"] == "copyability_unvalidated"
-    assert data["production_readiness"]["manual_review_actions"][0]["blocker"] == "copyability 线索未通过验证"
-    assert "不" in data["production_readiness"]["next_action"]
-    assert signal_counts["review_copy_unvalidated"] == 1
+    assert data["top_review_candidates"][0]["blocker_key"] == "copyability_near_miss"
+    assert data["top_review_candidates"][0]["blocker_label"] == "深扫近失，暂未达标"
+    assert data["top_review_candidates"][0]["review_handling"] == "watch"
+    assert data["top_review_candidates"][0]["operator_required"] is False
+    assert data["production_readiness"]["state"] == "near_threshold_copyability_near_miss"
+    assert data["production_readiness"]["top_blocker_key"] == "copyability_near_miss"
+    assert data["production_readiness"]["manual_review_actions"][0]["blocker"] == "深扫近失，暂未达标"
+    assert data["production_readiness"]["watch_review_wallets"] == 1
+    assert data["production_readiness"]["operator_review_wallets"] == 0
+    assert data["paper_pool_expansion"]["watch_count"] == 1
+    assert data["paper_pool_expansion"]["operator_required_count"] == 0
+    assert "自动" in data["production_readiness"]["next_action"]
+    assert signal_counts["review_copy_near_miss"] == 1
+    assert signal_counts["review_copy_unvalidated"] == 0
     assert len(rows) == 1
     assert rows[0]["leader_copy_events"] == 18
+
+
+def test_dashboard_keeps_unfinished_copyability_signal_in_validation_bucket(tmp_path):
+    settings = _settings(tmp_path)
+    _seed(settings)
+    wallet = "0xabc0000000000000000000000000000000000001"
+    conn = connect(settings.db_path)
+    try:
+        conn.execute(
+            "UPDATE leader_scores SET leader_score = 60.0, review_reason = 'watchlist_score' WHERE address = ?",
+            (wallet,),
+        )
+        conn.execute(
+            """
+            INSERT INTO wallet_processing_state(
+                wallet, discovery_tier, evidence_status, evidence_depth,
+                evidence_confidence, priority, current_stage, next_action,
+                next_action_at, activity_count, distinct_markets,
+                non_fast_trade_count, updated_at
+            ) VALUES (?, 'l3_deep', 'summary_ready', 1000, 1.0, 3, 'deep_done',
+                      'score_wallet', 0, 1000, 12, 800, 1800000000)
+            """,
+            (wallet,),
+        )
+        conn.execute(
+            """
+            INSERT INTO copy_leader_stats(
+                leader_wallet, leader_in_degree, copy_event_count, copy_market_count,
+                containment_pct_median, median_lag_seconds, qualified_follower_count,
+                last_copy_event_at, updated_at
+            ) VALUES (?, 1, 9, 3, 0.35, 25, 0, 1800000000, 1800000000)
+            """,
+            (wallet,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    data = dashboard_data(settings)
+    rows = wallet_table_rows(settings, signal="review_copy_unvalidated")
+    near_miss_rows = wallet_table_rows(settings, signal="review_copy_near_miss")
+    signal_counts = {row["signal"]: row["count"] for row in discovery_data(settings)["signal_counts"]}
+
+    assert data["top_review_candidates"][0]["blocker_key"] == "copyability_unvalidated"
+    assert data["top_review_candidates"][0]["review_handling"] == "automatic"
+    assert signal_counts["review_copy_unvalidated"] == 1
+    assert signal_counts["review_copy_near_miss"] == 0
+    assert len(rows) == 1
+    assert near_miss_rows == []
 
 
 def test_dashboard_groups_paper_evidence_incomplete_review(tmp_path):
@@ -2365,7 +2422,7 @@ def test_dashboard_ops_health_reports_stale_and_active_pipeline_jobs(tmp_path):
     assert runtime["source_fingerprint"] in html
     assert "生产收敛摘要" in html
     assert "Paper 候选" in html
-    assert "复核停靠分布" in html
+    assert "复核处置分布" in html
     assert "高分阻塞分布" in html
     assert "失败任务样本" in html
     assert "rate limit exhausted" in html

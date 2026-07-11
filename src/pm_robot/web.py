@@ -39,6 +39,7 @@ from pm_robot.orchestration.pipeline_audit import (
 )
 from pm_robot.orchestration.paper_runner import preview_paper_observer
 from pm_robot.orchestration.evidence_readiness import paper_evidence_ready, paper_evidence_ready_sql
+from pm_robot.orchestration.review_disposition import review_disposition
 from pm_robot.orchestration.wallet_pipeline import (
     DEFAULT_PIPELINE_PRIORITY_AGING_SECONDS,
     DEFAULT_PIPELINE_STAGE_WEIGHTS,
@@ -963,6 +964,17 @@ def _wallet_filter_where(
     elif signal == "review_copy_unvalidated":
         where.append("cw.candidate_stage = 'needs_manual_review'")
         where.append(f"{depth_expr} >= 200")
+        where.append(copy_evidence_expr)
+        where.append(f"NOT {copy_validation_expr}")
+        where.append(
+            "NOT (COALESCE(cj.status, '') = 'done' "
+            "AND COALESCE(cj.copyability_scan_mode, '') IN ('', 'default', 'deep'))"
+        )
+    elif signal == "review_copy_near_miss":
+        where.append("cw.candidate_stage = 'needs_manual_review'")
+        where.append(f"{depth_expr} >= 200")
+        where.append("COALESCE(cj.status, '') = 'done'")
+        where.append("COALESCE(cj.copyability_scan_mode, '') IN ('', 'default', 'deep')")
         where.append(copy_evidence_expr)
         where.append(f"NOT {copy_validation_expr}")
     elif signal == "review_paper_evidence_incomplete":
@@ -2157,10 +2169,7 @@ def _source_focus_wallet_rows(
         ),
     )
     for row in rows:
-        blocker_key, blocker_label = _source_focus_blocker(row, paper_min_score=paper_min_score)
-        row["blocker_key"] = blocker_key
-        row["blocker_label"] = blocker_label
-        row["review_next_action"] = _review_blocker_next_action(blocker_key)
+        _apply_review_disposition(row, paper_min_score=paper_min_score)
     return rows
 
 
@@ -2186,53 +2195,6 @@ def _wallet_source_match_params(source: str) -> list[str]:
     return [normalized, normalized]
 
 
-def _source_focus_blocker(row: dict[str, Any], *, paper_min_score: float) -> tuple[str, str]:
-    stage = str(row.get("candidate_stage") or "")
-    score = float(row.get("leader_score") or 0)
-    activity = int(row.get("activity_count") or 0)
-    next_action = str(row.get("next_action") or "")
-    copy_status = str(row.get("copyability_status") or "")
-    has_copy_signal = _has_copyability_signal(row)
-    has_copy_validation = _has_copyability_validation(row)
-    if stage in {"paper_candidate", "paper_approved", "live_eligible"}:
-        return ("paper_ready", "已进入 paper")
-    if stage == "blocked_hygiene":
-        return ("hygiene_blocked", "hygiene 阻断")
-    if stage == "blocked_copyability":
-        return ("copyability_blocked", "copyability 阻断")
-    if stage == "rejected":
-        return ("rejected", "已拒绝")
-    if activity <= 0:
-        return ("no_history", "未补历史")
-    if activity < 200:
-        return ("thin_evidence", "历史证据偏薄")
-    if next_action in {"light_pending", "medium_pending", "deep_pending"}:
-        return ("history_pending", "历史证据补充中")
-    if stage == "needs_data":
-        return ("score_needs_data", "评分证据不足")
-    if score <= 0:
-        return ("not_scored", "待评分")
-    if not has_copy_signal:
-        if copy_status in {"queued", "running"}:
-            return ("copyability_pending", "copyability 补证据中")
-        if copy_status == "done":
-            if _is_light_copyability_scan(row):
-                return ("copyability_light_no_signal", "copyability 轻扫无信号")
-            return ("copyability_no_signal", "copyability 无跟随信号")
-        return ("missing_copyability", "缺 copyability 证据")
-    if not has_copy_validation:
-        if copy_status in {"queued", "running"}:
-            return ("copyability_pending", "copyability 验证补证据中")
-        return ("copyability_unvalidated", "copyability 线索未通过验证")
-    if score < paper_min_score:
-        return ("score_below_paper", f"分数未达 {paper_min_score:.0f}")
-    if _is_paper_evidence_incomplete_review(row, paper_min_score=paper_min_score):
-        return ("paper_evidence_incomplete", "L3 证据未完成")
-    if stage == "needs_manual_review":
-        return ("manual_review", "复核停靠状态")
-    return ("unknown", "待确认")
-
-
 def _source_focus_blocker_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     groups: dict[str, dict[str, Any]] = {}
     for row in rows:
@@ -2246,7 +2208,10 @@ def _source_focus_blocker_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any
                 "blocker": label,
                 "count": 0,
                 "max_score": score,
-                "next_action": _review_blocker_next_action(key),
+                "next_action": row.get("review_next_action") or _review_blocker_next_action(key),
+                "handling": row.get("review_handling") or "manual",
+                "handling_label": row.get("review_handling_label") or "人工复核",
+                "operator_required": bool(row.get("operator_required")),
                 "example": row.get("address") or "",
             },
         )
@@ -2255,51 +2220,6 @@ def _source_focus_blocker_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any
             group["max_score"] = score
             group["example"] = row.get("address") or ""
     return sorted(groups.values(), key=lambda item: (-int(item.get("count") or 0), -float(item.get("max_score") or 0), str(item.get("blocker") or "")))
-
-
-def _copyability_int(row: dict[str, Any], *fields: str) -> int:
-    values: list[int] = []
-    for field in fields:
-        try:
-            values.append(int(row.get(field) or 0))
-        except (TypeError, ValueError):
-            values.append(0)
-    return max(values) if values else 0
-
-
-def _copyability_float(row: dict[str, Any], *fields: str) -> float:
-    values: list[float] = []
-    for field in fields:
-        try:
-            values.append(float(row.get(field) or 0))
-        except (TypeError, ValueError):
-            values.append(0.0)
-    return max(values) if values else 0.0
-
-
-def _has_copyability_signal(row: dict[str, Any]) -> bool:
-    """Raw copy links mean there is something to validate, not that it is copyable."""
-
-    copy_events = _copyability_int(row, "copy_event_count", "leader_copy_events", "feature_copy_event_count")
-    copy_markets = _copyability_int(row, "copy_market_count", "leader_copy_markets", "feature_copy_market_count")
-    followers = _copyability_int(row, "qualified_follower_count")
-    backtest_trades = _copyability_int(row, "backtest_trade_count")
-    return copy_events > 0 or copy_markets > 0 or followers > 0 or backtest_trades > 0
-
-
-def _has_copyability_validation(row: dict[str, Any]) -> bool:
-    """Validated copyability requires qualified followers or backtest-style evidence."""
-
-    followers = _copyability_int(row, "qualified_follower_count")
-    backtest_trades = _copyability_int(row, "backtest_trade_count")
-    edge_retention = _copyability_float(row, "edge_retention_pct")
-    walk_forward = _copyability_float(row, "walk_forward_consistency_pct")
-    return followers > 0 or backtest_trades > 0 or edge_retention > 0 or walk_forward > 0
-
-
-def _is_light_copyability_scan(row: dict[str, Any]) -> bool:
-    scan_mode = str(row.get("copyability_scan_mode") or "").strip()
-    return bool(scan_mode and scan_mode not in {"default", "deep"})
 
 
 def _discovery_run_rows(conn: sqlite3.Connection) -> list[dict[str, Any]]:
@@ -2364,7 +2284,8 @@ def _discovery_signal_counts(
         {"signal": "review_copy_pending", "name": "复核: Copy 补证据", "count": _wallet_signal_count(conn, stage=stage, source=source, query=query, signal="review_copy_pending")},
         {"signal": "review_copy_no_signal", "name": "复核: 深扫无信号", "count": _wallet_signal_count(conn, stage=stage, source=source, query=query, signal="review_copy_no_signal")},
         {"signal": "review_copy_light_no_signal", "name": "复核: 轻扫无信号", "count": _wallet_signal_count(conn, stage=stage, source=source, query=query, signal="review_copy_light_no_signal")},
-        {"signal": "review_copy_unvalidated", "name": "复核: Copy 未通过", "count": _wallet_signal_count(conn, stage=stage, source=source, query=query, signal="review_copy_unvalidated")},
+        {"signal": "review_copy_near_miss", "name": "观察: 深扫近失", "count": _wallet_signal_count(conn, stage=stage, source=source, query=query, signal="review_copy_near_miss")},
+        {"signal": "review_copy_unvalidated", "name": "自动: Copy 待验证", "count": _wallet_signal_count(conn, stage=stage, source=source, query=query, signal="review_copy_unvalidated")},
         {"signal": "review_paper_evidence_incomplete", "name": "复核: L3 未完成", "count": _wallet_signal_count(conn, stage=stage, source=source, query=query, signal="review_paper_evidence_incomplete")},
         {"signal": "review_thin_evidence", "name": "复核: 历史偏薄", "count": _wallet_signal_count(conn, stage=stage, source=source, query=query, signal="review_thin_evidence")},
         {"signal": "review_missing_copyability", "name": "复核: 缺 Copy", "count": _wallet_signal_count(conn, stage=stage, source=source, query=query, signal="review_missing_copyability")},
@@ -4272,10 +4193,7 @@ def _top_review_candidate_rows(
         (int(limit),),
     )
     for row in rows:
-        blocker_key, blocker_label = _top_review_blocker(row, paper_min_score=paper_min_score)
-        row["blocker_key"] = blocker_key
-        row["blocker_label"] = blocker_label
-        row["review_next_action"] = _review_blocker_next_action(blocker_key)
+        _apply_review_disposition(row, paper_min_score=paper_min_score)
     return rows
 
 
@@ -4350,10 +4268,7 @@ def _manual_review_action_rows(conn: sqlite3.Connection, *, paper_min_score: flo
         """,
     )
     for row in rows:
-        blocker_key, blocker_label = _top_review_blocker(row, paper_min_score=paper_min_score)
-        row["blocker_key"] = blocker_key
-        row["blocker_label"] = blocker_label
-        row["review_next_action"] = _review_blocker_next_action(blocker_key)
+        _apply_review_disposition(row, paper_min_score=paper_min_score)
     return _top_review_blocker_rows(rows)
 
 
@@ -4400,6 +4315,9 @@ def _paper_pool_expansion_audit(
             "limit": int(limit),
         },
         "wallet_count": len(rows),
+        "automatic_count": sum(1 for row in rows if row.get("review_handling") == "automatic"),
+        "watch_count": sum(1 for row in rows if row.get("review_handling") == "watch"),
+        "operator_required_count": sum(1 for row in rows if row.get("operator_required")),
         "near_paper_count": len(near_paper),
         "copyability_needed_count": len(needs_copy),
         "best_score": _round_value(max((float(row.get("leader_score") or 0) for row in rows), default=0)),
@@ -4426,6 +4344,25 @@ def _paper_pool_expansion_rows(
     rows = _rows(
         conn,
         """
+        WITH copy_job AS (
+            SELECT
+                pj.wallet,
+                pj.status,
+                pj.completed_at,
+                COALESCE(
+                    json_extract(pj.output_json, '$.graph_scan_mode'),
+                    json_extract(pj.input_json, '$.graph_scan_mode'),
+                    ''
+                ) AS copyability_scan_mode
+            FROM pipeline_jobs pj
+            JOIN (
+                SELECT wallet, MAX(job_id) AS job_id
+                FROM pipeline_jobs
+                WHERE job_type = 'copyability_evidence'
+                GROUP BY wallet
+            ) latest_job
+              ON latest_job.job_id = pj.job_id
+        )
         SELECT
             cw.address,
             cw.candidate_stage,
@@ -4456,6 +4393,9 @@ def _paper_pool_expansion_rows(
             COALESCE(clp.backtest_trade_count, 0) AS backtest_trade_count,
             ROUND(COALESCE(clp.net_roi, 0), 4) AS copy_backtest_roi,
             ROUND(COALESCE(clp.edge_retention_pct, 0), 2) AS edge_retention_pct,
+            COALESCE(cj.status, '') AS copyability_status,
+            COALESCE(cj.copyability_scan_mode, '') AS copyability_scan_mode,
+            COALESCE(cj.completed_at, 0) AS copyability_completed_at,
             ls.scored_at
         FROM candidate_wallets cw
         JOIN leader_latest_scores ls
@@ -4468,6 +4408,8 @@ def _paper_pool_expansion_rows(
           ON cls.leader_wallet = cw.address
         LEFT JOIN copy_leader_performance clp
           ON clp.leader_wallet = cw.address
+        LEFT JOIN copy_job cj
+          ON cj.wallet = cw.address
         WHERE cw.candidate_stage = 'needs_manual_review'
           AND COALESCE(ls.leader_score, 0) > 0
         ORDER BY COALESCE(ls.leader_score, 0) DESC, COALESCE(wps.activity_count, 0) DESC, cw.address ASC
@@ -4504,6 +4446,7 @@ def _paper_pool_expansion_rows(
         item["edge_retention_pct"] = _round_value(item.get("edge_retention_pct"))
         item["net_pnl_usdc"] = _round_value(item.get("net_pnl_usdc"))
         item["total_volume_usdc"] = _round_value(item.get("total_volume_usdc"))
+        _apply_review_disposition(item, paper_min_score=paper_min_score)
         state, action = _paper_pool_expansion_state(
             item,
             paper_min_score=paper_min_score,
@@ -4573,40 +4516,17 @@ def _paper_candidate_min_score(settings: RobotSettings) -> float:
     return float(_paper_candidate_thresholds(settings)["min_score"])
 
 
-def _top_review_blocker(row: dict[str, Any], *, paper_min_score: float) -> tuple[str, str]:
-    stage = str(row.get("candidate_stage") or "")
-    score = float(row.get("leader_score") or 0)
-    activity = int(row.get("activity_count") or 0)
-    copy_status = str(row.get("copyability_status") or "")
-    has_copy_signal = _has_copyability_signal(row)
-    has_copy_validation = _has_copyability_validation(row)
-    if stage in {"paper_candidate", "paper_approved", "live_eligible"}:
-        return ("paper_ready", "已进入 paper")
-    if stage == "blocked_hygiene":
-        return ("hygiene_blocked", "hygiene 阻断")
-    if stage == "blocked_copyability":
-        return ("copyability_blocked", "copyability 阻断")
-    if activity < 200:
-        return ("thin_evidence", "历史证据偏薄")
-    if not has_copy_signal:
-        if copy_status in {"queued", "running"}:
-            return ("copyability_pending", "copyability 补证据中")
-        if copy_status == "done":
-            if _is_light_copyability_scan(row):
-                return ("copyability_light_no_signal", "copyability 轻扫无信号")
-            return ("copyability_no_signal", "copyability 无跟随信号")
-        return ("missing_copyability", "缺 copyability 证据")
-    if not has_copy_validation:
-        if copy_status in {"queued", "running"}:
-            return ("copyability_pending", "copyability 验证补证据中")
-        return ("copyability_unvalidated", "copyability 线索未通过验证")
-    if score < paper_min_score:
-        return ("score_below_paper", f"分数未达 {paper_min_score:.0f}")
-    if _is_paper_evidence_incomplete_review(row, paper_min_score=paper_min_score):
-        return ("paper_evidence_incomplete", "L3 证据未完成")
-    if stage == "needs_manual_review":
-        return ("manual_review", "复核停靠状态")
-    return ("unknown", "待确认")
+def _apply_review_disposition(row: dict[str, Any], *, paper_min_score: float) -> None:
+    """Attach read-only handling metadata; persisted candidate_stage is unchanged."""
+
+    row["paper_evidence_ready"] = paper_evidence_ready(row)
+    disposition = review_disposition(row, paper_min_score=paper_min_score)
+    row["blocker_key"] = disposition.key
+    row["blocker_label"] = disposition.label
+    row["review_handling"] = disposition.handling
+    row["review_handling_label"] = disposition.handling_label
+    row["operator_required"] = disposition.operator_required
+    row["review_next_action"] = disposition.next_action
 
 
 def _top_review_blocker_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -4622,7 +4542,10 @@ def _top_review_blocker_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]
                 "blocker": label,
                 "count": 0,
                 "max_score": score,
-                "next_action": _review_blocker_next_action(key),
+                "next_action": row.get("review_next_action") or _review_blocker_next_action(key),
+                "handling": row.get("review_handling") or "manual",
+                "handling_label": row.get("review_handling_label") or "人工复核",
+                "operator_required": bool(row.get("operator_required")),
                 "example": row.get("address") or "",
             },
         )
@@ -4633,18 +4556,6 @@ def _top_review_blocker_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]
     return sorted(groups.values(), key=lambda item: (-int(item.get("count") or 0), -float(item.get("max_score") or 0), str(item.get("blocker") or "")))
 
 
-def _is_paper_evidence_incomplete_review(row: dict[str, Any], *, paper_min_score: float) -> bool:
-    """Classify high-score review wallets whose research evidence is not L3-ready."""
-
-    if str(row.get("candidate_stage") or "") != "needs_manual_review":
-        return False
-    if float(row.get("leader_score") or 0) < paper_min_score:
-        return False
-    if paper_evidence_ready(row):
-        return False
-    return str(row.get("review_reason") or "") == "paper_evidence_tier_incomplete" or bool(row.get("evidence_tier") or row.get("evidence_status"))
-
-
 def _review_blocker_next_action(key: str) -> str:
     actions = {
         "paper_ready": "进入外部 paper 验证或发布前复核",
@@ -4653,14 +4564,15 @@ def _review_blocker_next_action(key: str) -> str:
         "copyability_blocked": "保持阻断；只在新增 copyability 证据后复核",
         "rejected": "保持拒绝；不进入自动队列",
         "copyability_pending": "等待 copyability 队列完成后重评",
-        "copyability_no_signal": "深扫仍无信号，可自动降级或保持阻断",
-        "copyability_light_no_signal": "仅轻扫无信号；高分再排 deep，低分保留观察",
-        "copyability_unvalidated": "复核 follower/backtest 证据质量",
+        "copyability_no_signal": "深扫仍无信号，自动收敛为 copyability 阻断",
+        "copyability_light_no_signal": "仅轻扫无信号；高分自动排 deep，低分保留观察",
+        "copyability_near_miss": "等待新增实时事件后再扫描，不需要人工处理",
+        "copyability_unvalidated": "补 follower/backtest 证据后自动重评",
         "missing_copyability": "加入 copyability 证据队列",
-        "score_below_paper": "保留观察；等待新证据提高评分",
+        "score_below_paper": "自动观察；等待新证据提高评分",
         "thin_evidence": "继续补历史，样本不足不放行",
         "history_pending": "等待 L1/L2/L3 补证据任务完成",
-        "manual_review": "检查 review_reason，改写为明确阻断原因",
+        "manual_review": "证据与分数均达线，人工决定是否升级",
     }
     return actions.get(key, "继续观察或人工复核")
 
@@ -5446,6 +5358,21 @@ def _production_readiness_summary(
     # Operator-facing blocker should point at the active manual-review queue;
     # archived blockers remain visible in the stage counts.
     active_blocker = manual_review_actions[0] if manual_review_actions else {}
+    automatic_review_wallets = sum(
+        int(row.get("count") or 0)
+        for row in manual_review_actions
+        if row.get("handling") == "automatic"
+    )
+    watch_review_wallets = sum(
+        int(row.get("count") or 0)
+        for row in manual_review_actions
+        if row.get("handling") == "watch"
+    )
+    operator_review_wallets = sum(
+        int(row.get("count") or 0)
+        for row in manual_review_actions
+        if row.get("operator_required")
+    )
     top_blocker_key = (
         active_blocker.get("key")
         or (top_review_candidates[0].get("blocker_key") if top_review_candidates else "")
@@ -5462,12 +5389,18 @@ def _production_readiness_summary(
     elif paper_stage_wallets:
         state = "paper_candidates_present"
         next_action = "已有 paper 候选且出现可及时跟信号；外部 paper 验证应记录结果，仍不直接发布。"
-    elif at_threshold:
+    elif at_threshold and operator_review_wallets:
         state = "manual_gate"
-        next_action = "已有达到分数阈值的钱包，但仍停在复核观察状态，需要补齐风险或 copyability 证据。"
+        next_action = "有钱包的证据和分数均已达线，当前确实需要人工决定是否升级。"
+    elif at_threshold:
+        state = "automatic_review_at_threshold"
+        next_action = "已有达到分数阈值的钱包，但系统仍在补证据或等待新信号，无需手动处理。"
     elif near_threshold and top_blocker_key == "copyability_no_signal":
         state = "near_threshold_no_copy_signal"
         next_action = "近阈值钱包已补 copyability 但没有跟随信号，优先复核策略可复制性或降低候选优先级。"
+    elif near_threshold and top_blocker_key == "copyability_near_miss":
+        state = "near_threshold_copyability_near_miss"
+        next_action = "近阈值钱包已经完成深扫但只形成近失线索；继续实时观察，新增事件后自动重扫。"
     elif near_threshold and top_blocker_key == "copyability_unvalidated":
         state = "near_threshold_copyability_unvalidated"
         next_action = "近阈值钱包有原始 copyability 线索，但没有合格 follower 或回测成交证据，应降级观察而不是进入 paper。"
@@ -5490,6 +5423,9 @@ def _production_readiness_summary(
         "near_score_floor": max(0.0, paper_min_score - 5.0),
         "paper_stage_wallets": paper_stage_wallets,
         "needs_manual_review": manual_wallets,
+        "automatic_review_wallets": automatic_review_wallets,
+        "watch_review_wallets": watch_review_wallets,
+        "operator_review_wallets": operator_review_wallets,
         "manual_at_threshold": at_threshold,
         "manual_near_threshold": near_threshold,
         "max_manual_score": round(max_manual_score, 2),
@@ -6790,9 +6726,11 @@ def _paper_pool_expansion_panel(values: dict[str, Any]) -> str:
             + "</p>"
         )
     cards = [
-        ("待审钱包", _fmt_int(values.get("wallet_count")), "needs_manual_review", "ok" if wallets else "warn"),
+        ("复核停靠", _fmt_int(values.get("wallet_count")), "兼容状态总数", "ok" if wallets else "warn"),
+        ("系统处理中", _fmt_int(values.get("automatic_count")), "证据队列自动推进", "warn" if int(values.get("automatic_count") or 0) else "ok"),
+        ("自动观察", _fmt_int(values.get("watch_count")), "等待新增实时证据", "warn" if int(values.get("watch_count") or 0) else "ok"),
+        ("需人工判断", _fmt_int(values.get("operator_required_count")), "只有这些需要操作", "warn" if int(values.get("operator_required_count") or 0) else "ok"),
         ("近 Paper", _fmt_int(values.get("near_paper_count")), f">= {_fmt_num(scope.get('watch_min_score'))}", "ok" if int(values.get("near_paper_count") or 0) else "warn"),
-        ("需 Copy 证据", _fmt_int(values.get("copyability_needed_count")), "市场/跟随缺口", "warn" if int(values.get("copyability_needed_count") or 0) else "ok"),
         ("最高分", _fmt_num(values.get("best_score")), f"paper {_fmt_num(scope.get('paper_min_score'))}", "ok" if float(values.get("best_score") or 0) >= float(scope.get("watch_min_score") or 0) else "warn"),
     ]
     if not wallets:
@@ -6814,6 +6752,7 @@ def _paper_pool_expansion_panel(values: dict[str, Any]) -> str:
             f'<td><a class="mono strong-link" href="/wallet/{_e(address)}">{_short(address)}</a>'
             f'<small>{_e(row.get("review_reason") or "")}</small></td>'
             f'<td class="num">{_fmt_num(row.get("leader_score"))}<small>gap {_fmt_num(row.get("score_gap_to_paper"))}</small></td>'
+            f'<td>{_badge(row.get("review_handling_label") or "待确认")}<small>{_e(row.get("review_next_action") or "")}</small></td>'
             f'<td>{_badge(row.get("expansion_state"))}<small>{_e(row.get("next_action") or "")}</small></td>'
             f'<td class="num">{_fmt_int(row.get("copy_signal_events"))}<small>event gap {_fmt_int(row.get("copy_event_gap"))} · markets {_fmt_int(row.get("copy_signal_markets"))} · market gap {_fmt_int(row.get("copy_market_gap"))}</small></td>'
             f'<td><div class="numline">{_fmt_int(row.get("activity_count"))} events</div>'
@@ -6830,7 +6769,7 @@ def _paper_pool_expansion_panel(values: dict[str, Any]) -> str:
         + "</div>"
         + policy_warning
         + _simple_table(values.get("state_counts") or [], ["state", "count"], ["扩池状态", "数量"])
-        + _table(["钱包", "分数", "扩池判断", "Copy 证据", "历史证据", "Hygiene/PnL"], "".join(body))
+        + _table(["钱包", "分数", "处理方式", "扩池判断", "Copy 证据", "历史证据", "Hygiene/PnL"], "".join(body))
         + '<p class="muted">JSON: /api/paper-pool-expansion · read-only，只做扩池审计，不自动升级 paper。</p>'
     )
 
@@ -6847,6 +6786,7 @@ def _top_review_candidates_panel(rows: list[dict[str, Any]]) -> str:
             f'<small>{_e(row.get("review_reason", ""))}</small></td>'
             f'<td class="num">{_fmt_num(row.get("leader_score"))}</td>'
             f'<td>{_badge(row.get("blocker_label") or "待确认")}<small>{_e(row.get("review_next_action") or "")}</small></td>'
+            f'<td>{_badge(row.get("review_handling_label") or "待确认")}<small>{"需要操作" if row.get("operator_required") else "无需操作"}</small></td>'
             f'<td>{_badge(row.get("candidate_stage"))}<small>{_e(row.get("review_stage", ""))}</small></td>'
             f'<td><div class="numline">{_fmt_int(row.get("activity_count"))} events</div>'
             f'<small>{_e(row.get("evidence_tier", ""))} · {_e(row.get("next_action", ""))}</small></td>'
@@ -6855,7 +6795,7 @@ def _top_review_candidates_panel(rows: list[dict[str, Any]]) -> str:
             f'<td>{_badge(row.get("copyability_status") or "none")}<small>{_e(row.get("copyability_scan_mode") or "unknown")} · p{_fmt_int(row.get("copyability_priority"))}</small></td>'
             "</tr>"
         )
-    return _table(["钱包", "分数", "主阻塞", "阶段", "历史证据", "Copy 证据", "Copy 队列"], "".join(body))
+    return _table(["钱包", "分数", "当前原因", "处理方式", "阶段", "历史证据", "Copy 证据", "Copy 队列"], "".join(body))
 
 
 def _needs_data_reason_table(rows: list[dict[str, Any]]) -> str:
@@ -7174,6 +7114,9 @@ def _production_readiness_panel(values: dict[str, Any]) -> str:
         ),
         ("观察最高分", _fmt_num(values.get("max_manual_score")), f"阈值 {_fmt_num(values.get('paper_min_score'))}", "warn" if float(values.get("score_gap_to_paper") or 0) > 0 else "ok"),
         ("近阈值观察", _fmt_int(values.get("manual_near_threshold")), f">= {_fmt_num(values.get('near_score_floor'))}", "ok" if int(values.get("manual_near_threshold") or 0) else "warn"),
+        ("系统处理中", _fmt_int(values.get("automatic_review_wallets")), "证据任务自动推进", "warn" if int(values.get("automatic_review_wallets") or 0) else "ok"),
+        ("自动观察", _fmt_int(values.get("watch_review_wallets")), "等待新增信号", "warn" if int(values.get("watch_review_wallets") or 0) else "ok"),
+        ("需人工判断", _fmt_int(values.get("operator_review_wallets")), "唯一人工工作量", "warn" if int(values.get("operator_review_wallets") or 0) else "ok"),
         (
             "历史待补",
             _fmt_int(values.get("evidence_pending")),
@@ -7195,11 +7138,14 @@ def _production_readiness_panel(values: dict[str, Any]) -> str:
         ),
     ]
     rows = [
-        {"key": "needs_manual_review", "count": values.get("needs_manual_review")},
-        {"key": "blocked_hygiene", "count": values.get("blocked_hygiene")},
-        {"key": "blocked_copyability", "count": values.get("blocked_copyability")},
-        {"key": "needs_data", "count": values.get("needs_data")},
-        {"key": "top_blocker", "count": values.get("top_blocker") or ""},
+        {"key": "复核停靠总数", "count": values.get("needs_manual_review")},
+        {"key": "系统自动处理", "count": values.get("automatic_review_wallets")},
+        {"key": "自动观察等待", "count": values.get("watch_review_wallets")},
+        {"key": "真正需要人工", "count": values.get("operator_review_wallets")},
+        {"key": "Hygiene 阻断", "count": values.get("blocked_hygiene")},
+        {"key": "Copyability 阻断", "count": values.get("blocked_copyability")},
+        {"key": "待补证据", "count": values.get("needs_data")},
+        {"key": "当前首要原因", "count": values.get("top_blocker") or ""},
     ]
     action_rows = values.get("manual_review_actions") or []
     return (
@@ -7223,8 +7169,8 @@ def _production_readiness_panel(values: dict[str, Any]) -> str:
         + _paper_stage_gap_rows_panel(publish_gate.get("paper_stage_gap_wallets") or [])
         + '<h3 class="subhead">正式阻塞分布</h3>'
         + _simple_table(publish_gate.get("formal_blocker_rows") or [], ["blocker", "count", "next_action", "example"], ["阻塞", "钱包数", "下一步", "样本"])
-        + '<h3 class="subhead">复核停靠分布</h3>'
-        + _simple_table(action_rows, ["blocker", "count", "max_score", "next_action", "example"], ["动作", "数量", "最高分", "下一步", "例子"])
+        + '<h3 class="subhead">复核处置分布</h3>'
+        + _simple_table(action_rows, ["blocker", "handling_label", "count", "max_score", "next_action", "example"], ["当前原因", "处理方式", "数量", "最高分", "下一步", "例子"])
     )
 
 
