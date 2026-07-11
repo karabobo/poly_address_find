@@ -2,11 +2,32 @@
 
 from __future__ import annotations
 
+import os
 import sqlite3
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from threading import Lock
 from typing import Callable, Iterable
+
+
+RATE_LIMIT_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS api_rate_limit_state (
+    scope TEXT PRIMARY KEY,
+    capacity INTEGER NOT NULL CHECK (capacity > 0),
+    window_seconds REAL NOT NULL CHECK (window_seconds > 0),
+    next_permit_at REAL NOT NULL DEFAULT 0,
+    cooldown_until REAL NOT NULL DEFAULT 0,
+    last_status_code INTEGER,
+    last_retry_after_seconds REAL NOT NULL DEFAULT 0,
+    total_permits INTEGER NOT NULL DEFAULT 0,
+    total_cooldowns INTEGER NOT NULL DEFAULT 0,
+    last_cooldown_reason TEXT NOT NULL DEFAULT '',
+    updated_at REAL NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_api_rate_limit_state_cooldown
+    ON api_rate_limit_state(cooldown_until DESC, updated_at DESC);
+"""
 
 
 @dataclass(frozen=True)
@@ -64,14 +85,18 @@ class SharedApiRateLimiter:
         *,
         lock_timeout_seconds: float = 2.0,
         max_block_seconds: float = 30.0,
+        initialize_schema: bool = False,
         clock: Callable[[], float] = time.time,
         sleeper: Callable[[float], None] = time.sleep,
     ) -> None:
         self.db_path = Path(db_path)
         self.lock_timeout_seconds = max(0.0, float(lock_timeout_seconds))
         self.max_block_seconds = max(0.0, float(max_block_seconds))
+        self.initialize_schema = bool(initialize_schema)
         self._clock = clock
         self._sleep = sleeper
+        self._schema_ready = False
+        self._schema_lock = Lock()
         self.last_error = ""
 
     def wait(self, scopes: Iterable[RateLimitScope]) -> None:
@@ -111,9 +136,12 @@ class SharedApiRateLimiter:
         if not normalized:
             return RateLimitReservation(current, 0.0, True)
         conn: sqlite3.Connection | None = None
+        stage = "connect"
         try:
             conn = self._connect()
+            stage = "begin"
             conn.execute("BEGIN IMMEDIATE")
+            stage = "read_state"
             placeholders = ",".join("?" for _ in normalized)
             rows = conn.execute(
                 f"""
@@ -144,6 +172,7 @@ class SharedApiRateLimiter:
                     deferred=True,
                 )
             for scope in normalized:
+                stage = "write_state"
                 row = state.get(scope.name)
                 next_permit_at = max(
                     scheduled_at,
@@ -171,6 +200,7 @@ class SharedApiRateLimiter:
                         current,
                     ),
                 )
+            stage = "commit"
             conn.commit()
             self.last_error = ""
             return RateLimitReservation(
@@ -184,7 +214,7 @@ class SharedApiRateLimiter:
                     conn.rollback()
                 except sqlite3.Error:
                     pass
-            self.last_error = f"{type(exc).__name__}: {exc}"[:500]
+            self.last_error = f"reserve_{stage}: {type(exc).__name__}: {exc}"[:500]
             return RateLimitReservation(
                 scheduled_at=current,
                 wait_seconds=0.0,
@@ -286,17 +316,38 @@ class SharedApiRateLimiter:
             self.last_error = ""
             return max(0.0, float(row["cooldown_until"] or 0) - current)
         except sqlite3.Error as exc:
-            self.last_error = f"{type(exc).__name__}: {exc}"[:500]
+            self.last_error = f"cooldown_read: {type(exc).__name__}: {exc}"[:500]
             raise SharedRateLimitUnavailable(self.last_error) from exc
         finally:
             if conn is not None:
                 conn.close()
 
     def _connect(self) -> sqlite3.Connection:
+        if self.initialize_schema:
+            self.db_path.parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(self.db_path, timeout=self.lock_timeout_seconds)
-        conn.execute(f"PRAGMA busy_timeout = {int(self.lock_timeout_seconds * 1000)}")
-        conn.row_factory = sqlite3.Row
-        return conn
+        try:
+            conn.execute(f"PRAGMA busy_timeout = {int(self.lock_timeout_seconds * 1000)}")
+            conn.row_factory = sqlite3.Row
+            if self.initialize_schema and not self._schema_ready:
+                with self._schema_lock:
+                    if not self._schema_ready:
+                        schema_exists = conn.execute(
+                            """
+                            SELECT 1
+                            FROM sqlite_master
+                            WHERE type = 'table' AND name = 'api_rate_limit_state'
+                            """
+                        ).fetchone()
+                        if schema_exists is None:
+                            conn.execute("PRAGMA journal_mode = WAL")
+                            conn.executescript(RATE_LIMIT_SCHEMA_SQL)
+                            conn.commit()
+                        self._schema_ready = True
+            return conn
+        except Exception:
+            conn.close()
+            raise
 
 
 def sqlite_main_database_path(conn: sqlite3.Connection) -> Path | None:
@@ -369,6 +420,59 @@ def api_rate_limit_summary(
         "total_permits": sum(int(row.get("total_permits") or 0) for row in rows),
         "total_cooldowns": sum(int(row.get("total_cooldowns") or 0) for row in rows),
         "rows": rows,
+    }
+
+
+def api_rate_limit_summary_from_path(
+    db_path: Path,
+    *,
+    now: float | None = None,
+) -> dict[str, object]:
+    """Read the dedicated coordination database without touching the main wallet DB."""
+
+    path = Path(db_path)
+    if not path.exists():
+        summary = _empty_api_rate_limit_summary()
+        summary["coordination_error"] = "coordination database is not initialized"
+        return summary
+    conn: sqlite3.Connection | None = None
+    try:
+        uri = f"file:{path.resolve().as_posix()}?mode=ro"
+        conn = sqlite3.connect(uri, uri=True, timeout=0.5)
+        conn.execute("PRAGMA busy_timeout = 500")
+        conn.row_factory = sqlite3.Row
+        summary = api_rate_limit_summary(conn, now=now)
+        summary["available"] = True
+        return summary
+    except sqlite3.Error as exc:
+        summary = _empty_api_rate_limit_summary()
+        summary["coordination_error"] = f"{type(exc).__name__}: {exc}"[:500]
+        return summary
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def configured_rate_limit_db_path() -> Path | None:
+    value = os.environ.get("PM_ROBOT_RATE_LIMIT_DB_PATH", "").strip()
+    return Path(value) if value else None
+
+
+def configured_rate_limit_lock_timeout_seconds(default: float = 10.0) -> float:
+    try:
+        return max(0.1, float(os.environ.get("PM_ROBOT_RATE_LIMIT_LOCK_TIMEOUT_SECONDS", default)))
+    except (TypeError, ValueError):
+        return max(0.1, float(default))
+
+
+def _empty_api_rate_limit_summary() -> dict[str, object]:
+    return {
+        "scope_count": 0,
+        "active_cooldowns": 0,
+        "total_permits": 0,
+        "total_cooldowns": 0,
+        "rows": [],
+        "available": False,
     }
 
 

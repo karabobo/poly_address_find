@@ -53,7 +53,10 @@ from pm_robot.pipeline_terms import (
     EvidenceTier,
     PipelineJobType,
 )
-from pm_robot.storage.api_rate_limit import api_rate_limit_summary
+from pm_robot.storage.api_rate_limit import (
+    api_rate_limit_summary,
+    api_rate_limit_summary_from_path,
+)
 from pm_robot.storage.db import connect_readonly
 from pm_robot.storage.evidence_archive import evidence_archive_summary
 from pm_robot.storage.repository import evidence_backfill_summary
@@ -3047,7 +3050,7 @@ def _render_login(error: str) -> str:
         <main class="login">
           <form method="post" action="/login" class="login-box">
             <h1>pm-robot</h1>
-            <p>输入 VPS 上配置的 PM_ROBOT_UI_TOKEN。</p>
+            <p>输入部署环境中配置的访问令牌。</p>
             {message}
             <input name="token" type="password" autocomplete="current-password" autofocus>
             <button type="submit">登录</button>
@@ -3064,7 +3067,7 @@ def _render_missing_token() -> str:
         <main class="login">
           <section class="login-box">
             <h1>未配置访问令牌</h1>
-            <p>请在 /opt/pm-robot/.env 设置 PM_ROBOT_UI_TOKEN，然后重启 pm-robot-web.service。</p>
+            <p>请在部署环境中设置 PM_ROBOT_UI_TOKEN，然后重启网页服务。</p>
           </section>
         </main>
         """,
@@ -3984,11 +3987,25 @@ def _ops_health_summary(conn: sqlite3.Connection, settings: RobotSettings) -> di
     pipeline_backlog = _pending_evidence_backlog_summary(conn)
     runtime_loops = _runtime_loop_summary(conn, now=now)
     research_control_steps = _research_control_step_summary(conn, now=now)
-    upstream_request_budget = (
-        api_rate_limit_summary(conn, now=now)
-        if _table_exists(conn, "api_rate_limit_state")
-        else {"scope_count": 0, "active_cooldowns": 0, "total_cooldowns": 0, "rows": []}
-    )
+    if settings.rate_limit_db_path is not None:
+        upstream_request_budget = api_rate_limit_summary_from_path(
+            settings.rate_limit_db_path,
+            now=now,
+        )
+        upstream_request_budget["storage"] = "dedicated"
+    elif _table_exists(conn, "api_rate_limit_state"):
+        upstream_request_budget = api_rate_limit_summary(conn, now=now)
+        upstream_request_budget["storage"] = "main"
+        upstream_request_budget["available"] = True
+    else:
+        upstream_request_budget = {
+            "scope_count": 0,
+            "active_cooldowns": 0,
+            "total_cooldowns": 0,
+            "rows": [],
+            "storage": "missing",
+            "available": False,
+        }
     job_status = _rows(
         conn,
         """
@@ -8328,6 +8345,14 @@ def _ops_health_panel(values: dict[str, Any]) -> str:
     source_fingerprint = str(runtime.get("source_fingerprint") or "unknown")
     source_delivery = _source_delivery_text(str(runtime.get("source_delivery") or ""))
     source_root = str(runtime.get("source_root") or "")
+    budget_storage = str(upstream_request_budget.get("storage") or "missing")
+    budget_storage_label = {
+        "dedicated": "独立协调库",
+        "main": "主库兼容模式",
+        "missing": "未启用",
+    }.get(budget_storage, budget_storage)
+    budget_coordination_error = str(upstream_request_budget.get("coordination_error") or "")
+    budget_available = bool(upstream_request_budget.get("available", budget_storage == "main"))
     runtime_label = f"v{package_version} / {source_fingerprint}" if package_version != "unknown" else source_fingerprint
     cards = [
         ("运行版本", runtime_label, f"{_fmt_int(runtime.get('source_file_count'))} 个源码文件", "ok"),
@@ -8348,6 +8373,14 @@ def _ops_health_panel(values: dict[str, Any]) -> str:
         ("WAL", _fmt_bytes(int(storage.get("wal_bytes") or 0)), "写入日志", "warn" if int(storage.get("wal_bytes") or 0) >= 1_000_000_000 else "ok"),
         ("地址质量", _fmt_int(invalid_address_rows), "非标准钱包地址", "warn" if invalid_address_rows else "ok"),
         ("过期队列", _fmt_int(values.get("stale_running_count")), "running lease 已过期", "warn" if int(values.get("stale_running_count") or 0) else "ok"),
+        (
+            "额度协调",
+            budget_storage_label,
+            "与钱包主库分离" if budget_storage == "dedicated" else "建议使用独立协调库",
+            "warn"
+            if budget_coordination_error or not budget_available or budget_storage != "dedicated"
+            else "ok",
+        ),
         (
             "上游冷却",
             _fmt_int(upstream_request_budget.get("active_cooldowns")),
@@ -8418,6 +8451,12 @@ def _ops_health_panel(values: dict[str, Any]) -> str:
             ["预算", "状态", "速率", "冷却秒", "许可", "冷却次数", "最近状态码", "更新"],
         ),
     ]
+    if budget_coordination_error:
+        body.insert(
+            1,
+            '<div class="health-banner attention"><strong>额度协调库暂时不可读</strong>'
+            f'<span>{_e(budget_coordination_error)}</span></div>',
+        )
     if research_control_steps.get("has_data"):
         body.insert(
             5,

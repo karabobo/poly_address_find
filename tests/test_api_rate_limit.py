@@ -1,7 +1,8 @@
 import sqlite3
+import time
 from concurrent.futures import ThreadPoolExecutor
 from email.utils import formatdate
-from threading import Barrier
+from threading import Barrier, Thread
 from urllib.error import HTTPError
 
 import pytest
@@ -17,6 +18,7 @@ from pm_robot.storage.api_rate_limit import (
     SharedApiRateLimiter,
     SharedRateLimitDeferred,
     api_rate_limit_summary,
+    api_rate_limit_summary_from_path,
     sqlite_main_database_path,
     writable_sqlite_main_database_path,
 )
@@ -190,6 +192,113 @@ def test_shared_rate_limiter_blocks_network_when_migration_is_missing(tmp_path, 
 
     assert captured.value.error_type == "rate_limit_coordination_unavailable"
     assert network_calls == []
+
+
+def test_dedicated_rate_limit_database_initializes_its_own_schema(tmp_path):
+    db_path = tmp_path / "coordination" / "api_rate_limits.sqlite"
+    scope = RateLimitScope("data:/activity", capacity=30, window_seconds=10.0)
+
+    reservation = SharedApiRateLimiter(
+        db_path,
+        initialize_schema=True,
+    ).reserve([scope], now=100.0)
+    summary = api_rate_limit_summary_from_path(db_path, now=100.0)
+
+    assert reservation.coordinated is True
+    assert db_path.exists()
+    assert summary["available"] is True
+    assert summary["scope_count"] == 1
+    assert summary["total_permits"] == 1
+
+
+def test_dedicated_rate_limit_database_is_not_blocked_by_main_wallet_database(
+    tmp_path,
+    monkeypatch,
+):
+    main_db_path = _prepare_database(tmp_path)
+    dedicated_path = tmp_path / "api_rate_limits.sqlite"
+    monkeypatch.setenv("PM_ROBOT_RATE_LIMIT_DB_PATH", str(dedicated_path))
+    client_conn = connect(main_db_path)
+    locker = sqlite3.connect(main_db_path, timeout=0)
+    try:
+        locker.execute("BEGIN IMMEDIATE")
+        client = RateLimitedHttpClient(conn=client_conn)
+        reservation = client.shared_limiter.reserve(
+            [RateLimitScope("data:/activity", capacity=30, window_seconds=10.0)],
+            now=200.0,
+        )
+    finally:
+        locker.rollback()
+        locker.close()
+        client_conn.close()
+
+    assert client.shared_limiter.db_path == dedicated_path
+    assert client.shared_limiter.lock_timeout_seconds == 10.0
+    assert reservation.coordinated is True
+
+
+def test_existing_dedicated_schema_check_does_not_require_writer_lock(tmp_path):
+    db_path = tmp_path / "api_rate_limits.sqlite"
+    SharedApiRateLimiter(db_path, initialize_schema=True).reserve(
+        [RateLimitScope("data:*", capacity=50, window_seconds=10)],
+        now=100,
+    )
+    locker = sqlite3.connect(db_path, timeout=0)
+    try:
+        locker.execute("BEGIN IMMEDIATE")
+        limiter = SharedApiRateLimiter(
+            db_path,
+            initialize_schema=True,
+            lock_timeout_seconds=0.01,
+        )
+        conn = limiter._connect()
+        conn.close()
+    finally:
+        locker.rollback()
+        locker.close()
+
+    assert limiter._schema_ready is True
+
+
+def test_existing_dedicated_database_coordinates_many_short_lived_clients(tmp_path):
+    db_path = tmp_path / "api_rate_limits.sqlite"
+    scope = RateLimitScope("data:*", capacity=50, window_seconds=10)
+    SharedApiRateLimiter(db_path, initialize_schema=True).reserve([scope], now=100)
+    barrier = Barrier(8)
+
+    def reserve_slot(_):
+        limiter = SharedApiRateLimiter(db_path, initialize_schema=True)
+        barrier.wait()
+        return limiter.reserve([scope], now=101)
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        reservations = list(executor.map(reserve_slot, range(8)))
+
+    assert all(item.coordinated for item in reservations)
+
+
+def test_dedicated_rate_limit_database_waits_for_short_writer_contention(tmp_path):
+    db_path = tmp_path / "api_rate_limits.sqlite"
+    scope = RateLimitScope("data:*", capacity=50, window_seconds=10)
+    SharedApiRateLimiter(db_path, initialize_schema=True).reserve([scope], now=100)
+    locker = sqlite3.connect(db_path, timeout=0, check_same_thread=False)
+    locker.execute("BEGIN IMMEDIATE")
+
+    def release_lock():
+        time.sleep(0.1)
+        locker.rollback()
+        locker.close()
+
+    releaser = Thread(target=release_lock)
+    releaser.start()
+    reservation = SharedApiRateLimiter(
+        db_path,
+        initialize_schema=True,
+        lock_timeout_seconds=1,
+    ).reserve([scope], now=101)
+    releaser.join()
+
+    assert reservation.coordinated is True
 
 
 def test_sqlite_database_path_only_enables_file_backed_coordination(tmp_path):

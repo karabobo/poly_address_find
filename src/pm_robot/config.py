@@ -15,6 +15,7 @@ DEFAULT_POLICY_PATH = Path("config/leader_scoring_policy.json")
 @dataclass(frozen=True)
 class RobotSettings:
     db_path: Path = Path("data/pm_robot.sqlite")
+    rate_limit_db_path: Path | None = None
     policy_path: Path = DEFAULT_POLICY_PATH
     candidate_addresses_path: Path = Path("data/candidate_addresses.csv")
     candidate_review_path: Path = Path("reports/candidate_review_queue.csv")
@@ -28,8 +29,10 @@ class RobotSettings:
     @classmethod
     def load(cls, env_path: Path | None = None) -> "RobotSettings":
         load_dotenv(env_path or Path(".env"))
+        rate_limit_db_path = os.environ.get("PM_ROBOT_RATE_LIMIT_DB_PATH", "").strip()
         return cls(
             db_path=Path(os.environ.get("PM_ROBOT_DB_PATH", "data/pm_robot.sqlite")),
+            rate_limit_db_path=Path(rate_limit_db_path) if rate_limit_db_path else None,
             policy_path=Path(os.environ.get("PM_ROBOT_POLICY_PATH", str(DEFAULT_POLICY_PATH))),
             candidate_addresses_path=Path(
                 os.environ.get("PM_ROBOT_CANDIDATE_ADDRESSES", "data/candidate_addresses.csv")

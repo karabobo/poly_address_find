@@ -2586,6 +2586,36 @@ def test_dashboard_ops_health_distinguishes_normal_backlog_from_high_priority_ga
     assert "高优先级漏派样本" in html
 
 
+def test_ops_health_panel_shows_dedicated_rate_limit_coordination():
+    html = web_module._ops_health_panel(
+        {
+            "health": "ok",
+            "note": "运行正常",
+            "generated_at": 100,
+            "storage": {},
+            "address_quality": {},
+            "runtime": {},
+            "runtime_loops": {},
+            "research_control_steps": {},
+            "pipeline_backlog": {},
+            "upstream_request_budget": {
+                "storage": "dedicated",
+                "available": True,
+                "scope_count": 2,
+                "active_cooldowns": 0,
+                "rows": [],
+            },
+            "job_status": [],
+            "active_jobs": [],
+            "queue_progress": [],
+        }
+    )
+
+    assert "额度协调" in html
+    assert "独立协调库" in html
+    assert "与钱包主库分离" in html
+
+
 def test_dashboard_ops_health_ignores_future_scheduled_evidence_state(tmp_path):
     settings = _settings(tmp_path)
     _seed(settings)

@@ -19,6 +19,8 @@ from pm_robot.storage.api_rate_limit import (
     SharedApiRateLimiter,
     SharedRateLimitDeferred,
     SharedRateLimitUnavailable,
+    configured_rate_limit_db_path,
+    configured_rate_limit_lock_timeout_seconds,
     writable_sqlite_main_database_path,
 )
 from pm_robot.storage.repository import log_api_request
@@ -87,6 +89,14 @@ class RateLimitedHttpClient:
 
     def __post_init__(self) -> None:
         if self.shared_limiter is not None or self.conn is None:
+            return
+        dedicated_path = configured_rate_limit_db_path()
+        if dedicated_path is not None:
+            self.shared_limiter = SharedApiRateLimiter(
+                dedicated_path,
+                lock_timeout_seconds=configured_rate_limit_lock_timeout_seconds(),
+                initialize_schema=True,
+            )
             return
         db_path = writable_sqlite_main_database_path(self.conn)
         if db_path is not None:
@@ -181,7 +191,7 @@ class RateLimitedHttpClient:
                 ) from exc
             except SharedRateLimitUnavailable as exc:
                 raise HttpClientError(
-                    "shared upstream request budget is unavailable",
+                    f"shared upstream request budget is unavailable: {exc}",
                     status_code=429,
                     error_type="rate_limit_coordination_unavailable",
                     retry_after_seconds=exc.retry_after_seconds,
