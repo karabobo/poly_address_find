@@ -319,28 +319,28 @@ def run_copyability_evidence_worker(
                     max_leader_events=effective_max_leader_events,
                     max_followers_per_event=effective_max_followers_per_event,
                     now=now,
-                    commit=False,
+                    commit=True,
                 )
+                # Graph and backtest refreshes are idempotent replacements. Commit each
+                # phase so their CPU-heavy queries do not monopolize SQLite's writer lock.
                 _require_copyability_job_lease(
                     conn,
                     job_id=int(job["job_id"]),
                     worker_id=worker_id,
                     lease_seconds=lease_seconds,
-                    commit=False,
                 )
                 backtest = backtest_copy_stream_for_leaders(
                     conn,
                     policy,
                     [wallet],
                     now=now,
-                    commit=False,
+                    commit=True,
                 )
                 _require_copyability_job_lease(
                     conn,
                     job_id=int(job["job_id"]),
                     worker_id=worker_id,
                     lease_seconds=lease_seconds,
-                    commit=False,
                 )
                 materialized = materialize_wallet_feature(
                     conn,

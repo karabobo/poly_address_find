@@ -31,7 +31,10 @@ def test_copyability_worker_default_lease_matches_long_running_graph_refresh():
     assert default == 7_200
 
 
-def test_copyability_worker_rolls_back_when_completion_loses_lease(tmp_path, monkeypatch):
+def test_copyability_worker_keeps_completed_phases_when_completion_loses_lease(
+    tmp_path,
+    monkeypatch,
+):
     conn = connect(tmp_path / "robot.sqlite")
     wallet = "0x" + "c" * 40
     try:
@@ -63,24 +66,30 @@ def test_copyability_worker_rolls_back_when_completion_loses_lease(tmp_path, mon
             now,
             commit=True,
         ):
-            assert commit is False
+            assert commit is True
             conn_arg.execute(
-                "UPDATE candidate_wallets SET notes = 'stale-write' WHERE address = ?",
+                "UPDATE candidate_wallets SET notes = 'graph-write' WHERE address = ?",
                 (wallet,),
             )
+            conn_arg.commit()
             return TargetedCopyGraphSummary(1, 0, 0, 0, 0)
 
         def fake_backtest(conn_arg, policy, leaders, *, now=None, commit=True):
-            assert commit is False
+            assert commit is True
             return TargetedCopyBacktestSummary(1, 0, 0, 0)
 
         monkeypatch.setattr(copyability_evidence, "mine_copy_graph_for_leaders", fake_graph)
         monkeypatch.setattr(copyability_evidence, "backtest_copy_stream_for_leaders", fake_backtest)
-        monkeypatch.setattr(
-            copyability_evidence,
-            "materialize_wallet_feature",
-            lambda *args, **kwargs: True,
-        )
+
+        def fake_materialize(conn_arg, wallet_arg, **kwargs):
+            assert kwargs["commit"] is False
+            conn_arg.execute(
+                "UPDATE candidate_wallets SET notes = 'final-write' WHERE address = ?",
+                (wallet_arg,),
+            )
+            return True
+
+        monkeypatch.setattr(copyability_evidence, "materialize_wallet_feature", fake_materialize)
         monkeypatch.setattr(
             copyability_evidence,
             "_score_wallet_after_copyability",
@@ -112,7 +121,7 @@ def test_copyability_worker_rolls_back_when_completion_loses_lease(tmp_path, mon
         assert summary.status == "partial"
         assert summary.jobs_failed == 1
         assert "lease was lost" in summary.error
-        assert candidate["notes"] == "original"
+        assert candidate["notes"] == "graph-write"
         assert job["status"] == "running"
         assert job["lease_owner"] == "copy-lease-loss-worker"
         assert json.loads(job["output_json"]) == {}

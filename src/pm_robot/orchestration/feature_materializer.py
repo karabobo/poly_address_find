@@ -41,16 +41,23 @@ def materialize_wallet_features(
     updated = 0
     error = ""
     status = "ok"
+    materialized: list[tuple[str, WalletFeatures]] = []
     for wallet in targets:
         try:
             feature = _materialize_wallet(conn, wallet, now=ts)
             if feature is None:
                 continue
-            _write_materialized_feature(conn, wallet, feature)
-            updated += 1
+            materialized.append((wallet, feature))
         except Exception as exc:
             status = "partial"
             error = f"{wallet}: {exc}"
+    if materialized:
+        try:
+            _write_materialized_feature_batch(conn, materialized)
+            updated = len(materialized)
+        except Exception as exc:
+            status = "partial"
+            error = f"feature_batch: {exc}"
     return FeatureMaterializeSummary(
         wallets_attempted=len(targets),
         wallets_updated=updated,
@@ -106,6 +113,20 @@ def _write_materialized_feature(
     _write_with_retry(conn, _operation, commit=commit)
 
 
+def _write_materialized_feature_batch(
+    conn: sqlite3.Connection,
+    materialized: list[tuple[str, WalletFeatures]],
+) -> None:
+    """Persist one computed batch after acquiring the SQLite writer once."""
+
+    def _operation() -> None:
+        for wallet, feature in materialized:
+            _clear_materializer_owned_nullable_fields(conn, wallet)
+            upsert_wallet_feature(conn, feature)
+
+    _write_with_retry(conn, _operation)
+
+
 def _write_with_retry(conn: sqlite3.Connection, operation, *, commit: bool = True) -> None:
     if not commit:
         operation()
@@ -121,28 +142,13 @@ def _write_with_retry(conn: sqlite3.Connection, operation, *, commit: bool = Tru
 def _list_targets(conn: sqlite3.Connection, *, limit: int, min_activity_events: int) -> list[str]:
     rows = conn.execute(
         """
-        WITH latest_score AS (
-            SELECT ls.address, ls.review_reason
-            FROM leader_scores ls
-            JOIN (
-                SELECT address, MAX(score_id) AS score_id
-                FROM leader_scores
-                GROUP BY address
-            ) latest
-              ON latest.score_id = ls.score_id
-        ),
-        candidate_targets AS (
+        WITH candidate_targets AS (
             SELECT
                 cw.address,
                 COALESCE(ls.review_reason, '') AS review_reason,
                 COALESCE(
                     NULLIF(wps.activity_count, 0),
                     NULLIF(ebb.current_depth, 0),
-                    (
-                        SELECT COUNT(*)
-                        FROM wallet_activity wallet_activity_count
-                        WHERE wallet_activity_count.address = cw.address
-                    ),
                     0
                 ) AS wallet_activity_count,
                 COALESCE(pwq.total_roi, -999.0) AS paper_roi,
@@ -164,7 +170,7 @@ def _list_targets(conn: sqlite3.Connection, *, limit: int, min_activity_events: 
                 wf.extra_json,
                 COALESCE(cw.updated_at, 0) AS candidate_updated_at
             FROM candidate_wallets cw
-            LEFT JOIN latest_score ls
+            LEFT JOIN leader_latest_scores ls
               ON ls.address = cw.address
             LEFT JOIN wallet_features wf
               ON wf.address = cw.address
@@ -240,6 +246,74 @@ def _list_targets(conn: sqlite3.Connection, *, limit: int, min_activity_events: 
         LIMIT ?
         """,
         (min_activity_events, MATERIALIZER_VERSION, limit),
+    ).fetchall()
+    targets = [str(row["address"]) for row in rows]
+    if limit <= 0 or len(targets) >= limit:
+        return targets
+    targets.extend(
+        _list_raw_activity_fallback_targets(
+            conn,
+            exclude=targets,
+            limit=limit - len(targets),
+            min_activity_events=min_activity_events,
+        )
+    )
+    return targets
+
+
+def _list_raw_activity_fallback_targets(
+    conn: sqlite3.Connection,
+    *,
+    exclude: list[str],
+    limit: int,
+    min_activity_events: int,
+) -> list[str]:
+    """Find legacy raw-activity targets only when canonical state cannot fill a batch."""
+
+    if limit <= 0:
+        return []
+    excluded_sql = ""
+    params: list[Any] = [MATERIALIZER_VERSION]
+    if exclude:
+        placeholders = ",".join("?" for _ in exclude)
+        excluded_sql = f"AND cw.address NOT IN ({placeholders})"
+        params.extend(exclude)
+    params.extend((min_activity_events, limit))
+    rows = conn.execute(
+        f"""
+        SELECT cw.address
+        FROM candidate_wallets cw
+        JOIN wallet_activity wa
+          ON wa.address = cw.address
+         AND wa.type = 'TRADE'
+        LEFT JOIN wallet_features wf
+          ON wf.address = cw.address
+        LEFT JOIN wallet_processing_state wps
+          ON wps.wallet = cw.address
+        LEFT JOIN evidence_backfill_budget ebb
+          ON ebb.wallet = cw.address
+        LEFT JOIN wallet_registry wr
+          ON wr.address = cw.address
+        WHERE cw.candidate_stage NOT IN ('rejected', 'blocked_hygiene', 'blocked_copyability')
+          AND COALESCE(wr.raw_retention_tier, '') != 'summary_only'
+          AND COALESCE(NULLIF(wps.activity_count, 0), NULLIF(ebb.current_depth, 0), 0) = 0
+          AND (
+               (wf.maker_fraction IS NULL AND instr(COALESCE(wf.extra_json, '{{}}'), ?) = 0)
+            OR wf.leader_in_degree IS NULL
+            OR wf.copy_event_count IS NULL
+            OR wf.copy_market_count IS NULL
+            OR wf.copy_stream_roi IS NULL
+            OR wf.single_market_pnl_share IS NULL
+            OR wf.net_to_gross_exposure IS NULL
+            OR instr(COALESCE(wf.extra_json, '{{}}'), 'paper_roi_after_slippage') = 0
+          )
+          {excluded_sql}
+        GROUP BY cw.address
+        HAVING COUNT(wa.activity_id) >= ?
+        ORDER BY COUNT(wa.activity_id) DESC, COALESCE(cw.updated_at, 0) DESC, cw.address ASC
+        LIMIT ?
+        """,
+        tuple(params),
     ).fetchall()
     return [str(row["address"]) for row in rows]
 

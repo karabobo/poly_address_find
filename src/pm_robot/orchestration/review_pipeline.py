@@ -88,28 +88,43 @@ def score_database(
     policy_version = str(policy.get("version", ""))
     candidates = _list_score_candidates(conn, incremental=incremental, limit=limit, policy_version=policy_version)
     features_by_address = get_wallet_features(conn)
-    skipped_incomplete_overwrites = 0
-    skipped_unchanged_scores = 0
-    written_scores = 0
+    scores = []
     for candidate in candidates:
         score = score_candidate(candidate, features_by_address.get(candidate.address), policy)
-        score = apply_paper_evidence_guard(conn, score)
-        if _should_skip_incomplete_overwrite(conn, score, policy_version=policy_version):
-            skipped_incomplete_overwrites += 1
-            continue
-        if _write_with_retry(
-            conn,
-            lambda score=score: _should_skip_unchanged_score(conn, score, policy_version=policy_version),
-        ):
-            skipped_unchanged_scores += 1
-            continue
-        _write_with_retry(conn, lambda score=score: persist_score(conn, score, policy_version=policy_version))
-        written_scores += 1
-    restored = _write_with_retry(conn, lambda: restore_masked_valid_scores(conn, policy_version=policy_version))
-    blocked = _write_with_retry(conn, lambda: apply_paper_quality_blocks(conn))
-    no_signal_blocked = _write_with_retry(conn, lambda: apply_copyability_no_signal_blocks(conn))
-    evidence_guarded = _write_with_retry(conn, lambda: repair_paper_stage_evidence_incomplete(conn, policy_version=policy_version))
-    synced = _write_with_retry(conn, lambda: sync_candidate_stages_from_latest_scores(conn))
+        scores.append(apply_paper_evidence_guard(conn, score))
+
+    def persist_scores() -> tuple[int, int, int]:
+        skipped_incomplete = 0
+        skipped_unchanged = 0
+        written = 0
+        for score in scores:
+            if _should_skip_incomplete_overwrite(conn, score, policy_version=policy_version):
+                skipped_incomplete += 1
+                continue
+            if _should_skip_unchanged_score(conn, score, policy_version=policy_version):
+                skipped_unchanged += 1
+                continue
+            persist_score(conn, score, policy_version=policy_version)
+            written += 1
+        return skipped_incomplete, skipped_unchanged, written
+
+    skipped_incomplete_overwrites, skipped_unchanged_scores, written_scores = _write_with_retry(
+        conn,
+        persist_scores,
+    )
+
+    def finalize_scores() -> tuple[int, int, int, int, int]:
+        restored = restore_masked_valid_scores(conn, policy_version=policy_version)
+        blocked = apply_paper_quality_blocks(conn)
+        no_signal_blocked = apply_copyability_no_signal_blocks(conn)
+        evidence_guarded = repair_paper_stage_evidence_incomplete(conn, policy_version=policy_version)
+        synced = sync_candidate_stages_from_latest_scores(conn)
+        return restored, blocked, no_signal_blocked, evidence_guarded, synced
+
+    restored, blocked, no_signal_blocked, evidence_guarded, synced = _write_with_retry(
+        conn,
+        finalize_scores,
+    )
     if export_path:
         write_rows(export_path, latest_review_rows(conn))
     counts = _candidate_stage_counts(conn)
@@ -175,15 +190,6 @@ def repair_paper_stage_evidence_incomplete(
 ) -> int:
     rows = conn.execute(
         """
-        WITH latest AS (
-            SELECT
-                ls.*,
-                ROW_NUMBER() OVER (
-                    PARTITION BY ls.address
-                    ORDER BY ls.scored_at DESC, ls.score_id DESC
-                ) AS rn
-            FROM leader_scores ls
-        )
         SELECT
             cw.address,
             cw.candidate_stage AS current_stage,
@@ -194,9 +200,8 @@ def repair_paper_stage_evidence_incomplete(
             latest.scored_at,
             COALESCE(latest.policy_version, '') AS policy_version
         FROM candidate_wallets cw
-        JOIN latest
+        JOIN leader_latest_scores latest
           ON latest.address = cw.address
-         AND latest.rn = 1
         LEFT JOIN wallet_processing_state wps
           ON wps.wallet = cw.address
         WHERE cw.candidate_stage IN ('paper_candidate', 'paper_approved', 'live_eligible')
@@ -272,17 +277,6 @@ def _list_score_candidates(
 
     rows = conn.execute(
         """
-        WITH latest_score AS (
-            SELECT address, MAX(score_id) AS score_id
-            FROM leader_scores
-            GROUP BY address
-        ),
-        latest AS (
-            SELECT ls.address, ls.scored_at, COALESCE(ls.policy_version, '') AS policy_version
-            FROM leader_scores ls
-            JOIN latest_score latest_score
-              ON latest_score.score_id = ls.score_id
-        )
         SELECT cw.address, cw.sources, cw.labels, cw.notes, cw.links, cw.status
         FROM candidate_wallets cw
         LEFT JOIN wallet_features wf
@@ -291,7 +285,7 @@ def _list_score_candidates(
           ON wps.wallet = cw.address
         LEFT JOIN wallet_registry wr
           ON wr.address = cw.address
-        LEFT JOIN latest
+        LEFT JOIN leader_latest_scores latest
           ON latest.address = cw.address
         WHERE cw.candidate_stage NOT IN ('rejected', 'blocked_hygiene', 'blocked_copyability')
           AND COALESCE(wr.raw_retention_tier, '') != 'summary_only'
@@ -414,13 +408,7 @@ def _should_skip_unchanged_score(
     policy_version: str,
 ) -> bool:
     latest = conn.execute(
-        """
-        SELECT *
-        FROM leader_scores
-        WHERE address = ?
-        ORDER BY score_id DESC
-        LIMIT 1
-        """,
+        "SELECT * FROM leader_latest_scores WHERE address = ?",
         (score.address,),
     ).fetchone()
     if latest is None:
@@ -522,24 +510,13 @@ def _score_target_stage(
 def sync_candidate_stages_from_latest_scores(conn: sqlite3.Connection, *, now: int | None = None) -> int:
     rows = conn.execute(
         """
-        WITH latest AS (
-            SELECT
-                ls.address,
-                ls.review_stage,
-                ROW_NUMBER() OVER (
-                    PARTITION BY ls.address
-                    ORDER BY ls.scored_at DESC, ls.score_id DESC
-                ) AS rn
-            FROM leader_scores ls
-        )
         SELECT
             cw.address,
             cw.candidate_stage AS current_stage,
             latest.review_stage AS scored_stage
         FROM candidate_wallets cw
-        JOIN latest
+        JOIN leader_latest_scores latest
           ON latest.address = cw.address
-         AND latest.rn = 1
         WHERE cw.candidate_stage != latest.review_stage
         """
     ).fetchall()
@@ -578,24 +555,14 @@ def sync_candidate_stages_from_latest_scores(conn: sqlite3.Connection, *, now: i
 def restore_masked_valid_scores(conn: sqlite3.Connection, *, policy_version: str = "") -> int:
     rows = conn.execute(
         """
-        WITH latest AS (
-            SELECT
-                ls.*,
-                ROW_NUMBER() OVER (
-                    PARTITION BY ls.address
-                    ORDER BY ls.scored_at DESC, ls.score_id DESC
-                ) AS rn
-            FROM leader_scores ls
-        )
         SELECT
             latest.address,
             latest.review_reason AS masked_reason,
             cw.candidate_stage AS current_stage
-        FROM latest
+        FROM leader_latest_scores latest
         JOIN candidate_wallets cw
           ON cw.address = latest.address
-        WHERE latest.rn = 1
-          AND latest.leader_score = 0
+        WHERE latest.leader_score = 0
           AND latest.review_stage = 'needs_data'
           AND (
               latest.review_reason = 'no_wallet_metrics_attached'

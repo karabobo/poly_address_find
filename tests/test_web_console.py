@@ -1811,7 +1811,7 @@ def test_dashboard_evidence_pipeline_reports_l1_l2_l3_queue_progress(tmp_path, m
     assert "尝试耗尽" in html
     assert "维护循环将标记失败并释放水位" in html
     assert "执行队列前排" in html
-    assert "状态待派断点" in html
+    assert "待调度候选" in html
     assert "总到期待补" in html
     assert "总 ETA" in html
     assert "最近完成证据任务" in html
@@ -2552,6 +2552,7 @@ def test_dashboard_ops_health_distinguishes_normal_backlog_from_high_priority_ga
     data = dashboard_data(settings)
     backlog = data["ops_health"]["pipeline_backlog"]
     readiness = data["production_readiness"]
+    html = web_module._evidence_pipeline_panel(data["evidence_pipeline"])
 
     assert data["ops_health"]["health"] == "ok"
     assert backlog["pending_without_active_job"] == 1
@@ -2562,6 +2563,8 @@ def test_dashboard_ops_health_distinguishes_normal_backlog_from_high_priority_ga
     assert readiness["evidence_pending"] == 1
     assert readiness["evidence_active_pending"] == 0
     assert readiness["evidence_state_pending"] == 1
+    assert "受控背压" in html
+    assert "调度候选" in html
 
     conn = connect(settings.db_path)
     try:
@@ -2843,9 +2846,40 @@ def test_dashboard_and_startup_prewarm_use_lightweight_summary(tmp_path, monkeyp
 
     assert calls[0]["include_pair_quality"] is False
     assert calls[0]["include_heavy_audits"] is False
+    assert calls[0]["return_none_while_warming"] is True
     assert calls[1]["include_pair_quality"] is False
     assert calls[1]["include_heavy_audits"] is False
     assert calls[1]["force_refresh"] is True
+
+
+def test_dashboard_returns_immediate_warming_page_during_startup_prewarm(
+    tmp_path,
+    monkeypatch,
+):
+    settings = _settings(tmp_path)
+    settings.db_path.touch()
+    key = web_module._dashboard_cache_key(
+        settings,
+        include_pair_quality=False,
+        include_heavy_audits=False,
+    )
+    with web_module._DASHBOARD_CACHE_LOCK:
+        web_module._DASHBOARD_CACHE.pop(key, None)
+        web_module._DASHBOARD_REFRESHING.add(key)
+    monkeypatch.setattr(
+        web_module,
+        "dashboard_data",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("must not block")),
+    )
+    try:
+        html = _render_dashboard(settings)
+    finally:
+        with web_module._DASHBOARD_CACHE_LOCK:
+            web_module._DASHBOARD_REFRESHING.discard(key)
+
+    assert "正在准备控制台" in html
+    assert "后台研究任务仍在运行" in html
+    assert "window.location.reload" in html
 
 
 def test_lightweight_dashboard_defers_heavy_discovery_and_rtds_audits(tmp_path):

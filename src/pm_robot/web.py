@@ -275,7 +275,8 @@ def _dashboard_data_cached(
     include_pair_quality: bool = True,
     include_heavy_audits: bool = True,
     force_refresh: bool = False,
-) -> dict[str, Any]:
+    return_none_while_warming: bool = False,
+) -> dict[str, Any] | None:
     ttl = _dashboard_cache_ttl()
     if ttl <= 0:
         return dashboard_data(
@@ -283,7 +284,11 @@ def _dashboard_data_cached(
             include_pair_quality=include_pair_quality,
             include_heavy_audits=include_heavy_audits,
         )
-    key = (str(settings.db_path.resolve()), include_pair_quality, include_heavy_audits)
+    key = _dashboard_cache_key(
+        settings,
+        include_pair_quality=include_pair_quality,
+        include_heavy_audits=include_heavy_audits,
+    )
     now = time.time()
     if not force_refresh:
         stale_data: dict[str, Any] | None = None
@@ -297,6 +302,8 @@ def _dashboard_data_cached(
                 if key not in _DASHBOARD_REFRESHING:
                     _DASHBOARD_REFRESHING.add(key)
                     should_refresh = True
+            elif return_none_while_warming and key in _DASHBOARD_REFRESHING:
+                return None
         if stale_data is not None:
             if should_refresh:
                 _start_dashboard_cache_refresh(
@@ -314,6 +321,15 @@ def _dashboard_data_cached(
     with _DASHBOARD_CACHE_LOCK:
         _DASHBOARD_CACHE[key] = (time.time(), data)
     return data
+
+
+def _dashboard_cache_key(
+    settings: RobotSettings,
+    *,
+    include_pair_quality: bool,
+    include_heavy_audits: bool,
+) -> tuple[str, bool, bool]:
+    return (str(settings.db_path.resolve()), include_pair_quality, include_heavy_audits)
 
 
 def _dashboard_cache_ttl() -> int:
@@ -345,9 +361,25 @@ def _prewarm_dashboard_cache(settings: RobotSettings) -> None:
 def _start_dashboard_cache_prewarm(settings: RobotSettings) -> None:
     """Warm expensive dashboard queries without delaying the listening socket."""
 
+    key = _dashboard_cache_key(
+        settings,
+        include_pair_quality=False,
+        include_heavy_audits=False,
+    )
+    with _DASHBOARD_CACHE_LOCK:
+        if key in _DASHBOARD_REFRESHING:
+            return
+        _DASHBOARD_REFRESHING.add(key)
+
+    def prewarm() -> None:
+        try:
+            _prewarm_dashboard_cache(settings)
+        finally:
+            with _DASHBOARD_CACHE_LOCK:
+                _DASHBOARD_REFRESHING.discard(key)
+
     threading.Thread(
-        target=_prewarm_dashboard_cache,
-        args=(settings,),
+        target=prewarm,
         name="pm-robot-dashboard-prewarm",
         daemon=True,
     ).start()
@@ -2824,7 +2856,10 @@ def _render_dashboard(settings: RobotSettings) -> str:
         settings,
         include_pair_quality=False,
         include_heavy_audits=False,
+        return_none_while_warming=True,
     )
+    if data is None:
+        return _render_dashboard_warming()
     readiness = data["production_readiness"]
     publish_gate = readiness.get("formal_publish_gate") or {}
     pipeline = data["evidence_pipeline"]
@@ -2896,6 +2931,23 @@ def _render_dashboard(settings: RobotSettings) -> str:
         "</main>",
     ]
     return _render_page("pm-robot 研究总览", "".join(body))
+
+
+def _render_dashboard_warming() -> str:
+    return _render_page(
+        "正在准备研究控制台",
+        """
+        <main class="login">
+          <section class="login-box" aria-live="polite">
+            <span class="mode-pill">NAS 研究与评分</span>
+            <h1>正在准备控制台</h1>
+            <p>后台研究任务仍在运行，数据就绪后会自动进入。</p>
+            <div class="progress" aria-label="正在载入"><i style="width:72%"></i><span>载入最新状态</span></div>
+          </section>
+        </main>
+        <script>window.setTimeout(function () { window.location.reload(); }, 2500);</script>
+        """,
+    )
 
 
 def _render_wallets(settings: RobotSettings, *, stage: str, source: str, query: str, signal: str) -> str:
@@ -7940,8 +7992,8 @@ def _evidence_pipeline_panel(values: dict[str, Any]) -> str:
         banner_state = "attention"
         note = "高优先级钱包状态待补证据，但没有对应活动任务。"
     elif pending_state:
-        banner_state = "attention"
-        note = "钱包状态仍有待补证据项，但当前执行队列为空。"
+        banner_state = "ok"
+        note = "低优先级候选等待 planner 按并发水位分批派发，属于受控背压。"
     else:
         banner_state = "ok"
         note = "历史证据队列当前为空。"
@@ -7954,13 +8006,23 @@ def _evidence_pipeline_panel(values: dict[str, Any]) -> str:
         ("退避排队", _fmt_int(deferred_queued), "等待 next_attempt_at", "ok"),
         ("尝试耗尽", _fmt_int(exhausted_queued), "不会被 worker 领取", "warn" if exhausted_queued else "ok"),
         ("运行", _fmt_int(running), "running jobs", "ok" if running else "warn" if queued else "ok"),
-        ("状态待派", _fmt_int(pending_state), "状态表有下一动作但无活动任务", "warn" if pending_state else "ok"),
-        ("高优待派", _fmt_int(high_priority_pending_state), "优先级待派断点", "warn" if high_priority_pending_state else "ok"),
+        (
+            "调度候选",
+            _fmt_int(pending_state),
+            "等待 planner 并发槽位",
+            "warn" if high_priority_pending_state else "ok",
+        ),
+        (
+            "高优漏派",
+            _fmt_int(high_priority_pending_state),
+            "真正需要关注的调度断点",
+            "warn" if high_priority_pending_state else "ok",
+        ),
         (
             "总到期待补",
             _fmt_int(values.get("total_due_backlog")),
             "queued/running + 到期待派",
-            "warn" if int(values.get("total_due_backlog") or 0) else "ok",
+            "warn" if high_priority_pending_state or (queued and not running) else "ok",
         ),
         ("近1h完成", _fmt_int(values.get("completed_1h")), "done jobs", "ok"),
         ("24h完成", _fmt_int(values.get("completed_24h")), "done jobs", "ok"),
@@ -8038,7 +8100,7 @@ def _evidence_pipeline_panel(values: dict[str, Any]) -> str:
             ["任务动作", "队列范围", "状态", "数量", "最高优先级", "最早创建", "最近更新"],
             localized_keys={"job_action", "job_scope", "status"},
         )
-        + '<h3 class="subhead">状态待派断点</h3>'
+        + '<h3 class="subhead">待调度候选</h3>'
         + _simple_table(
             values.get("pending_state_by_action") or [],
             ["next_action", "count", "high_priority_count", "min_priority", "latest_updated_at"],

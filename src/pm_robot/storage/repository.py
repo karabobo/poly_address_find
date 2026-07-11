@@ -2762,16 +2762,7 @@ def apply_copyability_no_signal_blocks(
     status_filter = "cj.status IN ('done', 'running')" if wallet and allow_running else "cj.status = 'done'"
     rows = conn.execute(
         f"""
-        WITH latest_score AS (
-            SELECT
-                ls.*,
-                ROW_NUMBER() OVER (
-                    PARTITION BY ls.address
-                    ORDER BY ls.scored_at DESC, ls.score_id DESC
-                ) AS rn
-            FROM leader_scores ls
-        ),
-        latest_copy_job AS (
+        WITH latest_copy_job AS (
             SELECT pj.*
             FROM pipeline_jobs pj
             JOIN (
@@ -2792,9 +2783,8 @@ def apply_copyability_no_signal_blocks(
         FROM candidate_wallets cw
         JOIN wallet_features wf
           ON wf.address = cw.address
-        JOIN latest_score
+        JOIN leader_latest_scores latest_score
           ON latest_score.address = cw.address
-         AND latest_score.rn = 1
         JOIN latest_copy_job cj
           ON cj.wallet = cw.address
         WHERE cw.candidate_stage = 'needs_manual_review'
