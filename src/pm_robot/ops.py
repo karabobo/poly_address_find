@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import csv
 import json
 import os
@@ -991,12 +992,13 @@ def compact_low_value_evidence(
     source_path = settings.db_path.resolve()
     if not source_path.exists():
         raise FileNotFoundError(source_path)
-    with database_access_guard(source_path, exclusive=True):
-        return _compact_low_value_evidence_locked(
-            settings,
-            dry_run=dry_run,
-            progress=progress,
-        )
+    with database_access_guard(_retention_cycle_lock_key(source_path), exclusive=True):
+        with database_access_guard(source_path, exclusive=True):
+            return _compact_low_value_evidence_locked(
+                settings,
+                dry_run=dry_run,
+                progress=progress,
+            )
 
 
 def _compact_low_value_evidence_locked(
@@ -1240,6 +1242,16 @@ def _build_compact_evidence_database(
         _mark_wallet_registry_pruned(conn, wallets)
         _cancel_wallet_evidence_backfill(conn, wallets)
         now = int(time.time())
+        conn.execute(
+            """
+            UPDATE retention_cycle_state
+            SET database_id = lower(hex(randomblob(16))),
+                mutation_generation = mutation_generation + 1,
+                updated_at = ?
+            WHERE singleton = 1
+            """,
+            (now,),
+        )
         conn.execute(
             """
             INSERT OR IGNORE INTO wallet_activity_watermarks(
@@ -1849,6 +1861,35 @@ def prune_low_value_evidence(
     archive: bool = False,
     archive_dir: Path | None = None,
 ) -> dict[str, Any]:
+    """Serialize one direct prune against retention cycles and compaction."""
+
+    with database_access_guard(
+        _retention_cycle_lock_key(settings.db_path),
+        exclusive=True,
+    ):
+        return _prune_low_value_evidence_locked(
+            settings,
+            limit=limit,
+            max_activity_rows=max_activity_rows,
+            keep_recent_activity=keep_recent_activity,
+            dry_run=dry_run,
+            vacuum=vacuum,
+            archive=archive,
+            archive_dir=archive_dir,
+        )
+
+
+def _prune_low_value_evidence_locked(
+    settings: RobotSettings,
+    *,
+    limit: int = 20,
+    max_activity_rows: int = 0,
+    keep_recent_activity: int = 0,
+    dry_run: bool = True,
+    vacuum: bool = False,
+    archive: bool = False,
+    archive_dir: Path | None = None,
+) -> dict[str, Any]:
     """Archive and prune raw evidence after a wallet decision is summarized.
 
     Candidate, feature, latest-score, source, and registry summary rows remain the
@@ -1901,6 +1942,8 @@ def prune_low_value_evidence(
                     wallets,
                     keep_recent_activity=effective_keep_recent_activity,
                 )
+            if wallets:
+                _advance_retention_generation(conn, updated_at=int(time.time()))
             conn.commit()
         elif archive:
             archive_run = resumable_archive_run(conn)
@@ -2019,6 +2062,8 @@ def prune_low_value_evidence(
                 set_archive_run_status(conn, archive_run_id, final_archive_status)
                 archive_result["status"] = final_archive_status
                 archive_result["residual"] = residual
+            if wallets:
+                _advance_retention_generation(conn, updated_at=watermark_updated_at)
             conn.commit()
         else:
             conn.rollback()
@@ -2042,6 +2087,430 @@ def prune_low_value_evidence(
         "deleted": deleted,
         "archive": archive_result,
         "storage": storage_report(settings),
+    }
+
+
+def retention_backlog_snapshot(settings: RobotSettings) -> dict[str, Any]:
+    """Measure the currently safe summary-only retention backlog."""
+
+    conn = connect_readonly(settings.db_path)
+    try:
+        return _retention_backlog_snapshot_from_conn(conn)
+    finally:
+        conn.close()
+
+
+def _retention_backlog_snapshot_from_conn(conn: sqlite3.Connection) -> dict[str, Any]:
+    terminal_wallets = [
+        str(row["address"])
+        for row in _terminal_low_value_wallet_rows(conn, limit=None)
+    ]
+    needs_data_wallets = [
+        str(row["address"])
+        for row in _needs_data_low_value_wallet_rows(conn, limit=None)
+    ]
+    terminal_activity_rows = _wallet_activity_count_chunked(conn, terminal_wallets)
+    needs_data_activity_rows = _wallet_activity_count_chunked(conn, needs_data_wallets)
+    return {
+        "generated_at": int(time.time()),
+        "terminal_wallets": len(terminal_wallets),
+        "terminal_activity_rows": terminal_activity_rows,
+        "needs_data_wallets": len(needs_data_wallets),
+        "needs_data_activity_rows": needs_data_activity_rows,
+        "total_wallets": len(terminal_wallets) + len(needs_data_wallets),
+        "total_activity_rows": terminal_activity_rows + needs_data_activity_rows,
+    }
+
+
+def run_retention_cycle(
+    settings: RobotSettings,
+    *,
+    batches: int = 2,
+    limit: int = 20,
+    max_activity_rows: int = 5_000,
+    keep_recent_activity: int = 0,
+    batch_delay_seconds: float = 10.0,
+    cycle_interval_seconds: int = 900,
+    dry_run: bool = True,
+    archive: bool = False,
+    archive_dir: Path | None = None,
+    previous_report_path: Path | None = None,
+    report_path: Path | None = None,
+) -> dict[str, Any]:
+    """Run one cycle, or skip immediately when another retention writer owns it."""
+
+    lock_stack = contextlib.ExitStack()
+    try:
+        lock_stack.enter_context(
+            database_access_guard(
+                _retention_cycle_lock_key(settings.db_path),
+                exclusive=True,
+                timeout_seconds=0,
+            )
+        )
+    except TimeoutError:
+        return {
+            "ok": True,
+            "dry_run": dry_run,
+            "state": "already_running",
+            "skipped": True,
+        }
+    with lock_stack:
+        result = _run_retention_cycle_locked(
+            settings,
+            batches=batches,
+            limit=limit,
+            max_activity_rows=max_activity_rows,
+            keep_recent_activity=keep_recent_activity,
+            batch_delay_seconds=batch_delay_seconds,
+            cycle_interval_seconds=cycle_interval_seconds,
+            dry_run=dry_run,
+            archive=archive,
+            archive_dir=archive_dir,
+            previous_report_path=previous_report_path,
+        )
+        if report_path is not None:
+            _atomic_write_retention_report(report_path, result)
+        return result
+
+
+def _run_retention_cycle_locked(
+    settings: RobotSettings,
+    *,
+    batches: int = 2,
+    limit: int = 20,
+    max_activity_rows: int = 5_000,
+    keep_recent_activity: int = 0,
+    batch_delay_seconds: float = 10.0,
+    cycle_interval_seconds: int = 900,
+    dry_run: bool = True,
+    archive: bool = False,
+    archive_dir: Path | None = None,
+    previous_report_path: Path | None = None,
+) -> dict[str, Any]:
+    """Run bounded prune batches and report gross versus net backlog movement."""
+
+    requested_batches = max(0, int(batches))
+    started_at = int(time.time())
+    started_monotonic = time.monotonic()
+    _ensure_retention_cycle_state(settings)
+    database_identity_before = _retention_database_identity(settings.db_path)
+    previous_cycle = _previous_retention_cycle(previous_report_path)
+    previous_finished_at = int(previous_cycle.get("finished_at") or 0)
+    previous_report_age_seconds = started_at - previous_finished_at
+    previous_report_max_age_seconds = max(
+        3_600,
+        max(1, int(cycle_interval_seconds)) * 3,
+    )
+    previous_backlog = previous_cycle.get("backlog_after")
+    previous_cycle_valid = bool(
+        previous_cycle.get("ok")
+        and not previous_cycle.get("dry_run")
+        and previous_finished_at > 0
+        and 0 <= previous_report_age_seconds <= previous_report_max_age_seconds
+        and isinstance(previous_backlog, dict)
+        and previous_cycle.get("database_identity") == database_identity_before
+    )
+    backlog_before = (
+        dict(previous_backlog)
+        if previous_cycle_valid
+        else retention_backlog_snapshot(settings)
+    )
+    backlog_before_source = "previous_cycle" if previous_cycle_valid else "live_snapshot"
+    planned = _empty_evidence_delete_counts()
+    deleted = _empty_evidence_delete_counts()
+    batch_results: list[dict[str, Any]] = []
+    ok = True
+
+    # Repeating a dry-run would preview the same oldest wallet set each time.
+    batch_attempts = min(requested_batches, 1) if dry_run else requested_batches
+    for batch_index in range(batch_attempts):
+        result = _prune_low_value_evidence_locked(
+            settings,
+            limit=limit,
+            max_activity_rows=max_activity_rows,
+            keep_recent_activity=keep_recent_activity,
+            dry_run=dry_run,
+            archive=archive,
+            archive_dir=archive_dir,
+        )
+        batch_deleted = result.get("deleted") or {}
+        for table in planned:
+            row_count = int(batch_deleted.get(table) or 0)
+            planned[table] += row_count
+            if not dry_run:
+                deleted[table] += row_count
+        batch_results.append(
+            {
+                "batch": batch_index + 1,
+                "ok": bool(result.get("ok")),
+                "wallet_count": int(result.get("wallet_count") or 0),
+                "selected_activity_rows": int(result.get("selected_activity_rows") or 0),
+                "activity_budget_exceeded": bool(result.get("activity_budget_exceeded")),
+                "deleted": batch_deleted,
+                "archive": result.get("archive") or {},
+            }
+        )
+        if not result.get("ok"):
+            ok = False
+            break
+        if int(result.get("selected_activity_rows") or 0) <= 0:
+            break
+        if (
+            not dry_run
+            and batch_index + 1 < batch_attempts
+            and float(batch_delay_seconds) > 0
+        ):
+            time.sleep(float(batch_delay_seconds))
+
+    backlog_after, database_identity_after = _retention_snapshot_with_identity(
+        settings.db_path
+    )
+    finished_at = int(time.time())
+    duration_seconds = max(0.0, time.monotonic() - started_monotonic)
+    rate_basis = "previous_cycle" if previous_cycle_valid else "configured_interval"
+    effective_period_seconds = (
+        max(1.0, float(finished_at - previous_finished_at))
+        if previous_cycle_valid and finished_at > previous_finished_at
+        else max(
+            1.0,
+            float(max(0, int(cycle_interval_seconds))) + duration_seconds,
+        )
+    )
+    deleted_activity_rows = int(deleted.get("wallet_activity") or 0)
+    before_activity_rows = int(backlog_before.get("total_activity_rows") or 0)
+    after_activity_rows = int(backlog_after.get("total_activity_rows") or 0)
+    baseline_activity_rows = before_activity_rows
+    eligible_rows_added = max(
+        0,
+        after_activity_rows - baseline_activity_rows + deleted_activity_rows,
+    )
+    net_rows_removed = max(0, baseline_activity_rows - after_activity_rows)
+    gross_rate_per_hour = (
+        deleted_activity_rows * 3_600.0 / effective_period_seconds
+        if deleted_activity_rows > 0 and not dry_run
+        else 0.0
+    )
+    net_rate_per_hour = (
+        net_rows_removed * 3_600.0 / effective_period_seconds
+        if net_rows_removed > 0 and not dry_run
+        else 0.0
+    )
+    gross_eta_hours = (
+        after_activity_rows / gross_rate_per_hour
+        if after_activity_rows > 0 and gross_rate_per_hour > 0
+        else None
+    )
+    net_eta_hours = (
+        after_activity_rows / net_rate_per_hour
+        if after_activity_rows > 0 and net_rate_per_hour > 0
+        else None
+    )
+    if dry_run:
+        state = "dry_run"
+    elif after_activity_rows <= 0:
+        state = "caught_up"
+    elif net_rate_per_hour > 0:
+        state = "draining"
+    elif deleted_activity_rows > 0 and eligible_rows_added >= deleted_activity_rows:
+        state = "inflow_outpacing_cleanup"
+    else:
+        state = "no_progress"
+
+    return {
+        "ok": ok,
+        "dry_run": dry_run,
+        "state": state,
+        "started_at": started_at,
+        "finished_at": finished_at,
+        "duration_seconds": round(duration_seconds, 2),
+        "cycle_interval_seconds": max(0, int(cycle_interval_seconds)),
+        "effective_period_seconds": round(effective_period_seconds, 2),
+        "rate_basis": rate_basis,
+        "backlog_before_source": backlog_before_source,
+        "previous_report_age_seconds": (
+            previous_report_age_seconds if previous_finished_at > 0 else None
+        ),
+        "previous_report_max_age_seconds": previous_report_max_age_seconds,
+        "batches_requested": requested_batches,
+        "batches_completed": len(batch_results),
+        "wallet_count": sum(int(row["wallet_count"]) for row in batch_results),
+        "selected_activity_rows": sum(
+            int(row["selected_activity_rows"]) for row in batch_results
+        ),
+        "planned": planned,
+        "deleted": deleted,
+        "deleted_activity_rows": deleted_activity_rows,
+        "eligible_rows_added": eligible_rows_added,
+        "net_backlog_change_rows": after_activity_rows - baseline_activity_rows,
+        "gross_rate_per_hour": round(gross_rate_per_hour, 2),
+        "net_rate_per_hour": round(net_rate_per_hour, 2),
+        "gross_eta_hours": round(gross_eta_hours, 2) if gross_eta_hours is not None else None,
+        "net_eta_hours": round(net_eta_hours, 2) if net_eta_hours is not None else None,
+        "backlog_before": backlog_before,
+        "backlog_after": backlog_after,
+        "batch_results": batch_results,
+        "database_identity": database_identity_after,
+        "storage": _retention_storage_snapshot(settings),
+    }
+
+
+def _previous_retention_cycle(path: Path | None) -> dict[str, Any]:
+    if path is None:
+        return _empty_previous_retention_cycle()
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, json.JSONDecodeError, TypeError, ValueError):
+        return _empty_previous_retention_cycle()
+    backlog_after = payload.get("backlog_after") if isinstance(payload, dict) else None
+    if not isinstance(backlog_after, dict):
+        return _empty_previous_retention_cycle()
+    backlog_keys = (
+        "terminal_wallets",
+        "terminal_activity_rows",
+        "needs_data_wallets",
+        "needs_data_activity_rows",
+        "total_wallets",
+        "total_activity_rows",
+    )
+    if any(key not in backlog_after for key in backlog_keys):
+        return _empty_previous_retention_cycle()
+    database_identity = payload.get("database_identity")
+    if not isinstance(database_identity, dict):
+        return _empty_previous_retention_cycle()
+    try:
+        finished_at = int(payload.get("finished_at") or 0)
+        normalized_backlog = {
+            key: max(0, int(backlog_after[key])) for key in backlog_keys
+        }
+        normalized_backlog["generated_at"] = max(
+            0,
+            int(backlog_after.get("generated_at") or finished_at),
+        )
+        normalized_identity = {
+            "database_id": str(database_identity["database_id"]),
+            "mutation_generation": int(database_identity["mutation_generation"]),
+        }
+    except (TypeError, ValueError):
+        return _empty_previous_retention_cycle()
+    except KeyError:
+        return _empty_previous_retention_cycle()
+    return {
+        "ok": bool(payload.get("ok")),
+        "dry_run": bool(payload.get("dry_run")),
+        "finished_at": max(0, finished_at),
+        "backlog_after": normalized_backlog,
+        "database_identity": normalized_identity,
+    }
+
+
+def _empty_previous_retention_cycle() -> dict[str, Any]:
+    return {
+        "ok": False,
+        "dry_run": False,
+        "finished_at": 0,
+        "backlog_after": None,
+        "database_identity": None,
+    }
+
+
+def _atomic_write_retention_report(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    partial_path = path.with_name(f".{path.name}.tmp.{os.getpid()}")
+    try:
+        partial_path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(partial_path, path)
+    finally:
+        partial_path.unlink(missing_ok=True)
+
+
+def _ensure_retention_cycle_state(settings: RobotSettings) -> None:
+    conn = connect(settings.db_path)
+    try:
+        run_migrations(conn)
+    finally:
+        conn.close()
+
+
+def _retention_cycle_lock_key(path: Path) -> Path:
+    canonical_path = path.expanduser().resolve()
+    return Path(f"{canonical_path}.retention-cycle")
+
+
+def _retention_database_identity(path: Path) -> dict[str, Any]:
+    try:
+        conn = connect_readonly(path)
+        try:
+            return _retention_database_identity_from_conn(conn)
+        finally:
+            conn.close()
+    except (OSError, sqlite3.Error):
+        return {"database_id": "", "mutation_generation": -1}
+
+
+def _retention_database_identity_from_conn(
+    conn: sqlite3.Connection,
+) -> dict[str, Any]:
+    row = conn.execute(
+        """
+        SELECT database_id, mutation_generation
+        FROM retention_cycle_state
+        WHERE singleton = 1
+        """
+    ).fetchone()
+    if row is None:
+        return {"database_id": "", "mutation_generation": -1}
+    return {
+        "database_id": str(row["database_id"]),
+        "mutation_generation": int(row["mutation_generation"]),
+    }
+
+
+def _retention_snapshot_with_identity(
+    path: Path,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    conn = connect_readonly(path)
+    try:
+        conn.execute("BEGIN")
+        backlog = _retention_backlog_snapshot_from_conn(conn)
+        identity = _retention_database_identity_from_conn(conn)
+        conn.rollback()
+        return backlog, identity
+    finally:
+        conn.close()
+
+
+def _advance_retention_generation(conn: sqlite3.Connection, *, updated_at: int) -> None:
+    cursor = conn.execute(
+        """
+        UPDATE retention_cycle_state
+        SET mutation_generation = mutation_generation + 1,
+            updated_at = ?
+        WHERE singleton = 1
+        """,
+        (int(updated_at),),
+    )
+    if cursor.rowcount != 1:
+        raise RuntimeError("retention cycle state is not initialized")
+
+
+def _retention_storage_snapshot(settings: RobotSettings) -> dict[str, int]:
+    db_path = settings.db_path
+    wal_path = Path(f"{db_path}-wal")
+    shm_path = Path(f"{db_path}-shm")
+    db_bytes = _path_size(db_path)
+    wal_bytes = _path_size(wal_path)
+    shm_bytes = _path_size(shm_path)
+    archive_bytes = _directory_size(settings.archive_dir)
+    return {
+        "db_bytes": db_bytes,
+        "wal_bytes": wal_bytes,
+        "shm_bytes": shm_bytes,
+        "archive_bytes": archive_bytes,
+        "total_data_bytes": db_bytes + wal_bytes + shm_bytes + archive_bytes,
     }
 
 
@@ -3474,3 +3943,16 @@ def _path_size(path: Path) -> int:
         return path.stat().st_size
     except FileNotFoundError:
         return 0
+
+
+def _directory_size(path: Path) -> int:
+    if not path.exists():
+        return 0
+    total = 0
+    try:
+        for child in path.rglob("*"):
+            if child.is_file():
+                total += child.stat().st_size
+    except OSError:
+        return total
+    return total

@@ -3235,6 +3235,114 @@ def test_storage_maintenance_summary_exposes_parquet_archive_state(tmp_path):
     assert "3 钱包 / 120 行" in html
 
 
+def test_storage_maintenance_summary_exposes_retention_cycle_progress(tmp_path):
+    settings = RobotSettings(
+        db_path=tmp_path / "data" / "pm_robot.sqlite",
+        archive_dir=tmp_path / "data" / "parquet",
+        execution_mode="research",
+    )
+    conn = connect(settings.db_path)
+    try:
+        run_migrations(conn)
+        conn.commit()
+    finally:
+        conn.close()
+    report_path = tmp_path / "reports" / "retention_prune_status.json"
+    report_path.parent.mkdir(parents=True)
+    report_path.write_text(
+        json.dumps(
+            {
+                "ok": True,
+                "dry_run": False,
+                "state": "draining",
+                "deleted_activity_rows": 10_000,
+                "eligible_rows_added": 2_500,
+                "net_backlog_change_rows": -7_500,
+                "gross_rate_per_hour": 40_000,
+                "net_rate_per_hour": 30_000,
+                "gross_eta_hours": 25.0,
+                "net_eta_hours": 33.33,
+                "backlog_after": {
+                    "terminal_wallets": 100,
+                    "terminal_activity_rows": 200_000,
+                    "needs_data_wallets": 900,
+                    "needs_data_activity_rows": 800_000,
+                    "total_wallets": 1_000,
+                    "total_activity_rows": 1_000_000,
+                },
+                "storage": {
+                    "db_bytes": 2_000,
+                    "wal_bytes": 300,
+                    "shm_bytes": 20,
+                    "archive_bytes": 680,
+                    "total_data_bytes": 3_000,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    now = int(report_path.stat().st_mtime) + 60
+
+    summary = _storage_maintenance_summary(
+        settings,
+        now=now,
+        low_free_disk_bytes=1,
+        scheduled_backup_enabled=False,
+    )
+    html = _storage_maintenance_panel(summary)
+
+    retention = summary["retention_cycle"]
+    assert retention["fresh"] is True
+    assert retention["backlog_after"]["total_activity_rows"] == 1_000_000
+    assert retention["net_rate_per_hour"] == 30_000
+    assert summary["next_action"] == "低价值原始证据正在净减少，继续由 retention cycle 分批消化。"
+    assert "数据总占用" in html
+    assert "安全待清理" in html
+    assert "1,000,000" in html
+    assert "净清理速度" in html
+    assert "30,000 行/小时" in html
+    assert "33.3 小时" in html
+
+
+def test_storage_maintenance_does_not_present_stale_retention_eta_as_current(tmp_path):
+    settings = RobotSettings(
+        db_path=tmp_path / "data" / "pm_robot.sqlite",
+        execution_mode="research",
+    )
+    conn = connect(settings.db_path)
+    try:
+        run_migrations(conn)
+        conn.commit()
+    finally:
+        conn.close()
+    report_path = tmp_path / "reports" / "retention_prune_status.json"
+    report_path.parent.mkdir(parents=True)
+    report_path.write_text(
+        json.dumps(
+            {
+                "ok": True,
+                "state": "draining",
+                "net_eta_hours": 1.0,
+                "backlog_after": {"total_wallets": 2, "total_activity_rows": 100},
+                "storage": {"total_data_bytes": 1_000},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    summary = _storage_maintenance_summary(
+        settings,
+        now=int(report_path.stat().st_mtime) + web_module.RETENTION_REPORT_MAX_AGE_SEC + 1,
+        low_free_disk_bytes=1,
+        scheduled_backup_enabled=False,
+    )
+    html = _storage_maintenance_panel(summary)
+
+    assert summary["retention_cycle"]["fresh"] is False
+    assert "报告过期" in html
+    assert ">1.0 小时<" not in html
+
+
 def test_discovery_data_builds_workbench_metrics(tmp_path):
     settings = _settings(tmp_path)
     _seed(settings)

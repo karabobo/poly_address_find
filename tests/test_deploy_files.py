@@ -93,18 +93,24 @@ def test_nas_retention_prune_is_bounded_and_staggered():
     assert 'START_DELAY="${PM_ROBOT_MAINTENANCE_START_DELAY:-300}"' in loop
     assert 'sleep "$START_DELAY"' in loop
     assert "PM_ROBOT_MAINTENANCE_CLEANUP_BATCH_LIMIT=500" in env
-    assert "PM_ROBOT_RETENTION_PRUNE_BATCHES=2" in env
+    assert "PM_ROBOT_RETENTION_PRUNE_BATCHES=6" in env
     assert "PM_ROBOT_RETENTION_PRUNE_LIMIT=20" in env
     assert "PM_ROBOT_RETENTION_PRUNE_MAX_ACTIVITY_ROWS=5000" in env
     assert "PM_ROBOT_RETENTION_PRUNE_BATCH_DELAY=10" in env
     assert 'CLEANUP_BATCH_LIMIT="${PM_ROBOT_MAINTENANCE_CLEANUP_BATCH_LIMIT:-500}"' in loop
-    assert 'PRUNE_BATCHES="${PM_ROBOT_RETENTION_PRUNE_BATCHES:-2}"' in loop
+    assert 'PRUNE_BATCHES="${PM_ROBOT_RETENTION_PRUNE_BATCHES:-6}"' in loop
     assert 'PRUNE_LIMIT="${PM_ROBOT_RETENTION_PRUNE_LIMIT:-20}"' in loop
     assert 'PRUNE_MAX_ACTIVITY_ROWS="${PM_ROBOT_RETENTION_PRUNE_MAX_ACTIVITY_ROWS:-5000}"' in loop
     assert 'PRUNE_BATCH_DELAY="${PM_ROBOT_RETENTION_PRUNE_BATCH_DELAY:-10}"' in loop
     assert '--cleanup-batch-limit "$CLEANUP_BATCH_LIMIT"' in loop
+    assert "retention-cycle" in loop
+    assert '--batches "$PRUNE_BATCHES"' in loop
     assert '--max-activity-rows "$PRUNE_MAX_ACTIVITY_ROWS"' in loop
-    assert 'sleep "$PRUNE_BATCH_DELAY"' in loop
+    assert '--batch-delay-seconds "$PRUNE_BATCH_DELAY"' in loop
+    assert '--cycle-interval-seconds "$INTERVAL"' in loop
+    assert '--previous-report "$PRUNE_REPORT_PATH"' in loop
+    assert '--report-path "$PRUNE_REPORT_PATH"' in loop
+    assert 'mv "$PRUNE_REPORT_TMP" "$PRUNE_REPORT_PATH"' not in loop
     assert "--skip-cleanup" not in loop
 
 

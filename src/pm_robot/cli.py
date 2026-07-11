@@ -18,6 +18,7 @@ from pm_robot.ops import (
     dump_database_sql,
     maintenance,
     prune_low_value_evidence,
+    run_retention_cycle,
     status,
     write_health,
 )
@@ -763,6 +764,44 @@ def main() -> int:
         "--archive-dir",
         default="",
         help="Parquet archive root; defaults to PM_ROBOT_ARCHIVE_DIR",
+    )
+
+    retention_cycle_cmd = sub.add_parser(
+        "retention-cycle",
+        help="Run bounded low-value evidence pruning and report net backlog movement",
+    )
+    retention_cycle_cmd.add_argument(
+        "--db", dest="command_db", default=None, help="SQLite database path"
+    )
+    retention_cycle_cmd.add_argument("--batches", type=int, default=2)
+    retention_cycle_cmd.add_argument("--limit", type=int, default=20)
+    retention_cycle_cmd.add_argument("--max-activity-rows", type=int, default=5_000)
+    retention_cycle_cmd.add_argument("--keep-recent-activity", type=int, default=0)
+    retention_cycle_cmd.add_argument("--batch-delay-seconds", type=float, default=10.0)
+    retention_cycle_cmd.add_argument("--cycle-interval-seconds", type=int, default=900)
+    retention_cycle_cmd.add_argument(
+        "--execute", action="store_true", help="Actually delete rows; default is dry-run"
+    )
+    retention_cycle_cmd.add_argument(
+        "--archive",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Archive each selected batch before pruning",
+    )
+    retention_cycle_cmd.add_argument(
+        "--archive-dir",
+        default="",
+        help="Parquet archive root; defaults to PM_ROBOT_ARCHIVE_DIR",
+    )
+    retention_cycle_cmd.add_argument(
+        "--previous-report",
+        default="",
+        help="Previous cycle report used to calculate interval inflow and net rate",
+    )
+    retention_cycle_cmd.add_argument(
+        "--report-path",
+        default="",
+        help="Atomically publish the completed cycle report before releasing its lock",
     )
 
     compact_cmd = sub.add_parser(
@@ -1624,6 +1663,28 @@ def main() -> int:
             archive=args.archive,
             archive_dir=Path(args.archive_dir) if args.archive_dir else None,
         )
+        print(json.dumps(data, ensure_ascii=False, indent=2))
+        return 0 if data["ok"] else 1
+    if args.command == "retention-cycle":
+        data = run_retention_cycle(
+            settings,
+            batches=args.batches,
+            limit=args.limit,
+            max_activity_rows=args.max_activity_rows,
+            keep_recent_activity=args.keep_recent_activity,
+            batch_delay_seconds=args.batch_delay_seconds,
+            cycle_interval_seconds=args.cycle_interval_seconds,
+            dry_run=not args.execute,
+            archive=args.archive,
+            archive_dir=Path(args.archive_dir) if args.archive_dir else None,
+            previous_report_path=(
+                Path(args.previous_report) if args.previous_report else None
+            ),
+            report_path=Path(args.report_path) if args.report_path else None,
+        )
+        if data.get("state") == "already_running":
+            print(json.dumps(data, ensure_ascii=False), file=sys.stderr)
+            return 0
         print(json.dumps(data, ensure_ascii=False, indent=2))
         return 0 if data["ok"] else 1
     if args.command == "compact-evidence":

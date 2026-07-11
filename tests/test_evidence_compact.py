@@ -113,6 +113,9 @@ def test_compact_evidence_rebuild_preserves_summaries_and_filters_raw_rows(tmp_p
             now=2_000,
         )
         conn.commit()
+        database_id_before = conn.execute(
+            "SELECT database_id FROM retention_cycle_state WHERE singleton = 1"
+        ).fetchone()[0]
     finally:
         conn.close()
 
@@ -131,6 +134,10 @@ def test_compact_evidence_rebuild_preserves_summaries_and_filters_raw_rows(tmp_p
     conn = connect(db_path)
     try:
         assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+        database_id_after = conn.execute(
+            "SELECT database_id FROM retention_cycle_state WHERE singleton = 1"
+        ).fetchone()[0]
+        assert database_id_after != database_id_before
         assert conn.execute(
             "SELECT COUNT(*) FROM wallet_activity WHERE address = ?", (low,)
         ).fetchone()[0] == 0

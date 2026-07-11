@@ -294,7 +294,7 @@ def test_retention_migrations_backfill_counts_and_compact_copy_links(tmp_path):
         )
         conn.commit()
 
-        assert run_migrations(conn) == [46, 47, 48]
+        assert run_migrations(conn) == [46, 47, 48, 49]
         counts = {
             row["address"]: int(row["trade_count"])
             for row in conn.execute(
@@ -320,6 +320,11 @@ def test_retention_migrations_backfill_counts_and_compact_copy_links(tmp_path):
                 "SELECT backtest_trade_id, link_id FROM copy_backtest_trades ORDER BY backtest_trade_id"
             )
         ] == [(1, 101), (2, None)]
+        retention_state = conn.execute(
+            "SELECT database_id, mutation_generation FROM retention_cycle_state"
+        ).fetchone()
+        assert len(retention_state["database_id"]) == 32
+        assert retention_state["mutation_generation"] == 0
         assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
         assert run_migrations(conn) == []
     finally:

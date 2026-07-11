@@ -76,6 +76,7 @@ DASHBOARD_CACHE_TTL_SEC = 30
 WAL_WARN_BYTES = 1_000_000_000
 WAL_CRITICAL_BYTES = 3_000_000_000
 MAINTENANCE_REPORT_MAX_AGE_SEC = 7_500
+RETENTION_REPORT_MAX_AGE_SEC = 3_600
 WAL_PENDING_FRAME_WARN = 8_192
 LOW_FREE_DISK_BYTES = 100_000_000_000
 BACKUP_MAX_AGE_SECONDS = 26 * 3_600
@@ -3534,7 +3535,36 @@ def _storage_maintenance_panel(values: dict[str, Any]) -> str:
     wal_checkpoint = values.get("wal_checkpoint") or {}
     free_ratio = float(values.get("free_disk_ratio") or 0)
     archive = values.get("evidence_archive") or {}
+    retention = values.get("retention_cycle") or {}
+    retention_backlog = retention.get("backlog_after") or {}
+    retention_storage = retention.get("storage") or {}
+    retention_fresh = bool(retention.get("fresh"))
+    retention_state = str(retention.get("state") or "")
+    net_eta_hours = retention.get("net_eta_hours")
+    if not retention_fresh:
+        retention_eta_label = "报告过期" if retention.get("available") else "等待首轮"
+    elif retention_state == "caught_up":
+        retention_eta_label = "已清完"
+    elif retention_state == "inflow_outpacing_cleanup":
+        retention_eta_label = "新增更快"
+    elif net_eta_hours is not None:
+        retention_eta_label = _fmt_duration_hours(float(net_eta_hours)) or "已清完"
+    else:
+        retention_eta_label = "待测算"
     cards = [
+        (
+            "数据总占用",
+            _fmt_bytes(
+                int(retention_storage.get("total_data_bytes") or 0)
+                if retention_fresh
+                else int(values.get("db_bytes") or 0)
+                + int(values.get("wal_bytes") or 0)
+                + int(values.get("shm_bytes") or 0)
+                + int(archive.get("byte_size") or 0)
+            ),
+            "DB + WAL + SHM + Parquet",
+            "ok",
+        ),
         ("数据库", _fmt_bytes(int(values.get("db_bytes") or 0)), "SQLite 主文件", "ok"),
         (
             "WAL",
@@ -3571,6 +3601,41 @@ def _storage_maintenance_panel(values: dict[str, Any]) -> str:
             _fmt_int(archive.get("pending_count")),
             f"失败 {_fmt_int(archive.get('failed_count'))} 批",
             "warn" if int(archive.get("pending_count") or 0) or int(archive.get("failed_count") or 0) else "ok",
+        ),
+        (
+            "安全待清理",
+            _fmt_int(retention_backlog.get("total_activity_rows")),
+            f"{_fmt_int(retention_backlog.get('total_wallets'))} 个低价值钱包",
+            "warn" if int(retention_backlog.get("total_activity_rows") or 0) else "ok",
+        ),
+        (
+            "最近周期删除",
+            _fmt_int(retention.get("deleted_activity_rows")),
+            f"同期新增 {_fmt_int(retention.get('eligible_rows_added'))} 行",
+            "ok",
+        ),
+        (
+            "净清理速度",
+            f"{_fmt_int(retention.get('net_rate_per_hour'))} 行/小时",
+            f"毛速度 {_fmt_int(retention.get('gross_rate_per_hour'))} 行/小时",
+            "warn"
+            if not bool(retention.get("ok"))
+            or retention_state in {"inflow_outpacing_cleanup", "no_progress"}
+            else "ok",
+        ),
+        (
+            "净 ETA",
+            retention_eta_label,
+            (
+                f"报告于 {_duration_label(retention.get('age_seconds'))} 前更新"
+                if retention.get("available")
+                else "maintenance-loop 尚未生成周期报告"
+            ),
+            "warn"
+            if not retention_fresh
+            or not bool(retention.get("ok"))
+            or retention_state in {"inflow_outpacing_cleanup", "no_progress"}
+            else "ok",
         ),
         ("WAL 提醒阈值", _fmt_bytes(int(values.get("wal_warn_bytes") or 0)), "超过后安排窗口", "ok"),
         ("WAL 严重阈值", _fmt_bytes(int(values.get("wal_critical_bytes") or 0)), "建议长窗口", "warn" if bool(values.get("critical_wal")) else "ok"),
@@ -7653,6 +7718,107 @@ def _optional_int(value: Any) -> int | None:
         return None
 
 
+def _optional_float(value: Any) -> float | None:
+    try:
+        return float(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _retention_cycle_summary(
+    settings: RobotSettings,
+    *,
+    now: int,
+    max_age_seconds: int = RETENTION_REPORT_MAX_AGE_SEC,
+) -> dict[str, Any]:
+    """Read the bounded retention cycle report without querying large evidence tables."""
+
+    configured_path = os.environ.get("PM_ROBOT_RETENTION_PRUNE_REPORT_PATH", "").strip()
+    report_path = (
+        Path(configured_path)
+        if configured_path
+        else _report_file_path(settings, "retention_prune_status.json")
+    )
+    summary: dict[str, Any] = {
+        "available": False,
+        "fresh": False,
+        "age_seconds": None,
+        "max_age_seconds": int(max_age_seconds),
+        "ok": False,
+        "dry_run": False,
+        "state": "",
+        "deleted_activity_rows": 0,
+        "eligible_rows_added": 0,
+        "net_backlog_change_rows": 0,
+        "gross_rate_per_hour": 0.0,
+        "net_rate_per_hour": 0.0,
+        "gross_eta_hours": None,
+        "net_eta_hours": None,
+        "backlog_after": {},
+        "storage": {},
+        "error": "",
+    }
+    try:
+        modified_at = int(report_path.stat().st_mtime)
+        payload = json.loads(report_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        summary["error"] = "retention_report_missing"
+        return summary
+    except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
+        summary["error"] = f"retention_report_invalid:{exc}"
+        return summary
+    if not isinstance(payload, dict):
+        summary["error"] = "retention_report_not_object"
+        return summary
+    backlog_after = payload.get("backlog_after")
+    storage = payload.get("storage")
+    if not isinstance(backlog_after, dict) or not isinstance(storage, dict):
+        summary["available"] = True
+        summary["error"] = "retention_report_schema_unsupported"
+        return summary
+
+    age_seconds = max(0, int(now) - modified_at)
+    summary.update(
+        {
+            "available": True,
+            "fresh": age_seconds <= int(max_age_seconds),
+            "age_seconds": age_seconds,
+            "ok": bool(payload.get("ok")),
+            "dry_run": bool(payload.get("dry_run")),
+            "state": str(payload.get("state") or ""),
+            "deleted_activity_rows": _optional_int(payload.get("deleted_activity_rows")) or 0,
+            "eligible_rows_added": _optional_int(payload.get("eligible_rows_added")) or 0,
+            "net_backlog_change_rows": _optional_int(payload.get("net_backlog_change_rows")) or 0,
+            "gross_rate_per_hour": _optional_float(payload.get("gross_rate_per_hour")) or 0.0,
+            "net_rate_per_hour": _optional_float(payload.get("net_rate_per_hour")) or 0.0,
+            "gross_eta_hours": _optional_float(payload.get("gross_eta_hours")),
+            "net_eta_hours": _optional_float(payload.get("net_eta_hours")),
+            "backlog_after": {
+                key: _optional_int(backlog_after.get(key)) or 0
+                for key in (
+                    "terminal_wallets",
+                    "terminal_activity_rows",
+                    "needs_data_wallets",
+                    "needs_data_activity_rows",
+                    "total_wallets",
+                    "total_activity_rows",
+                )
+            },
+            "storage": {
+                key: _optional_int(storage.get(key)) or 0
+                for key in (
+                    "db_bytes",
+                    "wal_bytes",
+                    "shm_bytes",
+                    "archive_bytes",
+                    "total_data_bytes",
+                )
+            },
+        }
+    )
+    return summary
+
+
 def _storage_maintenance_summary(
     settings: RobotSettings,
     *,
@@ -7672,6 +7838,7 @@ def _storage_maintenance_summary(
     wal_to_db_ratio = round(wal_bytes / db_bytes, 4) if db_bytes > 0 else 0.0
     free_disk_ratio = round(free_disk_bytes / total_disk_bytes, 4) if total_disk_bytes > 0 else 0.0
     wal_checkpoint = _maintenance_checkpoint_summary(settings, now=now)
+    retention_cycle = _retention_cycle_summary(settings, now=now)
     wal_reusable = bool(wal_checkpoint.get("reusable"))
     critical_wal = wal_bytes >= int(wal_critical_bytes)
     needs_wal_window = wal_bytes >= int(wal_warn_bytes) and not wal_reusable
@@ -7735,6 +7902,23 @@ def _storage_maintenance_summary(
             if wal_bytes >= int(wal_warn_bytes) and wal_reusable
             else "存储处于常规范围，继续由 maintenance-loop 做轻量维护。"
         )
+    if state == "ok" and bool(retention_cycle.get("fresh")):
+        retention_state = str(retention_cycle.get("state") or "")
+        if not bool(retention_cycle.get("ok")):
+            state = "retention_failed"
+            next_action = "最近低价值证据清理周期失败，检查 maintenance-loop 报告和写锁竞争。"
+        elif retention_state == "inflow_outpacing_cleanup":
+            state = "retention_attention"
+            next_action = "低价值证据新增速度高于清理速度；先观察连续周期，再安全提高批次数。"
+        elif retention_state == "no_progress" and int(
+            (retention_cycle.get("backlog_after") or {}).get("total_activity_rows") or 0
+        ):
+            state = "retention_stalled"
+            next_action = "低价值证据仍有积压但本周期没有净下降，检查清理任务和写锁竞争。"
+        elif retention_state == "draining":
+            next_action = "低价值原始证据正在净减少，继续由 retention cycle 分批消化。"
+        elif retention_state == "caught_up":
+            next_action = "当前安全待清理队列已清空，继续保留钱包摘要并监控新增。"
     return {
         "state": state,
         "next_action": next_action,
@@ -7762,6 +7946,7 @@ def _storage_maintenance_summary(
         "backup_fresh": backup_fresh,
         "scheduled_backup_enabled": bool(scheduled_backup_enabled),
         "evidence_archive": archive_summary,
+        "retention_cycle": retention_cycle,
         "backup_now_command": "./pmrobot-nas.sh backup-now",
         "safe_command": "./pmrobot-nas.sh wal-truncate-window",
         "long_window_command": "./pmrobot-nas.sh wal-truncate-window 900",

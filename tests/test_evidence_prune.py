@@ -1,9 +1,18 @@
+import json
+import time
+
+import pytest
+
 from pm_robot.config import RobotSettings
 from pm_robot.models import CandidateAddress, CandidateStage, ScoreBreakdown, WalletFeatures
 from pm_robot.ops import (
+    _previous_retention_cycle,
     _prune_wallet_evidence_batch,
+    _retention_cycle_lock_key,
+    _retention_database_identity,
     build_wallet_registry,
     prune_low_value_evidence,
+    run_retention_cycle,
 )
 from pm_robot.storage.db import connect, run_migrations
 from pm_robot.storage.repository import (
@@ -148,6 +157,440 @@ def test_prune_evidence_dry_run_and_execute_low_value_only(tmp_path):
         assert rebuilt["registry_status"] == "archived_raw_pruned"
     finally:
         conn.close()
+
+
+def test_retention_cycle_aggregates_batches_and_backlog(tmp_path):
+    db_path = tmp_path / "robot.sqlite"
+    conn = connect(db_path)
+    wallets = ["0x" + str(index) * 40 for index in range(1, 4)]
+    try:
+        run_migrations(conn)
+        for wallet in wallets:
+            _seed_candidate(conn, wallet, materialized=True, roi=-0.2)
+            conn.execute(
+                "UPDATE candidate_wallets SET candidate_stage = 'blocked_hygiene' WHERE address = ?",
+                (wallet,),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+    identity_before = _retention_database_identity(db_path)
+    result = run_retention_cycle(
+        _settings(db_path),
+        batches=2,
+        limit=1,
+        max_activity_rows=5,
+        batch_delay_seconds=0,
+        cycle_interval_seconds=900,
+        dry_run=False,
+        archive=False,
+    )
+
+    assert result["ok"] is True
+    assert result["state"] == "draining"
+    assert result["batches_completed"] == 2
+    assert result["deleted_activity_rows"] == 10
+    assert result["planned"]["wallet_activity"] == 10
+    assert result["backlog_before"]["total_activity_rows"] == 15
+    assert result["backlog_after"]["total_activity_rows"] == 5
+    assert result["eligible_rows_added"] == 0
+    assert result["net_backlog_change_rows"] == -10
+    assert result["gross_rate_per_hour"] > 0
+    assert result["net_rate_per_hour"] > 0
+    assert result["net_eta_hours"] is not None
+    assert result["database_identity"]["database_id"] == identity_before["database_id"]
+    assert result["database_identity"]["mutation_generation"] == (
+        identity_before["mutation_generation"] + 2
+    )
+
+    conn = connect(db_path)
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM wallet_activity").fetchone()[0] == 5
+    finally:
+        conn.close()
+
+
+def test_retention_cycle_dry_run_reports_plan_without_deleting(tmp_path):
+    db_path = tmp_path / "robot.sqlite"
+    wallet = "0x" + "4" * 40
+    conn = connect(db_path)
+    try:
+        run_migrations(conn)
+        _seed_candidate(conn, wallet, materialized=True, roi=-0.2)
+        conn.execute(
+            "UPDATE candidate_wallets SET candidate_stage = 'blocked_hygiene' WHERE address = ?",
+            (wallet,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    result = run_retention_cycle(
+        _settings(db_path),
+        batches=3,
+        limit=1,
+        max_activity_rows=5,
+        batch_delay_seconds=0,
+        dry_run=True,
+        archive=False,
+    )
+
+    assert result["state"] == "dry_run"
+    assert result["batches_completed"] == 1
+    assert result["planned"]["wallet_activity"] == 5
+    assert result["deleted_activity_rows"] == 0
+    assert result["deleted"]["wallet_activity"] == 0
+    assert result["backlog_before"]["total_activity_rows"] == 5
+    assert result["backlog_after"]["total_activity_rows"] == 5
+
+    conn = connect(db_path)
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM wallet_activity").fetchone()[0] == 5
+    finally:
+        conn.close()
+
+
+def test_retention_cycle_uses_previous_report_to_measure_interval_inflow(tmp_path):
+    db_path = tmp_path / "robot.sqlite"
+    wallets = ["0x" + char * 40 for char in ("5", "6")]
+    conn = connect(db_path)
+    try:
+        run_migrations(conn)
+        for wallet in wallets:
+            _seed_candidate(conn, wallet, materialized=True, roi=-0.2)
+            conn.execute(
+                "UPDATE candidate_wallets SET candidate_stage = 'blocked_hygiene' WHERE address = ?",
+                (wallet,),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    previous_report = tmp_path / "retention.json"
+    database_identity = _retention_database_identity(db_path)
+    previous_report.write_text(
+        json.dumps(
+            {
+                "ok": True,
+                "dry_run": False,
+                "finished_at": int(time.time()) - 900,
+                "database_identity": database_identity,
+                "backlog_after": {
+                    "generated_at": int(time.time()) - 900,
+                    "terminal_wallets": 1,
+                    "terminal_activity_rows": 5,
+                    "needs_data_wallets": 0,
+                    "needs_data_activity_rows": 0,
+                    "total_wallets": 1,
+                    "total_activity_rows": 5,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = run_retention_cycle(
+        _settings(db_path),
+        batches=1,
+        limit=1,
+        max_activity_rows=5,
+        batch_delay_seconds=0,
+        cycle_interval_seconds=900,
+        dry_run=False,
+        archive=False,
+        previous_report_path=previous_report,
+    )
+
+    assert result["rate_basis"] == "previous_cycle"
+    assert result["backlog_before_source"] == "previous_cycle"
+    assert result["backlog_before"]["total_activity_rows"] == 5
+    assert result["deleted_activity_rows"] == 5
+    assert result["eligible_rows_added"] == 5
+    assert result["net_backlog_change_rows"] == 0
+    assert result["net_rate_per_hour"] == 0
+    assert result["state"] == "inflow_outpacing_cleanup"
+
+
+def test_retention_cycle_rejects_stale_or_wrong_database_baseline(tmp_path):
+    db_path = tmp_path / "robot.sqlite"
+    wallet = "0x" + "7" * 40
+    conn = connect(db_path)
+    try:
+        run_migrations(conn)
+        _seed_candidate(conn, wallet, materialized=True, roi=-0.2)
+        conn.execute(
+            "UPDATE candidate_wallets SET candidate_stage = 'blocked_hygiene' WHERE address = ?",
+            (wallet,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    database_identity = _retention_database_identity(db_path)
+    wrong_database_identity = dict(database_identity)
+    wrong_database_identity["database_id"] = "f" * 32
+    previous_report = tmp_path / "retention.json"
+    previous_report.write_text(
+        json.dumps(
+            {
+                "ok": True,
+                "dry_run": False,
+                "finished_at": int(time.time()) - 4_000,
+                "database_identity": wrong_database_identity,
+                "backlog_after": {
+                    "generated_at": int(time.time()) - 4_000,
+                    "terminal_wallets": 1,
+                    "terminal_activity_rows": 5,
+                    "needs_data_wallets": 0,
+                    "needs_data_activity_rows": 0,
+                    "total_wallets": 1,
+                    "total_activity_rows": 5,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = run_retention_cycle(
+        _settings(db_path),
+        batches=0,
+        dry_run=False,
+        previous_report_path=previous_report,
+    )
+
+    assert result["rate_basis"] == "configured_interval"
+    assert result["backlog_before_source"] == "live_snapshot"
+
+
+def test_retention_cycle_skips_when_retention_writer_is_active(
+    tmp_path,
+    monkeypatch,
+):
+    class BusyGuard:
+        def __enter__(self):
+            raise TimeoutError("retention cycle is already running")
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+    monkeypatch.setattr(
+        "pm_robot.ops.database_access_guard",
+        lambda *args, **kwargs: BusyGuard(),
+    )
+
+    report_path = tmp_path / "retention.json"
+    report_path.write_text('{"state":"existing"}\n', encoding="utf-8")
+    result = run_retention_cycle(
+        _settings(tmp_path / "robot.sqlite"),
+        report_path=report_path,
+    )
+
+    assert result == {
+        "ok": True,
+        "dry_run": True,
+        "state": "already_running",
+        "skipped": True,
+    }
+    assert json.loads(report_path.read_text(encoding="utf-8")) == {
+        "state": "existing"
+    }
+
+
+def test_retention_cycle_does_not_hide_internal_timeout(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "pm_robot.ops._run_retention_cycle_locked",
+        lambda *args, **kwargs: (_ for _ in ()).throw(TimeoutError("database timeout")),
+    )
+
+    with pytest.raises(TimeoutError, match="database timeout"):
+        run_retention_cycle(_settings(tmp_path / "robot.sqlite"))
+
+
+def test_retention_lock_key_is_canonical(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+
+    assert _retention_cycle_lock_key(tmp_path / "robot.sqlite") == (
+        _retention_cycle_lock_key(tmp_path.relative_to(tmp_path) / "robot.sqlite")
+    )
+
+
+def test_retention_cycle_atomically_publishes_report(tmp_path):
+    db_path = tmp_path / "robot.sqlite"
+    report_path = tmp_path / "reports" / "retention.json"
+
+    result = run_retention_cycle(
+        _settings(db_path),
+        batches=0,
+        dry_run=True,
+        report_path=report_path,
+    )
+
+    assert json.loads(report_path.read_text(encoding="utf-8")) == result
+    assert list(report_path.parent.glob(".retention.json.tmp.*")) == []
+
+
+def test_retention_cycle_publishes_report_before_releasing_lock(
+    tmp_path,
+    monkeypatch,
+):
+    events: list[str] = []
+
+    class RecordingGuard:
+        def __enter__(self):
+            events.append("lock_enter")
+
+        def __exit__(self, exc_type, exc, traceback):
+            events.append("lock_exit")
+            return False
+
+    result = {"ok": True, "state": "caught_up"}
+    monkeypatch.setattr(
+        "pm_robot.ops.database_access_guard",
+        lambda *args, **kwargs: RecordingGuard(),
+    )
+    monkeypatch.setattr(
+        "pm_robot.ops._run_retention_cycle_locked",
+        lambda *args, **kwargs: result,
+    )
+
+    def record_report_write(path, payload):
+        assert events == ["lock_enter"]
+        assert payload == result
+        events.append("report_write")
+
+    monkeypatch.setattr(
+        "pm_robot.ops._atomic_write_retention_report",
+        record_report_write,
+    )
+
+    assert run_retention_cycle(
+        _settings(tmp_path / "robot.sqlite"),
+        report_path=tmp_path / "retention.json",
+    ) == result
+    assert events == ["lock_enter", "report_write", "lock_exit"]
+
+
+def test_previous_retention_cycle_rejects_missing_or_invalid_backlog_fields(tmp_path):
+    report = tmp_path / "retention.json"
+    base = {
+        "ok": True,
+        "dry_run": False,
+        "finished_at": 1_000,
+        "database_identity": {"database_id": "a" * 32, "mutation_generation": 2},
+        "backlog_after": {
+            "generated_at": 1_000,
+            "terminal_wallets": 1,
+            "terminal_activity_rows": 5,
+            "needs_data_wallets": 0,
+            "needs_data_activity_rows": 0,
+            "total_wallets": 1,
+            "total_activity_rows": 5,
+        },
+    }
+    missing_total = json.loads(json.dumps(base))
+    missing_total["backlog_after"].pop("total_activity_rows")
+    report.write_text(json.dumps(missing_total), encoding="utf-8")
+    assert _previous_retention_cycle(report)["ok"] is False
+
+    invalid_generated_at = json.loads(json.dumps(base))
+    invalid_generated_at["backlog_after"]["generated_at"] = "not-a-number"
+    report.write_text(json.dumps(invalid_generated_at), encoding="utf-8")
+    assert _previous_retention_cycle(report)["ok"] is False
+
+
+def test_prune_evidence_cli_remains_compatible(tmp_path, monkeypatch, capsys):
+    from pm_robot.cli import main
+
+    captured: dict = {}
+
+    def fake_prune(_settings, **kwargs):
+        captured.update(kwargs)
+        return {"ok": True}
+
+    monkeypatch.setattr("pm_robot.cli.prune_low_value_evidence", fake_prune)
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "pm-robot",
+            "--env",
+            str(tmp_path / "missing.env"),
+            "--db",
+            str(tmp_path / "robot.sqlite"),
+            "prune-evidence",
+        ],
+    )
+
+    assert main() == 0
+    assert "previous_report_path" not in captured
+    assert json.loads(capsys.readouterr().out)["ok"] is True
+
+
+def test_retention_cycle_cli_forwards_previous_report(tmp_path, monkeypatch, capsys):
+    from pm_robot.cli import main
+
+    previous_report = tmp_path / "retention.json"
+    report_path = tmp_path / "retention-next.json"
+    captured: dict = {}
+
+    def fake_cycle(_settings, **kwargs):
+        captured.update(kwargs)
+        return {"ok": True}
+
+    monkeypatch.setattr("pm_robot.cli.run_retention_cycle", fake_cycle)
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "pm-robot",
+            "--env",
+            str(tmp_path / "missing.env"),
+            "--db",
+            str(tmp_path / "robot.sqlite"),
+            "retention-cycle",
+            "--previous-report",
+            str(previous_report),
+            "--report-path",
+            str(report_path),
+        ],
+    )
+
+    assert main() == 0
+    assert captured["previous_report_path"] == previous_report
+    assert captured["report_path"] == report_path
+    assert json.loads(capsys.readouterr().out)["ok"] is True
+
+
+def test_retention_cycle_cli_does_not_replace_report_when_cycle_is_active(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    from pm_robot.cli import main
+
+    monkeypatch.setattr(
+        "pm_robot.cli.run_retention_cycle",
+        lambda _settings, **kwargs: {
+            "ok": True,
+            "dry_run": False,
+            "state": "already_running",
+            "skipped": True,
+        },
+    )
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "pm-robot",
+            "--env",
+            str(tmp_path / "missing.env"),
+            "--db",
+            str(tmp_path / "robot.sqlite"),
+            "retention-cycle",
+            "--execute",
+        ],
+    )
+
+    assert main() == 0
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert json.loads(captured.err)["state"] == "already_running"
 
 
 def test_execute_prune_counts_sqlite_changes_without_precount_scan(tmp_path):
