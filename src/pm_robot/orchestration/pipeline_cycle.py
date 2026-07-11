@@ -48,6 +48,7 @@ class PipelineCycleOptions:
     planner_lock_sleep_seconds: float = 3.0
     feature_limit: int = 10
     feature_min_activity_events: int = 25
+    feature_commit_every: int = 10
     evidence_promotion_limit: int = 100
     score_limit: int = 0
     run_scoring: bool = True
@@ -170,6 +171,7 @@ def run_pipeline_cycle(
             conn,
             limit=options.feature_limit,
             min_activity_events=options.feature_min_activity_events,
+            commit_every=options.feature_commit_every,
         ),
         continue_on_error=options.continue_on_error,
         step_reporter=step_reporter,
@@ -307,6 +309,7 @@ def _dry_run_steps(options: PipelineCycleOptions) -> list[dict[str, Any]]:
             {
                 "limit": options.feature_limit,
                 "min_activity_events": options.feature_min_activity_events,
+                "commit_every": options.feature_commit_every,
             },
         ),
         _step(

@@ -26,6 +26,7 @@ from pm_robot.pipeline_terms import (
 )
 from pm_robot.risk.gates import hedge_block_reason, hygiene_block_reason
 from pm_robot.research.scoring import economic_materiality_reason
+from pm_robot.storage.db import retry_sqlite_locked
 from pm_robot.storage.repository import (
     _feature_from_row,
     evidence_promotion_approval_is_current,
@@ -48,6 +49,18 @@ class EvidencePromotionSummary:
     error: str = ""
 
 
+@dataclass(frozen=True)
+class _PreparedPromotion:
+    wallet: str
+    source_stage: str
+    job_action: str
+    next_stage: str
+    next_depth: int
+    stop_reason: str
+    evidence: dict[str, Any]
+    approved: bool
+
+
 def promote_wallet_evidence(
     conn: sqlite3.Connection,
     *,
@@ -60,13 +73,7 @@ def promote_wallet_evidence(
     ts = now or int(time.time())
     policy = load_policy(policy_path)
     policy_version = str(policy.get("version") or "unknown")
-    invalidated = _invalidate_stale_approvals(
-        conn,
-        policy_version=policy_version,
-        now=ts,
-    )
-    superseded = _supersede_unapproved_queued_jobs(conn, now=ts)
-    normalized = _normalize_unapproved_pending_states(
+    invalidated, superseded, normalized = _prepare_promotion_state(
         conn,
         policy_version=policy_version,
         now=ts,
@@ -80,6 +87,7 @@ def promote_wallet_evidence(
     deep_approved = 0
     deferred = 0
     errors: list[str] = []
+    prepared: list[_PreparedPromotion] = []
 
     for row in rows:
         wallet = str(row["wallet"]).lower()
@@ -87,7 +95,6 @@ def promote_wallet_evidence(
         job_action, target_depth, terminal_stage, terminal_depth = _promotion_transition(
             source_stage
         )
-        conn.execute("SAVEPOINT evidence_promotion_wallet")
         try:
             feature_row = conn.execute(
                 "SELECT * FROM wallet_features WHERE address = ?",
@@ -133,42 +140,33 @@ def promote_wallet_evidence(
                 "materializer_version": MATERIALIZER_VERSION,
                 "evaluated_at": ts,
             }
-            _write_promotion_budget(
-                conn,
-                wallet=wallet,
-                stage=next_stage,
-                target_depth=next_depth,
-                current_depth=int(evidence["activity_count"]),
-                stop_reason=stop_reason,
-                evidence=evidence,
-                now=ts,
+            prepared.append(
+                _PreparedPromotion(
+                    wallet=wallet,
+                    source_stage=source_stage,
+                    job_action=job_action,
+                    next_stage=next_stage,
+                    next_depth=next_depth,
+                    stop_reason=stop_reason,
+                    evidence=evidence,
+                    approved=approved,
+                )
             )
-            upsert_wallet_evidence_summary(
-                conn,
-                wallet,
-                evidence,
-                source_artifacts=[f"sqlite://wallet_activity/{wallet}"],
-                computed_at=ts,
-            )
-            sync_wallet_processing_state(
-                conn,
-                wallet,
-                evidence,
-                source="evidence_promotion",
-                now=ts,
-            )
-            conn.execute("RELEASE SAVEPOINT evidence_promotion_wallet")
-            if approved and job_action == EvidenceJobStage.MEDIUM_PENDING.value:
-                medium_approved += 1
-            elif approved:
-                deep_approved += 1
-            else:
-                deferred += 1
         except Exception as exc:
-            conn.execute("ROLLBACK TO SAVEPOINT evidence_promotion_wallet")
-            conn.execute("RELEASE SAVEPOINT evidence_promotion_wallet")
             errors.append(f"{wallet}: {exc}")
-    conn.commit()
+
+    for item in prepared:
+        try:
+            _persist_promotion_result(conn, item, now=ts)
+        except Exception as exc:
+            errors.append(f"{item.wallet}: {exc}")
+            continue
+        if item.approved and item.job_action == EvidenceJobStage.MEDIUM_PENDING.value:
+            medium_approved += 1
+        elif item.approved:
+            deep_approved += 1
+        else:
+            deferred += 1
     return EvidencePromotionSummary(
         targets_seen=len(rows),
         medium_approved=medium_approved,
@@ -180,6 +178,85 @@ def promote_wallet_evidence(
         waiting_for_fresh_features=waiting,
         status="partial" if errors else "ok",
         error="; ".join(errors[:3]),
+    )
+
+
+def _prepare_promotion_state(
+    conn: sqlite3.Connection,
+    *,
+    policy_version: str,
+    now: int,
+) -> tuple[int, int, int]:
+    """Commit queue normalization before any expensive evidence reads."""
+
+    def operation() -> tuple[int, int, int]:
+        invalidated = _invalidate_stale_approvals(
+            conn,
+            policy_version=policy_version,
+            now=now,
+        )
+        superseded = _supersede_unapproved_queued_jobs(conn, now=now)
+        normalized = _normalize_unapproved_pending_states(
+            conn,
+            policy_version=policy_version,
+            now=now,
+        )
+        conn.commit()
+        return invalidated, superseded, normalized
+
+    return retry_sqlite_locked(
+        operation,
+        rollback=conn.rollback,
+        attempts=4,
+        sleep_seconds=2.0,
+    )
+
+
+def _persist_promotion_result(
+    conn: sqlite3.Connection,
+    item: _PreparedPromotion,
+    *,
+    now: int,
+) -> None:
+    """Persist one promotion in a short transaction after evidence is computed."""
+
+    def operation() -> None:
+        try:
+            _write_promotion_budget(
+                conn,
+                wallet=item.wallet,
+                source_stage=item.source_stage,
+                stage=item.next_stage,
+                target_depth=item.next_depth,
+                current_depth=int(item.evidence["activity_count"]),
+                stop_reason=item.stop_reason,
+                evidence=item.evidence,
+                now=now,
+            )
+            upsert_wallet_evidence_summary(
+                conn,
+                item.wallet,
+                item.evidence,
+                source_artifacts=[f"sqlite://wallet_activity/{item.wallet}"],
+                computed_at=now,
+            )
+            sync_wallet_processing_state(
+                conn,
+                item.wallet,
+                item.evidence,
+                source="evidence_promotion",
+                now=now,
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+
+    retry_sqlite_locked(
+        operation,
+        rollback=conn.rollback,
+        attempts=4,
+        sleep_seconds=2.0,
     )
 
 
@@ -206,7 +283,7 @@ def _promotion_targets(
         AND COALESCE(
             CAST(json_extract(wf.extra_json, '$.feature_materializer_activity_count') AS INTEGER),
             -1
-        ) = COALESCE(ac.activity_count, 0)
+        ) = COALESCE(waw.trade_count, 0)
     """
     needs_gate_sql = """
         (
@@ -216,7 +293,7 @@ def _promotion_targets(
                     COALESCE(ebb.stop_reason, '') NOT LIKE
                         'promotion_deferred:medium_pending:' || ? || ':%'
                     OR COALESCE(wf.updated_at, 0) > ebb.updated_at
-                    OR COALESCE(ac.activity_count, 0) != ebb.current_depth
+                    OR COALESCE(waw.trade_count, 0) != ebb.current_depth
                 )
             )
             OR (
@@ -225,7 +302,7 @@ def _promotion_targets(
                     COALESCE(ebb.stop_reason, '') NOT LIKE
                         'promotion_deferred:deep_pending:' || ? || ':%'
                     OR COALESCE(wf.updated_at, 0) > ebb.updated_at
-                    OR COALESCE(ac.activity_count, 0) != ebb.current_depth
+                    OR COALESCE(waw.trade_count, 0) != ebb.current_depth
                 )
             )
         )
@@ -240,19 +317,13 @@ def _promotion_targets(
     )
     rows = conn.execute(
         f"""
-        WITH activity_counts AS (
-            SELECT address, COUNT(activity_id) AS activity_count
-            FROM wallet_activity
-            WHERE type = 'TRADE'
-            GROUP BY address
-        )
         SELECT
             ebb.wallet,
             ebb.stage,
             ebb.stop_reason,
             ebb.priority,
             wf.updated_at AS feature_updated_at,
-            COALESCE(ac.activity_count, 0) AS activity_count,
+            COALESCE(waw.trade_count, 0) AS activity_count,
             ls.leader_score,
             CASE
                 WHEN ls.scored_at IS NOT NULL
@@ -264,8 +335,8 @@ def _promotion_targets(
         FROM evidence_backfill_budget ebb
         JOIN candidate_wallets cw
           ON cw.address = ebb.wallet
-        LEFT JOIN activity_counts ac
-          ON ac.address = ebb.wallet
+        LEFT JOIN wallet_activity_watermarks waw
+          ON waw.address = ebb.wallet
         LEFT JOIN wallet_features wf
           ON wf.address = ebb.wallet
         LEFT JOIN leader_latest_scores ls
@@ -290,18 +361,12 @@ def _promotion_targets(
     waiting = int(
         conn.execute(
             f"""
-            WITH activity_counts AS (
-                SELECT address, COUNT(activity_id) AS activity_count
-                FROM wallet_activity
-                WHERE type = 'TRADE'
-                GROUP BY address
-            )
             SELECT COUNT(*)
             FROM evidence_backfill_budget ebb
             JOIN candidate_wallets cw
               ON cw.address = ebb.wallet
-            LEFT JOIN activity_counts ac
-              ON ac.address = ebb.wallet
+            LEFT JOIN wallet_activity_watermarks waw
+              ON waw.address = ebb.wallet
             LEFT JOIN wallet_features wf
               ON wf.address = ebb.wallet
             LEFT JOIN wallet_registry wr
@@ -388,6 +453,7 @@ def _write_promotion_budget(
     conn: sqlite3.Connection,
     *,
     wallet: str,
+    source_stage: str,
     stage: str,
     target_depth: int,
     current_depth: int,
@@ -395,7 +461,7 @@ def _write_promotion_budget(
     evidence: dict[str, Any],
     now: int,
 ) -> None:
-    conn.execute(
+    cursor = conn.execute(
         """
         UPDATE evidence_backfill_budget
         SET stage = ?,
@@ -406,6 +472,7 @@ def _write_promotion_budget(
             evidence_json = ?,
             updated_at = ?
         WHERE wallet = ?
+          AND stage = ?
         """,
         (
             stage,
@@ -415,8 +482,11 @@ def _write_promotion_budget(
             json.dumps(evidence, ensure_ascii=False, sort_keys=True),
             now,
             wallet,
+            source_stage,
         ),
     )
+    if cursor.rowcount != 1:
+        raise RuntimeError("promotion_source_stage_changed")
 
 
 def _supersede_unapproved_queued_jobs(

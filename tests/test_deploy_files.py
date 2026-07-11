@@ -896,6 +896,7 @@ def test_nas_research_control_runs_planning_features_and_scoring_in_one_cycle():
     assert "PM_ROBOT_RESEARCH_PLANNER_LOCK_ATTEMPTS=4" in env
     assert "PM_ROBOT_RESEARCH_PLANNER_LOCK_SLEEP_SECONDS=1" in env
     assert "PM_ROBOT_SCORE_FEATURE_LIMIT=80" in env
+    assert "PM_ROBOT_SCORE_FEATURE_COMMIT_EVERY=10" in env
     assert "PM_ROBOT_SCORE_LIMIT=300" in env
     assert "PM_ROBOT_PAPER_ACTIVITY_WALLET_LIMIT=10" in env
     assert "PM_ROBOT_PAPER_OBSERVER_MAX_SIGNAL_AGE_SEC=21600" in env
@@ -909,6 +910,8 @@ def test_nas_research_control_runs_planning_features_and_scoring_in_one_cycle():
     assert "--no-diagnostics" in loop
     assert "--state-stale-only" in loop
     assert "PM_ROBOT_SCORE_FEATURE_LIMIT:-80" in loop
+    assert "PM_ROBOT_SCORE_FEATURE_COMMIT_EVERY:-10" in loop
+    assert '--feature-commit-every "$FEATURE_COMMIT_EVERY"' in loop
     assert '--score-limit "$SCORE_LIMIT"' in loop
     assert "paper-handoff-export" in loop
     assert "/app/reports/paper_handoff.json" in loop
@@ -996,7 +999,7 @@ def test_nas_maintenance_loop_runs_lightweight_storage_and_queue_repair():
     assert "PM_ROBOT_MAINTENANCE_STALE_INGEST_RUN_SECONDS=21600" in env
     assert "PM_ROBOT_MAINTENANCE_FAILED_JOB_COOLDOWN_SECONDS=21600" in env
     assert "PM_ROBOT_MAINTENANCE_RUNTIME_HEARTBEAT_DAYS=30" in env
-    assert "PM_ROBOT_RETENTION_ARCHIVE_ENABLED=1" in env
+    assert "PM_ROBOT_RETENTION_ARCHIVE_ENABLED=0" in env
     assert "PM_ROBOT_ARCHIVE_DIR=/app/data/parquet" in env
     assert "PM_ROBOT_MAINTENANCE_CLEANUP_BATCH_LIMIT=500" in env
     assert "--cleanup-batch-limit \"$CLEANUP_BATCH_LIMIT\"" in loop
@@ -1016,7 +1019,7 @@ def test_nas_maintenance_loop_runs_lightweight_storage_and_queue_repair():
     assert "PM_ROBOT_MAINTENANCE_STALE_INGEST_RUN_SECONDS:-21600" in loop
     assert "PM_ROBOT_MAINTENANCE_FAILED_JOB_COOLDOWN_SECONDS:-21600" in loop
     assert "PM_ROBOT_MAINTENANCE_RUNTIME_HEARTBEAT_DAYS:-30" in loop
-    assert "PM_ROBOT_RETENTION_ARCHIVE_ENABLED:-1" in loop
+    assert "PM_ROBOT_RETENTION_ARCHIVE_ENABLED:-0" in loop
     assert 'archive_args="--archive"' in loop
     assert '"$archive_args"' in loop
     assert "--reset-stale-jobs" in systemd_service

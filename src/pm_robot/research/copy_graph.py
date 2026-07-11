@@ -78,6 +78,11 @@ def mine_copy_graph(conn: sqlite3.Connection, policy: dict[str, Any]) -> CopyGra
             leader_stats,
         )
     _merge_leader_features(conn)
+    prune_unqualified_copy_links_for_leaders(
+        conn,
+        [str(row[0]) for row in pair_stats],
+        commit=False,
+    )
     conn.commit()
     return CopyGraphSummary(
         links_written=links_written,
@@ -188,6 +193,37 @@ def mine_copy_graph_for_leaders(
         leader_stats_written=len(leader_stats),
         qualified_pairs=sum(1 for row in pair_stats if row[10]),
     )
+
+
+def prune_unqualified_copy_links_for_leaders(
+    conn: sqlite3.Connection,
+    leaders: list[str],
+    *,
+    commit: bool = True,
+) -> int:
+    """Discard rebuildable raw links after pair summaries have been persisted."""
+
+    leader_wallets = _normalize_wallets(leaders)
+    if not leader_wallets:
+        return 0
+    cursor = conn.execute(
+        f"""
+        DELETE FROM copy_trade_links
+        WHERE leader_wallet IN ({_placeholders(leader_wallets)})
+          AND NOT EXISTS (
+              SELECT 1
+              FROM copy_pair_stats AS pair
+              WHERE pair.leader_wallet = copy_trade_links.leader_wallet
+                AND pair.follower_wallet = copy_trade_links.follower_wallet
+                AND pair.qualifies = 1
+          )
+        """,
+        tuple(leader_wallets),
+    )
+    deleted = max(0, int(cursor.rowcount or 0))
+    if commit:
+        conn.commit()
+    return deleted
 
 
 def _insert_copy_links_for_leader(
@@ -513,6 +549,23 @@ def _build_pair_stats_for_leaders(
             (str(row["leader_wallet"]), str(row["follower_wallet"])): int(row["copy_events"] or 0)
             for row in reverse_rows
         }
+        # Unqualified raw links are ephemeral. Their persisted pair summary
+        # still supplies reverse-direction evidence on later targeted scans.
+        reverse_summary_rows = conn.execute(
+            f"""
+            SELECT leader_wallet, follower_wallet, copy_event_count
+            FROM copy_pair_stats
+            WHERE leader_wallet IN ({_placeholders(followers)})
+              AND follower_wallet IN ({placeholders})
+            """,
+            tuple(followers) + tuple(leaders),
+        ).fetchall()
+        for row in reverse_summary_rows:
+            key = (str(row["leader_wallet"]), str(row["follower_wallet"]))
+            reverse_counts[key] = max(
+                reverse_counts.get(key, 0),
+                int(row["copy_event_count"] or 0),
+            )
 
     out: list[tuple[Any, ...]] = []
     for row in forward_rows:

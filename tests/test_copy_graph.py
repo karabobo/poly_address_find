@@ -3,7 +3,11 @@ from pathlib import Path
 from pm_robot.config import load_policy
 from pm_robot.models import CandidateAddress
 from pm_robot.research.copy_backtest import backtest_copy_stream
-from pm_robot.research.copy_graph import mine_copy_graph
+from pm_robot.research.copy_graph import (
+    mine_copy_graph,
+    mine_copy_graph_for_leaders,
+    prune_unqualified_copy_links_for_leaders,
+)
 from pm_robot.storage.db import connect, run_migrations
 from pm_robot.storage.repository import (
     get_wallet_features,
@@ -345,5 +349,139 @@ def test_containment_uses_pair_overlap_window_not_full_history(tmp_path):
         assert summary.qualified_pairs == 1
         assert pair["follower_trade_count"] == 5
         assert pair["containment_pct"] == 1
+    finally:
+        conn.close()
+
+
+def test_targeted_copy_graph_prunes_unqualified_raw_links_but_keeps_summary(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    leader = "0x" + "7" * 40
+    follower = "0x" + "8" * 40
+    try:
+        run_migrations(conn)
+        upsert_candidate(conn, CandidateAddress(address=leader, sources="test"))
+        upsert_candidate(conn, CandidateAddress(address=follower, sources="test"))
+        event = {
+            "timestamp": 50_000,
+            "conditionId": "condition-one",
+            "eventSlug": "event-one",
+            "slug": "market-one",
+            "asset": "asset-one",
+            "outcome": "YES",
+            "type": "TRADE",
+            "side": "BUY",
+            "price": 0.5,
+            "size": 10,
+            "usdcSize": 5,
+            "transactionHash": "0xleader-one",
+        }
+        persist_wallet_activity(conn, leader, [event], ingested_at=60_000)
+        persist_wallet_activity(
+            conn,
+            follower,
+            [{**event, "timestamp": 50_005, "transactionHash": "0xfollower-one"}],
+            ingested_at=60_000,
+        )
+
+        summary = mine_copy_graph_for_leaders(
+            conn,
+            load_policy(Path("config/leader_scoring_policy.json")),
+            [leader],
+            now=60_000,
+        )
+        deleted = prune_unqualified_copy_links_for_leaders(conn, [leader])
+        pair = conn.execute(
+            "SELECT copy_event_count, qualifies FROM copy_pair_stats WHERE leader_wallet = ?",
+            (leader,),
+        ).fetchone()
+        remaining_links = conn.execute(
+            "SELECT COUNT(*) FROM copy_trade_links WHERE leader_wallet = ?",
+            (leader,),
+        ).fetchone()[0]
+
+        assert summary.links_written == 1
+        assert summary.qualified_pairs == 0
+        assert deleted == 1
+        assert remaining_links == 0
+        assert dict(pair) == {"copy_event_count": 1, "qualifies": 0}
+    finally:
+        conn.close()
+
+
+def test_targeted_copy_graph_uses_persisted_reverse_pair_summary(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    leader = "0x" + "9" * 40
+    follower = "0x" + "a" * 40
+    try:
+        run_migrations(conn)
+        upsert_candidate(conn, CandidateAddress(address=leader, sources="test"))
+        upsert_candidate(conn, CandidateAddress(address=follower, sources="test"))
+        event = {
+            "timestamp": 70_000,
+            "conditionId": "condition-reverse",
+            "eventSlug": "event-reverse",
+            "slug": "market-reverse",
+            "asset": "asset-reverse",
+            "outcome": "YES",
+            "type": "TRADE",
+            "side": "BUY",
+            "price": 0.5,
+            "size": 10,
+            "usdcSize": 5,
+            "transactionHash": "0xleader-reverse",
+        }
+        persist_wallet_activity(conn, leader, [event], ingested_at=80_000)
+        persist_wallet_activity(
+            conn,
+            follower,
+            [{**event, "timestamp": 70_005, "transactionHash": "0xfollower-reverse"}],
+            ingested_at=80_000,
+        )
+        conn.execute(
+            """
+            INSERT INTO copy_pair_stats(
+                leader_wallet, follower_wallet, copy_event_count, copy_market_count,
+                follower_trade_count, containment_pct, leader_precedes_pct,
+                median_lag_seconds, first_copy_ts, last_copy_ts, qualifies, updated_at
+            ) VALUES (?, ?, 9, 1, 9, 1, 0.9, 5, 60000, 69000, 0, 80000)
+            """,
+            (follower, leader),
+        )
+        activity_ids = {
+            str(row["address"]): int(row["activity_id"])
+            for row in conn.execute(
+                "SELECT address, activity_id FROM wallet_activity WHERE address IN (?, ?)",
+                (leader, follower),
+            )
+        }
+        conn.execute(
+            """
+            INSERT INTO copy_trade_links(
+                leader_wallet, follower_wallet, leader_activity_id, follower_activity_id,
+                condition_id, market_slug, asset_id, outcome, side,
+                leader_ts, follower_ts, lag_seconds, created_at
+            ) VALUES (?, ?, ?, ?, '', '', '', '', 'BUY', 60000, 60005, 5, 80000)
+            """,
+            (follower, leader, activity_ids[follower], activity_ids[leader]),
+        )
+        conn.commit()
+
+        mine_copy_graph_for_leaders(
+            conn,
+            load_policy(Path("config/leader_scoring_policy.json")),
+            [leader],
+            now=80_000,
+        )
+        pair = conn.execute(
+            """
+            SELECT copy_event_count, leader_precedes_pct
+            FROM copy_pair_stats
+            WHERE leader_wallet = ? AND follower_wallet = ?
+            """,
+            (leader, follower),
+        ).fetchone()
+
+        assert pair["copy_event_count"] == 1
+        assert pair["leader_precedes_pct"] == 0.1
     finally:
         conn.close()

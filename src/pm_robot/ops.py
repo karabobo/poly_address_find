@@ -10,7 +10,7 @@ import sqlite3
 import time
 from urllib.parse import quote
 from pathlib import Path
-from typing import Any, BinaryIO
+from typing import Any, BinaryIO, Callable
 
 from pm_robot.config import RobotSettings
 from pm_robot.risk.eligibility import winner_library_eligibility_status
@@ -18,7 +18,14 @@ from pm_robot.storage.api_rate_limit import (
     api_rate_limit_summary,
     api_rate_limit_summary_from_path,
 )
-from pm_robot.storage.db import connect, connect_readonly, is_sqlite_locked_error, run_migrations
+from pm_robot.storage.db import (
+    connect,
+    connect_readonly,
+    database_access_guard,
+    is_sqlite_locked_error,
+    pending_migration_versions,
+    run_migrations,
+)
 from pm_robot.storage.evidence_archive import (
     EVIDENCE_TABLE_SPECS,
     capture_archive_scope,
@@ -32,7 +39,7 @@ from pm_robot.storage.evidence_archive import (
     set_archive_run_status,
     verify_archive_manifest,
 )
-from pm_robot.storage.repository import api_request_summary
+from pm_robot.storage.repository import api_request_summary, refresh_activity_watermark
 
 DAY_SECONDS = 86_400
 WAL_CHECKPOINT_MODES = ("none", "passive", "truncate")
@@ -968,6 +975,869 @@ def _reset_stale_ingest_runs(
     }
 
 
+def compact_low_value_evidence(
+    settings: RobotSettings,
+    *,
+    dry_run: bool = True,
+    progress: Callable[[str], None] | None = None,
+) -> dict[str, Any]:
+    """Rebuild the hot SQLite store without raw evidence for decided wallets.
+
+    The source database is never edited in place. A disposable sibling database
+    is built and validated first, then atomically replaces the source file. The
+    operation intentionally creates no backup or rollback artifact.
+    """
+
+    source_path = settings.db_path.resolve()
+    if not source_path.exists():
+        raise FileNotFoundError(source_path)
+    with database_access_guard(source_path, exclusive=True):
+        return _compact_low_value_evidence_locked(
+            settings,
+            dry_run=dry_run,
+            progress=progress,
+        )
+
+
+def _compact_low_value_evidence_locked(
+    settings: RobotSettings,
+    *,
+    dry_run: bool,
+    progress: Callable[[str], None] | None,
+) -> dict[str, Any]:
+    """Run compact rebuild while the process owns exclusive database access."""
+
+    source_path = settings.db_path.resolve()
+    partial_path = source_path.with_name(f".{source_path.name}.compact.partial")
+    source_size = _path_size(source_path)
+    if dry_run:
+        source_uri = f"{source_path.as_uri()}?mode=ro"
+        source_conn = sqlite3.connect(source_uri, uri=True, timeout=120)
+        source_conn.execute("PRAGMA query_only = ON")
+    else:
+        source_conn = sqlite3.connect(source_path, timeout=120)
+        source_conn.execute("PRAGMA busy_timeout = 120000")
+        source_conn.execute("PRAGMA synchronous = NORMAL")
+        source_conn.execute("PRAGMA foreign_keys = ON")
+    source_conn.row_factory = sqlite3.Row
+    replaced = False
+    guard_active = False
+    try:
+        pending_versions = pending_migration_versions(source_conn)
+        if pending_versions:
+            raise RuntimeError(
+                "compact-evidence requires a current schema; run migrate first: "
+                + ",".join(str(version) for version in pending_versions)
+            )
+        if not dry_run:
+            checkpoint = source_conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+            if checkpoint is not None and int(checkpoint[0] or 0) != 0:
+                raise RuntimeError("cannot compact while SQLite WAL checkpoint is busy")
+            source_conn.execute("BEGIN IMMEDIATE")
+            guard_active = True
+        wallets = _all_low_value_prune_wallets(source_conn)
+        selected_activity_rows = _wallet_activity_count_chunked(source_conn, wallets)
+        _emit_compact_progress(
+            progress,
+            f"selected {len(wallets)} wallets and {selected_activity_rows} activity rows",
+        )
+        disk_usage = shutil.disk_usage(source_path.parent)
+        required_free_bytes = max(268_435_456, source_size * 2)
+        report = {
+            "ok": True,
+            "dry_run": dry_run,
+            "wallet_count": len(wallets),
+            "selected_activity_rows": selected_activity_rows,
+            "source_size_mb": round(source_size / 1_048_576, 2),
+            "free_disk_mb": round(disk_usage.free / 1_048_576, 2),
+            "required_free_mb": round(required_free_bytes / 1_048_576, 2),
+            "database_replaced": False,
+        }
+        if dry_run or not wallets:
+            if guard_active:
+                source_conn.rollback()
+                guard_active = False
+            return report
+        if disk_usage.free < required_free_bytes:
+            raise RuntimeError(
+                "insufficient free disk for compact rebuild: "
+                f"required={required_free_bytes} free={disk_usage.free}"
+            )
+
+        registry_rows = _wallet_registry_snapshot_rows(source_conn, wallets)
+        source_schema_manifest = _schema_object_manifest(source_conn)
+        source_sequence = _sqlite_sequence_manifest(source_conn)
+        source_control_counts = _control_plane_counts(source_conn)
+        expected_table_counts = _expected_compact_table_counts(
+            source_conn,
+            wallets,
+            selected_activity_rows=selected_activity_rows,
+        )
+        source_page_size = int(source_conn.execute("PRAGMA page_size").fetchone()[0])
+        source_user_version = int(source_conn.execute("PRAGMA user_version").fetchone()[0])
+        source_application_id = int(source_conn.execute("PRAGMA application_id").fetchone()[0])
+        source_mode = source_path.stat()
+
+        _remove_sqlite_file_set(partial_path)
+        _emit_compact_progress(progress, "building filtered database")
+        build_report = _build_compact_evidence_database(
+            source_path=source_path,
+            target_path=partial_path,
+            wallets=wallets,
+            registry_rows=registry_rows,
+            selected_activity_rows=selected_activity_rows,
+            page_size=source_page_size,
+            user_version=source_user_version,
+            application_id=source_application_id,
+            progress=progress,
+        )
+        for table, deleted_rows in build_report["foreign_key_repairs"][
+            "deleted_rows"
+        ].items():
+            expected_table_counts[table] = max(
+                0,
+                expected_table_counts.get(table, 0) - int(deleted_rows),
+            )
+        _emit_compact_progress(progress, "validating filtered database")
+        validation = _validate_compact_evidence_database(
+            target_path=partial_path,
+            wallets=wallets,
+            expected_schema_manifest=source_schema_manifest,
+            expected_sequence=source_sequence,
+            expected_control_counts=source_control_counts,
+            expected_table_counts=expected_table_counts,
+        )
+        if not validation["ok"]:
+            raise RuntimeError(f"compact database validation failed: {validation}")
+
+        source_conn.rollback()
+        guard_active = False
+        checkpoint = source_conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        if checkpoint is not None and int(checkpoint[0] or 0) != 0:
+            raise RuntimeError("cannot replace database while SQLite WAL checkpoint is busy")
+        source_conn.close()
+
+        _prepare_compact_replacement(source_path, partial_path, source_mode)
+        os.replace(partial_path, source_path)
+        replaced = True
+        _fsync_directory(source_path.parent)
+        final_size = _path_size(source_path)
+        report.update(
+            {
+                "database_replaced": True,
+                "target_size_mb": round(final_size / 1_048_576, 2),
+                "reclaimed_mb": round((source_size - final_size) / 1_048_576, 2),
+                "copied_rows": build_report["copied_rows"],
+                "foreign_key_repairs": build_report["foreign_key_repairs"],
+                "validation": validation,
+                "storage": storage_report(settings),
+            }
+        )
+        return report
+    except BaseException:
+        if guard_active:
+            try:
+                source_conn.rollback()
+            except sqlite3.Error:
+                pass
+        raise
+    finally:
+        try:
+            source_conn.close()
+        except sqlite3.Error:
+            pass
+        if not replaced:
+            _remove_sqlite_file_set(partial_path)
+
+
+def _build_compact_evidence_database(
+    *,
+    source_path: Path,
+    target_path: Path,
+    wallets: list[str],
+    registry_rows: list[dict[str, Any]],
+    selected_activity_rows: int,
+    page_size: int,
+    user_version: int,
+    application_id: int,
+    progress: Callable[[str], None] | None,
+) -> dict[str, Any]:
+    """Build a disposable filtered database; the caller owns final replacement."""
+
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(target_path, timeout=120, uri=True)
+    conn.row_factory = sqlite3.Row
+    copied_rows: dict[str, int] = {}
+    try:
+        conn.execute(f"PRAGMA page_size = {max(512, int(page_size))}")
+        conn.execute("PRAGMA journal_mode = OFF")
+        conn.execute("PRAGMA synchronous = OFF")
+        conn.execute("PRAGMA foreign_keys = OFF")
+        conn.execute("PRAGMA temp_store = FILE")
+        conn.execute("PRAGMA cache_size = -262144")
+        conn.execute("PRAGMA mmap_size = 1073741824")
+        source_uri = f"{source_path.as_uri()}?mode=ro"
+        conn.execute("ATTACH DATABASE ? AS source", (source_uri,))
+        conn.execute("CREATE TEMP TABLE temp_prune_wallets(wallet TEXT PRIMARY KEY)")
+        conn.executemany(
+            "INSERT INTO temp_prune_wallets(wallet) VALUES (?)",
+            ((wallet.lower(),) for wallet in wallets),
+        )
+        conn.execute(
+            "CREATE TEMP TABLE temp_prune_keep_activity(activity_id INTEGER PRIMARY KEY)"
+        )
+        schema_rows = conn.execute(
+            """
+            SELECT type, name, tbl_name, sql
+            FROM source.sqlite_master
+            WHERE sql IS NOT NULL
+              AND name NOT LIKE 'sqlite_%'
+            ORDER BY
+              CASE type WHEN 'table' THEN 0 WHEN 'index' THEN 1 WHEN 'view' THEN 2 ELSE 3 END,
+              name
+            """
+        ).fetchall()
+        table_rows = [row for row in schema_rows if row["type"] == "table"]
+        for row in table_rows:
+            conn.execute(str(row["sql"]))
+        conn.commit()
+
+        prune_specs = {spec.table: spec for spec in EVIDENCE_TABLE_SPECS}
+        for index, row in enumerate(table_rows, start=1):
+            table = str(row["name"])
+            quoted_table = _quote_sql_identifier(table)
+            columns = _copyable_table_columns(conn, "source", table)
+            if not columns:
+                continue
+            column_sql = ", ".join(_quote_sql_identifier(column) for column in columns)
+            where_sql = ""
+            spec = prune_specs.get(table)
+            if spec is not None:
+                prune_where = _source_prune_where_sql(spec.where_sql)
+                where_sql = f" WHERE NOT COALESCE(({prune_where}), 0)"
+            conn.execute(
+                f"INSERT INTO {quoted_table}({column_sql}) "
+                f"SELECT {column_sql} FROM source.{quoted_table}{where_sql}"
+            )
+            copied_rows[table] = int(conn.execute("SELECT changes()").fetchone()[0])
+            conn.commit()
+            if index == 1 or index % 8 == 0 or index == len(table_rows):
+                _emit_compact_progress(
+                    progress,
+                    f"copied tables {index}/{len(table_rows)}",
+                )
+
+        if _table_exists_in_schema(conn, "main", "sqlite_sequence") and _table_exists_in_schema(
+            conn, "source", "sqlite_sequence"
+        ):
+            conn.execute("DELETE FROM sqlite_sequence")
+            conn.execute(
+                "INSERT INTO sqlite_sequence(name, seq) "
+                "SELECT name, seq FROM source.sqlite_sequence"
+            )
+
+        _upsert_wallet_registry_rows(conn, registry_rows)
+        _mark_wallet_registry_pruned(conn, wallets)
+        _cancel_wallet_evidence_backfill(conn, wallets)
+        now = int(time.time())
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO wallet_activity_watermarks(
+                address, newest_timestamp, newest_activity_key, trade_count,
+                updated_at, last_full_backfill_at
+            )
+            SELECT wallet, 0, '', 0, ?, NULL
+            FROM temp_prune_wallets
+            """,
+            (now,),
+        )
+        conn.execute(
+            """
+            UPDATE wallet_activity_watermarks
+            SET newest_timestamp = 0,
+                newest_activity_key = '',
+                trade_count = 0,
+                updated_at = ?
+            WHERE address IN (SELECT wallet FROM temp_prune_wallets)
+            """,
+            (now,),
+        )
+        _rebuild_wallet_dashboard_snapshot(conn)
+        conn.commit()
+
+        deferred_rows = [row for row in schema_rows if row["type"] != "table"]
+        pre_trigger_rows = [row for row in deferred_rows if row["type"] != "trigger"]
+        trigger_rows = [row for row in deferred_rows if row["type"] == "trigger"]
+        rebuilt_count = 0
+        for row in pre_trigger_rows:
+            conn.execute(str(row["sql"]))
+            conn.commit()
+            rebuilt_count += 1
+            if rebuilt_count % 20 == 0:
+                _emit_compact_progress(
+                    progress,
+                    f"rebuilt schema objects {rebuilt_count}/{len(deferred_rows)}",
+                )
+        _emit_compact_progress(progress, "repairing foreign-key dependencies")
+        foreign_key_repairs = _repair_compact_foreign_key_dependencies(conn)
+        conn.commit()
+        for row in trigger_rows:
+            conn.execute(str(row["sql"]))
+            conn.commit()
+            rebuilt_count += 1
+            if rebuilt_count % 20 == 0 or rebuilt_count == len(deferred_rows):
+                _emit_compact_progress(
+                    progress,
+                    f"rebuilt schema objects {rebuilt_count}/{len(deferred_rows)}",
+                )
+        conn.execute(f"PRAGMA user_version = {max(0, int(user_version))}")
+        conn.execute(f"PRAGMA application_id = {max(0, int(application_id))}")
+        conn.execute("DETACH DATABASE source")
+        conn.execute("PRAGMA locking_mode = NORMAL")
+        conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute("PRAGMA synchronous = NORMAL")
+        conn.commit()
+    finally:
+        conn.close()
+    _remove_sqlite_sidecars(target_path)
+    return {
+        "copied_rows": copied_rows,
+        "filtered_wallet_activity_rows": max(0, int(selected_activity_rows)),
+        "foreign_key_repairs": foreign_key_repairs,
+    }
+
+
+def _repair_compact_foreign_key_dependencies(
+    conn: sqlite3.Connection,
+) -> dict[str, Any]:
+    """Apply source ON DELETE semantics to rows orphaned by filtered copying."""
+
+    deleted_rows: dict[str, int] = {}
+    nulled_rows: dict[str, int] = {}
+    initial_violations = 0
+    passes = 0
+    while True:
+        violations = conn.execute("PRAGMA foreign_key_check").fetchall()
+        if not violations:
+            return {
+                "initial_violations": initial_violations,
+                "passes": passes,
+                "deleted_rows": deleted_rows,
+                "nulled_rows": nulled_rows,
+            }
+        if passes == 0:
+            initial_violations = len(violations)
+        passes += 1
+        if passes > 20:
+            raise RuntimeError("foreign-key repair did not converge")
+
+        actions: dict[tuple[str, int], dict[str, Any]] = {}
+        foreign_keys: dict[str, dict[int, list[sqlite3.Row]]] = {}
+        for violation in violations:
+            table = str(violation[0])
+            rowid = violation[1]
+            foreign_key_id = int(violation[3])
+            if rowid is None:
+                raise RuntimeError(
+                    f"cannot repair foreign key for WITHOUT ROWID table {table}"
+                )
+            table_keys = foreign_keys.get(table)
+            if table_keys is None:
+                key_rows = conn.execute(
+                    f"PRAGMA foreign_key_list({_quote_sql_literal(table)})"
+                ).fetchall()
+                table_keys = {}
+                for key_row in key_rows:
+                    table_keys.setdefault(int(key_row[0]), []).append(key_row)
+                foreign_keys[table] = table_keys
+            key_rows = table_keys.get(foreign_key_id, [])
+            if not key_rows:
+                raise RuntimeError(
+                    f"foreign-key metadata missing for {table} id={foreign_key_id}"
+                )
+            on_delete = str(key_rows[0][6] or "NO ACTION").upper()
+            action = actions.setdefault(
+                (table, int(rowid)),
+                {"delete": False, "null_columns": set()},
+            )
+            if on_delete == "CASCADE":
+                action["delete"] = True
+                continue
+            if on_delete == "SET NULL":
+                action["null_columns"].update(str(row[3]) for row in key_rows)
+                continue
+            raise RuntimeError(
+                "filtered copy orphaned a protected foreign key: "
+                f"table={table} rowid={rowid} on_delete={on_delete}"
+            )
+
+        changes = 0
+        for (table, rowid), action in actions.items():
+            quoted_table = _quote_sql_identifier(table)
+            if action["delete"]:
+                conn.execute(f"DELETE FROM {quoted_table} WHERE rowid = ?", (rowid,))
+                affected = int(conn.execute("SELECT changes()").fetchone()[0])
+                deleted_rows[table] = deleted_rows.get(table, 0) + affected
+                changes += affected
+                continue
+            columns = sorted(action["null_columns"])
+            if not columns:
+                continue
+            assignments = ", ".join(
+                f"{_quote_sql_identifier(column)} = NULL" for column in columns
+            )
+            conn.execute(
+                f"UPDATE {quoted_table} SET {assignments} WHERE rowid = ?",
+                (rowid,),
+            )
+            affected = int(conn.execute("SELECT changes()").fetchone()[0])
+            nulled_rows[table] = nulled_rows.get(table, 0) + affected
+            changes += affected
+        if changes == 0:
+            raise RuntimeError("foreign-key repair made no progress")
+
+
+def _validate_compact_evidence_database(
+    *,
+    target_path: Path,
+    wallets: list[str],
+    expected_schema_manifest: dict[str, tuple[str, str]],
+    expected_sequence: dict[str, int],
+    expected_control_counts: dict[str, int],
+    expected_table_counts: dict[str, int],
+) -> dict[str, Any]:
+    conn = sqlite3.connect(target_path, timeout=120)
+    conn.row_factory = sqlite3.Row
+    try:
+        quick_check_rows = [str(row[0]) for row in conn.execute("PRAGMA quick_check")]
+        foreign_key_rows = conn.execute("PRAGMA foreign_key_check").fetchall()
+        schema_manifest = _schema_object_manifest(conn)
+        sequence = _sqlite_sequence_manifest(conn)
+        table_counts = _table_row_counts(conn)
+        control_counts = _control_plane_counts(conn)
+        conn.execute("CREATE TEMP TABLE temp_prune_wallets(wallet TEXT PRIMARY KEY)")
+        conn.executemany(
+            "INSERT INTO temp_prune_wallets(wallet) VALUES (?)",
+            ((wallet.lower(),) for wallet in wallets),
+        )
+        conn.execute(
+            "CREATE TEMP TABLE temp_prune_keep_activity(activity_id INTEGER PRIMARY KEY)"
+        )
+        tables = {
+            str(row[0])
+            for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
+        residuals: dict[str, int] = {}
+        for spec in EVIDENCE_TABLE_SPECS:
+            if spec.table not in tables:
+                continue
+            residuals[spec.table] = int(
+                conn.execute(
+                    f'SELECT COUNT(*) FROM "{spec.table}" WHERE {spec.where_sql}'
+                ).fetchone()[0]
+            )
+        registry_count = int(
+            conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM wallet_registry
+                WHERE address IN (SELECT wallet FROM temp_prune_wallets)
+                  AND registry_status = 'archived_raw_pruned'
+                  AND raw_retention_tier = 'summary_only'
+                  AND raw_pruned_at IS NOT NULL
+                """
+            ).fetchone()[0]
+        )
+        watermark_count = int(
+            conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM wallet_activity_watermarks
+                WHERE address IN (SELECT wallet FROM temp_prune_wallets)
+                  AND newest_timestamp = 0
+                  AND newest_activity_key = ''
+                  AND trade_count = 0
+                """
+            ).fetchone()[0]
+        )
+        dashboard_mismatches = _wallet_dashboard_snapshot_mismatches(conn)
+    finally:
+        conn.close()
+    table_count_mismatches = {
+        table: {
+            "expected": expected_table_counts.get(table),
+            "actual": table_counts.get(table),
+        }
+        for table in sorted(set(expected_table_counts) | set(table_counts))
+        if expected_table_counts.get(table) != table_counts.get(table)
+    }
+    schema_mismatches = sorted(
+        key
+        for key in set(expected_schema_manifest) | set(schema_manifest)
+        if expected_schema_manifest.get(key) != schema_manifest.get(key)
+    )
+    checks = {
+        "quick_check": quick_check_rows == ["ok"],
+        "foreign_keys": not foreign_key_rows,
+        "schema_objects": not schema_mismatches,
+        "sqlite_sequence": sequence == expected_sequence,
+        "table_row_counts": not table_count_mismatches,
+        "control_plane": control_counts == expected_control_counts,
+        "raw_evidence_removed": not any(residuals.values()),
+        "registry_summaries": registry_count == len(wallets),
+        "watermarks_reset": watermark_count == len(wallets),
+        "dashboard_snapshot": dashboard_mismatches == 0,
+    }
+    return {
+        "ok": all(checks.values()),
+        "checks": checks,
+        "quick_check": quick_check_rows,
+        "foreign_key_violations": len(foreign_key_rows),
+        "foreign_key_violation_rows": [
+            {
+                "table": str(row[0]),
+                "rowid": row[1],
+                "parent": str(row[2]),
+                "foreign_key_id": int(row[3]),
+            }
+            for row in foreign_key_rows[:20]
+        ],
+        "schema_mismatches": schema_mismatches,
+        "sqlite_sequence_mismatches": {
+            table: {
+                "expected": expected_sequence.get(table),
+                "actual": sequence.get(table),
+            }
+            for table in sorted(set(expected_sequence) | set(sequence))
+            if expected_sequence.get(table) != sequence.get(table)
+        },
+        "table_count_mismatches": table_count_mismatches,
+        "residuals": residuals,
+        "registry_count": registry_count,
+        "watermark_count": watermark_count,
+        "dashboard_snapshot_mismatches": dashboard_mismatches,
+    }
+
+
+def _wallet_registry_snapshot_rows(
+    conn: sqlite3.Connection,
+    wallets: list[str],
+    *,
+    batch_size: int = 400,
+) -> list[dict[str, Any]]:
+    now = int(time.time())
+    rows: list[dict[str, Any]] = []
+    bounded_batch = max(1, int(batch_size))
+    for start in range(0, len(wallets), bounded_batch):
+        batch = tuple(wallets[start : start + bounded_batch])
+        source_rows = _wallet_registry_source_rows(
+            conn,
+            limit=0,
+            stages=(),
+            addresses=batch,
+        )
+        rows.extend(_wallet_registry_row(dict(row), now=now) for row in source_rows)
+    return rows
+
+
+def _wallet_activity_count_chunked(
+    conn: sqlite3.Connection,
+    wallets: list[str],
+    *,
+    batch_size: int = 400,
+) -> int:
+    bounded_batch = max(1, int(batch_size))
+    return sum(
+        _wallet_activity_count(conn, wallets[start : start + bounded_batch])
+        for start in range(0, len(wallets), bounded_batch)
+    )
+
+
+def _copyable_table_columns(
+    conn: sqlite3.Connection,
+    schema: str,
+    table: str,
+) -> list[str]:
+    rows = conn.execute(
+        f"PRAGMA {_quote_sql_identifier(schema)}.table_xinfo({_quote_sql_literal(table)})"
+    ).fetchall()
+    return [str(row[1]) for row in rows if len(row) < 7 or int(row[6] or 0) == 0]
+
+
+def _source_prune_where_sql(where_sql: str) -> str:
+    return where_sql.replace(
+        "FROM leader_latest_scores",
+        "FROM source.leader_latest_scores",
+    )
+
+
+def _expected_compact_table_counts(
+    conn: sqlite3.Connection,
+    wallets: list[str],
+    *,
+    selected_activity_rows: int,
+) -> dict[str, int]:
+    prepare_prune_temp_tables(conn, wallets, keep_recent_activity=0)
+    try:
+        tables = [
+            str(row[0])
+            for row in conn.execute(
+                """
+                SELECT name
+                FROM sqlite_master
+                WHERE type = 'table'
+                  AND name NOT LIKE 'sqlite_%'
+                ORDER BY name
+                """
+            ).fetchall()
+        ]
+        prune_specs = {spec.table: spec for spec in EVIDENCE_TABLE_SPECS}
+        expected: dict[str, int] = {}
+        for table in tables:
+            total = int(
+                conn.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0]
+            )
+            spec = prune_specs.get(table)
+            if spec is None:
+                expected[table] = total
+                continue
+            pruned = (
+                max(0, int(selected_activity_rows))
+                if table == "wallet_activity"
+                else int(
+                    conn.execute(
+                        f'SELECT COUNT(*) FROM "{table}" WHERE {spec.where_sql}'
+                    ).fetchone()[0]
+                )
+            )
+            expected[table] = total - pruned
+        missing_registry = int(
+            conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM temp_prune_wallets selected
+                LEFT JOIN wallet_registry registry ON registry.address = selected.wallet
+                WHERE registry.address IS NULL
+                """
+            ).fetchone()[0]
+        )
+        missing_watermarks = int(
+            conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM temp_prune_wallets selected
+                LEFT JOIN wallet_activity_watermarks watermarks
+                  ON watermarks.address = selected.wallet
+                WHERE watermarks.address IS NULL
+                """
+            ).fetchone()[0]
+        )
+        expected["wallet_registry"] += missing_registry
+        expected["wallet_activity_watermarks"] += missing_watermarks
+        if "wallet_dashboard_snapshot" in expected:
+            expected["wallet_dashboard_snapshot"] = expected["candidate_wallets"]
+        return expected
+    finally:
+        drop_prune_temp_tables(conn)
+
+
+def _table_row_counts(conn: sqlite3.Connection) -> dict[str, int]:
+    tables = [
+        str(row[0])
+        for row in conn.execute(
+            """
+            SELECT name
+            FROM sqlite_master
+            WHERE type = 'table'
+              AND name NOT LIKE 'sqlite_%'
+            ORDER BY name
+            """
+        ).fetchall()
+    ]
+    return {
+        table: int(conn.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0])
+        for table in tables
+    }
+
+
+def _rebuild_wallet_dashboard_snapshot(conn: sqlite3.Connection) -> None:
+    """Refresh the trigger-maintained dashboard projection after bulk state edits."""
+
+    if not _table_exists_in_schema(conn, "main", "wallet_dashboard_snapshot"):
+        return
+    conn.execute(
+        """
+        INSERT INTO wallet_dashboard_snapshot(
+            address, candidate_stage, activity_count, discovery_tier,
+            next_action, leader_score, updated_at
+        )
+        SELECT
+            cw.address,
+            cw.candidate_stage,
+            COALESCE(wps.activity_count, eb.current_depth, 0),
+            COALESCE(wps.discovery_tier, ''),
+            COALESCE(wps.next_action, ''),
+            COALESCE(ls.leader_score, 0),
+            MAX(
+                COALESCE(cw.updated_at, 0),
+                COALESCE(wps.updated_at, 0),
+                COALESCE(eb.updated_at, 0),
+                COALESCE(ls.scored_at, 0)
+            )
+        FROM candidate_wallets cw
+        LEFT JOIN wallet_processing_state wps ON wps.wallet = cw.address
+        LEFT JOIN evidence_backfill_budget eb ON eb.wallet = cw.address
+        LEFT JOIN leader_latest_scores ls ON ls.address = cw.address
+        ON CONFLICT(address) DO UPDATE SET
+            candidate_stage = excluded.candidate_stage,
+            activity_count = excluded.activity_count,
+            discovery_tier = excluded.discovery_tier,
+            next_action = excluded.next_action,
+            leader_score = excluded.leader_score,
+            updated_at = excluded.updated_at
+        """
+    )
+    conn.execute(
+        """
+        DELETE FROM wallet_dashboard_snapshot
+        WHERE address NOT IN (SELECT address FROM candidate_wallets)
+        """
+    )
+
+
+def _wallet_dashboard_snapshot_mismatches(conn: sqlite3.Connection) -> int:
+    if not _table_exists_in_schema(conn, "main", "wallet_dashboard_snapshot"):
+        return 0
+    return int(
+        conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM candidate_wallets cw
+            LEFT JOIN wallet_processing_state wps ON wps.wallet = cw.address
+            LEFT JOIN evidence_backfill_budget eb ON eb.wallet = cw.address
+            LEFT JOIN leader_latest_scores ls ON ls.address = cw.address
+            LEFT JOIN wallet_dashboard_snapshot snapshot ON snapshot.address = cw.address
+            WHERE snapshot.address IS NULL
+               OR snapshot.candidate_stage != cw.candidate_stage
+               OR snapshot.activity_count != COALESCE(wps.activity_count, eb.current_depth, 0)
+               OR snapshot.discovery_tier != COALESCE(wps.discovery_tier, '')
+               OR snapshot.next_action != COALESCE(wps.next_action, '')
+               OR snapshot.leader_score != COALESCE(ls.leader_score, 0)
+               OR snapshot.updated_at != MAX(
+                    COALESCE(cw.updated_at, 0),
+                    COALESCE(wps.updated_at, 0),
+                    COALESCE(eb.updated_at, 0),
+                    COALESCE(ls.scored_at, 0)
+               )
+            """
+        ).fetchone()[0]
+    )
+
+
+def _schema_object_manifest(conn: sqlite3.Connection) -> dict[str, tuple[str, str]]:
+    return {
+        f"{row['type']}:{row['name']}": (str(row["tbl_name"]), str(row["sql"]))
+        for row in conn.execute(
+            """
+            SELECT type, name, tbl_name, sql
+            FROM sqlite_master
+            WHERE name NOT LIKE 'sqlite_%'
+              AND sql IS NOT NULL
+            ORDER BY type, name
+            """
+        ).fetchall()
+    }
+
+
+def _sqlite_sequence_manifest(conn: sqlite3.Connection) -> dict[str, int]:
+    if not _table_exists_in_schema(conn, "main", "sqlite_sequence"):
+        return {}
+    return {
+        str(row[0]): int(row[1])
+        for row in conn.execute("SELECT name, seq FROM sqlite_sequence ORDER BY name")
+    }
+
+
+def _control_plane_counts(conn: sqlite3.Connection) -> dict[str, int]:
+    return {
+        table: int(conn.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0])
+        for table in (
+            "candidate_wallets",
+            "wallet_features",
+            "wallet_processing_state",
+            "schema_migrations",
+        )
+    }
+
+
+def _table_exists_in_schema(
+    conn: sqlite3.Connection,
+    schema: str,
+    table: str,
+) -> bool:
+    row = conn.execute(
+        f"SELECT 1 FROM {_quote_sql_identifier(schema)}.sqlite_master "
+        "WHERE type='table' AND name=?",
+        (table,),
+    ).fetchone()
+    return row is not None
+
+
+def _quote_sql_identifier(value: str) -> str:
+    return '"' + value.replace('"', '""') + '"'
+
+
+def _quote_sql_literal(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
+
+
+def _prepare_compact_replacement(
+    source_path: Path,
+    target_path: Path,
+    source_mode: os.stat_result,
+) -> None:
+    _remove_sqlite_sidecars(source_path, require_empty_wal=True)
+    _remove_sqlite_sidecars(target_path)
+    os.chmod(target_path, source_mode.st_mode & 0o7777)
+    try:
+        os.chown(target_path, source_mode.st_uid, source_mode.st_gid)
+    except PermissionError:
+        pass
+    with target_path.open("rb") as file_obj:
+        os.fsync(file_obj.fileno())
+
+
+def _remove_sqlite_sidecars(path: Path, *, require_empty_wal: bool = False) -> None:
+    for suffix in ("-wal", "-shm"):
+        sidecar = path.with_name(path.name + suffix)
+        if sidecar.exists():
+            if require_empty_wal and suffix == "-wal" and sidecar.stat().st_size > 0:
+                raise RuntimeError("database changed after compact validation; replacement aborted")
+            sidecar.unlink()
+
+
+def _remove_sqlite_file_set(path: Path) -> None:
+    _remove_sqlite_sidecars(path)
+    if path.exists():
+        path.unlink()
+
+
+def _fsync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _emit_compact_progress(
+    progress: Callable[[str], None] | None,
+    message: str,
+) -> None:
+    if progress is not None:
+        progress(message)
+
+
 def prune_low_value_evidence(
     settings: RobotSettings,
     *,
@@ -1075,6 +1945,13 @@ def prune_low_value_evidence(
             archive_run_id=str(archive_result.get("run_id") or ""),
         )
         if not dry_run:
+            watermark_updated_at = int(time.time())
+            for wallet in wallets:
+                refresh_activity_watermark(
+                    conn,
+                    wallet,
+                    updated_at=watermark_updated_at,
+                )
             raw_artifact_uri = ""
             archive_run_id = ""
             if archive_result.get("status") == "verified":
@@ -1217,8 +2094,18 @@ def _materialize_wallet_registry(
         row = dict(source_row)
         archived = archived_rows.get(str(row["address"]))
         rows.append(archived if archived is not None else _wallet_registry_row(row, now=now))
+    _upsert_wallet_registry_rows(conn, rows)
+    return rows
+
+
+def _upsert_wallet_registry_rows(
+    conn: sqlite3.Connection,
+    rows: list[dict[str, Any]],
+) -> None:
+    """Persist precomputed registry summaries without re-reading raw evidence."""
+
     if not rows:
-        return []
+        return
     placeholders = ", ".join("?" for _ in WALLET_REGISTRY_TABLE_COLUMNS)
     assignments = ", ".join(
         f"{column} = excluded.{column}"
@@ -1236,7 +2123,6 @@ def _materialize_wallet_registry(
             for row in rows
         ],
     )
-    return rows
 
 
 def _wallet_registry_source_rows(
@@ -1959,8 +2845,58 @@ def _low_value_prune_wallets(
     if limit <= 0:
         return []
     activity_budget = max(0, int(max_activity_rows))
-    terminal_rows = conn.execute(
-        """
+    terminal_rows = _terminal_low_value_wallet_rows(conn, limit=limit)
+    wallets, selected_activity_rows, budget_exhausted = _select_prune_wallet_rows(
+        conn,
+        terminal_rows,
+        limit=limit,
+        max_activity_rows=activity_budget,
+    )
+    if budget_exhausted:
+        return wallets
+    remaining = limit - len(wallets)
+    if remaining <= 0:
+        return wallets
+    if activity_budget and selected_activity_rows >= activity_budget:
+        return wallets
+    needs_data_rows = _needs_data_low_value_wallet_rows(conn, limit=remaining)
+    needs_data_wallets, _, _ = _select_prune_wallet_rows(
+        conn,
+        needs_data_rows,
+        limit=remaining,
+        max_activity_rows=max(0, activity_budget - selected_activity_rows),
+        allow_first_over_budget=not wallets,
+    )
+    wallets.extend(needs_data_wallets)
+    return wallets
+
+
+def _all_low_value_prune_wallets(conn: sqlite3.Connection) -> list[str]:
+    """Return the exact full backlog eligible for summary-only retention."""
+
+    wallets: list[str] = []
+    seen: set[str] = set()
+    for row in (
+        *_terminal_low_value_wallet_rows(conn, limit=None),
+        *_needs_data_low_value_wallet_rows(conn, limit=None),
+    ):
+        address = str(row["address"]).lower()
+        if address in seen:
+            continue
+        seen.add(address)
+        wallets.append(address)
+    return wallets
+
+
+def _terminal_low_value_wallet_rows(
+    conn: sqlite3.Connection,
+    *,
+    limit: int | None,
+) -> list[sqlite3.Row]:
+    limit_sql = "" if limit is None else "LIMIT ?"
+    params: tuple[int, ...] = () if limit is None else (max(0, int(limit)),)
+    return conn.execute(
+        f"""
         SELECT cw.address
         FROM candidate_wallets cw
         LEFT JOIN wallet_registry wr
@@ -1983,25 +2919,21 @@ def _low_value_prune_wallets(
         ORDER BY
           cw.updated_at ASC,
           cw.address ASC
-        LIMIT ?
+        {limit_sql}
         """,
-        (limit,),
+        params,
     ).fetchall()
-    wallets, selected_activity_rows, budget_exhausted = _select_prune_wallet_rows(
-        conn,
-        terminal_rows,
-        limit=limit,
-        max_activity_rows=activity_budget,
-    )
-    if budget_exhausted:
-        return wallets
-    remaining = limit - len(wallets)
-    if remaining <= 0:
-        return wallets
-    if activity_budget and selected_activity_rows >= activity_budget:
-        return wallets
-    needs_data_rows = conn.execute(
-        """
+
+
+def _needs_data_low_value_wallet_rows(
+    conn: sqlite3.Connection,
+    *,
+    limit: int | None,
+) -> list[sqlite3.Row]:
+    limit_sql = "" if limit is None else "LIMIT ?"
+    params: tuple[int, ...] = () if limit is None else (max(0, int(limit)),)
+    return conn.execute(
+        f"""
         SELECT cw.address
         FROM candidate_wallets cw
         JOIN wallet_features wf
@@ -2016,7 +2948,7 @@ def _low_value_prune_wallets(
           AND wr.raw_pruned_at IS NULL
           AND ls.review_stage = 'needs_data'
           AND ls.leader_score = 0
-          AND instr(COALESCE(wf.extra_json, '{}'), 'feature_materializer_version') > 0
+          AND instr(COALESCE(wf.extra_json, '{{}}'), 'feature_materializer_version') > 0
           AND COALESCE(ebb.stage, '') IN (
               '',
               'light_done',
@@ -2045,19 +2977,10 @@ def _low_value_prune_wallets(
           END ASC,
           cw.updated_at ASC,
           cw.address ASC
-        LIMIT ?
+        {limit_sql}
         """,
-        (remaining,),
+        params,
     ).fetchall()
-    needs_data_wallets, _, _ = _select_prune_wallet_rows(
-        conn,
-        needs_data_rows,
-        limit=remaining,
-        max_activity_rows=max(0, activity_budget - selected_activity_rows),
-        allow_first_over_budget=not wallets,
-    )
-    wallets.extend(needs_data_wallets)
-    return wallets
 
 
 def _select_prune_wallet_rows(

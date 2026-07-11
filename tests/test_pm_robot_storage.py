@@ -125,6 +125,207 @@ def test_concurrent_migration_runners_apply_each_version_once(tmp_path):
     assert len(stored_versions) == max(len(result) for result in results)
 
 
+def test_failed_migration_restores_foreign_keys_and_rolls_back(tmp_path, monkeypatch):
+    import pm_robot.storage.db as db_module
+
+    migrations_dir = tmp_path / "migrations"
+    migrations_dir.mkdir()
+    (migrations_dir / "0001_failure.sql").write_text(
+        """
+        PRAGMA foreign_keys = OFF;
+        BEGIN IMMEDIATE;
+        CREATE TABLE partial_migration(id INTEGER PRIMARY KEY);
+        INSERT INTO missing_table(id) VALUES (1);
+        COMMIT;
+        PRAGMA foreign_keys = ON;
+        """,
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(db_module, "MIGRATIONS_DIR", migrations_dir)
+    conn = connect(tmp_path / "robot.sqlite")
+    try:
+        assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+
+        with pytest.raises(sqlite3.OperationalError, match="missing_table"):
+            run_migrations(conn)
+
+        assert conn.in_transaction is False
+        assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'partial_migration'"
+        ).fetchone() is None
+        assert conn.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+def test_retention_migrations_backfill_counts_and_compact_copy_links(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    wallets = {
+        "existing": "0x" + "1" * 40,
+        "missing": "0x" + "2" * 40,
+        "non_trade": "0x" + "3" * 40,
+        "empty": "0x" + "4" * 40,
+    }
+    try:
+        conn.executescript(
+            """
+            CREATE TABLE schema_migrations(
+                version INTEGER PRIMARY KEY,
+                applied_at INTEGER NOT NULL
+            );
+            CREATE TABLE candidate_wallets(address TEXT PRIMARY KEY);
+            CREATE TABLE wallet_activity(
+                activity_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                address TEXT NOT NULL,
+                activity_key TEXT NOT NULL,
+                timestamp INTEGER NOT NULL,
+                type TEXT NOT NULL
+            );
+            CREATE INDEX idx_wallet_activity_address_time
+                ON wallet_activity(address, timestamp DESC);
+            CREATE INDEX idx_wallet_activity_trade_address_time
+                ON wallet_activity(type, address, timestamp);
+            CREATE TABLE wallet_activity_watermarks(
+                address TEXT PRIMARY KEY,
+                newest_timestamp INTEGER NOT NULL DEFAULT 0,
+                newest_activity_key TEXT NOT NULL DEFAULT '',
+                updated_at INTEGER NOT NULL,
+                last_full_backfill_at INTEGER
+            );
+            CREATE TABLE copy_trade_links(
+                link_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                leader_wallet TEXT NOT NULL REFERENCES candidate_wallets(address) ON DELETE CASCADE,
+                follower_wallet TEXT NOT NULL REFERENCES candidate_wallets(address) ON DELETE CASCADE,
+                leader_activity_id INTEGER NOT NULL REFERENCES wallet_activity(activity_id) ON DELETE CASCADE,
+                follower_activity_id INTEGER NOT NULL REFERENCES wallet_activity(activity_id) ON DELETE CASCADE,
+                condition_id TEXT,
+                market_slug TEXT,
+                asset_id TEXT,
+                outcome TEXT,
+                side TEXT,
+                leader_ts INTEGER NOT NULL,
+                follower_ts INTEGER NOT NULL,
+                lag_seconds INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                UNIQUE(leader_activity_id, follower_activity_id)
+            );
+            CREATE INDEX idx_copy_trade_links_leader
+                ON copy_trade_links(leader_wallet, follower_wallet, follower_ts DESC);
+            CREATE INDEX idx_copy_trade_links_follower
+                ON copy_trade_links(follower_wallet, follower_ts DESC);
+            CREATE TABLE copy_pair_stats(
+                leader_wallet TEXT NOT NULL,
+                follower_wallet TEXT NOT NULL,
+                qualifies INTEGER NOT NULL,
+                PRIMARY KEY(leader_wallet, follower_wallet)
+            );
+            CREATE TABLE copy_backtest_trades(
+                backtest_trade_id INTEGER PRIMARY KEY,
+                leader_wallet TEXT NOT NULL,
+                follower_wallet TEXT,
+                link_id INTEGER REFERENCES copy_trade_links(link_id) ON DELETE SET NULL
+            );
+            """
+        )
+        conn.executemany(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (?, 1)",
+            ((version,) for version in range(1, 46)),
+        )
+        conn.executemany(
+            "INSERT INTO candidate_wallets(address) VALUES (?)",
+            ((wallet,) for wallet in wallets.values()),
+        )
+        conn.executemany(
+            """
+            INSERT INTO wallet_activity(address, activity_key, timestamp, type)
+            VALUES (?, ?, ?, ?)
+            """,
+            (
+                (wallets["existing"], "existing-trade-1", 10, "TRADE"),
+                (wallets["existing"], "existing-redeem", 20, "REDEEM"),
+                (wallets["existing"], "existing-trade-2", 30, "TRADE"),
+                (wallets["missing"], "missing-trade", 40, "TRADE"),
+                (wallets["non_trade"], "non-trade-redeem", 50, "REDEEM"),
+            ),
+        )
+        conn.executemany(
+            """
+            INSERT INTO wallet_activity_watermarks(
+                address, newest_timestamp, newest_activity_key, updated_at
+            ) VALUES (?, 0, 'stale', 1)
+            """,
+            ((wallets[name],) for name in ("existing", "empty")),
+        )
+        conn.executemany(
+            """
+            INSERT INTO copy_pair_stats(leader_wallet, follower_wallet, qualifies)
+            VALUES (?, ?, ?)
+            """,
+            (
+                (wallets["existing"], wallets["missing"], 1),
+                (wallets["existing"], wallets["non_trade"], 0),
+            ),
+        )
+        conn.executemany(
+            """
+            INSERT INTO copy_trade_links(
+                link_id, leader_wallet, follower_wallet,
+                leader_activity_id, follower_activity_id,
+                condition_id, market_slug, asset_id, outcome, side,
+                leader_ts, follower_ts, lag_seconds, created_at
+            ) VALUES (?, ?, ?, ?, ?, '', '', '', '', 'BUY', ?, ?, 5, 60)
+            """,
+            (
+                (101, wallets["existing"], wallets["missing"], 1, 4, 10, 15),
+                (102, wallets["existing"], wallets["non_trade"], 3, 5, 30, 35),
+            ),
+        )
+        conn.executemany(
+            """
+            INSERT INTO copy_backtest_trades(
+                backtest_trade_id, leader_wallet, follower_wallet, link_id
+            ) VALUES (?, ?, ?, ?)
+            """,
+            (
+                (1, wallets["existing"], wallets["missing"], 101),
+                (2, wallets["existing"], wallets["non_trade"], 102),
+            ),
+        )
+        conn.commit()
+
+        assert run_migrations(conn) == [46, 47, 48]
+        counts = {
+            row["address"]: int(row["trade_count"])
+            for row in conn.execute(
+                "SELECT address, trade_count FROM wallet_activity_watermarks"
+            )
+        }
+
+        assert counts == {
+            wallets["existing"]: 2,
+            wallets["missing"]: 1,
+            wallets["non_trade"]: 0,
+            wallets["empty"]: 0,
+        }
+        assert [
+            (int(row["link_id"]), str(row["follower_wallet"]))
+            for row in conn.execute(
+                "SELECT link_id, follower_wallet FROM copy_trade_links ORDER BY link_id"
+            )
+        ] == [(101, wallets["missing"])]
+        assert [
+            (int(row["backtest_trade_id"]), row["link_id"])
+            for row in conn.execute(
+                "SELECT backtest_trade_id, link_id FROM copy_backtest_trades ORDER BY backtest_trade_id"
+            )
+        ] == [(1, 101), (2, None)]
+        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+        assert run_migrations(conn) == []
+    finally:
+        conn.close()
+
+
 def test_runtime_heartbeat_lock_failure_cannot_rollback_committed_wallet_data(tmp_path):
     db_path = tmp_path / "robot.sqlite"
     conn = connect(db_path)
@@ -456,6 +657,53 @@ def test_persist_wallet_activity_hashes_keys_and_skips_legacy_duplicates(tmp_pat
         assert key.startswith("sha256:")
         assert watermark["newest_timestamp"] == 1_000
         assert watermark["newest_activity_key"].startswith("sha256:")
+        assert watermark["trade_count"] == 2
+    finally:
+        conn.close()
+
+
+def test_noop_activity_reingest_does_not_dirty_evidence_timestamps(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    wallet = "0x" + "e" * 40
+    event = {
+        "timestamp": 1_000,
+        "conditionId": "condition-1",
+        "slug": "market-1",
+        "asset": "asset-1",
+        "type": "TRADE",
+        "side": "BUY",
+        "price": 0.5,
+        "size": 10,
+        "usdcSize": 5,
+        "transactionHash": "0xnoop",
+    }
+    try:
+        run_migrations(conn)
+        upsert_candidate(conn, CandidateAddress(address=wallet, sources="test"))
+        assert persist_wallet_activity(conn, wallet, [event], ingested_at=2_000) == 1
+        first_watermark_updated = conn.execute(
+            "SELECT updated_at FROM wallet_activity_watermarks WHERE address = ?",
+            (wallet,),
+        ).fetchone()[0]
+        first_candidate_updated = conn.execute(
+            "SELECT updated_at FROM candidate_wallets WHERE address = ?",
+            (wallet,),
+        ).fetchone()[0]
+
+        assert persist_wallet_activity(conn, wallet, [event], ingested_at=2_100) == 0
+        watermark = conn.execute(
+            "SELECT trade_count, updated_at FROM wallet_activity_watermarks WHERE address = ?",
+            (wallet,),
+        ).fetchone()
+        candidate = conn.execute(
+            "SELECT updated_at, last_ingested_at FROM candidate_wallets WHERE address = ?",
+            (wallet,),
+        ).fetchone()
+
+        assert watermark["trade_count"] == 1
+        assert watermark["updated_at"] == first_watermark_updated
+        assert candidate["updated_at"] == first_candidate_updated
+        assert candidate["last_ingested_at"] == 2_100
     finally:
         conn.close()
 

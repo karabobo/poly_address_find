@@ -16,7 +16,10 @@ from pm_robot.orchestration.feature_materializer import materialize_wallet_featu
 from pm_robot.orchestration.review_pipeline import apply_paper_evidence_guard
 from pm_robot.pipeline_terms import PipelineJobType
 from pm_robot.research.copy_backtest import backtest_copy_stream_for_leaders
-from pm_robot.research.copy_graph import mine_copy_graph_for_leaders
+from pm_robot.research.copy_graph import (
+    mine_copy_graph_for_leaders,
+    prune_unqualified_copy_links_for_leaders,
+)
 from pm_robot.research.scoring import score_candidate
 from pm_robot.storage.db import retry_sqlite_locked
 from pm_robot.storage.repository import (
@@ -321,6 +324,11 @@ def run_copyability_evidence_worker(
                     now=now,
                     commit=True,
                 )
+                raw_links_pruned = prune_unqualified_copy_links_for_leaders(
+                    conn,
+                    [wallet],
+                    commit=True,
+                )
                 # Graph and backtest refreshes are idempotent replacements. Commit each
                 # phase so their CPU-heavy queries do not monopolize SQLite's writer lock.
                 _require_copyability_job_lease(
@@ -385,6 +393,7 @@ def run_copyability_evidence_worker(
                         "wallet": wallet,
                         "graph": graph.__dict__,
                         "backtest": backtest.__dict__,
+                        "raw_links_pruned": raw_links_pruned,
                         "features_materialized": materialized,
                         "score_written": scored,
                         "no_signal_blocked": no_signal_blocked,

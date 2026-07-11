@@ -35,6 +35,7 @@ def materialize_wallet_features(
     *,
     limit: int = 5,
     min_activity_events: int = 25,
+    commit_every: int = 10,
     now: int | None = None,
 ) -> FeatureMaterializeSummary:
     ts = now or int(time.time())
@@ -45,8 +46,7 @@ def materialize_wallet_features(
         now=ts,
     )
     updated = 0
-    error = ""
-    status = "ok"
+    errors: list[str] = []
     materialized: list[tuple[str, WalletFeatures]] = []
     for wallet in targets:
         try:
@@ -55,20 +55,20 @@ def materialize_wallet_features(
                 continue
             materialized.append((wallet, feature))
         except Exception as exc:
-            status = "partial"
-            error = f"{wallet}: {exc}"
-    if materialized:
+            errors.append(f"{wallet}: {exc}")
+    batch_size = max(1, int(commit_every))
+    for start in range(0, len(materialized), batch_size):
+        batch = materialized[start : start + batch_size]
         try:
-            _write_materialized_feature_batch(conn, materialized)
-            updated = len(materialized)
+            _write_materialized_feature_batch(conn, batch)
+            updated += len(batch)
         except Exception as exc:
-            status = "partial"
-            error = f"feature_batch: {exc}"
+            errors.append(f"feature_batch:{start // batch_size}: {exc}")
     return FeatureMaterializeSummary(
         wallets_attempted=len(targets),
         wallets_updated=updated,
-        status=status,
-        error=error,
+        status="partial" if errors else "ok",
+        error="; ".join(errors[:3]),
     )
 
 
@@ -139,8 +139,12 @@ def _write_with_retry(conn: sqlite3.Connection, operation, *, commit: bool = Tru
         return
 
     def _operation() -> None:
-        operation()
-        conn.commit()
+        try:
+            operation()
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
 
     retry_sqlite_locked(_operation, rollback=conn.rollback, attempts=4, sleep_seconds=2.0)
 
@@ -154,16 +158,11 @@ def _list_targets(
 ) -> list[str]:
     rows = conn.execute(
         """
-        WITH activity_counts AS (
-            SELECT address, COUNT(activity_id) AS activity_count
-            FROM wallet_activity
-            WHERE type = 'TRADE'
-            GROUP BY address
-        ), candidate_targets AS (
+        WITH candidate_targets AS (
             SELECT
                 cw.address,
                 COALESCE(ls.review_reason, '') AS review_reason,
-                COALESCE(ac.activity_count, 0) AS wallet_activity_count,
+                COALESCE(waw.trade_count, 0) AS wallet_activity_count,
                 COALESCE(pwq.total_roi, -999.0) AS paper_roi,
                 COALESCE(pwq.orders, 0) AS paper_orders,
                 COALESCE(pwq.settled_positions, 0) AS settled_positions,
@@ -194,8 +193,8 @@ def _list_targets(
               ON wps.wallet = cw.address
             LEFT JOIN evidence_backfill_budget ebb
               ON ebb.wallet = cw.address
-            LEFT JOIN activity_counts ac
-              ON ac.address = cw.address
+            LEFT JOIN wallet_activity_watermarks waw
+              ON waw.address = cw.address
             LEFT JOIN wallet_registry wr
               ON wr.address = cw.address
             WHERE cw.candidate_stage NOT IN ('rejected', 'blocked_hygiene', 'blocked_copyability')

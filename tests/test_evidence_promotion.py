@@ -3,6 +3,7 @@ import time
 
 from pm_robot.config import load_policy
 from pm_robot.models import CandidateAddress, CandidateStage, ScoreBreakdown, WalletFeatures
+import pm_robot.orchestration.evidence_promotion as evidence_promotion
 from pm_robot.orchestration.evidence_backfill import summarize_wallet_evidence
 from pm_robot.orchestration.evidence_promotion import promote_wallet_evidence
 from pm_robot.orchestration.feature_materializer import MATERIALIZER_VERSION
@@ -127,6 +128,95 @@ def test_light_done_requires_policy_materiality_before_medium(tmp_path):
         assert rows[approved]["stop_reason"].startswith("promotion_approved:medium_pending:")
         assert rows[deferred]["stage"] == EvidenceJobStage.LIGHT_DONE.value
         assert rows[deferred]["stop_reason"].startswith("promotion_deferred:medium_pending:")
+    finally:
+        conn.close()
+
+
+def test_promotion_computes_evidence_outside_write_transaction(tmp_path, monkeypatch):
+    conn = connect(tmp_path / "robot.sqlite")
+    wallets = ["0x" + digit * 40 for digit in ("a", "b")]
+    observed_transactions: list[bool] = []
+    original_summarize = evidence_promotion.summarize_wallet_evidence
+
+    def inspect_transaction(conn_arg, wallet):
+        observed_transactions.append(conn_arg.in_transaction)
+        return original_summarize(conn_arg, wallet)
+
+    try:
+        run_migrations(conn)
+        for wallet in wallets:
+            _seed_stage(
+                conn,
+                wallet,
+                stage=EvidenceJobStage.LIGHT_DONE.value,
+                activity_count=80,
+            )
+            _seed_ready_features(conn, wallet, 80)
+        conn.commit()
+        monkeypatch.setattr(
+            evidence_promotion,
+            "summarize_wallet_evidence",
+            inspect_transaction,
+        )
+
+        summary = promote_wallet_evidence(
+            conn,
+            policy_path=POLICY_PATH,
+            limit=10,
+            now=40_000,
+        )
+
+        assert summary.targets_seen == 2
+        assert observed_transactions == [False, False]
+    finally:
+        conn.close()
+
+
+def test_promotion_rolls_back_when_source_stage_changes(tmp_path, monkeypatch):
+    conn = connect(tmp_path / "robot.sqlite")
+    wallet = "0x" + "c" * 40
+    original_targets = evidence_promotion._promotion_targets
+
+    def change_stage_after_selection(conn_arg, **kwargs):
+        rows, waiting = original_targets(conn_arg, **kwargs)
+        conn_arg.execute(
+            "UPDATE evidence_backfill_budget SET stage = 'paused_test' WHERE wallet = ?",
+            (wallet,),
+        )
+        conn_arg.commit()
+        return rows, waiting
+
+    try:
+        run_migrations(conn)
+        _seed_stage(
+            conn,
+            wallet,
+            stage=EvidenceJobStage.LIGHT_DONE.value,
+            activity_count=80,
+        )
+        _seed_ready_features(conn, wallet, 80)
+        conn.commit()
+        monkeypatch.setattr(
+            evidence_promotion,
+            "_promotion_targets",
+            change_stage_after_selection,
+        )
+
+        summary = promote_wallet_evidence(
+            conn,
+            policy_path=POLICY_PATH,
+            limit=10,
+            now=40_000,
+        )
+        budget = conn.execute(
+            "SELECT stage FROM evidence_backfill_budget WHERE wallet = ?",
+            (wallet,),
+        ).fetchone()
+
+        assert summary.status == "partial"
+        assert "promotion_source_stage_changed" in summary.error
+        assert conn.in_transaction is False
+        assert budget["stage"] == "paused_test"
     finally:
         conn.close()
 

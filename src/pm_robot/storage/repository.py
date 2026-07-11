@@ -327,16 +327,15 @@ def list_activity_backfill_targets(
 ) -> list[str]:
     rows = conn.execute(
         """
-        SELECT cw.address, COUNT(wa.activity_id) AS raw_activity_count
+        SELECT cw.address, COALESCE(waw.trade_count, 0) AS raw_activity_count
         FROM candidate_wallets cw
-        LEFT JOIN wallet_activity wa
-          ON wa.address = cw.address
+        LEFT JOIN wallet_activity_watermarks waw
+          ON waw.address = cw.address
         LEFT JOIN wallet_registry wr
           ON wr.address = cw.address
         WHERE cw.candidate_stage NOT IN ('rejected', 'blocked_hygiene', 'blocked_copyability')
           AND COALESCE(wr.raw_retention_tier, '') != 'summary_only'
-        GROUP BY cw.address
-        HAVING raw_activity_count < ?
+          AND COALESCE(waw.trade_count, 0) < ?
         ORDER BY raw_activity_count ASC, COALESCE(cw.last_ingested_at, 0) ASC, cw.updated_at DESC
         LIMIT ?
         """,
@@ -485,10 +484,13 @@ def seed_missing_evidence_backfill_budgets(
     ts = now or int(time.time())
     rows = conn.execute(
         """
-        SELECT cw.address, cw.sources, COUNT(wa.activity_id) AS activity_count
+        SELECT
+            cw.address,
+            cw.sources,
+            COALESCE(waw.trade_count, 0) AS activity_count
         FROM candidate_wallets cw
-        LEFT JOIN wallet_activity wa
-          ON wa.address = cw.address
+        LEFT JOIN wallet_activity_watermarks waw
+          ON waw.address = cw.address
         LEFT JOIN evidence_backfill_budget ebb
           ON ebb.wallet = cw.address
         LEFT JOIN wallet_registry wr
@@ -497,7 +499,6 @@ def seed_missing_evidence_backfill_budgets(
           AND ebb.wallet IS NULL
           AND cw.candidate_stage NOT IN ('rejected', 'blocked_hygiene', 'blocked_copyability')
           AND COALESCE(wr.raw_retention_tier, '') != 'summary_only'
-        GROUP BY cw.address
         ORDER BY cw.updated_at DESC
         LIMIT ?
         """,
@@ -533,14 +534,14 @@ def list_evidence_backfill_targets(
             ebb.*,
             cw.candidate_stage,
             cw.sources,
-            COUNT(wa.activity_id) AS activity_count
+            COALESCE(waw.trade_count, 0) AS activity_count
         FROM evidence_backfill_budget ebb
         JOIN candidate_wallets cw
           ON cw.address = ebb.wallet
         LEFT JOIN wallet_registry wr
           ON wr.address = cw.address
-        LEFT JOIN wallet_activity wa
-          ON wa.address = ebb.wallet
+        LEFT JOIN wallet_activity_watermarks waw
+          ON waw.address = ebb.wallet
         WHERE ebb.stage = ?
           AND ebb.next_attempt_at <= ?
           AND (
@@ -549,7 +550,6 @@ def list_evidence_backfill_targets(
           )
           AND cw.candidate_stage NOT IN ('rejected', 'blocked_hygiene', 'blocked_copyability')
           AND COALESCE(wr.raw_retention_tier, '') != 'summary_only'
-        GROUP BY ebb.wallet
         ORDER BY ebb.priority ASC, ebb.updated_at ASC, ebb.wallet ASC
         LIMIT ?
         """,
@@ -589,17 +589,14 @@ def evidence_promotion_approval_is_current(
             wf.updated_at AS feature_updated_at,
             wf.extra_json AS feature_extra_json,
             COALESCE(ls.policy_version, '') AS latest_score_policy_version,
-            (
-                SELECT COUNT(*)
-                FROM wallet_activity wa
-                WHERE wa.address = ebb.wallet
-                  AND wa.type = 'TRADE'
-            ) AS raw_activity_count
+            COALESCE(waw.trade_count, 0) AS raw_activity_count
         FROM evidence_backfill_budget ebb
         LEFT JOIN wallet_features wf
           ON wf.address = ebb.wallet
         LEFT JOIN leader_latest_scores ls
           ON ls.address = ebb.wallet
+        LEFT JOIN wallet_activity_watermarks waw
+          ON waw.address = ebb.wallet
         WHERE ebb.wallet = ?
         """,
         (wallet.lower(),),
@@ -1850,9 +1847,15 @@ def _wallet_processing_state_ready(conn: sqlite3.Connection) -> bool:
 
 
 def _wallet_activity_count(conn: sqlite3.Connection, wallet: str) -> int:
+    row = conn.execute(
+        "SELECT trade_count FROM wallet_activity_watermarks WHERE address = ?",
+        (wallet.lower(),),
+    ).fetchone()
+    if row is not None:
+        return int(row["trade_count"] or 0)
     return int(
         conn.execute(
-            "SELECT COUNT(*) FROM wallet_activity WHERE address = ?",
+            "SELECT COUNT(*) FROM wallet_activity WHERE address = ? AND type = 'TRADE'",
             (wallet.lower(),),
         ).fetchone()[0]
     )
@@ -2388,10 +2391,28 @@ def persist_wallet_activity(
             [row[:2] + row[3:] for row in rows],
         )
     inserted = conn.total_changes - before_insert
-    update_activity_watermark(conn, address, events, updated_at=ingested_at)
+    trade_count = int(
+        conn.execute(
+            "SELECT COUNT(*) FROM wallet_activity WHERE address = ? AND type = 'TRADE'",
+            (address,),
+        ).fetchone()[0]
+    )
+    update_activity_watermark(
+        conn,
+        address,
+        events,
+        updated_at=ingested_at,
+        trade_count=trade_count,
+        evidence_changed=inserted > 0,
+    )
     conn.execute(
-        "UPDATE candidate_wallets SET last_ingested_at = ?, updated_at = ? WHERE address = ?",
-        (ingested_at, ingested_at, address),
+        """
+        UPDATE candidate_wallets
+        SET last_ingested_at = ?,
+            updated_at = CASE WHEN ? > 0 THEN ? ELSE updated_at END
+        WHERE address = ?
+        """,
+        (ingested_at, inserted, ingested_at, address),
     )
     if commit:
         conn.commit()
@@ -2415,14 +2436,19 @@ def _raw_evidence_write_suppressed(conn: sqlite3.Connection, address: str) -> bo
 def activity_watermark(conn: sqlite3.Connection, address: str) -> dict[str, Any]:
     row = conn.execute(
         """
-        SELECT newest_timestamp, newest_activity_key, last_full_backfill_at
+        SELECT newest_timestamp, newest_activity_key, trade_count, last_full_backfill_at
         FROM wallet_activity_watermarks
         WHERE address = ?
         """,
         (address.lower(),),
     ).fetchone()
     if not row:
-        return {"newest_timestamp": 0, "newest_activity_key": "", "last_full_backfill_at": None}
+        return {
+            "newest_timestamp": 0,
+            "newest_activity_key": "",
+            "trade_count": 0,
+            "last_full_backfill_at": None,
+        }
     return dict(row)
 
 
@@ -2432,6 +2458,8 @@ def update_activity_watermark(
     events: list[dict[str, Any]],
     *,
     updated_at: int,
+    trade_count: int,
+    evidence_changed: bool = True,
 ) -> None:
     address = address.lower()
     newest_ts = 0
@@ -2442,36 +2470,92 @@ def update_activity_watermark(
         if timestamp > newest_ts:
             newest_ts = timestamp
             newest_key = key
-    if newest_ts <= 0:
-        conn.execute(
-            """
-            INSERT INTO wallet_activity_watermarks(address, updated_at)
-            VALUES (?, ?)
-            ON CONFLICT(address) DO UPDATE SET updated_at = excluded.updated_at
-            """,
-            (address, updated_at),
-        )
-        return
     conn.execute(
         """
         INSERT INTO wallet_activity_watermarks(
-            address, newest_timestamp, newest_activity_key, updated_at
-        ) VALUES (?, ?, ?, ?)
+            address, newest_timestamp, newest_activity_key, trade_count, updated_at
+        ) VALUES (?, ?, ?, ?, ?)
         ON CONFLICT(address) DO UPDATE SET
             newest_timestamp = CASE
-                WHEN excluded.newest_timestamp > wallet_activity_watermarks.newest_timestamp
+                WHEN ? = 1
+                 AND excluded.newest_timestamp > wallet_activity_watermarks.newest_timestamp
                 THEN excluded.newest_timestamp
                 ELSE wallet_activity_watermarks.newest_timestamp
             END,
             newest_activity_key = CASE
-                WHEN excluded.newest_timestamp >= wallet_activity_watermarks.newest_timestamp
+                WHEN ? = 1
+                 AND excluded.newest_timestamp >= wallet_activity_watermarks.newest_timestamp
                 THEN excluded.newest_activity_key
                 ELSE wallet_activity_watermarks.newest_activity_key
             END,
-            updated_at = excluded.updated_at
+            trade_count = excluded.trade_count,
+            updated_at = CASE
+                WHEN ? = 1
+                  OR excluded.trade_count != wallet_activity_watermarks.trade_count
+                THEN excluded.updated_at
+                ELSE wallet_activity_watermarks.updated_at
+            END
         """,
-        (address, newest_ts, newest_key, updated_at),
+        (
+            address,
+            newest_ts,
+            newest_key,
+            max(0, int(trade_count)),
+            updated_at,
+            1 if evidence_changed else 0,
+            1 if evidence_changed else 0,
+            1 if evidence_changed else 0,
+        ),
     )
+
+
+def refresh_activity_watermark(conn: sqlite3.Connection, address: str, *, updated_at: int) -> int:
+    """Reconcile the exact raw-event watermark after direct retention deletes."""
+
+    address = address.lower()
+    row = conn.execute(
+        """
+        SELECT
+            SUM(CASE WHEN type = 'TRADE' THEN 1 ELSE 0 END) AS trade_count,
+            COALESCE(MAX(timestamp), 0) AS newest_timestamp
+        FROM wallet_activity
+        WHERE address = ?
+        """,
+        (address,),
+    ).fetchone()
+    trade_count = int(row["trade_count"] or 0)
+    newest_timestamp = int(row["newest_timestamp"] or 0)
+    newest = conn.execute(
+        """
+        SELECT activity_key
+        FROM wallet_activity
+        WHERE address = ?
+        ORDER BY timestamp DESC, activity_id DESC
+        LIMIT 1
+        """,
+        (address,),
+    ).fetchone()
+    newest_key = str(newest["activity_key"] or "") if newest else ""
+    conn.execute(
+        """
+        INSERT INTO wallet_activity_watermarks(
+            address, newest_timestamp, newest_activity_key, trade_count, updated_at
+        ) VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(address) DO UPDATE SET
+            newest_timestamp = excluded.newest_timestamp,
+            newest_activity_key = excluded.newest_activity_key,
+            trade_count = excluded.trade_count,
+            updated_at = CASE
+                WHEN excluded.newest_timestamp != wallet_activity_watermarks.newest_timestamp
+                  OR excluded.newest_activity_key != wallet_activity_watermarks.newest_activity_key
+                  OR excluded.trade_count != wallet_activity_watermarks.trade_count
+                THEN excluded.updated_at
+                ELSE wallet_activity_watermarks.updated_at
+            END
+        """,
+        (address, newest_timestamp, newest_key, trade_count, updated_at),
+    )
+    return trade_count
 
 
 def activity_event_key(event: dict[str, Any]) -> str:

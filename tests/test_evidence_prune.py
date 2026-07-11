@@ -115,6 +115,10 @@ def test_prune_evidence_dry_run_and_execute_low_value_only(tmp_path):
             "SELECT COUNT(*) FROM wallet_activity WHERE address = ?", (low,)
         ).fetchone()[0] == 2
         assert conn.execute(
+            "SELECT trade_count FROM wallet_activity_watermarks WHERE address = ?",
+            (low,),
+        ).fetchone()[0] == 2
+        assert conn.execute(
             "SELECT COUNT(*) FROM wallet_activity WHERE address = ?", (high,)
         ).fetchone()[0] == 5
         assert conn.execute(
@@ -303,6 +307,10 @@ def test_prune_terminal_wallet_freezes_summary_and_stops_automatic_work(tmp_path
         ).fetchone()[0] == 1
         assert conn.execute(
             "SELECT COUNT(*) FROM wallet_activity WHERE address = ?", (wallet,)
+        ).fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT trade_count FROM wallet_activity_watermarks WHERE address = ?",
+            (wallet,),
         ).fetchone()[0] == 0
         assert conn.execute(
             "SELECT COUNT(*) FROM copy_pair_stats WHERE follower_wallet = ?", (wallet,)

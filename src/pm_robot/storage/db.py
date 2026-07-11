@@ -11,17 +11,48 @@ from typing import Callable, Iterator, TypeVar
 
 MIGRATIONS_DIR = Path(__file__).resolve().parents[1] / "migrations"
 T = TypeVar("T")
+DATABASE_ACCESS_LOCK_SUFFIX = ".access.lock"
+
+
+class _AccessLockedConnection(sqlite3.Connection):
+    """SQLite connection that owns a shared database maintenance lock."""
+
+    _pm_robot_access_lock: object | None = None
+
+    def close(self) -> None:
+        lock_file = self._pm_robot_access_lock
+        self._pm_robot_access_lock = None
+        try:
+            super().close()
+        finally:
+            if lock_file is not None:
+                _release_database_access_lock(lock_file)
 
 
 def connect(db_path: Path, *, check_same_thread: bool = True) -> sqlite3.Connection:
     """Open a writable application connection."""
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(db_path, timeout=120, check_same_thread=check_same_thread)
-    conn.execute("PRAGMA busy_timeout = 120000")
-    conn.execute("PRAGMA synchronous = NORMAL")
-    conn.execute("PRAGMA foreign_keys = ON")
-    conn.row_factory = sqlite3.Row
-    return conn
+    access_lock = _acquire_database_access_lock(db_path, exclusive=False)
+    conn: _AccessLockedConnection | None = None
+    try:
+        conn = sqlite3.connect(
+            db_path,
+            timeout=120,
+            check_same_thread=check_same_thread,
+            factory=_AccessLockedConnection,
+        )
+        conn._pm_robot_access_lock = access_lock
+        conn.execute("PRAGMA busy_timeout = 120000")
+        conn.execute("PRAGMA synchronous = NORMAL")
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.row_factory = sqlite3.Row
+        return conn
+    except BaseException:
+        if conn is None:
+            _release_database_access_lock(access_lock)
+        else:
+            conn.close()
+        raise
 
 
 def is_sqlite_locked_error(exc: BaseException) -> bool:
@@ -68,28 +99,99 @@ def connect_readonly(
 ) -> sqlite3.Connection:
     """Open a query-only connection that cannot start write transactions."""
     uri = f"{db_path.resolve().as_uri()}?mode=ro"
-    conn = sqlite3.connect(
-        uri,
-        uri=True,
-        timeout=timeout_seconds,
-        check_same_thread=check_same_thread,
+    access_lock = _acquire_database_access_lock(
+        db_path,
+        exclusive=False,
+        timeout_seconds=max(0, timeout_seconds),
     )
-    conn.execute(f"PRAGMA busy_timeout = {max(timeout_seconds, 0) * 1000}")
-    conn.execute("PRAGMA query_only = ON")
-    conn.row_factory = sqlite3.Row
-    return conn
+    conn: _AccessLockedConnection | None = None
+    try:
+        conn = sqlite3.connect(
+            uri,
+            uri=True,
+            timeout=timeout_seconds,
+            check_same_thread=check_same_thread,
+            factory=_AccessLockedConnection,
+        )
+        conn._pm_robot_access_lock = access_lock
+        conn.execute(f"PRAGMA busy_timeout = {max(timeout_seconds, 0) * 1000}")
+        conn.execute("PRAGMA query_only = ON")
+        conn.row_factory = sqlite3.Row
+        return conn
+    except BaseException:
+        if conn is None:
+            _release_database_access_lock(access_lock)
+        else:
+            conn.close()
+        raise
 
 
 def initialize_database(db_path: Path) -> None:
     """Apply persistent SQLite settings during install or maintenance."""
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(db_path, timeout=120)
+    with database_access_guard(db_path, exclusive=False):
+        conn = sqlite3.connect(db_path, timeout=120)
+        try:
+            conn.execute("PRAGMA busy_timeout = 120000")
+            conn.execute("PRAGMA journal_mode = WAL")
+            conn.execute("PRAGMA synchronous = NORMAL")
+        finally:
+            conn.close()
+
+
+@contextlib.contextmanager
+def database_access_guard(
+    db_path: Path,
+    *,
+    exclusive: bool,
+    timeout_seconds: float = 120.0,
+) -> Iterator[None]:
+    """Coordinate ordinary connections with offline atomic database replacement."""
+
+    lock_file = _acquire_database_access_lock(
+        db_path,
+        exclusive=exclusive,
+        timeout_seconds=timeout_seconds,
+    )
     try:
-        conn.execute("PRAGMA busy_timeout = 120000")
-        conn.execute("PRAGMA journal_mode = WAL")
-        conn.execute("PRAGMA synchronous = NORMAL")
+        yield
     finally:
-        conn.close()
+        _release_database_access_lock(lock_file)
+
+
+def _acquire_database_access_lock(
+    db_path: Path,
+    *,
+    exclusive: bool,
+    timeout_seconds: float = 120.0,
+):
+    lock_path = Path(f"{db_path}{DATABASE_ACCESS_LOCK_SUFFIX}")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_file = lock_path.open("a+", encoding="utf-8")
+    operation = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+    deadline = time.monotonic() + max(0.0, timeout_seconds)
+    try:
+        while True:
+            try:
+                fcntl.flock(lock_file.fileno(), operation | fcntl.LOCK_NB)
+                return lock_file
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    mode = "exclusive" if exclusive else "shared"
+                    raise TimeoutError(
+                        f"timed out waiting for {mode} database access lock: {lock_path}"
+                    )
+                time.sleep(0.1)
+    except BaseException:
+        lock_file.close()
+        raise
+
+
+def _release_database_access_lock(lock_file) -> None:
+    try:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+    finally:
+        lock_file.close()
 
 
 def _migration_paths() -> list[tuple[int, Path]]:
@@ -108,6 +210,13 @@ def _applied_migration_versions(conn: sqlite3.Connection) -> set[int] | None:
     if table_exists is None:
         return None
     return {int(row[0]) for row in conn.execute("SELECT version FROM schema_migrations")}
+
+
+def pending_migration_versions(conn: sqlite3.Connection) -> list[int]:
+    """Return unapplied migration versions without changing the database."""
+
+    applied = _applied_migration_versions(conn) or set()
+    return [version for version, _path in _migration_paths() if version not in applied]
 
 
 @contextlib.contextmanager
@@ -157,12 +266,21 @@ def run_migrations(conn: sqlite3.Connection) -> list[int]:
         for version, path in migrations:
             if version in applied:
                 continue
-            conn.executescript(path.read_text(encoding="utf-8"))
-            conn.execute(
-                "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
-                (version, int(time.time())),
-            )
-            conn.commit()
+            foreign_keys = int(conn.execute("PRAGMA foreign_keys").fetchone()[0])
+            try:
+                conn.executescript(path.read_text(encoding="utf-8"))
+                conn.execute(
+                    "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+                    (version, int(time.time())),
+                )
+                conn.commit()
+            except BaseException:
+                conn.rollback()
+                raise
+            finally:
+                # A failed table-rebuild migration can stop before its final
+                # PRAGMA. Restore the connection's original integrity mode.
+                conn.execute(f"PRAGMA foreign_keys = {foreign_keys}")
             applied.add(version)
             newly_applied.append(version)
         return newly_applied

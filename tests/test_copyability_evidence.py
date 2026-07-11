@@ -1692,6 +1692,10 @@ def test_copyability_queue_refreshes_targeted_graph_backtest_and_features(tmp_pa
         assert summary.backtest_trades_written == 5
         assert summary.features_materialized == 1
         assert summary.scores_written == 1
+        assert conn.execute(
+            "SELECT COUNT(*) FROM copy_trade_links WHERE leader_wallet = ?",
+            (leader,),
+        ).fetchone()[0] == 5
         assert pair["qualifies"] == 1
         assert perf["backtest_trade_count"] == 5
         assert features[leader].copy_event_count == 5
@@ -1702,6 +1706,7 @@ def test_copyability_queue_refreshes_targeted_graph_backtest_and_features(tmp_pa
         assert latest_score["review_stage"]
         assert latest_score["review_reason"] != "watchlist_score"
         assert job_output["score_written"] is True
+        assert job_output["raw_links_pruned"] == 0
         assert after["statuses"] == [
             {"job_type": "copyability_evidence", "status": "done", "count": 1}
         ]

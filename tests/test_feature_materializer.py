@@ -254,6 +254,93 @@ def test_materialize_wallet_features_retries_locked_feature_write(tmp_path, monk
         conn.close()
 
 
+def test_materialize_wallet_features_preserves_successful_chunks(tmp_path, monkeypatch):
+    conn = connect(tmp_path / "robot.sqlite")
+    wallets = ["0x" + digit * 40 for digit in ("8", "9")]
+    attempts = {"count": 0}
+    original_write = feature_materializer._write_materialized_feature_batch
+
+    def fail_first_chunk(conn_arg, materialized):
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            raise sqlite3.OperationalError("database is locked")
+        original_write(conn_arg, materialized)
+
+    try:
+        run_migrations(conn)
+        for wallet in wallets:
+            _seed_wallet(conn, wallet)
+        monkeypatch.setattr(
+            feature_materializer,
+            "_write_materialized_feature_batch",
+            fail_first_chunk,
+        )
+
+        summary = materialize_wallet_features(
+            conn,
+            limit=2,
+            min_activity_events=25,
+            commit_every=1,
+            now=30_000,
+        )
+        features = get_wallet_features(conn)
+
+        assert attempts["count"] == 2
+        assert summary.wallets_attempted == 2
+        assert summary.wallets_updated == 1
+        assert summary.status == "partial"
+        assert sum(
+            features[wallet].extra.get("feature_materializer_version")
+            == feature_materializer.MATERIALIZER_VERSION
+            for wallet in wallets
+        ) == 1
+    finally:
+        conn.close()
+
+
+def test_materialize_wallet_features_rolls_back_failed_chunk(tmp_path, monkeypatch):
+    conn = connect(tmp_path / "robot.sqlite")
+    wallets = ["0x" + digit * 40 for digit in ("6", "7")]
+    original_upsert = feature_materializer.upsert_wallet_feature
+    writes = {"count": 0}
+
+    def fail_after_first_write(conn_arg, feature):
+        writes["count"] += 1
+        original_upsert(conn_arg, feature)
+        if writes["count"] == 2:
+            raise RuntimeError("synthetic batch failure")
+
+    try:
+        run_migrations(conn)
+        for wallet in wallets:
+            _seed_wallet(conn, wallet)
+        monkeypatch.setattr(
+            feature_materializer,
+            "upsert_wallet_feature",
+            fail_after_first_write,
+        )
+
+        summary = materialize_wallet_features(
+            conn,
+            limit=2,
+            min_activity_events=25,
+            commit_every=2,
+            now=30_000,
+        )
+        features = get_wallet_features(conn)
+
+        assert summary.wallets_updated == 0
+        assert summary.status == "partial"
+        assert conn.in_transaction is False
+        assert all(
+            features[wallet].extra.get("feature_materializer_version")
+            != feature_materializer.MATERIALIZER_VERSION
+            for wallet in wallets
+        )
+    finally:
+        conn.close()
+
+
 def test_materializer_refreshes_owned_values_but_preserves_external_override(tmp_path):
     conn = connect(tmp_path / "robot.sqlite")
     wallet = "0x" + "a" * 40

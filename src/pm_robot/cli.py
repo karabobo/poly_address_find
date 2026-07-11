@@ -14,6 +14,7 @@ from pm_robot.ops import (
     backup_database,
     build_winner_library,
     build_wallet_registry,
+    compact_low_value_evidence,
     dump_database_sql,
     maintenance,
     prune_low_value_evidence,
@@ -420,6 +421,7 @@ def main() -> int:
     cycle_cmd.add_argument("--copyability-rescan-seconds", type=int, default=21_600)
     cycle_cmd.add_argument("--feature-limit", type=int, default=10)
     cycle_cmd.add_argument("--feature-min-activity-events", type=int, default=25)
+    cycle_cmd.add_argument("--feature-commit-every", type=int, default=10)
     cycle_cmd.add_argument(
         "--evidence-promotion-limit",
         type=int,
@@ -465,6 +467,7 @@ def main() -> int:
     materialize_features_cmd.add_argument("--db", dest="command_db", default=None, help="SQLite database path")
     materialize_features_cmd.add_argument("--limit", type=int, default=5)
     materialize_features_cmd.add_argument("--min-activity-events", type=int, default=25)
+    materialize_features_cmd.add_argument("--commit-every", type=int, default=10)
 
     trade_roles_cmd = sub.add_parser(
         "ingest-trade-roles",
@@ -760,6 +763,17 @@ def main() -> int:
         "--archive-dir",
         default="",
         help="Parquet archive root; defaults to PM_ROBOT_ARCHIVE_DIR",
+    )
+
+    compact_cmd = sub.add_parser(
+        "compact-evidence",
+        help="Offline rebuild that removes all currently eligible low-value raw evidence",
+    )
+    compact_cmd.add_argument("--db", dest="command_db", default=None, help="SQLite database path")
+    compact_cmd.add_argument(
+        "--execute",
+        action="store_true",
+        help="Build, validate, and atomically replace the database; default is dry-run",
     )
 
     archive_status_cmd = sub.add_parser("archive-status", help="Print Parquet evidence archive status")
@@ -1289,6 +1303,7 @@ def main() -> int:
                     planner_lock_sleep_seconds=max(0.0, args.planner_lock_sleep_seconds),
                     feature_limit=args.feature_limit,
                     feature_min_activity_events=args.feature_min_activity_events,
+                    feature_commit_every=max(1, args.feature_commit_every),
                     evidence_promotion_limit=args.evidence_promotion_limit,
                     score_limit=args.score_limit,
                     run_scoring=not args.no_score,
@@ -1326,6 +1341,7 @@ def main() -> int:
                 conn,
                 limit=args.limit,
                 min_activity_events=args.min_activity_events,
+                commit_every=max(1, args.commit_every),
             )
         finally:
             conn.close()
@@ -1607,6 +1623,18 @@ def main() -> int:
             vacuum=args.vacuum,
             archive=args.archive,
             archive_dir=Path(args.archive_dir) if args.archive_dir else None,
+        )
+        print(json.dumps(data, ensure_ascii=False, indent=2))
+        return 0 if data["ok"] else 1
+    if args.command == "compact-evidence":
+        data = compact_low_value_evidence(
+            settings,
+            dry_run=not args.execute,
+            progress=lambda message: print(
+                json.dumps({"compact_progress": message}, ensure_ascii=False),
+                file=sys.stderr,
+                flush=True,
+            ),
         )
         print(json.dumps(data, ensure_ascii=False, indent=2))
         return 0 if data["ok"] else 1
