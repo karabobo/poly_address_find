@@ -25,7 +25,6 @@ from pm_robot.pipeline_terms import REVIEW_FUNNEL_CANDIDATE_STAGES
 from pm_robot.risk.eligibility import (
     paper_eligibility_status,
     publish_eligibility_status,
-    winner_library_eligibility_status,
 )
 from pm_robot.storage.repository import (
     evidence_backfill_summary,
@@ -57,9 +56,11 @@ def pipeline_smoothness_report(
 
     for row in rows:
         wallet = str(row["address"]).lower()
-        paper = paper_eligibility_status(conn, wallet)
-        publish = publish_eligibility_status(conn, wallet)
-        winner = winner_library_eligibility_status(conn, wallet)
+        facts = dict(row)
+        paper = paper_eligibility_status(conn, wallet, facts=facts)
+        publish = publish_eligibility_status(conn, wallet, facts=facts)
+        # Winner-library eligibility currently has the same gate as publish.
+        winner = publish
         paper_eligible += int(paper.eligible)
         publish_eligible += int(publish.eligible)
         winner_eligible += int(winner.eligible)
@@ -136,24 +137,7 @@ def _stage_counts(conn: sqlite3.Connection) -> dict[str, int]:
 def _eligibility_rows(conn: sqlite3.Connection, *, min_score: float) -> list[sqlite3.Row]:
     return conn.execute(
         f"""
-        WITH latest AS (
-            SELECT ls.*
-            FROM leader_scores ls
-            JOIN (
-                SELECT address, MAX(score_id) AS max_id
-                FROM leader_scores
-                GROUP BY address
-            ) latest_id
-              ON latest_id.address = ls.address
-             AND latest_id.max_id = ls.score_id
-        ),
-        trade_counts AS (
-            SELECT address, COUNT(*) AS trade_events
-            FROM wallet_activity
-            WHERE type = 'TRADE'
-            GROUP BY address
-        ),
-        active_jobs AS (
+        WITH active_jobs AS (
             SELECT wallet, job_type, GROUP_CONCAT(DISTINCT status) AS statuses
             FROM pipeline_jobs
             WHERE status IN ('queued', 'running', 'failed')
@@ -163,18 +147,43 @@ def _eligibility_rows(conn: sqlite3.Connection, *, min_score: float) -> list[sql
             cw.address,
             cw.candidate_stage,
             cw.updated_at,
-            COALESCE(latest.leader_score, 0) AS leader_score,
-            COALESCE(latest.review_reason, '') AS review_reason,
-            COALESCE(tc.trade_events, 0) AS trade_events,
+            COALESCE(ls.leader_score, 0) AS leader_score,
+            COALESCE(ls.review_reason, '') AS review_reason,
+            COALESCE((
+                SELECT COUNT(*)
+                FROM candidate_source_events cse
+                WHERE cse.address = cw.address
+            ), 0) AS source_count,
+            COALESCE((
+                SELECT COUNT(*)
+                FROM wallet_activity wa
+                WHERE wa.address = cw.address
+                  AND wa.type = 'TRADE'
+            ), 0) AS trade_events,
+            COALESCE(wf.copy_event_count, 0) AS copy_event_count,
+            COALESCE(wf.hygiene_status, '') AS hygiene_status,
+            wf.maker_fraction,
+            COALESCE(wf.edge_retention_pct, 0) AS edge_retention_pct,
+            COALESCE(wf.walk_forward_consistency_pct, 0) AS walk_forward_consistency_pct,
+            COALESCE(wf.extra_json, '{{}}') AS feature_extra_json,
+            COALESCE(pwq.production_ready, 0) AS production_ready,
+            COALESCE(pwq.blockers_json, '[]') AS paper_blockers_json,
+            wps.discovery_tier,
             COALESCE(wps.evidence_status, '') AS evidence_status,
+            COALESCE(wps.current_stage, '') AS current_stage,
+            COALESCE(wps.activity_count, 0) AS activity_count,
+            COALESCE(wps.distinct_markets, 0) AS distinct_markets,
+            COALESCE(wps.non_fast_trade_count, 0) AS non_fast_trade_count,
             COALESCE(wps.next_action, '') AS next_action,
             COALESCE(wallet_job.statuses, '') AS wallet_pipeline_status,
             COALESCE(copy_job.statuses, '') AS copyability_status
         FROM candidate_wallets cw
-        LEFT JOIN latest
-          ON latest.address = cw.address
-        LEFT JOIN trade_counts tc
-          ON tc.address = cw.address
+        LEFT JOIN leader_latest_scores ls
+          ON ls.address = cw.address
+        LEFT JOIN wallet_features wf
+          ON wf.address = cw.address
+        LEFT JOIN paper_wallet_quality pwq
+          ON pwq.wallet = cw.address
         LEFT JOIN wallet_processing_state wps
           ON wps.wallet = cw.address
         LEFT JOIN active_jobs wallet_job
@@ -184,7 +193,7 @@ def _eligibility_rows(conn: sqlite3.Connection, *, min_score: float) -> list[sql
           ON copy_job.job_type = ?
          AND copy_job.wallet = cw.address
         WHERE cw.candidate_stage IN ({",".join("?" for _ in SMOOTHNESS_STAGES)})
-          AND COALESCE(latest.leader_score, 0) >= ?
+          AND COALESCE(ls.leader_score, 0) >= ?
         ORDER BY
             CASE cw.candidate_stage
                 WHEN 'live_eligible' THEN 0
@@ -193,8 +202,8 @@ def _eligibility_rows(conn: sqlite3.Connection, *, min_score: float) -> list[sql
                 WHEN 'needs_manual_review' THEN 3
                 ELSE 4
             END ASC,
-            COALESCE(latest.leader_score, 0) DESC,
-            COALESCE(tc.trade_events, 0) ASC,
+            COALESCE(ls.leader_score, 0) DESC,
+            trade_events ASC,
             cw.updated_at DESC,
             cw.address ASC
         """,

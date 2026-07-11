@@ -89,10 +89,15 @@ def paper_eligibility_status(
     return _deduped_result(reasons)
 
 
-def publish_eligibility_status(conn: sqlite3.Connection, wallet: str) -> EligibilityResult:
+def publish_eligibility_status(
+    conn: sqlite3.Connection,
+    wallet: str,
+    *,
+    facts: dict[str, Any] | sqlite3.Row | None = None,
+) -> EligibilityResult:
     """Return whether a wallet may be active in published research leaders."""
 
-    row = _wallet_eligibility_facts(conn, wallet)
+    row = _wallet_eligibility_facts(conn, wallet, facts=facts)
     reasons = list(paper_eligibility_status(conn, wallet, facts=row).reasons)
     stage = _text(row.get("candidate_stage")).lower()
     if stage != PUBLISHABLE_STAGE:
@@ -119,10 +124,15 @@ def publish_eligibility_status(conn: sqlite3.Connection, wallet: str) -> Eligibi
     return _deduped_result(reasons)
 
 
-def winner_library_eligibility_status(conn: sqlite3.Connection, wallet: str) -> EligibilityResult:
+def winner_library_eligibility_status(
+    conn: sqlite3.Connection,
+    wallet: str,
+    *,
+    facts: dict[str, Any] | sqlite3.Row | None = None,
+) -> EligibilityResult:
     """Return whether a wallet belongs in the filtered copyable-winner library."""
 
-    return publish_eligibility_status(conn, wallet)
+    return publish_eligibility_status(conn, wallet, facts=facts)
 
 
 def _wallet_eligibility_facts(

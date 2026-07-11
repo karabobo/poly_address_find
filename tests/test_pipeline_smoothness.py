@@ -128,6 +128,35 @@ def test_pipeline_smoothness_reports_eligibility_blockers_and_backlog(tmp_path):
         conn.close()
 
 
+def test_pipeline_smoothness_scopes_trade_counts_to_selected_wallets(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    wallet = "0x" + "4" * 40
+    try:
+        run_migrations(conn)
+        upsert_candidate(conn, CandidateAddress(address=wallet, sources="test_source"))
+        _score(conn, wallet, score=72, stage=CandidateStage.NEEDS_REVIEW, reason="watchlist_score")
+        persist_wallet_activity(conn, wallet, _trade_events(wallet, 3), ingested_at=20_000)
+        conn.commit()
+
+        statements: list[str] = []
+        conn.set_trace_callback(statements.append)
+        report = pipeline_smoothness_report(conn, top=10, min_score=40, now=50_100)
+        conn.set_trace_callback(None)
+
+        row = next(item for item in report["top_stuck_wallets"] if item["wallet"] == wallet)
+        assert row["trade_events"] == 3
+        eligibility_query = next(
+            statement
+            for statement in statements
+            if "WITH active_jobs AS" in statement and "AS trade_events" in statement
+        )
+        assert "LEFT JOIN leader_latest_scores" in eligibility_query
+        assert "WHERE wa.address = cw.address" in eligibility_query
+        assert "GROUP BY address" not in eligibility_query
+    finally:
+        conn.close()
+
+
 def _insert_l3_evidence(conn, wallet: str) -> None:
     conn.execute(
         """
