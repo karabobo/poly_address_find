@@ -20,7 +20,19 @@ PRUNE_ARCHIVE_ENABLED="${PM_ROBOT_RETENTION_ARCHIVE_ENABLED:-0}"
 PRUNE_REPORT_PATH="${PM_ROBOT_RETENTION_PRUNE_REPORT_PATH:-/app/reports/retention_prune_status.json}"
 PRUNE_CATCHUP_PASSES="${PM_ROBOT_RETENTION_CATCHUP_PASSES:-4}"
 PRUNE_CATCHUP_DELAY="${PM_ROBOT_RETENTION_CATCHUP_DELAY:-60}"
+PRUNE_CATCHUP_BACKLOG_ROWS="${PM_ROBOT_RETENTION_CATCHUP_BACKLOG_ROWS:-1000000}"
+PRUNE_HIGH_BACKLOG_INTERVAL="${PM_ROBOT_RETENTION_HIGH_BACKLOG_INTERVAL:-60}"
 PRUNE_CONTROL_LOCK_TIMEOUT="${PM_ROBOT_RETENTION_CONTROL_LOCK_TIMEOUT:-60}"
+
+case "$PRUNE_CATCHUP_BACKLOG_ROWS" in
+  ''|*[!0-9]*) PRUNE_CATCHUP_BACKLOG_ROWS=1000000 ;;
+esac
+case "$PRUNE_HIGH_BACKLOG_INTERVAL" in
+  ''|*[!0-9]*) PRUNE_HIGH_BACKLOG_INTERVAL=60 ;;
+esac
+if [ "$PRUNE_HIGH_BACKLOG_INTERVAL" -lt 30 ]; then
+  PRUNE_HIGH_BACKLOG_INTERVAL=30
+fi
 
 runtime_heartbeat() {
   name="$1"
@@ -70,6 +82,7 @@ while true; do
     fi
   fi
   prune_state=""
+  prune_backlog_rows=0
   if [ "$maintenance_ok" -eq 1 ] && [ "$PRUNE_ENABLED" = "1" ]; then
     archive_args="--no-archive"
     if [ "$PRUNE_ARCHIVE_ENABLED" = "1" ]; then
@@ -103,11 +116,20 @@ while true; do
         break
       fi
       prune_state="$(python -c 'import json, sys; print(json.load(open(sys.argv[1], encoding="utf-8")).get("state", ""))' "$PRUNE_REPORT_PATH" 2>/dev/null || true)"
+      prune_backlog_rows="$(python -c 'import json, sys; payload=json.load(open(sys.argv[1], encoding="utf-8")); print(max(0, int((payload.get("backlog_after") or {}).get("total_activity_rows") or 0)))' "$PRUNE_REPORT_PATH" 2>/dev/null || printf '0')"
       case "$prune_state" in
         inflow_outpacing_cleanup|yielded_to_research|retention_starved)
           if [ "$prune_pass" -lt "$PRUNE_CATCHUP_PASSES" ]; then
             echo "$(date -Iseconds) maintenance loop: retention ${prune_state}; retry in ${PRUNE_CATCHUP_DELAY}s"
             sleep "$PRUNE_CATCHUP_DELAY"
+          fi
+          ;;
+        draining)
+          if [ "$prune_backlog_rows" -gt "$PRUNE_CATCHUP_BACKLOG_ROWS" ] && [ "$prune_pass" -lt "$PRUNE_CATCHUP_PASSES" ]; then
+            echo "$(date -Iseconds) maintenance loop: retention backlog ${prune_backlog_rows} remains above ${PRUNE_CATCHUP_BACKLOG_ROWS}; retry in ${PRUNE_CATCHUP_DELAY}s"
+            sleep "$PRUNE_CATCHUP_DELAY"
+          else
+            break
           fi
           ;;
         *)
@@ -128,5 +150,10 @@ while true; do
     echo "$(date -Iseconds) maintenance loop: failed" >&2
     runtime_heartbeat loop_maintenance failed "maintenance failed"
   fi
-  sleep "$INTERVAL"
+  next_interval="$INTERVAL"
+  if [ "$maintenance_ok" -eq 1 ] && [ "$PRUNE_ENABLED" = "1" ] && [ "$prune_state" = "draining" ] && [ "$prune_backlog_rows" -gt "$PRUNE_CATCHUP_BACKLOG_ROWS" ]; then
+    next_interval="$PRUNE_HIGH_BACKLOG_INTERVAL"
+    echo "$(date -Iseconds) maintenance loop: retention backlog ${prune_backlog_rows} remains high; next cycle in ${next_interval}s"
+  fi
+  sleep "$next_interval"
 done

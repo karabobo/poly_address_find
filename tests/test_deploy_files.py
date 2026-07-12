@@ -104,6 +104,8 @@ def test_nas_retention_prune_is_bounded_and_staggered():
     assert "PM_ROBOT_RETENTION_CONTROL_LOCK_TIMEOUT=60" in env
     assert "PM_ROBOT_RETENTION_CATCHUP_PASSES=4" in env
     assert "PM_ROBOT_RETENTION_CATCHUP_DELAY=60" in env
+    assert "PM_ROBOT_RETENTION_CATCHUP_BACKLOG_ROWS=1000000" in env
+    assert "PM_ROBOT_RETENTION_HIGH_BACKLOG_INTERVAL=60" in env
     assert 'CLEANUP_BATCH_LIMIT="${PM_ROBOT_MAINTENANCE_CLEANUP_BATCH_LIMIT:-500}"' in loop
     assert 'PRUNE_BATCHES="${PM_ROBOT_RETENTION_PRUNE_BATCHES:-6}"' in loop
     assert 'PRUNE_LIMIT="${PM_ROBOT_RETENTION_PRUNE_LIMIT:-20}"' in loop
@@ -112,6 +114,14 @@ def test_nas_retention_prune_is_bounded_and_staggered():
     assert 'PRUNE_CONTROL_LOCK_TIMEOUT="${PM_ROBOT_RETENTION_CONTROL_LOCK_TIMEOUT:-60}"' in loop
     assert 'PRUNE_CATCHUP_PASSES="${PM_ROBOT_RETENTION_CATCHUP_PASSES:-4}"' in loop
     assert 'PRUNE_CATCHUP_DELAY="${PM_ROBOT_RETENTION_CATCHUP_DELAY:-60}"' in loop
+    assert (
+        'PRUNE_CATCHUP_BACKLOG_ROWS="${PM_ROBOT_RETENTION_CATCHUP_BACKLOG_ROWS:-1000000}"'
+        in loop
+    )
+    assert (
+        'PRUNE_HIGH_BACKLOG_INTERVAL="${PM_ROBOT_RETENTION_HIGH_BACKLOG_INTERVAL:-60}"'
+        in loop
+    )
     assert '--cleanup-batch-limit "$CLEANUP_BATCH_LIMIT"' in loop
     assert "retention-cycle" in loop
     assert '--batches "$PRUNE_BATCHES"' in loop
@@ -123,6 +133,11 @@ def test_nas_retention_prune_is_bounded_and_staggered():
     assert '--report-path "$PRUNE_REPORT_PATH"' in loop
     assert 'mv "$PRUNE_REPORT_TMP" "$PRUNE_REPORT_PATH"' not in loop
     assert "inflow_outpacing_cleanup|yielded_to_research|retention_starved" in loop
+    assert "retention backlog ${prune_backlog_rows} remains above" in loop
+    assert 'next_interval="$PRUNE_HIGH_BACKLOG_INTERVAL"' in loop
+    assert '[ "$prune_state" = "draining" ]' in loop
+    assert "*[!0-9]*) PRUNE_CATCHUP_BACKLOG_ROWS=1000000" in loop
+    assert 'if [ "$PRUNE_HIGH_BACKLOG_INTERVAL" -lt 30 ]' in loop
     assert 'sleep "$PRUNE_CATCHUP_DELAY"' in loop
     assert "--skip-cleanup" not in loop
 
@@ -146,7 +161,10 @@ import sys
 args = sys.argv[1:]
 if args and args[0] == "-c":
     payload = json.loads(pathlib.Path(args[-1]).read_text(encoding="utf-8"))
-    print(payload.get("state", ""))
+    if "total_activity_rows" in args[1]:
+        print((payload.get("backlog_after") or {{}}).get("total_activity_rows", 0))
+    else:
+        print(payload.get("state", ""))
 elif "runtime-heartbeat" in args:
     path = pathlib.Path(os.environ["HEARTBEAT_LOG"])
     with path.open("a", encoding="utf-8") as handle:
@@ -219,6 +237,148 @@ exit 99
     assert "runtime-heartbeat --name loop_maintenance --status failed" in heartbeat_log.read_text(
         encoding="utf-8"
     )
+
+
+@pytest.mark.parametrize(
+    (
+        "retention_state",
+        "backlog_rows",
+        "backlog_threshold",
+        "high_backlog_interval",
+        "exit_after_sleep",
+        "expected_retention_calls",
+        "expected_sleep_args",
+    ),
+    [
+        ("draining", 1_500_000, "1000000", 60, 4, 4, ["1", "1", "1", "60"]),
+        ("draining", 1_000_000, "1000000", 60, 1, 1, ["900"]),
+        (
+            "yielded_to_research",
+            1_500_000,
+            "1000000",
+            60,
+            4,
+            4,
+            ["1", "1", "1", "900"],
+        ),
+        ("draining", 1_500_000, "invalid", 0, 4, 4, ["1", "1", "1", "30"]),
+    ],
+)
+def test_nas_retention_catchup_is_adaptive_and_bounded(
+    tmp_path,
+    retention_state,
+    backlog_rows,
+    backlog_threshold,
+    high_backlog_interval,
+    exit_after_sleep,
+    expected_retention_calls,
+    expected_sleep_args,
+):
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    retention_report = tmp_path / "retention.json"
+    maintenance_report = tmp_path / "maintenance.json"
+    retention_counter = tmp_path / "retention.count"
+    sleep_counter = tmp_path / "sleep.count"
+    sleep_args_log = tmp_path / "sleep.args"
+
+    fake_python = fake_bin / "python"
+    fake_python.write_text(
+        f"""#!{sys.executable}
+import json
+import os
+import pathlib
+import sys
+
+args = sys.argv[1:]
+if args and args[0] == "-c":
+    payload = json.loads(pathlib.Path(args[-1]).read_text(encoding="utf-8"))
+    if "total_activity_rows" in args[1]:
+        print((payload.get("backlog_after") or {{}}).get("total_activity_rows", 0))
+    else:
+        print(payload.get("state", ""))
+elif "runtime-heartbeat" in args:
+    pass
+elif "retention-cycle" in args:
+    counter_path = pathlib.Path(os.environ["RETENTION_COUNTER"])
+    count = int(counter_path.read_text(encoding="utf-8")) if counter_path.exists() else 0
+    counter_path.write_text(str(count + 1), encoding="utf-8")
+    report_path = pathlib.Path(args[args.index("--report-path") + 1])
+    payload = {{
+        "ok": True,
+        "state": os.environ["RETENTION_STATE"],
+        "backlog_after": {{"total_wallets": 1, "total_activity_rows": int(os.environ["BACKLOG_ROWS"])}},
+        "storage": {{}},
+    }}
+    report_path.write_text(json.dumps(payload), encoding="utf-8")
+    print(json.dumps(payload))
+elif "maintenance" in args:
+    print(json.dumps({{"ok": True}}))
+else:
+    raise SystemExit("unexpected python invocation: " + " ".join(args))
+""",
+        encoding="utf-8",
+    )
+    fake_python.chmod(0o755)
+
+    fake_sleep = fake_bin / "sleep"
+    fake_sleep.write_text(
+        """#!/bin/sh
+printf '%s\n' "$1" >> "$SLEEP_ARGS_LOG"
+count=0
+if [ -f "$SLEEP_COUNTER" ]; then
+  count="$(cat "$SLEEP_COUNTER")"
+fi
+count=$((count + 1))
+printf '%s' "$count" > "$SLEEP_COUNTER"
+if [ "$count" -ge "$EXIT_AFTER_SLEEP" ]; then
+  exit 99
+fi
+exit 0
+""",
+        encoding="utf-8",
+    )
+    fake_sleep.chmod(0o755)
+
+    fake_date = fake_bin / "date"
+    fake_date.write_text("#!/bin/sh\nprintf '%s\n' '2026-07-12T00:00:00Z'\n", encoding="utf-8")
+    fake_date.chmod(0o755)
+
+    env = {
+        **os.environ,
+        "PATH": f"{fake_bin}:{os.environ.get('PATH', '')}",
+        "BACKLOG_ROWS": str(backlog_rows),
+        "EXIT_AFTER_SLEEP": str(exit_after_sleep),
+        "RETENTION_STATE": retention_state,
+        "RETENTION_COUNTER": str(retention_counter),
+        "SLEEP_ARGS_LOG": str(sleep_args_log),
+        "SLEEP_COUNTER": str(sleep_counter),
+        "PM_ROBOT_MAINTENANCE_START_DELAY": "0",
+        "PM_ROBOT_MAINTENANCE_INTERVAL": "900",
+        "PM_ROBOT_MAINTENANCE_REPORT_PATH": str(maintenance_report),
+        "PM_ROBOT_RETENTION_PRUNE_REPORT_PATH": str(retention_report),
+        "PM_ROBOT_RETENTION_CATCHUP_PASSES": "4",
+        "PM_ROBOT_RETENTION_CATCHUP_DELAY": "1",
+        "PM_ROBOT_RETENTION_CATCHUP_BACKLOG_ROWS": backlog_threshold,
+        "PM_ROBOT_RETENTION_HIGH_BACKLOG_INTERVAL": str(high_backlog_interval),
+    }
+    result = subprocess.run(
+        ["sh", "deploy/nas/maintenance-loop.sh"],
+        cwd=Path(__file__).resolve().parents[1],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert result.returncode == 99
+    assert int(retention_counter.read_text(encoding="utf-8")) == expected_retention_calls
+    assert sleep_args_log.read_text(encoding="utf-8").splitlines() == expected_sleep_args
+    expected_retries = expected_retention_calls - 1
+    expected_backlog_retries = expected_retries if retention_state == "draining" else 0
+    assert result.stdout.count("remains above") == expected_backlog_retries
+    expected_acceleration = retention_state == "draining" and backlog_rows > 1_000_000
+    assert ("remains high; next cycle" in result.stdout) is expected_acceleration
 
 
 def test_canonical_docs_describe_current_research_pipeline_only():
