@@ -97,6 +97,7 @@ def test_run_rtds_activity_discovery_writes_realtime_candidate(tmp_path):
         [
             "PONG",
             _rtds_message(wallet, "0x1", size=1200, price=0.5),
+            _rtds_message(wallet, "0x2", size=1200, price=0.5),
         ]
     )
     try:
@@ -106,7 +107,7 @@ def test_run_rtds_activity_discovery_writes_realtime_candidate(tmp_path):
             conn,
             min_trade_usdc=500,
             batch_size=1,
-            max_messages=1,
+            max_messages=2,
             reconnect_sleep=0,
             websocket_factory=lambda endpoint: ws,
         )
@@ -129,21 +130,22 @@ def test_run_rtds_activity_discovery_writes_realtime_candidate(tmp_path):
 
         assert summary.status == "ok"
         assert summary.connections_succeeded == 1
-        assert summary.messages_seen == 1
-        assert summary.trades_seen == 1
-        assert summary.trades_selected == 1
-        assert summary.batches_flushed == 1
+        assert summary.messages_seen == 2
+        assert summary.trades_seen == 2
+        assert summary.trades_selected == 2
+        assert summary.batches_flushed == 2
         assert summary.paper_activity_events_written == 0
         assert candidate["sources"] == "polymarket_rtds_activity"
         assert "realtime_trade_activity" in candidate["labels"]
         assert observed["recent_max_trade_usdc"] == 600
-        assert observed["promotion_reason"] == "single_trade_usdc>=100"
+        assert observed["recent_trade_count"] == 2
+        assert observed["promotion_reason"] == "recent_10_trade_usdc_total>=300"
         assert source is not None
         assert features.recent_30d_volume_usdc == 600
         assert heartbeat is not None
-        assert "messages=1" in heartbeat["error"]
-        assert "trades=1" in heartbeat["error"]
-        assert "selected=1" in heartbeat["error"]
+        assert "messages=2" in heartbeat["error"]
+        assert "trades=2" in heartbeat["error"]
+        assert "selected=2" in heartbeat["error"]
         assert "paper_events=0" in heartbeat["error"]
         assert any("activity" in item for item in ws.sent)
     finally:
@@ -180,9 +182,13 @@ def test_rtds_reconnects_when_heartbeat_frames_mask_an_idle_stream(monkeypatch, 
         assert summary.status == "partial"
         assert "rtds stream idle for 3.0s" in summary.error
         assert conn.execute(
-            "SELECT 1 FROM candidate_wallets WHERE address = ?",
+            "SELECT 1 FROM observed_wallets WHERE wallet = ?",
             (wallet,),
         ).fetchone() is not None
+        assert conn.execute(
+            "SELECT 1 FROM candidate_wallets WHERE address = ?",
+            (wallet,),
+        ).fetchone() is None
     finally:
         conn.close()
 
@@ -270,9 +276,13 @@ def test_rtds_flushes_pending_rows_before_idle_reconnect(monkeypatch, tmp_path):
         assert summary.messages_seen == 2
         assert summary.trades_selected == 2
         assert conn.execute(
-            "SELECT COUNT(*) FROM candidate_wallets WHERE address IN (?, ?)",
+            "SELECT COUNT(*) FROM observed_wallets WHERE wallet IN (?, ?)",
             (first_wallet, second_wallet),
         ).fetchone()[0] == 2
+        assert conn.execute(
+            "SELECT COUNT(*) FROM candidate_wallets WHERE address IN (?, ?)",
+            (first_wallet, second_wallet),
+        ).fetchone()[0] == 0
     finally:
         conn.close()
 

@@ -21,8 +21,9 @@ from pm_robot.storage.repository import (
 )
 
 OBSERVED_RECENT_TRADE_LIMIT = 10
-OBSERVED_SINGLE_TRADE_USDC_THRESHOLD = 100.0
+OBSERVED_REPEAT_TRADE_COUNT_THRESHOLD = 2
 OBSERVED_CUMULATIVE_USDC_THRESHOLD = 300.0
+OBSERVED_LARGE_SINGLE_TRADE_USDC_THRESHOLD = 5_000.0
 
 
 @dataclass(frozen=True)
@@ -576,11 +577,20 @@ def _observation_snapshot(recent_trades: list[dict[str, Any]], *, existing_row: 
 
 
 def _promotion_reason(observation: dict[str, Any], *, existing_candidate: bool) -> str:
+    """Require repeat activity before noisy trade streams create a new candidate."""
     if existing_candidate:
         return "existing_candidate"
-    if float(observation.get("recent_max_trade_usdc") or 0.0) >= OBSERVED_SINGLE_TRADE_USDC_THRESHOLD:
-        return f"single_trade_usdc>={int(OBSERVED_SINGLE_TRADE_USDC_THRESHOLD)}"
-    if float(observation.get("recent_usdc_total") or 0.0) >= OBSERVED_CUMULATIVE_USDC_THRESHOLD:
+    if (
+        float(observation.get("recent_max_trade_usdc") or 0.0)
+        >= OBSERVED_LARGE_SINGLE_TRADE_USDC_THRESHOLD
+    ):
+        return f"single_trade_usdc>={int(OBSERVED_LARGE_SINGLE_TRADE_USDC_THRESHOLD)}"
+    if (
+        int(observation.get("recent_trade_count") or 0)
+        >= OBSERVED_REPEAT_TRADE_COUNT_THRESHOLD
+        and float(observation.get("recent_usdc_total") or 0.0)
+        >= OBSERVED_CUMULATIVE_USDC_THRESHOLD
+    ):
         return f"recent_{OBSERVED_RECENT_TRADE_LIMIT}_trade_usdc_total>={int(OBSERVED_CUMULATIVE_USDC_THRESHOLD)}"
     return ""
 

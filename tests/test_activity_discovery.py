@@ -49,7 +49,7 @@ def _activity(wallet: str, tx: str, usdc: float, market: str = "market-1") -> di
     }
 
 
-def test_discover_activity_candidates_promotes_large_observed_trade(tmp_path):
+def test_discover_activity_candidates_keeps_one_off_trade_in_observation_pool(tmp_path):
     conn = connect(tmp_path / "robot.sqlite")
     wallet = "0x" + "1" * 40
     try:
@@ -73,31 +73,46 @@ def test_discover_activity_candidates_promotes_large_observed_trade(tmp_path):
         )
         row = conn.execute("SELECT * FROM candidate_wallets WHERE address = ?", (wallet,)).fetchone()
         observed = conn.execute("SELECT * FROM observed_wallets WHERE wallet = ?", (wallet,)).fetchone()
-        source = conn.execute(
-            "SELECT * FROM candidate_source_events WHERE address = ? AND source = 'polymarket_trades_global'",
-            (wallet,),
-        ).fetchone()
         budget = conn.execute(
             "SELECT * FROM evidence_backfill_budget WHERE wallet = ?",
             (wallet,),
         ).fetchone()
-        features = get_wallet_features(conn)[wallet]
 
         assert summary.status == "ok"
         assert summary.wallets_seen == 2
-        assert summary.candidates_inserted_or_updated == 1
+        assert summary.candidates_inserted_or_updated == 0
         assert summary.observed_wallets == 2
-        assert summary.promoted_wallets == 1
-        assert row["sources"] == "polymarket_trades_global"
-        assert "trade_activity_seed" in row["labels"]
+        assert summary.promoted_wallets == 0
+        assert row is None
         assert observed["recent_trade_count"] == 1
         assert observed["recent_max_trade_usdc"] == 120
-        assert observed["promotion_reason"] == "single_trade_usdc>=100"
-        assert source is not None
-        assert budget["stage"] == "light_pending"
-        assert budget["priority"] == 50
-        assert features.recent_30d_volume_usdc == 120
-        assert features.extra["activity_discovery"]["market_count"] == 1
+        assert observed["promotion_reason"] == ""
+        assert budget is None
+        assert wallet not in get_wallet_features(conn)
+    finally:
+        conn.close()
+
+
+def test_discover_activity_candidates_promotes_exceptionally_large_single_trade(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    wallet = "0x" + "1" * 40
+    try:
+        run_migrations(conn)
+        client = FakeGlobalActivityClient({0: [_activity(wallet, "0xlarge", 6_000)]})
+
+        summary = discover_activity_candidates(conn, pages=1, client=client)
+        candidate = conn.execute(
+            "SELECT sources FROM candidate_wallets WHERE address = ?",
+            (wallet,),
+        ).fetchone()
+        observed = conn.execute(
+            "SELECT promotion_reason FROM observed_wallets WHERE wallet = ?",
+            (wallet,),
+        ).fetchone()
+
+        assert summary.promoted_wallets == 1
+        assert candidate["sources"] == "polymarket_trades_global"
+        assert observed["promotion_reason"] == "single_trade_usdc>=5000"
     finally:
         conn.close()
 
@@ -111,8 +126,10 @@ def test_discover_activity_candidates_only_marks_promoted_after_candidate_insert
         client = FakeGlobalActivityClient(
             {
                 0: [
-                    _activity(promoted_wallet, "0x1", 150),
-                    _activity(observed_only_wallet, "0x2", 120),
+                    _activity(promoted_wallet, "0x1", 200),
+                    _activity(promoted_wallet, "0x2", 200),
+                    _activity(observed_only_wallet, "0x3", 180),
+                    _activity(observed_only_wallet, "0x4", 180),
                 ]
             }
         )
@@ -145,7 +162,7 @@ def test_discover_activity_candidates_only_marks_promoted_after_candidate_insert
         assert promoted_candidate is not None
         assert promoted["promoted_at"] is not None
         assert observed_only_candidate is None
-        assert observed_only["promotion_reason"] == "single_trade_usdc>=100"
+        assert observed_only["promotion_reason"] == "recent_10_trade_usdc_total>=300"
         assert observed_only["promoted_at"] is None
     finally:
         conn.close()
@@ -310,7 +327,7 @@ def test_discover_activity_candidates_reports_limited_when_global_activity_forbi
 def test_discovery_persists_successful_pages_before_shared_cooldown(tmp_path):
     conn = connect(tmp_path / "robot.sqlite")
     wallet = "0x" + "9" * 40
-    client = PartialRateLimitedActivityClient([_activity(wallet, "0xpartial", 150)])
+    client = PartialRateLimitedActivityClient([_activity(wallet, "0xpartial", 6_000)])
     try:
         run_migrations(conn)
         summary = discover_activity_candidates(
