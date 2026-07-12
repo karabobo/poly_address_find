@@ -39,6 +39,7 @@ from pm_robot.orchestration.copyability_evidence import (
     run_copyability_evidence_worker,
 )
 from pm_robot.orchestration.evidence_backfill import (
+    DATA_API_ACTIVITY_MAX_PAGE_LIMIT,
     plan_queued_evidence_backfill,
     prioritize_backfill_from_scores,
     queued_evidence_backfill_status,
@@ -343,7 +344,11 @@ def main() -> int:
     wallet_pipeline_worker_cmd.add_argument("--shard-index", type=int, required=True)
     wallet_pipeline_worker_cmd.add_argument("--shard-count", type=int, default=3)
     wallet_pipeline_worker_cmd.add_argument("--limit", type=int, default=8)
-    wallet_pipeline_worker_cmd.add_argument("--page-limit", type=int, default=200)
+    wallet_pipeline_worker_cmd.add_argument(
+        "--page-limit",
+        type=int,
+        default=DATA_API_ACTIVITY_MAX_PAGE_LIMIT,
+    )
     wallet_pipeline_worker_cmd.add_argument("--sleep", type=float, default=0.02)
     wallet_pipeline_worker_cmd.add_argument("--lease-seconds", type=int, default=900)
     wallet_pipeline_worker_cmd.add_argument(

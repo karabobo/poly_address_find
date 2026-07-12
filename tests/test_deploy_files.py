@@ -1,3 +1,7 @@
+import json
+import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -288,6 +292,8 @@ def test_nas_research_control_runs_ordered_cycle_with_sharded_workers():
     assert "runtime-status" in helper
     assert "PM_ROBOT_PIPELINE_WORKER_LIMIT=6" in env
     assert "PM_ROBOT_PIPELINE_WORKER_INTERVAL=60" in env
+    assert "PM_ROBOT_PIPELINE_WORKER_ACTIVE_INTERVAL=5" in env
+    assert "PM_ROBOT_PIPELINE_WORKER_PAGE_LIMIT=500" in env
     assert "PM_ROBOT_PIPELINE_PRIORITY_AGING_SECONDS=1800" in env
     assert "PM_ROBOT_RESEARCH_CONTROL_INTERVAL=300" in env
     assert "PM_ROBOT_PIPELINE_STATE_LIMIT=25" in env
@@ -318,9 +324,85 @@ def test_nas_research_control_runs_ordered_cycle_with_sharded_workers():
     assert "loop_research_control" in control
     assert "wallet-pipeline-worker" in worker
     assert "PM_ROBOT_PIPELINE_WORKER_INTERVAL:-60" in worker
+    assert "PM_ROBOT_PIPELINE_WORKER_ACTIVE_INTERVAL:-5" in worker
+    assert "PM_ROBOT_PIPELINE_WORKER_PAGE_LIMIT:-500" in worker
+    assert 'worker_state="$(printf' in worker
+    assert 'sleep_interval="$ACTIVE_INTERVAL"' in worker
+    assert 'sleep_interval="$INTERVAL"' in worker
     assert "--priority-aging-seconds \"$PRIORITY_AGING_SECONDS\"" in worker
     assert "sleep \"$INTERVAL\"" in control
-    assert "sleep \"$INTERVAL\"" in worker
+    assert "sleep \"$sleep_interval\"" in worker
+
+
+@pytest.mark.parametrize(
+    ("summary", "expected_interval", "expected_status"),
+    [
+        ({"status": "ok", "jobs_attempted": 3}, 5, "ok"),
+        ({"status": "ok", "jobs_attempted": 0}, 60, "ok"),
+        ({"status": "partial", "jobs_attempted": 1}, 60, "partial"),
+    ],
+)
+def test_nas_wallet_worker_loop_selects_busy_or_idle_interval(
+    tmp_path,
+    summary,
+    expected_interval,
+    expected_status,
+):
+    result = _run_nas_wallet_worker_once(tmp_path, json.dumps(summary))
+
+    assert result.returncode == 0, result.stderr
+    assert (
+        f"next poll in {expected_interval}s "
+        f"(status={expected_status}, jobs_attempted={summary['jobs_attempted']})"
+    ) in result.stdout
+
+
+def test_nas_wallet_worker_loop_reports_malformed_summary(tmp_path):
+    result = _run_nas_wallet_worker_once(tmp_path, "not-json")
+
+    assert result.returncode == 0
+    assert "invalid JSON summary; using idle interval" in result.stderr
+    assert "next poll in 60s (status=invalid, jobs_attempted=0)" in result.stdout
+
+
+def _run_nas_wallet_worker_once(tmp_path, worker_output):
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    python_wrapper = fake_bin / "python"
+    python_wrapper.write_text(
+        "#!/bin/sh\n"
+        "if [ \"$1\" = \"-m\" ]; then\n"
+        "  printf '%s\\n' \"$FAKE_WORKER_OUTPUT\"\n"
+        "  exit \"${FAKE_WORKER_EXIT:-0}\"\n"
+        "fi\n"
+        f'exec "{sys.executable}" "$@"\n',
+        encoding="utf-8",
+    )
+    python_wrapper.chmod(0o755)
+    date_wrapper = fake_bin / "date"
+    date_wrapper.write_text(
+        "#!/bin/sh\nprintf '%s\\n' '2026-07-12T09:00:00+08:00'\n",
+        encoding="utf-8",
+    )
+    date_wrapper.chmod(0o755)
+    env = {
+        **os.environ,
+        "PATH": f"{fake_bin}:{os.environ.get('PATH', '')}",
+        "FAKE_WORKER_OUTPUT": worker_output,
+        "PM_ROBOT_PIPELINE_SHARD_INDEX": "0",
+        "PM_ROBOT_PIPELINE_WORKER_RUN_ONCE": "1",
+        "PM_ROBOT_PIPELINE_WORKER_ACTIVE_INTERVAL": "5",
+        "PM_ROBOT_PIPELINE_WORKER_INTERVAL": "60",
+    }
+    return subprocess.run(
+        ["sh", "deploy/nas/wallet-pipeline-worker-loop.sh"],
+        cwd=Path(__file__).resolve().parents[1],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
 
 
 def test_nas_copyability_planner_enforces_active_queue_waterline():

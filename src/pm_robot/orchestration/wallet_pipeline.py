@@ -12,6 +12,7 @@ from typing import Any
 
 from pm_robot.clients.polymarket_public import PublicPolymarketClient
 from pm_robot.orchestration.evidence_backfill import (
+    DATA_API_ACTIVITY_MAX_PAGE_LIMIT,
     DEEP_DEPTH,
     LIGHT_DEPTH,
     MEDIUM_DEPTH,
@@ -231,7 +232,7 @@ def run_wallet_pipeline_worker(
     shard_index: int,
     shard_count: int,
     limit: int = 8,
-    page_limit: int = 200,
+    page_limit: int = DATA_API_ACTIVITY_MAX_PAGE_LIMIT,
     sleep_seconds: float = 0.02,
     lease_seconds: int = 900,
     priority_aging_seconds: int = DEFAULT_PIPELINE_PRIORITY_AGING_SECONDS,

@@ -6,6 +6,7 @@ from pm_robot.models import CandidateAddress, CandidateStage, ScoreBreakdown
 from pm_robot.pipeline_terms import EvidenceJobStage
 from pm_robot.orchestration.feature_materializer import MATERIALIZER_VERSION
 from pm_robot.orchestration.evidence_backfill import (
+    _fetch_activity_history,
     plan_queued_evidence_backfill,
     prioritize_backfill_from_scores,
     queued_evidence_backfill_status,
@@ -68,6 +69,43 @@ def _event(wallet: str, idx: int, *, market: str) -> dict:
         "usdcSize": 5,
         "transactionHash": f"0x{idx:064x}",
     }
+
+
+def test_activity_history_uses_one_request_for_light_depth():
+    wallet = "0x" + "1" * 40
+    rows = [_event(wallet, idx, market=f"politics-{idx % 4}") for idx in range(200)]
+    client = FakeEvidenceClient({wallet: rows})
+
+    result = _fetch_activity_history(
+        client,
+        wallet,
+        page_limit=500,
+        max_events=200,
+        sleep_seconds=0,
+    )
+
+    assert len(result) == 200
+    assert client.activity_calls == [(wallet, 200, 0)]
+
+
+def test_activity_history_clamps_page_size_to_data_api_limit():
+    wallet = "0x" + "2" * 40
+    rows = [_event(wallet, idx, market=f"politics-{idx % 4}") for idx in range(1_000)]
+    client = FakeEvidenceClient({wallet: rows})
+
+    result = _fetch_activity_history(
+        client,
+        wallet,
+        page_limit=1_000,
+        max_events=1_000,
+        sleep_seconds=0,
+    )
+
+    assert len(result) == 1_000
+    assert client.activity_calls == [
+        (wallet, 500, 0),
+        (wallet, 500, 500),
+    ]
 
 
 def test_evidence_backfill_promotes_diverse_light_wallet_to_medium(tmp_path):

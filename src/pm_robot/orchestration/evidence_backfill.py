@@ -45,6 +45,7 @@ from pm_robot.storage.repository import (
 LIGHT_DEPTH = 200
 MEDIUM_DEPTH = 1_000
 DEEP_DEPTH = 3_000
+DATA_API_ACTIVITY_MAX_PAGE_LIMIT = 500
 
 
 @dataclass(frozen=True)
@@ -692,7 +693,10 @@ def _fetch_activity_history(
 ) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     offset = 0
-    effective_page_limit = max(1, min(page_limit, max_events))
+    effective_page_limit = max(
+        1,
+        min(page_limit, max_events, DATA_API_ACTIVITY_MAX_PAGE_LIMIT),
+    )
     while len(out) < max_events:
         batch = client.activity(wallet, limit=effective_page_limit, offset=offset)
         if not batch:
