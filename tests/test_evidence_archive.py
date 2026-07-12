@@ -120,7 +120,7 @@ def test_verified_parquet_archive_precedes_sqlite_prune(tmp_path):
     assert result["deleted"]["wallet_activity"] == 5
     manifest_path = settings.archive_dir / result["archive"]["manifest_path"]
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    assert manifest["source_schema_version"] == 51
+    assert manifest["source_schema_version"] == 52
     assert manifest["prune_version"] == "v3_parquet_archive"
     assert manifest["compression"] == "zstd"
     activity_file = next(item for item in manifest["files"] if item["table_name"] == "wallet_activity")

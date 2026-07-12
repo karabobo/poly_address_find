@@ -218,7 +218,7 @@ def refresh_active_candidate_registry(
     *,
     limit: int = 500,
 ) -> dict[str, int]:
-    """Refresh compact summaries for active candidates without changing their stage."""
+    """Refresh compact summaries for active candidates and recent departures."""
 
     row_limit = max(1, int(limit))
     stage_placeholders = ", ".join("?" for _ in ACTIVE_CANDIDATE_REGISTRY_STAGES)
@@ -244,7 +244,10 @@ def refresh_active_candidate_registry(
           ON lp.wallet = cw.address
          AND lp.revoked_at IS NULL
          AND lp.expires_at > strftime('%s','now')
-        WHERE cw.candidate_stage IN ({stage_placeholders})
+        WHERE (
+              cw.candidate_stage IN ({stage_placeholders})
+              OR wr.candidate_stage IN ({stage_placeholders})
+          )
           AND (
               wr.address IS NULL
               OR (
@@ -285,7 +288,11 @@ def refresh_active_candidate_registry(
         ORDER BY COALESCE(wr.updated_at, 0) ASC, cw.updated_at ASC, cw.address ASC
         LIMIT ?
         """,
-        (*ACTIVE_CANDIDATE_REGISTRY_STAGES, row_limit),
+        (
+            *ACTIVE_CANDIDATE_REGISTRY_STAGES,
+            *ACTIVE_CANDIDATE_REGISTRY_STAGES,
+            row_limit,
+        ),
     ).fetchall()
     addresses = tuple(str(row["address"]) for row in rows)
     refreshed_rows = _materialize_wallet_registry(conn, addresses=addresses) if addresses else []
@@ -295,10 +302,13 @@ def refresh_active_candidate_registry(
         FROM candidate_wallets cw
         JOIN wallet_registry wr
           ON wr.address = cw.address
-        WHERE cw.candidate_stage IN ({stage_placeholders})
+        WHERE (
+              cw.candidate_stage IN ({stage_placeholders})
+              OR wr.candidate_stage IN ({stage_placeholders})
+          )
           AND wr.registry_status IN ('archive_pending', 'archived_raw_pruned')
         """,
-        ACTIVE_CANDIDATE_REGISTRY_STAGES,
+        (*ACTIVE_CANDIDATE_REGISTRY_STAGES, *ACTIVE_CANDIDATE_REGISTRY_STAGES),
     ).fetchone()
     return {
         "wallets_refreshed": len(refreshed_rows),

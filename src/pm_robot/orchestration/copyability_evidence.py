@@ -6,15 +6,18 @@ import hashlib
 import json
 import sqlite3
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
 from pm_robot.config import load_policy
-from pm_robot.models import CandidateAddress
+from pm_robot.models import CandidateAddress, CandidateStage
 from pm_robot.orchestration.feature_materializer import materialize_wallet_feature
 from pm_robot.orchestration.review_pipeline import apply_score_lifecycle_guards
-from pm_robot.pipeline_terms import PipelineJobType
+from pm_robot.pipeline_terms import (
+    COPYABILITY_DEEP_SCAN_UNVALIDATED_REASON,
+    PipelineJobType,
+)
 from pm_robot.research.copy_backtest import backtest_copy_stream_for_leaders
 from pm_robot.research.copy_graph import (
     mine_copy_graph_for_leaders,
@@ -344,6 +347,7 @@ def run_copyability_evidence_worker(
                     [wallet],
                     now=now,
                     commit=True,
+                    preserve_existing_on_empty=graph.qualified_pairs > 0,
                 )
                 _require_copyability_job_lease(
                     conn,
@@ -364,6 +368,9 @@ def run_copyability_evidence_worker(
                         wallet=wallet,
                         policy=policy,
                         policy_version=str(policy.get("version", "")),
+                        graph_scan_mode=graph_scan_mode,
+                        pair_stats_written=graph.pair_stats_written,
+                        qualified_pairs=graph.qualified_pairs,
                     )
                     if materialized
                     else False
@@ -533,6 +540,9 @@ def _score_wallet_after_copyability(
     wallet: str,
     policy: dict[str, Any],
     policy_version: str,
+    graph_scan_mode: str = "",
+    pair_stats_written: int = 0,
+    qualified_pairs: int = 0,
 ) -> bool:
     """Write a fresh score for the wallet whose copyability evidence just changed."""
 
@@ -564,6 +574,14 @@ def _score_wallet_after_copyability(
         score_candidate(candidate, _feature_from_row(feature_row), policy),
         policy,
     )
+    if (
+        str(graph_scan_mode or "default") in {"default", "deep"}
+        and int(pair_stats_written) > 0
+        and int(qualified_pairs) == 0
+        and score.stage == CandidateStage.NEEDS_DATA
+        and score.reason == "score_below_watchlist_after_evidence"
+    ):
+        score = replace(score, reason=COPYABILITY_DEEP_SCAN_UNVALIDATED_REASON)
     persist_score(conn, score, policy_version=policy_version)
     consume_fresh_score_actions(
         conn,
@@ -830,6 +848,10 @@ def _select_copyability_targets(
                             OR latest.review_reason LIKE '%copy_stream_roi%'
                         )
                     )
+                 OR (
+                        latest.review_stage = 'needs_data'
+                        AND latest.review_reason = '{COPYABILITY_DEEP_SCAN_UNVALIDATED_REASON}'
+                    )
               )
         ),
         eligible_candidates AS (
@@ -845,6 +867,21 @@ def _select_copyability_targets(
                             'live_eligible'
                         )
                         AND leader_score >= ?
+                    )
+                 OR (
+                        candidate_stage = 'needs_data'
+                        AND review_stage = 'needs_data'
+                        AND review_reason = '{COPYABILITY_DEEP_SCAN_UNVALIDATED_REASON}'
+                        AND leader_score >= ?
+                        AND existing_job_status = 'done'
+                        AND existing_scan_mode IN ('', 'default', 'deep')
+                        AND (
+                               COALESCE(feature_copy_event_count, 0) > 0
+                            OR COALESCE(feature_copy_market_count, 0) > 0
+                            OR COALESCE(feature_copy_candidate_pair_count, 0) > 0
+                            OR COALESCE(feature_copy_candidate_event_count, 0) > 0
+                            OR COALESCE(feature_copy_candidate_market_count, 0) > 0
+                        )
                     )
                  OR (
                         candidate_stage = 'needs_manual_review'
@@ -1009,6 +1046,7 @@ def _select_copyability_targets(
             SUBJECT_KEY,
             *normalized_addresses,
             int(min_activity_events),
+            float(min_score),
             float(min_score),
             LIGHT_NO_SIGNAL_DEEP_RESCAN_MIN_SCORE,
             now,

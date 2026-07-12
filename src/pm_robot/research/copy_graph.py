@@ -11,7 +11,11 @@ from typing import Any
 
 from pm_robot.config import threshold
 from pm_robot.models import WalletFeatures
+from pm_robot.orchestration.evidence_readiness import paper_evidence_ready_sql
 from pm_robot.storage.repository import _feature_from_row, upsert_wallet_feature
+
+
+SQLITE_IN_CHUNK_SIZE = 400
 
 
 @dataclass(frozen=True)
@@ -441,6 +445,7 @@ def _build_pair_stats(
         (row["leader_wallet"], row["follower_wallet"]): int(row["copy_events"])
         for row in forward_rows
     }
+    evidence_ready_followers = _deep_evidence_ready_wallets(conn)
 
     out: list[tuple[Any, ...]] = []
     for row in forward_rows:
@@ -463,8 +468,10 @@ def _build_pair_stats(
         reverse_events = reverse_counts.get((follower, leader), 0)
         precedes = copy_events / (copy_events + reverse_events) if copy_events + reverse_events else 0.0
         lags = [int(x) for x in str(row["lags"] or "").split(",") if x != ""]
+        # A partial follower history makes the containment denominator unstable.
         qualifies = int(
-            copy_events >= min_events
+            str(follower) in evidence_ready_followers
+            and copy_events >= min_events
             and copy_markets >= min_markets
             and containment >= min_containment
             and precedes >= min_precedes
@@ -566,6 +573,7 @@ def _build_pair_stats_for_leaders(
                 reverse_counts.get(key, 0),
                 int(row["copy_event_count"] or 0),
             )
+    evidence_ready_followers = _deep_evidence_ready_wallets(conn, followers)
 
     out: list[tuple[Any, ...]] = []
     for row in forward_rows:
@@ -585,8 +593,10 @@ def _build_pair_stats_for_leaders(
         reverse_events = reverse_counts.get((follower, leader), 0)
         precedes = copy_events / (copy_events + reverse_events) if copy_events + reverse_events else 0.0
         lags = [int(x) for x in str(row["lags"] or "").split(",") if x != ""]
+        # A partial follower history makes the containment denominator unstable.
         qualifies = int(
-            copy_events >= min_events
+            follower in evidence_ready_followers
+            and copy_events >= min_events
             and copy_markets >= min_markets
             and containment >= min_containment
             and precedes >= min_precedes
@@ -608,6 +618,40 @@ def _build_pair_stats_for_leaders(
             )
         )
     return out
+
+
+def _deep_evidence_ready_wallets(
+    conn: sqlite3.Connection,
+    wallets: list[str] | None = None,
+) -> set[str]:
+    """Return followers whose retained history can support a stable denominator."""
+
+    readiness_sql = paper_evidence_ready_sql("wps")
+    if wallets is None:
+        rows = conn.execute(
+            f"""
+            SELECT wps.wallet
+            FROM wallet_processing_state AS wps
+            WHERE {readiness_sql}
+            """
+        ).fetchall()
+        return {str(row["wallet"]) for row in rows}
+
+    ready_wallets: set[str] = set()
+    normalized_wallets = _normalize_wallets(wallets)
+    for offset in range(0, len(normalized_wallets), SQLITE_IN_CHUNK_SIZE):
+        chunk = normalized_wallets[offset : offset + SQLITE_IN_CHUNK_SIZE]
+        rows = conn.execute(
+            f"""
+            SELECT wps.wallet
+            FROM wallet_processing_state AS wps
+            WHERE wps.wallet IN ({_placeholders(chunk)})
+              AND {readiness_sql}
+            """,
+            tuple(chunk),
+        ).fetchall()
+        ready_wallets.update(str(row["wallet"]) for row in rows)
+    return ready_wallets
 
 
 def _build_leader_stats(conn: sqlite3.Connection, now: int) -> list[tuple[Any, ...]]:

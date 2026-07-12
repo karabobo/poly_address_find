@@ -70,6 +70,7 @@ CANDIDATE_STAGES = tuple(stage.value for stage in CandidateStage)
 
 EVIDENCE_PROMOTION_APPROVAL_PREFIX = "promotion_approved"
 EVIDENCE_PROMOTION_DEFERRED_PREFIX = "promotion_deferred"
+COPYABILITY_DEEP_SCAN_UNVALIDATED_REASON = "copyability_deep_scan_unvalidated"
 
 
 def evidence_promotion_approval_reason(

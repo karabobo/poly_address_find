@@ -2,7 +2,7 @@ from pathlib import Path
 
 from pm_robot.config import load_policy
 from pm_robot.models import CandidateAddress
-from pm_robot.research.copy_backtest import backtest_copy_stream
+from pm_robot.research.copy_backtest import backtest_copy_stream, backtest_copy_stream_for_leaders
 from pm_robot.research.copy_graph import (
     mine_copy_graph,
     mine_copy_graph_for_leaders,
@@ -15,6 +15,28 @@ from pm_robot.storage.repository import (
     rebuild_wallet_episodes,
     upsert_candidate,
 )
+
+
+def _mark_deep_evidence_ready(conn, wallet: str) -> None:
+    activity_count = conn.execute(
+        "SELECT COUNT(*) FROM wallet_activity WHERE address = ?",
+        (wallet,),
+    ).fetchone()[0]
+    conn.execute(
+        """
+        INSERT INTO wallet_processing_state(
+            wallet, discovery_tier, evidence_status, current_stage,
+            activity_count, updated_at
+        ) VALUES (?, 'l3_deep', 'summary_ready', 'deep_done', ?, 1)
+        ON CONFLICT(wallet) DO UPDATE SET
+            discovery_tier = excluded.discovery_tier,
+            evidence_status = excluded.evidence_status,
+            current_stage = excluded.current_stage,
+            activity_count = excluded.activity_count,
+            updated_at = excluded.updated_at
+        """,
+        (wallet, activity_count),
+    )
 
 
 def test_mine_copy_graph_promotes_qualified_leader(tmp_path):
@@ -56,6 +78,7 @@ def test_mine_copy_graph_promotes_qualified_leader(tmp_path):
             follower_events.append(copied)
         persist_wallet_activity(conn, leader, leader_events, ingested_at=2_000)
         persist_wallet_activity(conn, follower, follower_events, ingested_at=2_000)
+        _mark_deep_evidence_ready(conn, follower)
         rebuild_wallet_episodes(conn, leader)
 
         summary = mine_copy_graph(conn, load_policy(Path("config/leader_scoring_policy.json")))
@@ -124,6 +147,7 @@ def test_mine_copy_graph_allows_multi_strategy_followers(tmp_path):
             )
         persist_wallet_activity(conn, leader, leader_events, ingested_at=2_000)
         persist_wallet_activity(conn, follower, follower_events, ingested_at=2_000)
+        _mark_deep_evidence_ready(conn, follower)
 
         summary = mine_copy_graph(conn, load_policy(Path("config/leader_scoring_policy.json")))
         pair = conn.execute(
@@ -185,6 +209,7 @@ def test_backtest_copy_stream_merges_positive_roi(tmp_path):
             follower_events.append(copied)
         persist_wallet_activity(conn, leader, leader_events, ingested_at=20_000)
         persist_wallet_activity(conn, follower, follower_events, ingested_at=20_000)
+        _mark_deep_evidence_ready(conn, follower)
         rebuild_wallet_episodes(conn, leader)
         mine_copy_graph(conn, policy)
 
@@ -199,6 +224,101 @@ def test_backtest_copy_stream_merges_positive_roi(tmp_path):
         assert features[leader].edge_retention_pct > 0
         assert features[leader].walk_forward_consistency_pct == 100
         assert features[leader].survival_score == 100
+    finally:
+        conn.close()
+
+
+def test_targeted_backtest_preserves_last_good_result_when_no_new_settlement(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    leader = "0x" + "3" * 40
+    follower = "0x" + "4" * 40
+    policy = load_policy(Path("config/leader_scoring_policy.json"))
+    try:
+        run_migrations(conn)
+        upsert_candidate(conn, CandidateAddress(address=leader, sources="test"))
+        upsert_candidate(conn, CandidateAddress(address=follower, sources="test"))
+        leader_events = []
+        follower_events = []
+        for idx in range(5):
+            opened = {
+                "timestamp": 20_000 + idx * 100,
+                "conditionId": f"condition-{idx}",
+                "eventSlug": f"event-{idx}",
+                "slug": f"market-{idx}",
+                "asset": f"asset-{idx}",
+                "outcome": "YES",
+                "type": "TRADE",
+                "side": "BUY",
+                "price": 0.5,
+                "size": 10,
+                "usdcSize": 5,
+                "transactionHash": f"0xleaderbuy{idx}",
+            }
+            leader_events.extend(
+                [
+                    opened,
+                    {
+                        **opened,
+                        "timestamp": opened["timestamp"] + 50,
+                        "side": "SELL",
+                        "price": 0.8,
+                        "usdcSize": 8,
+                        "transactionHash": f"0xleadersell{idx}",
+                    },
+                ]
+            )
+            follower_events.append(
+                {
+                    **opened,
+                    "timestamp": opened["timestamp"] + 5,
+                    "transactionHash": f"0xfollowerbuy{idx}",
+                }
+            )
+        persist_wallet_activity(conn, leader, leader_events, ingested_at=30_000)
+        persist_wallet_activity(conn, follower, follower_events, ingested_at=30_000)
+        _mark_deep_evidence_ready(conn, follower)
+        rebuild_wallet_episodes(conn, leader)
+        mine_copy_graph_for_leaders(conn, policy, [leader], now=30_000)
+        first = backtest_copy_stream_for_leaders(conn, policy, [leader], now=30_000)
+        original_performance = dict(
+            conn.execute(
+                "SELECT * FROM copy_leader_performance WHERE leader_wallet = ?",
+                (leader,),
+            ).fetchone()
+        )
+        original_trade_count = conn.execute(
+            "SELECT COUNT(*) FROM copy_backtest_trades WHERE leader_wallet = ?",
+            (leader,),
+        ).fetchone()[0]
+
+        conn.execute(
+            "UPDATE wallet_episodes SET status = 'open' WHERE address = ?",
+            (leader,),
+        )
+        conn.commit()
+        refreshed = backtest_copy_stream_for_leaders(
+            conn,
+            policy,
+            [leader],
+            now=40_000,
+            preserve_existing_on_empty=True,
+        )
+        preserved_performance = dict(
+            conn.execute(
+                "SELECT * FROM copy_leader_performance WHERE leader_wallet = ?",
+                (leader,),
+            ).fetchone()
+        )
+
+        assert first.leader_performance_written == 1
+        assert refreshed.trades_written == 0
+        assert refreshed.leader_performance_written == 0
+        assert refreshed.leaders_preserved_on_empty == 1
+        assert preserved_performance == original_performance
+        assert conn.execute(
+            "SELECT COUNT(*) FROM copy_backtest_trades WHERE leader_wallet = ?",
+            (leader,),
+        ).fetchone()[0] == original_trade_count
     finally:
         conn.close()
 
@@ -271,6 +391,7 @@ def test_backtest_uses_gamma_settlement_for_open_episode(tmp_path):
             )
         persist_wallet_activity(conn, leader, leader_events, ingested_at=40_000)
         persist_wallet_activity(conn, follower, follower_events, ingested_at=40_000)
+        _mark_deep_evidence_ready(conn, follower)
         rebuild_wallet_episodes(conn, leader)
         mine_copy_graph(conn, policy)
 
@@ -339,6 +460,7 @@ def test_containment_uses_pair_overlap_window_not_full_history(tmp_path):
             )
         persist_wallet_activity(conn, leader, leader_events, ingested_at=20_000)
         persist_wallet_activity(conn, follower, follower_events, ingested_at=20_000)
+        _mark_deep_evidence_ready(conn, follower)
 
         summary = mine_copy_graph(conn, load_policy(Path("config/leader_scoring_policy.json")))
         pair = conn.execute(
@@ -349,6 +471,83 @@ def test_containment_uses_pair_overlap_window_not_full_history(tmp_path):
         assert summary.qualified_pairs == 1
         assert pair["follower_trade_count"] == 5
         assert pair["containment_pct"] == 1
+    finally:
+        conn.close()
+
+
+def test_copy_pair_waits_for_complete_follower_evidence(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    leader = "0x" + "5" * 40
+    follower = "0x" + "6" * 40
+    policy = load_policy(Path("config/leader_scoring_policy.json"))
+    try:
+        run_migrations(conn)
+        upsert_candidate(conn, CandidateAddress(address=leader, sources="test"))
+        upsert_candidate(conn, CandidateAddress(address=follower, sources="test"))
+        leader_events = []
+        follower_events = []
+        for idx in range(5):
+            event = {
+                "timestamp": 40_000 + idx * 100,
+                "conditionId": f"condition-{idx}",
+                "eventSlug": f"event-{idx}",
+                "slug": f"market-{idx}",
+                "asset": f"asset-{idx}",
+                "outcome": "YES",
+                "type": "TRADE",
+                "side": "BUY",
+                "price": 0.5,
+                "size": 10,
+                "usdcSize": 5,
+                "transactionHash": f"0xleader{idx}",
+            }
+            leader_events.append(event)
+            follower_events.append(
+                {
+                    **event,
+                    "timestamp": event["timestamp"] + 5,
+                    "transactionHash": f"0xfollower{idx}",
+                }
+            )
+        persist_wallet_activity(conn, leader, leader_events, ingested_at=50_000)
+        persist_wallet_activity(conn, follower, follower_events, ingested_at=50_000)
+
+        incomplete = mine_copy_graph_for_leaders(conn, policy, [leader], now=50_000)
+        incomplete_pair = conn.execute(
+            "SELECT qualifies FROM copy_pair_stats WHERE leader_wallet = ? AND follower_wallet = ?",
+            (leader, follower),
+        ).fetchone()
+        conn.execute(
+            """
+            INSERT INTO wallet_processing_state(
+                wallet, discovery_tier, evidence_status, current_stage,
+                activity_count, distinct_markets, non_fast_trade_count, updated_at
+            ) VALUES (?, 'l1_light', 'summary_ready', 'deep_done', 5, 5, 5, 1)
+            """,
+            (follower,),
+        )
+        shallow = mine_copy_graph_for_leaders(conn, policy, [leader], now=55_000)
+        shallow_pair = conn.execute(
+            "SELECT qualifies FROM copy_pair_stats WHERE leader_wallet = ? AND follower_wallet = ?",
+            (leader, follower),
+        ).fetchone()
+        _mark_deep_evidence_ready(conn, follower)
+        conn.execute(
+            "UPDATE wallet_processing_state SET current_stage = '' WHERE wallet = ?",
+            (follower,),
+        )
+        complete = mine_copy_graph_for_leaders(conn, policy, [leader], now=60_000)
+        complete_pair = conn.execute(
+            "SELECT qualifies FROM copy_pair_stats WHERE leader_wallet = ? AND follower_wallet = ?",
+            (leader, follower),
+        ).fetchone()
+
+        assert incomplete.qualified_pairs == 0
+        assert incomplete_pair["qualifies"] == 0
+        assert shallow.qualified_pairs == 0
+        assert shallow_pair["qualifies"] == 0
+        assert complete.qualified_pairs == 1
+        assert complete_pair["qualifies"] == 1
     finally:
         conn.close()
 

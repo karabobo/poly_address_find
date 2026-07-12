@@ -6,6 +6,7 @@ from pm_robot.orchestration.rtds_discovery import (
     rtds_trade_to_activity_row,
     run_rtds_activity_discovery,
 )
+from pm_robot.pipeline_terms import COPYABILITY_DEEP_SCAN_UNVALIDATED_REASON
 from pm_robot.storage.db import connect, run_migrations
 from pm_robot.storage.repository import get_wallet_features
 
@@ -440,6 +441,67 @@ def test_rtds_persists_low_score_deep_copyability_near_miss_activity(tmp_path):
         assert summary.watch_eligible_wallets == 1
         assert activity is not None
         assert "polymarket_rtds_watch_activity" in activity["raw_json"]
+    finally:
+        conn.close()
+
+
+def test_rtds_watch_includes_rescannable_needs_data_near_miss(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    wallet = "0x" + "6" * 40
+    try:
+        run_migrations(conn)
+        conn.execute(
+            """
+            INSERT INTO candidate_wallets(
+                address, sources, labels, notes, links, status,
+                candidate_stage, first_seen_at, updated_at
+            ) VALUES (?, 'test', '', '', '', 'active', 'needs_data', 1, 1)
+            """,
+            (wallet,),
+        )
+        conn.execute(
+            """
+            INSERT INTO leader_scores(
+                address, leader_score, review_stage, review_reason,
+                components_json, penalties_json, policy_version, scored_at
+            ) VALUES (?, 44, 'needs_data', ?, '{}', '{}', 'test', 1)
+            """,
+            (wallet, COPYABILITY_DEEP_SCAN_UNVALIDATED_REASON),
+        )
+        conn.execute(
+            """
+            INSERT INTO wallet_processing_state(
+                wallet, discovery_tier, evidence_status, evidence_depth,
+                evidence_confidence, priority, current_stage, next_action,
+                next_action_at, activity_count, non_fast_trade_count,
+                distinct_markets, updated_at
+            ) VALUES (?, 'l3_deep', 'summary_ready', 1000, 1.0, 10,
+                      'deep_done', 'score_wallet', 0, 1000, 500, 20, 1)
+            """,
+            (wallet,),
+        )
+        conn.execute(
+            """
+            INSERT INTO wallet_features(address, extra_json, updated_at)
+            VALUES (?, '{"copy_candidate_event_count":12,"copy_candidate_market_count":5}', 1)
+            """,
+            (wallet,),
+        )
+        conn.execute(
+            """
+            INSERT INTO pipeline_jobs(
+                job_type, wallet, subject_key, tier, priority, shard, status,
+                lease_owner, lease_until, attempts, max_attempts, next_attempt_at,
+                input_json, output_json, last_error, created_at, updated_at, completed_at
+            ) VALUES ('copyability_evidence', ?, 'copyability', 'copyability', 10, 0, 'done',
+                      NULL, 0, 1, 3, 0, '{"graph_scan_mode":"deep"}',
+                      '{"graph_scan_mode":"deep"}', '', 1, 1, 1)
+            """,
+            (wallet,),
+        )
+        conn.commit()
+
+        assert rtds_module._rtds_watch_wallets(conn, min_score=65) == {wallet}
     finally:
         conn.close()
 

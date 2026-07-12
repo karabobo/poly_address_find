@@ -4,7 +4,7 @@ import sqlite3
 from pathlib import Path
 
 from pm_robot.config import load_policy
-from pm_robot.models import CandidateAddress, CandidateStage, WalletFeatures
+from pm_robot.models import CandidateAddress, CandidateStage, ScoreBreakdown, WalletFeatures
 import pm_robot.orchestration.copyability_evidence as copyability_evidence
 from pm_robot.orchestration.copyability_evidence import (
     JOB_TYPE,
@@ -14,6 +14,7 @@ from pm_robot.orchestration.copyability_evidence import (
     plan_copyability_evidence_jobs,
     run_copyability_evidence_worker,
 )
+from pm_robot.pipeline_terms import COPYABILITY_DEEP_SCAN_UNVALIDATED_REASON
 from pm_robot.research.copy_backtest import TargetedCopyBacktestSummary
 from pm_robot.research.copy_graph import TargetedCopyGraphSummary
 from pm_robot.storage.db import connect, run_migrations
@@ -74,7 +75,15 @@ def test_copyability_worker_keeps_completed_phases_when_completion_loses_lease(
             conn_arg.commit()
             return TargetedCopyGraphSummary(1, 0, 0, 0, 0)
 
-        def fake_backtest(conn_arg, policy, leaders, *, now=None, commit=True):
+        def fake_backtest(
+            conn_arg,
+            policy,
+            leaders,
+            *,
+            now=None,
+            commit=True,
+            preserve_existing_on_empty=False,
+        ):
             assert commit is True
             return TargetedCopyBacktestSummary(1, 0, 0, 0)
 
@@ -768,6 +777,166 @@ def test_copyability_planner_requires_new_activity_for_stale_deep_rescan(tmp_pat
         conn.close()
 
 
+def test_copyability_planner_rescans_needs_data_near_miss_after_new_activity(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    wallet = "0x" + "6" * 40
+    try:
+        run_migrations(conn)
+        upsert_candidate(conn, CandidateAddress(address=wallet, sources="test"))
+        conn.execute(
+            "UPDATE candidate_wallets SET candidate_stage = 'needs_data' WHERE address = ?",
+            (wallet,),
+        )
+        conn.execute(
+            """
+            INSERT INTO leader_scores(
+                address, leader_score, review_stage, review_reason,
+                components_json, penalties_json, policy_version, scored_at
+            ) VALUES (?, 44, 'needs_data', ?, '{}', '{}', 'test', 10000)
+            """,
+            (wallet, COPYABILITY_DEEP_SCAN_UNVALIDATED_REASON),
+        )
+        conn.execute(
+            """
+            INSERT INTO wallet_processing_state(
+                wallet, discovery_tier, evidence_status, evidence_depth,
+                evidence_confidence, priority, current_stage, next_action,
+                next_action_at, activity_count, non_fast_trade_count,
+                distinct_markets, updated_at
+            ) VALUES (?, 'l3_deep', 'summary_ready', 500, 1.0, 10,
+                'deep_done', 'score_wallet', 0, 500, 300, 10, 10000)
+            """,
+            (wallet,),
+        )
+        conn.execute(
+            """
+            INSERT INTO wallet_features(address, extra_json, updated_at)
+            VALUES (?, '{"copy_candidate_event_count":12,"copy_candidate_market_count":5}', 10000)
+            """,
+            (wallet,),
+        )
+        conn.execute(
+            """
+            INSERT INTO pipeline_jobs(
+                job_type, wallet, subject_key, tier, priority, shard, status,
+                lease_owner, lease_until, attempts, max_attempts, next_attempt_at,
+                input_json, output_json, last_error, created_at, updated_at, completed_at
+            ) VALUES (?, ?, 'copyability', 'copyability', 10, 0, 'done',
+                NULL, 0, 1, 3, 0, ?, ?, '', 100, 100, 100)
+            """,
+            (
+                JOB_TYPE,
+                wallet,
+                json.dumps({"graph_scan_mode": "deep", "activity_newest_timestamp": 1234}),
+                json.dumps({"graph_scan_mode": "deep", "activity_newest_timestamp": 1234}),
+            ),
+        )
+        conn.commit()
+
+        quiet = plan_copyability_evidence_jobs(
+            conn,
+            limit=10,
+            min_score=40,
+            min_activity_events=25,
+            shard_count=1,
+            rescan_seconds=100,
+            now=10_000,
+        )
+        assert quiet.jobs_enqueued == 0
+
+        conn.execute(
+            """
+            INSERT INTO wallet_activity_watermarks(
+                address, newest_timestamp, newest_activity_key, updated_at
+            ) VALUES (?, 1235, 'new-event', 200)
+            """,
+            (wallet,),
+        )
+        conn.commit()
+
+        summary = plan_copyability_evidence_jobs(
+            conn,
+            limit=10,
+            min_score=40,
+            min_activity_events=25,
+            shard_count=1,
+            rescan_seconds=100,
+            now=10_000,
+        )
+        job = conn.execute(
+            "SELECT status, input_json FROM pipeline_jobs WHERE job_type = ? AND wallet = ?",
+            (JOB_TYPE, wallet),
+        ).fetchone()
+
+        assert summary.jobs_enqueued == 1
+        assert job["status"] == "queued"
+        assert json.loads(job["input_json"])["planner_reason"] == "new_activity_after_deep_scan"
+    finally:
+        conn.close()
+
+
+def test_migration_repairs_legacy_deep_near_miss_reason(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    wallet = "0x" + "0" * 40
+    try:
+        run_migrations(conn)
+        upsert_candidate(conn, CandidateAddress(address=wallet, sources="test"))
+        conn.execute(
+            "UPDATE candidate_wallets SET candidate_stage = 'needs_data' WHERE address = ?",
+            (wallet,),
+        )
+        conn.execute(
+            """
+            INSERT INTO leader_scores(
+                address, leader_score, review_stage, review_reason,
+                components_json, penalties_json, policy_version, scored_at
+            ) VALUES (?, 44, 'needs_data', 'score_below_watchlist_after_evidence',
+                      '{"score":44}', '{}', 'test', 100)
+            """,
+            (wallet,),
+        )
+        conn.execute(
+            """
+            INSERT INTO wallet_features(address, extra_json, updated_at)
+            VALUES (?, '{"copy_candidate_pair_count":1,"copy_candidate_event_count":10}', 100)
+            """,
+            (wallet,),
+        )
+        conn.execute(
+            """
+            INSERT INTO pipeline_jobs(
+                job_type, wallet, subject_key, tier, priority, shard, status,
+                lease_owner, lease_until, attempts, max_attempts, next_attempt_at,
+                input_json, output_json, last_error, created_at, updated_at, completed_at
+            ) VALUES ('copyability_evidence', ?, 'copyability', 'copyability', 10, 0,
+                      'done', NULL, 0, 1, 3, 0, '{"graph_scan_mode":"deep"}',
+                      '{"graph_scan_mode":"deep","graph":{"pair_stats_written":2,"qualified_pairs":0}}',
+                      '', 100, 100, 100)
+            """,
+            (wallet,),
+        )
+        conn.execute("DELETE FROM schema_migrations WHERE version = 52")
+        conn.commit()
+
+        assert run_migrations(conn) == [52]
+        scores = conn.execute(
+            """
+            SELECT review_reason
+            FROM leader_scores
+            WHERE address = ?
+            ORDER BY score_id
+            """,
+            (wallet,),
+        ).fetchall()
+
+        assert [row["review_reason"] for row in scores] == [
+            "score_below_watchlist_after_evidence",
+            COPYABILITY_DEEP_SCAN_UNVALIDATED_REASON,
+        ]
+    finally:
+        conn.close()
+
+
 def test_copyability_planner_upgrades_high_score_light_no_signal_to_deep_scan(tmp_path):
     conn = connect(tmp_path / "robot.sqlite")
     high_light = "0x" + "1" * 40
@@ -1324,7 +1493,15 @@ def test_copyability_worker_uses_per_job_light_scan_bounds(tmp_path, monkeypatch
                 qualified_pairs=0,
             )
 
-        def fake_backtest(conn_arg, policy, leaders, *, now=None, commit=True):
+        def fake_backtest(
+            conn_arg,
+            policy,
+            leaders,
+            *,
+            now=None,
+            commit=True,
+            preserve_existing_on_empty=False,
+        ):
             return TargetedCopyBacktestSummary(
                 leaders_seen=1,
                 trades_written=0,
@@ -1410,7 +1587,15 @@ def test_copyability_worker_does_not_prefer_light_scan_over_higher_priority_jobs
                 qualified_pairs=0,
             )
 
-        def fake_backtest(conn_arg, policy, leaders, *, now=None, commit=True):
+        def fake_backtest(
+            conn_arg,
+            policy,
+            leaders,
+            *,
+            now=None,
+            commit=True,
+            preserve_existing_on_empty=False,
+        ):
             return TargetedCopyBacktestSummary(
                 leaders_seen=1,
                 trades_written=0,
@@ -1488,7 +1673,15 @@ def test_copyability_worker_can_prefer_light_scan_with_equal_priority(tmp_path, 
                 qualified_pairs=0,
             )
 
-        def fake_backtest(conn_arg, policy, leaders, *, now=None, commit=True):
+        def fake_backtest(
+            conn_arg,
+            policy,
+            leaders,
+            *,
+            now=None,
+            commit=True,
+            preserve_existing_on_empty=False,
+        ):
             return TargetedCopyBacktestSummary(
                 leaders_seen=1,
                 trades_written=0,
@@ -1597,7 +1790,15 @@ def test_copyability_worker_blocks_completed_deep_scan_with_no_signal(tmp_path, 
                 qualified_pairs=0,
             )
 
-        def fake_backtest(conn_arg, policy, leaders, *, now=None, commit=True):
+        def fake_backtest(
+            conn_arg,
+            policy,
+            leaders,
+            *,
+            now=None,
+            commit=True,
+            preserve_existing_on_empty=False,
+        ):
             return TargetedCopyBacktestSummary(
                 leaders_seen=1,
                 trades_written=0,
@@ -1648,6 +1849,52 @@ def test_copyability_worker_blocks_completed_deep_scan_with_no_signal(tmp_path, 
         assert latest["review_reason"] == "copyability_scan_no_signal"
         assert output["score_written"] is True
         assert output["no_signal_blocked"] == 1
+    finally:
+        conn.close()
+
+
+def test_deep_near_miss_score_uses_rescannable_reason(tmp_path, monkeypatch):
+    conn = connect(tmp_path / "robot.sqlite")
+    wallet = "0x" + "e" * 40
+    try:
+        run_migrations(conn)
+        upsert_candidate(conn, CandidateAddress(address=wallet, sources="test"))
+        upsert_wallet_feature(conn, WalletFeatures(address=wallet, hygiene_status="clean"))
+        monkeypatch.setattr(
+            copyability_evidence,
+            "score_candidate",
+            lambda candidate, features, policy: ScoreBreakdown(
+                address=wallet,
+                leader_score=44,
+                stage=CandidateStage.NEEDS_DATA,
+                reason="score_below_watchlist_after_evidence",
+                components={},
+                penalties={},
+            ),
+        )
+        monkeypatch.setattr(
+            copyability_evidence,
+            "apply_score_lifecycle_guards",
+            lambda conn_arg, score, policy: score,
+        )
+
+        written = copyability_evidence._score_wallet_after_copyability(
+            conn,
+            wallet=wallet,
+            policy={},
+            policy_version="test",
+            graph_scan_mode="deep",
+            pair_stats_written=2,
+            qualified_pairs=0,
+        )
+        latest = conn.execute(
+            "SELECT review_stage, review_reason FROM leader_latest_scores WHERE address = ?",
+            (wallet,),
+        ).fetchone()
+
+        assert written is True
+        assert latest["review_stage"] == CandidateStage.NEEDS_DATA.value
+        assert latest["review_reason"] == COPYABILITY_DEEP_SCAN_UNVALIDATED_REASON
     finally:
         conn.close()
 
@@ -1709,6 +1956,15 @@ def test_copyability_queue_refreshes_targeted_graph_backtest_and_features(tmp_pa
 
         persist_wallet_activity(conn, leader, leader_events, ingested_at=20_000)
         persist_wallet_activity(conn, follower, follower_events, ingested_at=20_000)
+        conn.execute(
+            """
+            INSERT INTO wallet_processing_state(
+                wallet, discovery_tier, evidence_status, current_stage,
+                activity_count, updated_at
+            ) VALUES (?, 'l3_deep', 'summary_ready', 'deep_done', 5, 20000)
+            """,
+            (follower,),
+        )
         rebuild_wallet_episodes(conn, leader)
         conn.commit()
 

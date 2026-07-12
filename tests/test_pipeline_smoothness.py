@@ -3,6 +3,7 @@ from pm_robot.orchestration.copyability_evidence import plan_copyability_evidenc
 from pm_robot.orchestration.eligibility_repair import prepare_eligibility_repairs
 from pm_robot.orchestration.pipeline_smoothness import pipeline_smoothness_report
 from pm_robot.orchestration.wallet_pipeline import plan_wallet_pipeline_jobs
+from pm_robot.pipeline_terms import COPYABILITY_DEEP_SCAN_UNVALIDATED_REASON
 from pm_robot.storage.db import connect, run_migrations
 from pm_robot.storage.repository import (
     materialize_wallet_processing_state,
@@ -203,6 +204,57 @@ def test_pipeline_smoothness_does_not_requeue_completed_deep_near_miss(tmp_path)
         assert "copyability_evidence" not in row["recommended_actions"]
         assert report["eligibility"]["disposition_counts"] == {"copyability_near_miss": 1}
         assert report["eligibility"]["action_counts"] == {}
+    finally:
+        conn.close()
+
+
+def test_pipeline_smoothness_keeps_rescannable_needs_data_near_miss_visible(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    wallet = "0x" + "6" * 40
+    try:
+        run_migrations(conn)
+        upsert_candidate(conn, CandidateAddress(address=wallet, sources="test_source"))
+        upsert_wallet_feature(
+            conn,
+            WalletFeatures(
+                address=wallet,
+                hygiene_status="clean",
+                extra={
+                    "copy_candidate_event_count": 12,
+                    "copy_candidate_market_count": 5,
+                },
+            ),
+        )
+        _score(
+            conn,
+            wallet,
+            score=44,
+            stage=CandidateStage.NEEDS_DATA,
+            reason=COPYABILITY_DEEP_SCAN_UNVALIDATED_REASON,
+        )
+        persist_wallet_activity(conn, wallet, _trade_events(wallet, 120), ingested_at=20_000)
+        _insert_l3_evidence(conn, wallet)
+        conn.execute(
+            """
+            INSERT INTO pipeline_jobs(
+                job_type, wallet, subject_key, tier, priority, shard, status,
+                lease_owner, lease_until, attempts, max_attempts, next_attempt_at,
+                input_json, output_json, last_error, created_at, updated_at, completed_at
+            ) VALUES ('copyability_evidence', ?, 'copyability', 'copyability', 3, 0,
+                      'done', NULL, 0, 1, 3, 0, '{"graph_scan_mode":"deep"}',
+                      '{"graph_scan_mode":"deep"}', '', 50000, 50000, 50000)
+            """,
+            (wallet,),
+        )
+        conn.commit()
+
+        report = pipeline_smoothness_report(conn, top=10, min_score=40, now=50_100)
+        row = next(item for item in report["top_stuck_wallets"] if item["wallet"] == wallet)
+
+        assert row["candidate_stage"] == CandidateStage.NEEDS_DATA.value
+        assert row["review_disposition"] == "copyability_near_miss"
+        assert row["review_handling"] == "watch"
+        assert "copyability_evidence" not in row["recommended_actions"]
     finally:
         conn.close()
 

@@ -232,6 +232,10 @@ def test_retention_migrations_backfill_counts_and_compact_copy_links(tmp_path):
             "INSERT INTO schema_migrations(version, applied_at) VALUES (?, 1)",
             ((version,) for version in range(1, 46)),
         )
+        # This partial-schema fixture isolates retention migrations 46-51.
+        conn.execute(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (52, 1)"
+        )
         conn.executemany(
             "INSERT INTO candidate_wallets(address) VALUES (?)",
             ((wallet,) for wallet in wallets.values()),

@@ -1,4 +1,5 @@
 from pm_robot.orchestration.review_disposition import review_disposition
+from pm_robot.pipeline_terms import COPYABILITY_DEEP_SCAN_UNVALIDATED_REASON
 
 
 def _base_row(**overrides):
@@ -23,6 +24,20 @@ def _base_row(**overrides):
 
 def test_deep_copyability_near_miss_is_an_automatic_watch_state():
     disposition = review_disposition(_base_row())
+
+    assert disposition.key == "copyability_near_miss"
+    assert disposition.handling == "watch"
+    assert disposition.operator_required is False
+
+
+def test_needs_data_deep_near_miss_remains_an_automatic_watch_state():
+    disposition = review_disposition(
+        _base_row(
+            candidate_stage="needs_data",
+            review_reason=COPYABILITY_DEEP_SCAN_UNVALIDATED_REASON,
+            leader_score=44,
+        )
+    )
 
     assert disposition.key == "copyability_near_miss"
     assert disposition.handling == "watch"

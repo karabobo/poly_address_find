@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from typing import Any, Mapping
 
 from pm_robot.orchestration.evidence_readiness import paper_evidence_ready
+from pm_robot.pipeline_terms import COPYABILITY_DEEP_SCAN_UNVALIDATED_REASON
 
 
 HANDLING_AUTOMATIC = "automatic"
@@ -52,6 +53,7 @@ def review_disposition(
     activity = _int(row.get("activity_count") or row.get("trade_events"))
     next_action = _text(row.get("next_action") or row.get("evidence_next_action"))
     copy_status = _text(row.get("copyability_status"))
+    review_reason = _text(row.get("review_reason"))
 
     if stage in {"paper_candidate", "paper_approved", "live_eligible"}:
         return _result(
@@ -89,7 +91,7 @@ def review_disposition(
         return _automatic("thin_evidence", "历史证据偏薄", "继续补历史，样本不足不放行。")
     if next_action in {"light_pending", "medium_pending", "deep_pending"}:
         return _automatic("history_pending", "历史证据补充中", "等待 L1/L2/L3 任务完成。")
-    if stage == "needs_data":
+    if stage == "needs_data" and review_reason != COPYABILITY_DEEP_SCAN_UNVALIDATED_REASON:
         return _automatic("score_needs_data", "评分证据不足", "补齐评分所需证据后自动重评。")
 
     has_signal = has_copyability_signal(row)

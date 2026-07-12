@@ -23,7 +23,10 @@ from pm_robot.orchestration.eligibility_repair import (
 )
 from pm_robot.orchestration.review_disposition import review_disposition
 from pm_robot.orchestration.wallet_pipeline import JOB_TYPE as WALLET_PIPELINE_JOB_TYPE
-from pm_robot.pipeline_terms import REVIEW_FUNNEL_CANDIDATE_STAGES
+from pm_robot.pipeline_terms import (
+    COPYABILITY_DEEP_SCAN_UNVALIDATED_REASON,
+    REVIEW_FUNNEL_CANDIDATE_STAGES,
+)
 from pm_robot.risk.eligibility import (
     paper_eligibility_status,
     publish_eligibility_status,
@@ -242,7 +245,13 @@ def _eligibility_rows(conn: sqlite3.Connection, *, min_score: float) -> list[sql
          AND copy_job.wallet = cw.address
         LEFT JOIN latest_copy_job
           ON latest_copy_job.wallet = cw.address
-        WHERE cw.candidate_stage IN ({",".join("?" for _ in SMOOTHNESS_STAGES)})
+        WHERE (
+               cw.candidate_stage IN ({",".join("?" for _ in SMOOTHNESS_STAGES)})
+            OR (
+                   cw.candidate_stage = 'needs_data'
+               AND ls.review_reason = ?
+            )
+        )
           AND COALESCE(ls.leader_score, 0) >= ?
         ORDER BY
             CASE cw.candidate_stage
@@ -262,6 +271,7 @@ def _eligibility_rows(conn: sqlite3.Connection, *, min_score: float) -> list[sql
             WALLET_PIPELINE_JOB_TYPE,
             COPYABILITY_JOB_TYPE,
             *SMOOTHNESS_STAGES,
+            COPYABILITY_DEEP_SCAN_UNVALIDATED_REASON,
             min_score,
         ),
     ).fetchall()

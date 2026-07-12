@@ -17,6 +17,7 @@ from pm_robot.orchestration.review_disposition import (
     review_disposition,
 )
 from pm_robot.pipeline_terms import (
+    COPYABILITY_DEEP_SCAN_UNVALIDATED_REASON,
     PAPER_ELIGIBLE_CANDIDATE_STAGES,
     PROVISIONAL_CANDIDATE_STAGES,
     PipelineJobType,
@@ -804,9 +805,19 @@ def _rtds_watch_wallets(conn: sqlite3.Connection, *, min_score: float) -> set[st
           ON clp.leader_wallet = cw.address
         LEFT JOIN latest_copy_job
           ON latest_copy_job.wallet = cw.address
-        WHERE cw.candidate_stage IN ({placeholders})
+        WHERE (
+               cw.candidate_stage IN ({placeholders})
+            OR (
+                   cw.candidate_stage = 'needs_data'
+               AND latest_score.review_reason = ?
+            )
+        )
         """,
-        (PipelineJobType.COPYABILITY_EVIDENCE.value, *PROVISIONAL_CANDIDATE_STAGES),
+        (
+            PipelineJobType.COPYABILITY_EVIDENCE.value,
+            *PROVISIONAL_CANDIDATE_STAGES,
+            COPYABILITY_DEEP_SCAN_UNVALIDATED_REASON,
+        ),
     ).fetchall()
     eligible: set[str] = set()
     for row in rows:

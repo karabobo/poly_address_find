@@ -369,6 +369,64 @@ def test_active_candidate_registry_refresh_materializes_only_stale_active_rows(t
         conn.close()
 
 
+def test_active_candidate_registry_refresh_syncs_wallet_downgraded_out_of_paper(tmp_path):
+    db_path = tmp_path / "robot.sqlite"
+    wallet = "0x" + "1" * 40
+    conn = connect(db_path)
+    try:
+        run_migrations(conn)
+        _seed_publishable_winner(conn, wallet)
+
+        first = refresh_active_candidate_registry(conn)
+        conn.commit()
+        active_row = conn.execute(
+            "SELECT candidate_stage, updated_at FROM wallet_registry WHERE address = ?",
+            (wallet,),
+        ).fetchone()
+
+        conn.execute(
+            "UPDATE candidate_wallets SET candidate_stage = ? WHERE address = ?",
+            (CandidateStage.NEEDS_DATA.value, wallet),
+        )
+        conn.execute(
+            """
+            INSERT INTO leader_scores(
+                address, leader_score, review_stage, review_reason,
+                components_json, penalties_json, policy_version, scored_at
+            ) VALUES (?, 12.5, ?, 'downgraded_out_of_paper', '{}', '{}', 'test-downgrade', ?)
+            """,
+            (
+                wallet,
+                CandidateStage.NEEDS_DATA.value,
+                int(active_row["updated_at"]) + 1,
+            ),
+        )
+        conn.commit()
+
+        second = refresh_active_candidate_registry(conn)
+        downgraded = conn.execute(
+            """
+            SELECT candidate_stage, leader_score, review_stage, review_reason, policy_version
+            FROM wallet_registry
+            WHERE address = ?
+            """,
+            (wallet,),
+        ).fetchone()
+
+        assert first["wallets_refreshed"] == 1
+        assert active_row["candidate_stage"] == CandidateStage.LIVE_ELIGIBLE.value
+        assert second["wallets_refreshed"] == 1
+        assert dict(downgraded) == {
+            "candidate_stage": CandidateStage.NEEDS_DATA.value,
+            "leader_score": 12.5,
+            "review_stage": CandidateStage.NEEDS_DATA.value,
+            "review_reason": "downgraded_out_of_paper",
+            "policy_version": "test-downgrade",
+        }
+    finally:
+        conn.close()
+
+
 def test_active_candidate_registry_refresh_does_not_relabel_pruned_raw_history(tmp_path):
     db_path = tmp_path / "robot.sqlite"
     wallet = "0x" + "f" * 40

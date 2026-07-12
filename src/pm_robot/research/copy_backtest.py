@@ -27,6 +27,7 @@ class TargetedCopyBacktestSummary:
     trades_written: int
     leader_performance_written: int
     leaders_with_positive_net_roi: int
+    leaders_preserved_on_empty: int = 0
 
 
 def backtest_copy_stream(conn: sqlite3.Connection, policy: dict[str, Any]) -> CopyBacktestSummary:
@@ -86,6 +87,7 @@ def backtest_copy_stream_for_leaders(
     *,
     now: int | None = None,
     commit: bool = True,
+    preserve_existing_on_empty: bool = False,
 ) -> TargetedCopyBacktestSummary:
     """Backtest copy streams for a bounded set of leaders.
 
@@ -112,12 +114,47 @@ def backtest_copy_stream_for_leaders(
         now=ts,
         leaders=leader_wallets,
     )
-    placeholders = _placeholders(leader_wallets)
+    new_trade_leaders = {str(row[0]) for row in trades}
+    preserved_leaders: set[str] = set()
+    if preserve_existing_on_empty:
+        placeholders = _placeholders(leader_wallets)
+        preserved_leaders = {
+            str(row["leader_wallet"])
+            for row in conn.execute(
+                f"""
+                SELECT performance.leader_wallet
+                FROM copy_leader_performance performance
+                WHERE performance.leader_wallet IN ({placeholders})
+                  AND EXISTS (
+                      SELECT 1
+                      FROM copy_pair_stats pair
+                      WHERE pair.leader_wallet = performance.leader_wallet
+                        AND pair.qualifies = 1
+                  )
+                """,
+                tuple(leader_wallets),
+            ).fetchall()
+            if str(row["leader_wallet"]) not in new_trade_leaders
+        }
+    rebuild_leaders = [leader for leader in leader_wallets if leader not in preserved_leaders]
+    if not rebuild_leaders:
+        if commit:
+            conn.commit()
+        return TargetedCopyBacktestSummary(
+            leaders_seen=len(leader_wallets),
+            trades_written=0,
+            leader_performance_written=0,
+            leaders_with_positive_net_roi=0,
+            leaders_preserved_on_empty=len(preserved_leaders),
+        )
+
+    placeholders = _placeholders(rebuild_leaders)
+    rebuild_trades = [row for row in trades if str(row[0]) in rebuild_leaders]
     conn.execute(
         f"DELETE FROM copy_backtest_trades WHERE leader_wallet IN ({placeholders})",
-        tuple(leader_wallets),
+        tuple(rebuild_leaders),
     )
-    if trades:
+    if rebuild_trades:
         conn.executemany(
             """
             INSERT OR IGNORE INTO copy_backtest_trades(
@@ -128,17 +165,17 @@ def backtest_copy_stream_for_leaders(
                 net_pnl_usdc, net_roi, created_at
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            trades,
+            rebuild_trades,
         )
     if commit:
         conn.commit()
 
-    performance = _build_leader_performance(conn, ts, leaders=leader_wallets)
+    performance = _build_leader_performance(conn, ts, leaders=rebuild_leaders)
     conn.execute(
         f"DELETE FROM copy_leader_performance WHERE leader_wallet IN ({placeholders})",
-        tuple(leader_wallets),
+        tuple(rebuild_leaders),
     )
-    _clear_copy_stream_features(conn, leader_wallets)
+    _clear_copy_stream_features(conn, rebuild_leaders)
     if performance:
         conn.executemany(
             """
@@ -152,14 +189,15 @@ def backtest_copy_stream_for_leaders(
             """,
             performance,
         )
-    _merge_copy_stream_features(conn, leader_wallets)
+    _merge_copy_stream_features(conn, rebuild_leaders)
     if commit:
         conn.commit()
     return TargetedCopyBacktestSummary(
         leaders_seen=len(leader_wallets),
-        trades_written=len(trades),
+        trades_written=len(rebuild_trades),
         leader_performance_written=len(performance),
         leaders_with_positive_net_roi=sum(1 for row in performance if float(row[7]) > 0),
+        leaders_preserved_on_empty=len(preserved_leaders),
     )
 
 
