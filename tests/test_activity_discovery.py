@@ -262,6 +262,48 @@ def test_discover_activity_candidates_merges_existing_candidate_source(tmp_path)
         conn.close()
 
 
+def test_existing_candidate_refresh_does_not_consume_new_promotion_limit(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    existing_wallet = "0x" + "3" * 40
+    new_wallet = "0x" + "4" * 40
+    try:
+        run_migrations(conn)
+        upsert_candidate(
+            conn,
+            CandidateAddress(address=existing_wallet, sources="manual", labels="watchlist"),
+        )
+        conn.commit()
+        client = FakeGlobalActivityClient(
+            {
+                0: [
+                    _activity(existing_wallet, "0xexisting", 6_000),
+                    _activity(new_wallet, "0xnew1", 200),
+                    _activity(new_wallet, "0xnew2", 200),
+                ]
+            }
+        )
+
+        summary = discover_activity_candidates(
+            conn,
+            pages=1,
+            max_candidates=1,
+            client=client,
+        )
+
+        assert summary.candidates_inserted_or_updated == 2
+        assert summary.promoted_wallets == 1
+        assert conn.execute(
+            "SELECT 1 FROM candidate_wallets WHERE address = ?",
+            (new_wallet,),
+        ).fetchone() is not None
+        assert conn.execute(
+            "SELECT promotion_reason FROM observed_wallets WHERE wallet = ?",
+            (existing_wallet,),
+        ).fetchone()["promotion_reason"] == "existing_candidate"
+    finally:
+        conn.close()
+
+
 def test_activity_discovery_observes_but_does_not_revive_summary_only_wallet(tmp_path):
     conn = connect(tmp_path / "robot.sqlite")
     wallet = "0x" + "7" * 40

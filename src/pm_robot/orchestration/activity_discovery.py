@@ -387,6 +387,10 @@ def _persist_activity_items(
     promoted = 0
     promoted_items: list[dict[str, Any]] = []
     for item in _sorted_activity_items(wallets):
+        existing_candidate = conn.execute(
+            "SELECT 1 FROM candidate_wallets WHERE address = ?",
+            (item["wallet"].lower(),),
+        ).fetchone() is not None
         candidate = _candidate_from_activity_source(
             item,
             now=now,
@@ -394,16 +398,24 @@ def _persist_activity_items(
             labels=labels,
             status_prefix=status_prefix,
         )
-        observation = _record_observed_wallet(conn, candidate, item, now=now)
+        observation = _record_observed_wallet(
+            conn,
+            candidate,
+            item,
+            now=now,
+            existing_candidate=existing_candidate,
+        )
         observed += 1
         if item["wallet"] in archived:
             continue
-        if not _should_promote_observed_wallet(conn, item["wallet"], observation):
+        if not observation["promotion_reason"]:
             continue
-        if promoted >= max_candidates:
+        is_new_promotion = not existing_candidate
+        if is_new_promotion and promoted >= max_candidates:
             continue
-        promoted += 1
-        promoted_items.append(item)
+        if is_new_promotion:
+            promoted += 1
+            promoted_items.append(item)
         _mark_observed_wallet_promoted(conn, item["wallet"], observation["promotion_reason"], now=now)
         upsert_candidate(conn, candidate)
         seed_evidence_backfill_budget(
@@ -462,6 +474,7 @@ def _record_observed_wallet(
     item: dict[str, Any],
     *,
     now: int,
+    existing_candidate: bool = False,
 ) -> dict[str, Any]:
     wallet = candidate.address.lower()
     existing = conn.execute("SELECT * FROM observed_wallets WHERE wallet = ?", (wallet,)).fetchone()
@@ -470,7 +483,11 @@ def _record_observed_wallet(
         item.get("recent_trades") or [],
         now=now,
     )
-    snapshot = _observation_snapshot(recent_trades, existing_row=existing)
+    snapshot = _observation_snapshot(
+        recent_trades,
+        existing_row=existing,
+        existing_candidate=existing_candidate,
+    )
     observed_trade_count = int(existing["observed_trade_count"] or 0) + new_trade_count if existing else new_trade_count
     first_seen_at = int(existing["first_seen_at"] or now) if existing else now
     sources = _merge_observation_text(existing["sources"] if existing else "", candidate.sources)
@@ -528,20 +545,6 @@ def _record_observed_wallet(
     return snapshot
 
 
-def _should_promote_observed_wallet(
-    conn: sqlite3.Connection,
-    wallet: str,
-    observation: dict[str, Any],
-) -> bool:
-    existing_candidate = conn.execute(
-        "SELECT 1 FROM candidate_wallets WHERE address = ?",
-        (wallet.lower(),),
-    ).fetchone()
-    reason = _promotion_reason(observation, existing_candidate=existing_candidate is not None)
-    observation["promotion_reason"] = reason
-    return bool(reason)
-
-
 def _mark_observed_wallet_promoted(
     conn: sqlite3.Connection,
     wallet: str,
@@ -561,7 +564,12 @@ def _mark_observed_wallet_promoted(
     )
 
 
-def _observation_snapshot(recent_trades: list[dict[str, Any]], *, existing_row: sqlite3.Row | None) -> dict[str, Any]:
+def _observation_snapshot(
+    recent_trades: list[dict[str, Any]],
+    *,
+    existing_row: sqlite3.Row | None,
+    existing_candidate: bool = False,
+) -> dict[str, Any]:
     recent_usdc_total = sum(float(trade.get("usdc_size") or 0.0) for trade in recent_trades)
     recent_max_trade_usdc = max((float(trade.get("usdc_size") or 0.0) for trade in recent_trades), default=0.0)
     observed_trade_count = int(existing_row["observed_trade_count"] or 0) if existing_row else len(recent_trades)
@@ -572,7 +580,10 @@ def _observation_snapshot(recent_trades: list[dict[str, Any]], *, existing_row: 
         "recent_max_trade_usdc": recent_max_trade_usdc,
         "promotion_reason": "",
     }
-    snapshot["promotion_reason"] = _promotion_reason(snapshot, existing_candidate=False)
+    snapshot["promotion_reason"] = _promotion_reason(
+        snapshot,
+        existing_candidate=existing_candidate,
+    )
     return snapshot
 
 
