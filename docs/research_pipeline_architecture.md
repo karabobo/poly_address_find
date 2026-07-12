@@ -180,6 +180,9 @@ default `up`, `restart`, `runtime-ensure`, or watchdog commands.
   concurrent planners cannot reserve the same high-waterline slot.
 - Workers normally claim by wallet priority, then promote the oldest queued job after the configured aging
   threshold. This preserves urgent-wallet ordering without allowing low-priority L2/L3 work to wait forever.
+- Pipeline audits report fresh candidate-state and score handoffs as waiting work. They become warnings only after
+  the 10-minute handoff grace period; never-scored wallets and wallets with an existing stale score are reported as
+  separate, non-overlapping failure classes.
 - `wallet-pipeline-jobs` and the research console expose the same per-stage queue counts, configured weights,
   scheduler cursor, and aged-job totals. Queue age is measured from `pipeline_jobs.updated_at` only when
   `attempts < max_attempts` and `next_attempt_at` is due, matching the worker claim rule and avoiding false

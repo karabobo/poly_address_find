@@ -404,6 +404,107 @@ def test_pipeline_audit_issues_only_actionable_candidate_missing_state(tmp_path)
         conn.close()
 
 
+def test_pipeline_audit_grants_fresh_candidate_state_handoff_grace(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    wallet = "0x" + "d" * 40
+    try:
+        run_migrations(conn)
+        upsert_candidate(conn, CandidateAddress(address=wallet, sources="test_source"))
+        conn.execute(
+            "UPDATE candidate_wallets SET first_seen_at = ?, updated_at = ? WHERE address = ?",
+            (49_700, 49_700, wallet),
+        )
+        conn.commit()
+
+        fresh_report = pipeline_audit_report(conn, now=50_000)
+        fresh_candidates = fresh_report["funnel"]["candidates"]
+        assert fresh_candidates["active_without_processing_state"] == 1
+        assert fresh_candidates["active_without_processing_state_stale"] == 0
+        assert fresh_candidates["handoff_grace_seconds"] == 600
+        assert not any(
+            issue["code"] == "candidate_missing_processing_state"
+            for issue in fresh_report["issues"]
+        )
+
+        stale_report = pipeline_audit_report(conn, now=50_301)
+        stale_candidates = stale_report["funnel"]["candidates"]
+        assert stale_candidates["active_without_processing_state"] == 1
+        assert stale_candidates["active_without_processing_state_stale"] == 1
+        assert any(
+            issue["code"] == "candidate_missing_processing_state" and issue["count"] == 1
+            for issue in stale_report["issues"]
+        )
+    finally:
+        conn.close()
+
+
+def test_pipeline_audit_grants_fresh_score_handoff_grace_and_separates_stale_scores(
+    tmp_path,
+):
+    conn = connect(tmp_path / "robot.sqlite")
+    wallet = "0x" + "e" * 40
+    try:
+        run_migrations(conn)
+        upsert_candidate(conn, CandidateAddress(address=wallet, sources="test_source"))
+        conn.execute(
+            """
+            INSERT INTO wallet_processing_state(
+                wallet, discovery_tier, evidence_status, current_stage,
+                next_action, updated_at
+            ) VALUES (?, 'l1_light', 'summary_ready', 'light_done', 'score_wallet', ?)
+            """,
+            (wallet, 49_700),
+        )
+        conn.commit()
+
+        fresh_report = pipeline_audit_report(conn, now=50_000)
+        fresh_evidence = fresh_report["funnel"]["evidence"]
+        assert fresh_evidence["summary_ready_without_score"] == 1
+        assert fresh_evidence["summary_ready_without_score_stale"] == 0
+        assert fresh_evidence["summary_ready_score_stale"] == 0
+        assert fresh_evidence["handoff_grace_seconds"] == 600
+        assert not any(
+            issue["code"] == "evidence_summary_ready_without_score"
+            for issue in fresh_report["issues"]
+        )
+
+        unscored_report = pipeline_audit_report(conn, now=50_301)
+        unscored_evidence = unscored_report["funnel"]["evidence"]
+        assert unscored_evidence["summary_ready_without_score_stale"] == 1
+        assert unscored_evidence["summary_ready_score_stale"] == 0
+        assert any(
+            issue["code"] == "evidence_summary_ready_without_score" and issue["count"] == 1
+            for issue in unscored_report["issues"]
+        )
+
+        conn.execute(
+            """
+            INSERT INTO leader_scores(
+                address, leader_score, review_stage, review_reason,
+                components_json, penalties_json, policy_version, scored_at
+            ) VALUES (?, 0, 'needs_data', 'test', '{}', '{}', 'test', ?)
+            """,
+            (wallet, 49_000),
+        )
+        conn.commit()
+
+        scored_report = pipeline_audit_report(conn, now=50_301)
+        scored_evidence = scored_report["funnel"]["evidence"]
+        assert scored_evidence["summary_ready_without_score"] == 0
+        assert scored_evidence["summary_ready_without_score_stale"] == 0
+        assert scored_evidence["summary_ready_score_stale"] == 1
+        assert not any(
+            issue["code"] == "evidence_summary_ready_without_score"
+            for issue in scored_report["issues"]
+        )
+        assert any(
+            issue["code"] == "evidence_summary_ready_score_stale" and issue["count"] == 1
+            for issue in scored_report["issues"]
+        )
+    finally:
+        conn.close()
+
+
 def test_pipeline_audit_ignores_stale_scores_for_blocked_candidates(tmp_path):
     conn = connect(tmp_path / "robot.sqlite")
     blocked_wallet = "0x" + "c" * 40
@@ -558,7 +659,7 @@ def test_pipeline_audit_excludes_summary_only_wallets_from_actionable_backlogs(t
         reactivated_evidence = reactivated_report["funnel"]["evidence"]
         assert reactivated_evidence["pending_without_active_job"] == 1
         assert reactivated_evidence["summary_ready_without_score"] == 1
-        assert reactivated_evidence["summary_ready_score_stale"] == 2
+        assert reactivated_evidence["summary_ready_score_stale"] == 1
         assert len(reactivated_report["samples"]["pending_without_active_job"]) == 1
         assert len(reactivated_report["samples"]["summary_ready_without_recent_score"]) == 2
     finally:

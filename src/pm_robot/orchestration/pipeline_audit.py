@@ -30,7 +30,8 @@ PENDING_EVIDENCE_ACTIONS = (
     EvidenceJobStage.DEEP_PENDING.value,
 )
 HIGH_PRIORITY_PENDING_JOB_PRIORITY = 10
-SCORE_STALE_GRACE_SECONDS = 600
+PIPELINE_HANDOFF_GRACE_SECONDS = 600
+SCORE_STALE_GRACE_SECONDS = PIPELINE_HANDOFF_GRACE_SECONDS
 BLOCKING_CANDIDATE_STAGES = ("rejected", "blocked_hygiene", "blocked_copyability")
 PAPER_READY_CANDIDATE_STAGES = ("paper_candidate", "paper_approved", "live_eligible")
 ADDRESS_TABLE_COLUMNS = (
@@ -62,7 +63,7 @@ def pipeline_audit_report(
         tables = _table_names(conn)
         schema = _schema_report(conn, tables)
         observation = _observation_report(conn, tables)
-        candidates = _candidate_report(conn, tables)
+        candidates = _candidate_report(conn, tables, now=generated_at)
         address_quality = address_quality_report(conn, tables=tables)
         evidence = _evidence_report(
             conn,
@@ -159,7 +160,12 @@ def _observation_report(conn: sqlite3.Connection, tables: set[str]) -> dict[str,
     }
 
 
-def _candidate_report(conn: sqlite3.Connection, tables: set[str]) -> dict[str, Any]:
+def _candidate_report(
+    conn: sqlite3.Connection,
+    tables: set[str],
+    *,
+    now: int,
+) -> dict[str, Any]:
     if "candidate_wallets" not in tables:
         return {"available": False}
     total = _count(conn, "candidate_wallets")
@@ -169,6 +175,8 @@ def _candidate_report(conn: sqlite3.Connection, tables: set[str]) -> dict[str, A
         "stage_counts": _counts_by(conn, "candidate_wallets", "candidate_stage"),
         "without_processing_state": 0,
         "active_without_processing_state": 0,
+        "active_without_processing_state_stale": 0,
+        "handoff_grace_seconds": PIPELINE_HANDOFF_GRACE_SECONDS,
         "without_latest_score": 0,
         "without_wallet_features": 0,
         "without_source_events": 0,
@@ -181,9 +189,17 @@ def _candidate_report(conn: sqlite3.Connection, tables: set[str]) -> dict[str, A
         report["active_without_processing_state"] = _candidate_missing(
             conn, "wallet_processing_state", "wallet", active_candidates_only=True
         )
+        report["active_without_processing_state_stale"] = _candidate_missing(
+            conn,
+            "wallet_processing_state",
+            "wallet",
+            active_candidates_only=True,
+            first_seen_before=now - PIPELINE_HANDOFF_GRACE_SECONDS,
+        )
     elif total:
         report["without_processing_state"] = total
         report["active_without_processing_state"] = total
+        report["active_without_processing_state_stale"] = total
     if "leader_scores" in tables:
         report["without_latest_score"] = _scalar(
             conn,
@@ -264,7 +280,13 @@ def _evidence_report(
         "pending_without_active_job": pending_without_job,
         "high_priority_pending_without_active_job": high_priority_pending_without_job,
         "summary_ready_without_score": _summary_ready_without_score(conn, tables),
+        "summary_ready_without_score_stale": _summary_ready_without_score(
+            conn,
+            tables,
+            updated_before=now - PIPELINE_HANDOFF_GRACE_SECONDS,
+        ),
         "summary_ready_score_stale": _summary_ready_score_stale(conn, tables, now=now),
+        "handoff_grace_seconds": PIPELINE_HANDOFF_GRACE_SECONDS,
         "paused_fast_market": _scalar(
             conn,
             """
@@ -427,7 +449,7 @@ def _issues(
         issues,
         "warning",
         "candidate_missing_processing_state",
-        candidates.get("active_without_processing_state", 0),
+        candidates.get("active_without_processing_state_stale", 0),
     )
     _add_count_issue(
         issues,
@@ -451,7 +473,7 @@ def _issues(
         issues,
         "warning",
         "evidence_summary_ready_without_score",
-        evidence.get("summary_ready_without_score", 0),
+        evidence.get("summary_ready_without_score_stale", 0),
     )
     _add_count_issue(
         issues,
@@ -572,10 +594,14 @@ def _candidate_missing(
     column: str,
     *,
     active_candidates_only: bool = False,
+    first_seen_before: int | None = None,
 ) -> int:
     blocking_placeholders = ",".join("?" for _ in BLOCKING_CANDIDATE_STAGES)
     active_filter = f"AND cw.candidate_stage NOT IN ({blocking_placeholders})" if active_candidates_only else ""
-    params = BLOCKING_CANDIDATE_STAGES if active_candidates_only else ()
+    age_filter = "AND cw.first_seen_at < ?" if first_seen_before is not None else ""
+    params: tuple[Any, ...] = BLOCKING_CANDIDATE_STAGES if active_candidates_only else ()
+    if first_seen_before is not None:
+        params = (*params, first_seen_before)
     return _scalar(
         conn,
         f"""
@@ -585,6 +611,7 @@ def _candidate_missing(
             SELECT 1 FROM {table} target WHERE target.{column} = cw.address
         )
         {active_filter}
+        {age_filter}
         """,
         params,
     )
@@ -648,11 +675,20 @@ def _invalid_address_count(conn: sqlite3.Connection, table: str, column: str) ->
     )
 
 
-def _summary_ready_without_score(conn: sqlite3.Connection, tables: set[str]) -> int:
+def _summary_ready_without_score(
+    conn: sqlite3.Connection,
+    tables: set[str],
+    *,
+    updated_before: int | None = None,
+) -> int:
     if not {"candidate_wallets", "wallet_processing_state", "leader_scores"}.issubset(tables):
         return 0
     blocking_placeholders = ",".join("?" for _ in BLOCKING_CANDIDATE_STAGES)
     registry_join, retention_filter = _active_raw_evidence_scope_sql(tables)
+    age_filter = "AND COALESCE(wps.updated_at, 0) < ?" if updated_before is not None else ""
+    params: tuple[Any, ...] = BLOCKING_CANDIDATE_STAGES
+    if updated_before is not None:
+        params = (*params, updated_before)
     return _scalar(
         conn,
         f"""
@@ -664,11 +700,12 @@ def _summary_ready_without_score(conn: sqlite3.Connection, tables: set[str]) -> 
         WHERE (wps.evidence_status = 'summary_ready' OR wps.next_action = 'score_wallet')
           AND cw.candidate_stage NOT IN ({blocking_placeholders})
           {retention_filter}
+          {age_filter}
           AND NOT EXISTS (
               SELECT 1 FROM leader_scores ls WHERE ls.address = wps.wallet
           )
         """,
-        BLOCKING_CANDIDATE_STAGES,
+        params,
     )
 
 
@@ -689,6 +726,10 @@ def _summary_ready_score_stale(conn: sqlite3.Connection, tables: set[str], *, no
           AND cw.candidate_stage NOT IN ({blocking_placeholders})
           {retention_filter}
           AND COALESCE(wps.updated_at, 0) < ?
+          AND EXISTS (
+              SELECT 1 FROM leader_scores existing_score
+              WHERE existing_score.address = wps.wallet
+          )
           AND COALESCE((
               SELECT MAX(scored_at)
               FROM leader_scores ls
