@@ -482,7 +482,7 @@ def test_dashboard_shows_paper_handoff_without_implying_auto_execution(tmp_path)
             INSERT INTO wallet_features(
                 address, net_pnl_usdc, total_volume_usdc, copy_stream_roi,
                 hygiene_status, extra_json, updated_at
-            ) VALUES (?, 27212.03, 184882.82, 0.2073, 'ok', '{}', ?)
+            ) VALUES (?, 27212.03, 184882.82, 0.2073, 'screened', '{}', ?)
             """,
             (wallet, now),
         )
@@ -541,6 +541,7 @@ def test_dashboard_shows_paper_handoff_without_implying_auto_execution(tmp_path)
     assert handoff["wallets"][0]["research_check_passed"] == 4
     assert handoff["wallets"][0]["research_check_total"] == 4
     assert handoff["wallets"][0]["research_check_summary"] == "研究证据完整"
+    assert handoff["wallets"][0]["research_checks"][2]["value"] == "screened"
     assert handoff["wallets"][0]["paper_execution_state"] == "not_started_on_nas"
     assert "runtime_research_only" in handoff["wallets"][0]["formal_blocker_list"]
     assert "missing_paper_wallet_quality" in handoff["wallets"][0]["formal_blocker_list"]

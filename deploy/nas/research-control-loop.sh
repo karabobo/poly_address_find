@@ -2,6 +2,8 @@
 set -eu
 
 INTERVAL="${PM_ROBOT_RESEARCH_CONTROL_INTERVAL:-${PM_ROBOT_SCORE_LOOP_INTERVAL:-300}}"
+ACTIVE_INTERVAL="${PM_ROBOT_RESEARCH_CONTROL_ACTIVE_INTERVAL:-60}"
+RUN_ONCE="${PM_ROBOT_RESEARCH_CONTROL_RUN_ONCE:-0}"
 LEGACY_MIN_SCORE="${PM_ROBOT_ELIGIBILITY_REPAIR_MIN_SCORE:-${PM_ROBOT_COPYABILITY_MIN_SCORE:-40}}"
 MIN_SCORE="${PM_ROBOT_RESEARCH_MIN_SCORE:-$LEGACY_MIN_SCORE}"
 STATE_LIMIT="${PM_ROBOT_PIPELINE_STATE_LIMIT:-25}"
@@ -40,8 +42,13 @@ runtime_heartbeat() {
 }
 
 while true; do
+  sleep_interval="$INTERVAL"
+  cycle_status="failed"
+  features_attempted=0
+  scores_considered=0
+  control_output=""
   echo "$(date -Iseconds) research control: ordered cycle start"
-  if python -m pm_robot.cli --env /app/.env pipeline-cycle \
+  if control_output="$(python -m pm_robot.cli --env /app/.env pipeline-cycle \
       --execute-plan \
       --continue-on-error \
       --heartbeat-prefix loop_research_control_step \
@@ -70,10 +77,54 @@ while true; do
       --feature-commit-every "$FEATURE_COMMIT_EVERY" \
       --evidence-promotion-limit "$EVIDENCE_PROMOTION_LIMIT" \
       --score-limit "$SCORE_LIMIT" \
-      --policy "$POLICY_PATH"; then
-    echo "$(date -Iseconds) research control: ordered cycle ok"
-    runtime_heartbeat loop_research_control ok
+      --policy "$POLICY_PATH")"; then
+    printf '%s\n' "$control_output"
+    control_state=""
+    if control_state="$(printf '%s' "$control_output" | python -c '
+import json
+import sys
+
+payload = json.load(sys.stdin)
+if payload.get("ok") is not True:
+    raise ValueError("pipeline cycle did not report ok")
+steps = {
+    str(step.get("name") or ""): step
+    for step in payload.get("steps") or []
+    if isinstance(step, dict)
+}
+feature_data = (steps.get("materialize_features") or {}).get("data")
+score_data = (steps.get("incremental_score") or {}).get("data")
+if not isinstance(feature_data, dict) or "wallets_attempted" not in feature_data:
+    raise ValueError("materialize_features summary is missing")
+if not isinstance(score_data, dict) or "score_candidates_considered" not in score_data:
+    raise ValueError("incremental_score summary is missing")
+features_attempted = int(feature_data["wallets_attempted"])
+scores_considered = int(score_data["score_candidates_considered"])
+if features_attempted < 0 or scores_considered < 0:
+    raise ValueError("pipeline cycle counters must be non-negative")
+print(f"ok {features_attempted} {scores_considered}")
+' 2>/dev/null)"; then
+      cycle_status="${control_state%% *}"
+      remaining_state="${control_state#* }"
+      features_attempted="${remaining_state%% *}"
+      scores_considered="${remaining_state#* }"
+      if { [ "$FEATURE_LIMIT" -gt 0 ] && [ "$features_attempted" -ge "$FEATURE_LIMIT" ]; } || \
+         { [ "$SCORE_LIMIT" -gt 0 ] && [ "$scores_considered" -ge "$SCORE_LIMIT" ]; }; then
+        # A full batch signals backlog; keep bounded transactions but schedule the next cycle sooner.
+        sleep_interval="$ACTIVE_INTERVAL"
+      fi
+      echo "$(date -Iseconds) research control: ordered cycle ok"
+      runtime_heartbeat loop_research_control ok
+    else
+      cycle_status="invalid"
+      summary_preview="$(printf '%.160s' "$control_output" | tr '\n\r' '  ')"
+      echo "$(date -Iseconds) research control: invalid JSON summary; using idle interval; output=${summary_preview}" >&2
+      runtime_heartbeat loop_research_control partial "pipeline-cycle returned an invalid summary"
+    fi
   else
+    if [ -n "$control_output" ]; then
+      printf '%s\n' "$control_output"
+    fi
     echo "$(date -Iseconds) research control: ordered cycle partial; later phases used committed data" >&2
     runtime_heartbeat loop_research_control partial "one or more isolated pipeline-cycle phases failed"
   fi
@@ -90,5 +141,9 @@ while true; do
     echo "$(date -Iseconds) research control: export paper handoff failed" >&2
     runtime_heartbeat loop_score_paper_handoff failed "paper-handoff-export failed from research control"
   fi
-  sleep "$INTERVAL"
+  echo "$(date -Iseconds) research control: next cycle in ${sleep_interval}s (status=${cycle_status}, features_attempted=${features_attempted}, scores_considered=${scores_considered})"
+  if [ "$RUN_ONCE" = "1" ]; then
+    break
+  fi
+  sleep "$sleep_interval"
 done

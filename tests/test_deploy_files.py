@@ -296,6 +296,7 @@ def test_nas_research_control_runs_ordered_cycle_with_sharded_workers():
     assert "PM_ROBOT_PIPELINE_WORKER_PAGE_LIMIT=500" in env
     assert "PM_ROBOT_PIPELINE_PRIORITY_AGING_SECONDS=1800" in env
     assert "PM_ROBOT_RESEARCH_CONTROL_INTERVAL=300" in env
+    assert "PM_ROBOT_RESEARCH_CONTROL_ACTIVE_INTERVAL=60" in env
     assert "PM_ROBOT_PIPELINE_STATE_LIMIT=25" in env
     assert "PM_ROBOT_PIPELINE_STATE_COMMIT_EVERY=5" in env
     assert "PM_ROBOT_PIPELINE_PLANNER_MAX_ACTIVE_JOBS=240" in env
@@ -316,6 +317,7 @@ def test_nas_research_control_runs_ordered_cycle_with_sharded_workers():
     assert "PM_ROBOT_PIPELINE_STATE_COMMIT_EVERY:-5" in control
     assert "PM_ROBOT_RESEARCH_BUSY_TIMEOUT_SECONDS:-15" in control
     assert "PM_ROBOT_RESEARCH_CONTROL_LOCK_TIMEOUT_SECONDS:-120" in control
+    assert "PM_ROBOT_RESEARCH_CONTROL_ACTIVE_INTERVAL:-60" in control
     assert "PM_ROBOT_RESEARCH_PLANNER_LOCK_ATTEMPTS:-4" in control
     assert '--wallet-max-active-jobs "$WALLET_MAX_ACTIVE_JOBS"' in control
     assert '--copyability-max-active-jobs "$COPYABILITY_MAX_ACTIVE_JOBS"' in control
@@ -330,8 +332,152 @@ def test_nas_research_control_runs_ordered_cycle_with_sharded_workers():
     assert 'sleep_interval="$ACTIVE_INTERVAL"' in worker
     assert 'sleep_interval="$INTERVAL"' in worker
     assert "--priority-aging-seconds \"$PRIORITY_AGING_SECONDS\"" in worker
-    assert "sleep \"$INTERVAL\"" in control
+    assert 'control_state="$(printf' in control
+    assert 'sleep_interval="$ACTIVE_INTERVAL"' in control
+    assert 'sleep_interval="$INTERVAL"' in control
+    assert "sleep \"$sleep_interval\"" in control
     assert "sleep \"$sleep_interval\"" in worker
+
+
+@pytest.mark.parametrize(
+    ("summary", "expected_interval"),
+    [
+        (
+            {
+                "ok": True,
+                "steps": [
+                    {
+                        "name": "materialize_features",
+                        "data": {"wallets_attempted": 80},
+                    },
+                    {
+                        "name": "incremental_score",
+                        "data": {"score_candidates_considered": 25},
+                    },
+                ],
+            },
+            60,
+        ),
+        (
+            {
+                "ok": True,
+                "steps": [
+                    {
+                        "name": "materialize_features",
+                        "data": {"wallets_attempted": 12},
+                    },
+                    {
+                        "name": "incremental_score",
+                        "data": {"score_candidates_considered": 300},
+                    },
+                ],
+            },
+            60,
+        ),
+        (
+            {
+                "ok": True,
+                "steps": [
+                    {
+                        "name": "materialize_features",
+                        "data": {"wallets_attempted": 12},
+                    },
+                    {
+                        "name": "incremental_score",
+                        "data": {"score_candidates_considered": 40},
+                    },
+                ],
+            },
+            300,
+        ),
+    ],
+)
+def test_nas_research_control_selects_backlog_or_idle_interval(
+    tmp_path,
+    summary,
+    expected_interval,
+):
+    result = _run_nas_research_control_once(tmp_path, json.dumps(summary))
+
+    assert result.returncode == 0, result.stderr
+    assert f"next cycle in {expected_interval}s (status=ok" in result.stdout
+
+
+def test_nas_research_control_uses_idle_interval_for_malformed_summary(tmp_path):
+    result = _run_nas_research_control_once(tmp_path, "not-json")
+
+    assert result.returncode == 0
+    assert "invalid JSON summary; using idle interval" in result.stderr
+    assert "next cycle in 300s (status=invalid" in result.stdout
+
+
+def test_nas_research_control_rejects_incomplete_success_summary(tmp_path):
+    result = _run_nas_research_control_once(tmp_path, '{"ok": true, "steps": []}')
+
+    assert result.returncode == 0
+    assert "invalid JSON summary; using idle interval" in result.stderr
+    assert "next cycle in 300s (status=invalid" in result.stdout
+
+
+def test_nas_research_control_uses_idle_interval_after_failed_cycle(tmp_path):
+    result = _run_nas_research_control_once(tmp_path, '{"ok": false}', exit_code=1)
+
+    assert result.returncode == 0
+    assert "ordered cycle partial" in result.stderr
+    assert "next cycle in 300s (status=failed" in result.stdout
+
+
+def _run_nas_research_control_once(tmp_path, control_output, *, exit_code=0):
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    python_wrapper = fake_bin / "python"
+    python_wrapper.write_text(
+        "#!/bin/sh\n"
+        "if [ \"$1\" = \"-m\" ]; then\n"
+        "  case \" $* \" in\n"
+        "    *\" pipeline-cycle \"*)\n"
+        "      printf '%s\\n' \"$FAKE_CONTROL_OUTPUT\"\n"
+        "      exit \"${FAKE_CONTROL_EXIT:-0}\"\n"
+        "      ;;\n"
+        "    *\" paper-handoff-export \"*)\n"
+        "      printf '%s\\n' '{\"ok\": true}'\n"
+        "      exit 0\n"
+        "      ;;\n"
+        "    *\" runtime-heartbeat \"*)\n"
+        "      exit 0\n"
+        "      ;;\n"
+        "  esac\n"
+        "fi\n"
+        f'exec "{sys.executable}" "$@"\n',
+        encoding="utf-8",
+    )
+    python_wrapper.chmod(0o755)
+    date_wrapper = fake_bin / "date"
+    date_wrapper.write_text(
+        "#!/bin/sh\nprintf '%s\\n' '2026-07-12T09:00:00+08:00'\n",
+        encoding="utf-8",
+    )
+    date_wrapper.chmod(0o755)
+    env = {
+        **os.environ,
+        "PATH": f"{fake_bin}:{os.environ.get('PATH', '')}",
+        "FAKE_CONTROL_OUTPUT": control_output,
+        "FAKE_CONTROL_EXIT": str(exit_code),
+        "PM_ROBOT_RESEARCH_CONTROL_RUN_ONCE": "1",
+        "PM_ROBOT_RESEARCH_CONTROL_ACTIVE_INTERVAL": "60",
+        "PM_ROBOT_RESEARCH_CONTROL_INTERVAL": "300",
+        "PM_ROBOT_SCORE_FEATURE_LIMIT": "80",
+        "PM_ROBOT_SCORE_LIMIT": "300",
+    }
+    return subprocess.run(
+        ["sh", "deploy/nas/research-control-loop.sh"],
+        cwd=Path(__file__).resolve().parents[1],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
 
 
 @pytest.mark.parametrize(
@@ -1022,7 +1168,8 @@ def test_nas_research_control_runs_planning_features_and_scoring_in_one_cycle():
     assert "paper-observer-evaluate" not in loop
     assert "loop_score_paper_observer_preview" not in loop
     assert "loop_score_paper_observer_evaluation" not in loop
-    assert "sleep \"$INTERVAL\"" in loop
+    assert "PM_ROBOT_RESEARCH_CONTROL_ACTIVE_INTERVAL:-60" in loop
+    assert "sleep \"$sleep_interval\"" in loop
 
 
 def test_nas_wallet_pipeline_control_plane_has_one_owner():

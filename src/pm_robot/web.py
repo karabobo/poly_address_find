@@ -39,6 +39,7 @@ from pm_robot.orchestration.pipeline_audit import (
 )
 from pm_robot.orchestration.paper_runner import preview_paper_observer
 from pm_robot.orchestration.evidence_readiness import paper_evidence_ready, paper_evidence_ready_sql
+from pm_robot.risk.eligibility import ELIGIBLE_HYGIENE_STATUSES
 from pm_robot.orchestration.feature_materializer import MATERIALIZER_VERSION
 from pm_robot.orchestration.review_disposition import review_disposition
 from pm_robot.orchestration.wallet_pipeline import (
@@ -5916,7 +5917,7 @@ def _paper_handoff_research_checks(row: dict[str, Any], *, paper_min_score: floa
     evidence_tier = str(row.get("evidence_tier") or "")
     evidence_status = str(row.get("evidence_status") or "")
     evidence_current_stage = str(row.get("evidence_current_stage") or "")
-    hygiene_status = str(row.get("hygiene_status") or "")
+    hygiene_status = str(row.get("hygiene_status") or "").lower()
     followers = int(row.get("qualified_follower_count") or 0)
     backtest_trades = int(row.get("backtest_trade_count") or 0)
     edge_retention = float(row.get("edge_retention_pct") or 0)
@@ -5937,7 +5938,7 @@ def _paper_handoff_research_checks(row: dict[str, Any], *, paper_min_score: floa
         {
             "key": "hygiene_clean",
             "label": "Hygiene 低风险",
-            "passed": hygiene_status in {"ok", "clean", "low_risk"},
+            "passed": hygiene_status in ELIGIBLE_HYGIENE_STATUSES,
             "value": hygiene_status or "unknown",
         },
         {

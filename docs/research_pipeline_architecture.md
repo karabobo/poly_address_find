@@ -143,6 +143,9 @@ default `up`, `restart`, `runtime-ensure`, or watchdog commands.
   control lock so research remains the priority.
 - Planner backpressure limits queued/running wallet evidence and copyability jobs. Copyability planning keeps
   its per-pass batch limit separate from the active-queue waterline and only fills currently available slots.
+- Research control keeps feature and scoring transactions bounded. A cycle that fills either batch schedules
+  the next cycle on the shorter active interval; idle, failed, or malformed summaries retain the conservative
+  interval so backlog drains without turning the control plane into a tight loop.
 - When queue capacity is tight, the planner allocates slots across light, medium, and deep evidence stages by
   configured weight, current active-job share, and a persistent smooth weighted round-robin cursor. Priority
   ordering remains intact within each stage, while fully drained planner cycles cannot reset stage fairness.
@@ -165,6 +168,8 @@ default `up`, `restart`, `runtime-ensure`, or watchdog commands.
   coordination transaction uses a short timeout and never contains network I/O or sleep.
 - Optional SQLite recovery points are integrity-checked when explicitly created. Their freshness is not part of
   default runtime health while scheduled backups are paused.
+- Paper handoff and paper eligibility share the same accepted hygiene statuses; the UI does not maintain a
+  second status vocabulary that can contradict the scoring gate.
 - `paper_candidate` and `live_eligible` are research states, never implicit permission to place real orders.
 
 ## Current Follow-Up Work
