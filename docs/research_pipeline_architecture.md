@@ -162,6 +162,10 @@ default `up`, `restart`, `runtime-ensure`, or watchdog commands.
 - Retention reports control-lock wait, prune work, inter-batch sleep, and unclassified overhead separately. Its
   SQLite page cache and mmap window are private to the single retention connection, bounded to 1 GiB each, and do
   not change discovery, worker, scoring, or web connections. NAS defaults are 128 MiB cache and 256 MiB mmap.
+- Production zero-raw pruning revalidates wallet eligibility inside the write transaction, then resets activity
+  watermarks in one batch and skips the redundant post-delete evidence scan. Archive or keep-recent modes retain
+  exact per-wallet watermark reconciliation and residual checks. Reports split delete, watermark, residual,
+  finalization, and commit time so later tuning remains evidence-led.
 - Planner backpressure limits queued/running wallet evidence and copyability jobs. Copyability planning keeps
   its per-pass batch limit separate from the active-queue waterline and only fills currently available slots.
 - Research control keeps feature and scoring transactions bounded. A full batch schedules a `scoring_only` pass on

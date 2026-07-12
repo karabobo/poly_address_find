@@ -3552,6 +3552,7 @@ def _storage_maintenance_panel(values: dict[str, Any]) -> str:
     retention_backlog = retention.get("backlog_after") or {}
     retention_timings = retention.get("timings") or {}
     retention_tuning = retention.get("sqlite_tuning_requested") or {}
+    retention_phases = retention.get("prune_phase_timings") or {}
     retention_fresh = bool(retention.get("fresh"))
     retention_state = str(retention.get("state") or "")
     net_eta_hours = retention.get("net_eta_hours")
@@ -3696,6 +3697,22 @@ def _storage_maintenance_panel(values: dict[str, Any]) -> str:
                 f" · 批间休眠 {_short_duration_label(retention_timings.get('inter_batch_sleep_seconds'))}"
                 f" · cache {_fmt_int(retention_tuning.get('cache_mib'))} MiB"
                 if retention_timings
+                else "新版 retention 完成一轮后显示"
+            ),
+            "ok",
+        ),
+        (
+            "清理事务拆分",
+            (
+                _short_duration_label(retention_phases.get("delete_seconds"))
+                if retention_phases
+                else "待采样"
+            ),
+            (
+                f"水位 {_short_duration_label(retention_phases.get('watermark_seconds'))}"
+                f" · 复查 {_short_duration_label(retention_phases.get('residual_seconds'))}"
+                f" · 提交 {_short_duration_label(retention_phases.get('commit_seconds'))}"
+                if retention_phases
                 else "新版 retention 完成一轮后显示"
             ),
             "ok",
@@ -8010,6 +8027,7 @@ def _retention_cycle_summary(
         "batches_completed": 0,
         "timings": {},
         "sqlite_tuning_requested": {},
+        "prune_phase_timings": {},
         "backlog_after": {},
         "storage": {},
         "error": "",
@@ -8030,6 +8048,7 @@ def _retention_cycle_summary(
     storage = payload.get("storage")
     timings = payload.get("timings")
     sqlite_tuning = payload.get("sqlite_tuning_requested")
+    prune_phase_timings = payload.get("prune_phase_timings")
     if not isinstance(backlog_after, dict) or not isinstance(storage, dict):
         summary["available"] = True
         summary["error"] = "retention_report_schema_unsupported"
@@ -8074,6 +8093,22 @@ def _retention_cycle_summary(
                 for key in ("cache_mib", "mmap_mib")
             }
             if isinstance(sqlite_tuning, dict)
+            else {},
+            "prune_phase_timings": {
+                key: _optional_float(prune_phase_timings.get(key)) or 0.0
+                for key in (
+                    "selection_seconds",
+                    "archive_seconds",
+                    "writer_setup_seconds",
+                    "revalidation_seconds",
+                    "delete_seconds",
+                    "watermark_seconds",
+                    "residual_seconds",
+                    "finalize_seconds",
+                    "commit_seconds",
+                )
+            }
+            if isinstance(prune_phase_timings, dict)
             else {},
             "backlog_after": {
                 key: _optional_int(backlog_after.get(key)) or 0

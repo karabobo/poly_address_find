@@ -3,6 +3,7 @@ import time
 
 import pytest
 
+import pm_robot.ops as ops
 from pm_robot.config import RobotSettings
 from pm_robot.models import CandidateAddress, CandidateStage, ScoreBreakdown, WalletFeatures
 from pm_robot.ops import (
@@ -214,6 +215,9 @@ def test_retention_cycle_aggregates_batches_and_backlog(tmp_path):
     assert result["timings"]["prune_work_seconds"] >= 0
     assert result["timings"]["inter_batch_sleep_seconds"] >= 0
     assert result["timings"]["other_seconds"] >= 0
+    assert result["prune_phase_timings"]["delete_seconds"] >= 0
+    assert result["prune_phase_timings"]["watermark_seconds"] >= 0
+    assert result["prune_phase_timings"]["residual_seconds"] == 0
     assert len(result["batch_results"]) == 2
     for batch in result["batch_results"]:
         assert batch["timings"]["control_lock_wait_seconds"] >= 0
@@ -221,6 +225,7 @@ def test_retention_cycle_aggregates_batches_and_backlog(tmp_path):
         assert batch["sqlite_tuning"]["cache_mib_requested"] == 16
         assert batch["sqlite_tuning"]["cache_mib_effective"] == 16
         assert batch["sqlite_tuning"]["mmap_mib_requested"] == 32
+        assert batch["phase_timings"]["delete_seconds"] >= 0
     assert result["database_identity"]["database_id"] == identity_before["database_id"]
     assert result["database_identity"]["mutation_generation"] == (
         identity_before["mutation_generation"] + 2
@@ -922,10 +927,18 @@ def test_retention_cycle_cli_does_not_replace_report_when_cycle_is_active(
 def test_execute_prune_counts_sqlite_changes_without_precount_scan(tmp_path):
     conn = connect(tmp_path / "robot.sqlite")
     wallet = "0x" + "9" * 40
+    untouched_wallet = "0x" + "b" * 40
     statements: list[str] = []
     try:
         run_migrations(conn)
         _seed_candidate(conn, wallet, materialized=True)
+        upsert_candidate(conn, CandidateAddress(address=untouched_wallet, sources="test"))
+        persist_wallet_activity(
+            conn,
+            untouched_wallet,
+            [_activity(idx + 100) for idx in range(5)],
+            ingested_at=2_000,
+        )
         conn.set_trace_callback(statements.append)
 
         deleted = _prune_wallet_evidence_batch(
@@ -934,12 +947,155 @@ def test_execute_prune_counts_sqlite_changes_without_precount_scan(tmp_path):
             keep_recent_activity=0,
             dry_run=False,
         )
+        conn.set_trace_callback(None)
 
         assert deleted["wallet_activity"] == 5
+        assert conn.execute(
+            "SELECT COUNT(*) FROM wallet_activity WHERE address = ?",
+            (untouched_wallet,),
+        ).fetchone()[0] == 5
         assert not any(
             "SELECT COUNT(*)" in statement.upper()
             for statement in statements
         )
+        activity_deletes = [
+            statement.upper()
+            for statement in statements
+            if statement.lstrip().upper().startswith('DELETE FROM "WALLET_ACTIVITY"')
+        ]
+        assert activity_deletes
+        assert all("TEMP_PRUNE_KEEP_ACTIVITY" not in sql for sql in activity_deletes)
+    finally:
+        conn.close()
+
+
+def test_zero_raw_prune_uses_bulk_watermark_reset(tmp_path, monkeypatch):
+    db_path = tmp_path / "robot.sqlite"
+    wallet = "0x" + "7" * 40
+    conn = connect(db_path)
+    try:
+        run_migrations(conn)
+        _seed_candidate(conn, wallet, materialized=True)
+        conn.execute(
+            "UPDATE candidate_wallets SET candidate_stage = 'blocked_hygiene' WHERE address = ?",
+            (wallet,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    def fail_per_wallet_refresh(*args, **kwargs):
+        raise AssertionError("zero-raw retention must not rescan each wallet")
+
+    monkeypatch.setattr(ops, "refresh_activity_watermark", fail_per_wallet_refresh)
+
+    result = prune_low_value_evidence(
+        _settings(db_path),
+        limit=10,
+        keep_recent_activity=0,
+        dry_run=False,
+    )
+
+    assert result["deleted"]["wallet_activity"] == 5
+    conn = connect(db_path)
+    try:
+        watermark = conn.execute(
+            """
+            SELECT newest_timestamp, newest_activity_key, trade_count, activity_count
+            FROM wallet_activity_watermarks
+            WHERE address = ?
+            """,
+            (wallet,),
+        ).fetchone()
+        assert tuple(watermark) == (0, "", 0, 0)
+    finally:
+        conn.close()
+
+
+def test_zero_raw_prune_skips_redundant_residual_scan(tmp_path, monkeypatch):
+    db_path = tmp_path / "robot.sqlite"
+    wallet = "0x" + "8" * 40
+    conn = connect(db_path)
+    try:
+        run_migrations(conn)
+        _seed_candidate(conn, wallet, materialized=True)
+        conn.execute(
+            "UPDATE candidate_wallets SET candidate_stage = 'blocked_hygiene' WHERE address = ?",
+            (wallet,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    def fail_residual_scan(*args, **kwargs):
+        raise AssertionError("transactional zero-raw delete has no residual scope")
+
+    monkeypatch.setattr(ops, "_remaining_wallet_evidence_counts", fail_residual_scan)
+
+    result = prune_low_value_evidence(
+        _settings(db_path),
+        limit=10,
+        keep_recent_activity=0,
+        dry_run=False,
+    )
+
+    assert result["wallets"] == [wallet]
+    assert result["deleted"]["wallet_activity"] == 5
+
+
+def test_zero_raw_prune_revalidates_stage_before_delete(tmp_path, monkeypatch):
+    db_path = tmp_path / "robot.sqlite"
+    wallet = "0x" + "a" * 40
+    conn = connect(db_path)
+    try:
+        run_migrations(conn)
+        _seed_candidate(conn, wallet, materialized=True)
+        conn.execute(
+            "UPDATE candidate_wallets SET candidate_stage = 'blocked_hygiene' WHERE address = ?",
+            (wallet,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    original_revalidate = ops._revalidate_low_value_prune_wallets
+
+    def upgrade_before_revalidate(conn, wallets):
+        conn.execute(
+            "UPDATE candidate_wallets SET candidate_stage = 'paper_candidate' WHERE address = ?",
+            (wallet,),
+        )
+        return original_revalidate(conn, wallets)
+
+    monkeypatch.setattr(
+        ops,
+        "_revalidate_low_value_prune_wallets",
+        upgrade_before_revalidate,
+    )
+
+    result = prune_low_value_evidence(
+        _settings(db_path),
+        limit=10,
+        keep_recent_activity=0,
+        dry_run=False,
+    )
+
+    assert result["wallet_count"] == 0
+    conn = connect(db_path)
+    try:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM wallet_activity WHERE address = ?",
+            (wallet,),
+        ).fetchone()[0] == 5
+        assert conn.execute(
+            "SELECT activity_count FROM wallet_activity_watermarks WHERE address = ?",
+            (wallet,),
+        ).fetchone()[0] == 5
+        registry = conn.execute(
+            "SELECT raw_pruned_at FROM wallet_registry WHERE address = ?",
+            (wallet,),
+        ).fetchone()
+        assert registry is None or registry["raw_pruned_at"] is None
     finally:
         conn.close()
 

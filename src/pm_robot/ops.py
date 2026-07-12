@@ -2053,6 +2053,18 @@ def _prune_low_value_evidence_locked(
     archive_root = archive_dir or settings.archive_dir
     archive_run: dict[str, Any] | None = None
     effective_keep_recent_activity = max(0, int(keep_recent_activity))
+    phase_timings = {
+        "selection_seconds": 0.0,
+        "archive_seconds": 0.0,
+        "writer_setup_seconds": 0.0,
+        "revalidation_seconds": 0.0,
+        "delete_seconds": 0.0,
+        "watermark_seconds": 0.0,
+        "residual_seconds": 0.0,
+        "finalize_seconds": 0.0,
+        "commit_seconds": 0.0,
+    }
+    selection_started = time.monotonic()
     conn = connect(settings.db_path)
     try:
         run_migrations(conn)
@@ -2120,6 +2132,7 @@ def _prune_low_value_evidence_locked(
             selected_activity_rows = _wallet_activity_count(conn, wallets)
     finally:
         conn.close()
+        phase_timings["selection_seconds"] += time.monotonic() - selection_started
     if archive_run is not None:
         effective_keep_recent_activity = int(archive_run.get("keep_recent_activity") or 0)
 
@@ -2133,12 +2146,14 @@ def _prune_low_value_evidence_locked(
         "byte_size": 0,
     }
     if archive and not dry_run and archive_run is not None:
+        archive_started = time.monotonic()
         archive_result = _complete_evidence_archive(
             settings,
             archive_root=archive_root,
             archive_run=archive_run,
             keep_recent_activity=effective_keep_recent_activity,
         )
+        phase_timings["archive_seconds"] += time.monotonic() - archive_started
         if not archive_result["ok"]:
             return {
                 "ok": False,
@@ -2154,10 +2169,14 @@ def _prune_low_value_evidence_locked(
                 ),
                 "deleted": _empty_evidence_delete_counts(),
                 "archive": archive_result,
+                "phase_timings": {
+                    key: round(value, 3) for key, value in phase_timings.items()
+                },
                 "storage": storage_report(settings),
             }
 
     sqlite_tuning: dict[str, int | float] = {}
+    writer_setup_started = time.monotonic()
     conn = connect(settings.db_path)
     try:
         run_migrations(conn)
@@ -2167,9 +2186,11 @@ def _prune_low_value_evidence_locked(
             mmap_mib=sqlite_mmap_mib,
         )
         conn.execute("PRAGMA foreign_keys = OFF")
-        archive_run_id = str(archive_result.get("run_id") or "")
-        if not dry_run and not archive_run_id:
+        delete_archive_run_id = str(archive_result.get("run_id") or "")
+        phase_timings["writer_setup_seconds"] += time.monotonic() - writer_setup_started
+        if not dry_run and not delete_archive_run_id:
             # Recheck policy under the writer lock so no newly active wallet is pruned.
+            revalidation_started = time.monotonic()
             conn.execute("BEGIN IMMEDIATE")
             wallets = _revalidate_low_value_prune_wallets(conn, wallets)
             selected_activity_rows = _wallet_activity_count(conn, wallets)
@@ -2180,31 +2201,55 @@ def _prune_low_value_evidence_locked(
                     stages=(),
                     addresses=tuple(wallets),
                 )
+            phase_timings["revalidation_seconds"] += (
+                time.monotonic() - revalidation_started
+            )
+        delete_started = time.monotonic()
         deleted = _prune_wallet_evidence_batch(
             conn,
             wallets,
             keep_recent_activity=effective_keep_recent_activity,
             dry_run=dry_run,
-            archive_run_id=archive_run_id,
+            archive_run_id=delete_archive_run_id,
         )
+        phase_timings["delete_seconds"] += time.monotonic() - delete_started
         if not dry_run:
             watermark_updated_at = int(time.time())
-            for wallet in wallets:
-                refresh_activity_watermark(
+            zero_raw_transaction = bool(
+                effective_keep_recent_activity == 0 and not delete_archive_run_id
+            )
+            watermark_started = time.monotonic()
+            if zero_raw_transaction:
+                _reset_activity_watermarks_after_zero_raw_prune(
                     conn,
-                    wallet,
+                    wallets,
                     updated_at=watermark_updated_at,
                 )
+            else:
+                for wallet in wallets:
+                    refresh_activity_watermark(
+                        conn,
+                        wallet,
+                        updated_at=watermark_updated_at,
+                    )
+            phase_timings["watermark_seconds"] += time.monotonic() - watermark_started
             raw_artifact_uri = ""
             archive_run_id = ""
             if archive_result.get("status") == "verified":
                 archive_run_id = str(archive_result["run_id"])
                 raw_artifact_uri = f"parquet://{archive_result['manifest_path']}"
-            residual = _remaining_wallet_evidence_counts(
-                conn,
-                wallets,
-                keep_recent_activity=effective_keep_recent_activity,
+            residual_started = time.monotonic()
+            residual = (
+                _empty_evidence_delete_counts()
+                if zero_raw_transaction
+                else _remaining_wallet_evidence_counts(
+                    conn,
+                    wallets,
+                    keep_recent_activity=effective_keep_recent_activity,
+                )
             )
+            phase_timings["residual_seconds"] += time.monotonic() - residual_started
+            finalize_started = time.monotonic()
             if not any(residual.values()):
                 _mark_wallet_registry_pruned(
                     conn,
@@ -2223,7 +2268,10 @@ def _prune_low_value_evidence_locked(
                 archive_result["residual"] = residual
             if wallets:
                 _advance_retention_generation(conn, updated_at=watermark_updated_at)
+            phase_timings["finalize_seconds"] += time.monotonic() - finalize_started
+            commit_started = time.monotonic()
             conn.commit()
+            phase_timings["commit_seconds"] += time.monotonic() - commit_started
         else:
             conn.rollback()
         conn.execute("PRAGMA foreign_keys = ON")
@@ -2246,6 +2294,9 @@ def _prune_low_value_evidence_locked(
         "deleted": deleted,
         "archive": archive_result,
         "sqlite_tuning": sqlite_tuning,
+        "phase_timings": {
+            key: round(value, 3) for key, value in phase_timings.items()
+        },
         "storage": storage_report(settings),
     }
 
@@ -2440,6 +2491,7 @@ def _run_retention_cycle_locked(
     control_lock_wait_seconds = 0.0
     prune_work_seconds = 0.0
     inter_batch_sleep_seconds = 0.0
+    prune_phase_timings: dict[str, float] = {}
 
     # Repeating a dry-run would preview the same oldest wallet set each time.
     batch_attempts = min(requested_batches, 1) if dry_run else requested_batches
@@ -2481,6 +2533,11 @@ def _run_retention_cycle_locked(
         batch_prune_seconds = time.monotonic() - prune_started
         prune_work_seconds += batch_prune_seconds
         batch_deleted = result.get("deleted") or {}
+        batch_phase_timings = result.get("phase_timings") or {}
+        for key, value in batch_phase_timings.items():
+            prune_phase_timings[str(key)] = (
+                prune_phase_timings.get(str(key), 0.0) + float(value or 0.0)
+            )
         for table in planned:
             row_count = int(batch_deleted.get(table) or 0)
             planned[table] += row_count
@@ -2496,6 +2553,7 @@ def _run_retention_cycle_locked(
                 "deleted": batch_deleted,
                 "archive": result.get("archive") or {},
                 "sqlite_tuning": result.get("sqlite_tuning") or {},
+                "phase_timings": batch_phase_timings,
                 "timings": {
                     "control_lock_wait_seconds": round(batch_control_wait_seconds, 3),
                     "prune_work_seconds": round(batch_prune_seconds, 3),
@@ -2642,6 +2700,9 @@ def _run_retention_cycle_locked(
         "sqlite_tuning_requested": {
             "cache_mib": _bounded_retention_memory_mib(sqlite_cache_mib),
             "mmap_mib": _bounded_retention_memory_mib(sqlite_mmap_mib),
+        },
+        "prune_phase_timings": {
+            key: round(value, 3) for key, value in prune_phase_timings.items()
         },
         "database_identity": database_identity_after,
         "storage": _retention_storage_snapshot(settings),
@@ -4018,7 +4079,10 @@ def _prune_wallet_evidence_batch(
                 (archive_run_id, spec.table),
             )
         else:
-            conn.execute(f'DELETE FROM "{spec.table}" WHERE {spec.where_sql}')
+            where_sql = spec.where_sql
+            if spec.table == "wallet_activity" and keep_recent_activity <= 0:
+                where_sql = "address IN (SELECT wallet FROM temp_prune_wallets)"
+            conn.execute(f'DELETE FROM "{spec.table}" WHERE {where_sql}')
         deleted[spec.table] = conn.total_changes - changes_before
     drop_prune_temp_tables(conn)
     return deleted
@@ -4026,6 +4090,40 @@ def _prune_wallet_evidence_batch(
 
 def _empty_evidence_delete_counts() -> dict[str, int]:
     return {spec.table: 0 for spec in EVIDENCE_TABLE_SPECS}
+
+
+def _reset_activity_watermarks_after_zero_raw_prune(
+    conn: sqlite3.Connection,
+    wallets: list[str],
+    *,
+    updated_at: int,
+) -> None:
+    """Reset exact watermarks without rescanning rows deleted in this transaction."""
+
+    if not wallets:
+        return
+    conn.executemany(
+        """
+        INSERT INTO wallet_activity_watermarks(
+            address, newest_timestamp, newest_activity_key, trade_count,
+            activity_count, updated_at
+        ) VALUES (?, 0, '', 0, 0, ?)
+        ON CONFLICT(address) DO UPDATE SET
+            newest_timestamp = 0,
+            newest_activity_key = '',
+            trade_count = 0,
+            activity_count = 0,
+            updated_at = CASE
+                WHEN wallet_activity_watermarks.newest_timestamp != 0
+                  OR wallet_activity_watermarks.newest_activity_key != ''
+                  OR wallet_activity_watermarks.trade_count != 0
+                  OR wallet_activity_watermarks.activity_count != 0
+                THEN excluded.updated_at
+                ELSE wallet_activity_watermarks.updated_at
+            END
+        """,
+        ((wallet.lower(), updated_at) for wallet in wallets),
+    )
 
 
 def _remaining_wallet_evidence_counts(
