@@ -1465,6 +1465,44 @@ def test_candidate_source_wallet_latest_snapshot_tracks_event_changes(tmp_path):
         conn.close()
 
 
+def test_candidate_source_wallet_first_keeps_one_immutable_origin(tmp_path):
+    settings = _settings(tmp_path)
+    _seed(settings)
+    wallet = "0xabc0000000000000000000000000000000000001"
+    conn = connect(settings.db_path)
+    try:
+        first = conn.execute(
+            "SELECT * FROM candidate_source_wallet_first WHERE address = ?",
+            (wallet,),
+        ).fetchone()
+        assert first["source"] == "polymarket_trades_global"
+
+        conn.execute(
+            """
+            INSERT INTO candidate_source_events(
+                address, source, status, labels, notes, links,
+                evidence_json, observed_at, recorded_at
+            ) VALUES (?, 'polymarket_rtds_activity', 'active', '', '', '',
+                      '{}', ?, ?)
+            """,
+            (wallet, 1_700_000_000, 1_800_000_100),
+        )
+        first_after = conn.execute(
+            "SELECT * FROM candidate_source_wallet_first WHERE address = ?",
+            (wallet,),
+        ).fetchone()
+        assert first_after["source"] == "polymarket_trades_global"
+        assert first_after["first_event_id"] == first["first_event_id"]
+        conn.commit()
+    finally:
+        conn.close()
+
+    quality = {row["source"]: row for row in dashboard_data(settings)["source_quality"]}
+    assert quality["polymarket_trades_global"]["wallets"] == 1
+    assert "polymarket_rtds_activity" not in quality
+    assert wallet_table_rows(settings, source="polymarket_rtds_activity") == []
+
+
 def test_leader_latest_scores_snapshot_tracks_score_changes(tmp_path):
     settings = _settings(tmp_path)
     _seed(settings)

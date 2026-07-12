@@ -2266,17 +2266,17 @@ def _source_quality_rows(conn: sqlite3.Connection) -> list[dict[str, Any]]:
         conn,
         """
         WITH top_sources AS (
-            SELECT source, COUNT(*) AS wallets, MAX(latest_recorded_at) AS latest_at
-            FROM candidate_source_wallet_latest
+            SELECT source, COUNT(*) AS wallets, MAX(first_recorded_at) AS latest_at
+            FROM candidate_source_wallet_first
             WHERE source != ''
             GROUP BY source
             ORDER BY wallets DESC, latest_at DESC, source ASC
             LIMIT 12
         ),
         source_wallets AS (
-            SELECT csl.source, csl.address, csl.latest_recorded_at AS latest_at
-            FROM candidate_source_wallet_latest csl
-            JOIN top_sources ts ON ts.source = csl.source
+            SELECT cswf.source, cswf.address, cswf.first_recorded_at AS latest_at
+            FROM candidate_source_wallet_first cswf
+            JOIN top_sources ts ON ts.source = cswf.source
         ),
         source_wallet_metrics AS (
             SELECT
@@ -2338,13 +2338,9 @@ def _source_focus_wallet_rows(
         conn,
         """
         WITH matched_wallets AS (
-            SELECT DISTINCT cw.address
-            FROM candidate_wallets cw
-            WHERE {source_match}
-            UNION
-            SELECT DISTINCT cse.address
-            FROM candidate_source_events cse
-            WHERE cse.source = ?
+            SELECT cswf.address
+            FROM candidate_source_wallet_first cswf
+            WHERE cswf.source = ?
         )
         SELECT
             cw.address,
@@ -2400,9 +2396,8 @@ def _source_focus_wallet_rows(
             COALESCE(wps.activity_count, eb.current_depth, 0) DESC,
             cw.address ASC
         LIMIT ?
-        """.format(source_match=_candidate_source_token_match_sql("cw")),
+        """,
         (
-            source.strip(),
             source.strip(),
             min(max(int(limit), 1), MAX_LIST_LIMIT),
         ),
@@ -2412,26 +2407,19 @@ def _source_focus_wallet_rows(
     return rows
 
 
-def _candidate_source_token_match_sql(candidate_alias: str) -> str:
-    """Match a full pipe-delimited source token, not an arbitrary substring."""
-    return f"instr(' | ' || {candidate_alias}.sources || ' | ', ' | ' || ? || ' | ') > 0"
-
-
 def _wallet_source_match_sql(candidate_alias: str) -> str:
-    """Match either candidate source tokens or immutable source-event provenance."""
+    """Match the one source that first introduced a wallet into the pipeline."""
     return (
-        f"({_candidate_source_token_match_sql(candidate_alias)} "
-        "OR EXISTS ("
-        "SELECT 1 FROM candidate_source_events cse_filter "
-        f"WHERE cse_filter.address = {candidate_alias}.address "
-        "AND cse_filter.source = ?"
-        "))"
+        "EXISTS ("
+        "SELECT 1 FROM candidate_source_wallet_first cswf_filter "
+        f"WHERE cswf_filter.address = {candidate_alias}.address "
+        "AND cswf_filter.source = ?"
+        ")"
     )
 
 
 def _wallet_source_match_params(source: str) -> list[str]:
-    normalized = source.strip()
-    return [normalized, normalized]
+    return [source.strip()]
 
 
 def _source_focus_blocker_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -3385,7 +3373,7 @@ def _wallet_filter_form(
     return (
         '<section class="filter-shell"><form class="filters sticky-filters" method="get" action="/wallets">'
         '<label>候选阶段<select name="stage">' + "".join(stage_options) + "</select></label>"
-        '<label>发现来源<select name="source">' + "".join(source_options) + "</select></label>"
+        '<label>首次发现来源<select name="source">' + "".join(source_options) + "</select></label>"
         f'<label>搜索<input name="q" value="{_e(query)}" placeholder="输入地址、标签或备注"></label>'
         f'<input type="hidden" name="signal" value="{_e(signal)}">'
         '<button type="submit">应用筛选</button><a class="button secondary" href="/wallets">清空</a>'
@@ -3574,7 +3562,7 @@ def _source_quality_table(rows: list[dict[str, Any]]) -> str:
             f'<td class="num">{_fmt_num(row.get("max_score"))}</td>'
             "</tr>"
         )
-    return _table(["来源", "钱包", "L2+", "L3", "可评分", "观察/Paper", "阻断", "均分", "最高分"], "".join(body))
+    return _table(["首次来源", "钱包", "L2+", "L3", "可评分", "观察/Paper", "阻断", "均分", "最高分"], "".join(body))
 
 
 def _storage_maintenance_panel(values: dict[str, Any]) -> str:
