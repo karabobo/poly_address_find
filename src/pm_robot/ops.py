@@ -48,6 +48,7 @@ DAY_SECONDS = 86_400
 WAL_CHECKPOINT_MODES = ("none", "passive", "truncate")
 DEFAULT_FAILED_JOB_COOLDOWN_SECONDS = 21_600
 RETENTION_STARVATION_YIELD_THRESHOLD = 3
+RETENTION_RATE_EWMA_ALPHA = 0.25
 MAX_RETENTION_SQLITE_MEMORY_MIB = 1_024
 ACTIVE_CANDIDATE_REGISTRY_STAGES = (
     "paper_candidate",
@@ -2330,6 +2331,38 @@ def _bounded_retention_memory_mib(value: int) -> int:
     return min(MAX_RETENTION_SQLITE_MEMORY_MIB, max(0, int(value)))
 
 
+def _smoothed_retention_rate(current_rate: float, previous_rate: float) -> float:
+    """Smooth cycle volatility while retaining the last useful rate across yields."""
+
+    current = max(0.0, float(current_rate))
+    previous = max(0.0, float(previous_rate))
+    if previous <= 0:
+        return current
+    if current <= 0:
+        return previous
+    return (
+        RETENTION_RATE_EWMA_ALPHA * current
+        + (1.0 - RETENTION_RATE_EWMA_ALPHA) * previous
+    )
+
+
+def _conservative_retention_rate(
+    gross_rate: float,
+    net_rate: float,
+    smoothed_gross_rate: float,
+    smoothed_net_rate: float,
+) -> float:
+    """Cap the forecast at the slowest positive current or smoothed rate."""
+
+    rates = (
+        float(gross_rate),
+        float(net_rate),
+        float(smoothed_gross_rate),
+        float(smoothed_net_rate),
+    )
+    return min(rates) if all(rate > 0 for rate in rates) else 0.0
+
+
 def _configure_retention_connection(
     conn: sqlite3.Connection,
     *,
@@ -2628,6 +2661,49 @@ def _run_retention_cycle_locked(
         if net_rows_removed > 0 and not dry_run
         else 0.0
     )
+    previous_smoothed_gross_rate = (
+        float(previous_cycle.get("smoothed_gross_rate_per_hour") or 0.0)
+        if previous_cycle_valid
+        else 0.0
+    )
+    previous_smoothed_net_rate = (
+        float(previous_cycle.get("smoothed_net_rate_per_hour") or 0.0)
+        if previous_cycle_valid
+        else 0.0
+    )
+    smoothed_gross_rate_per_hour = _smoothed_retention_rate(
+        gross_rate_per_hour,
+        previous_smoothed_gross_rate,
+    )
+    smoothed_net_rate_per_hour = _smoothed_retention_rate(
+        net_rate_per_hour,
+        previous_smoothed_net_rate,
+    )
+    forecast_rate_per_hour = _conservative_retention_rate(
+        gross_rate_per_hour,
+        net_rate_per_hour,
+        smoothed_gross_rate_per_hour,
+        smoothed_net_rate_per_hour,
+    )
+    forecast_eta_hours = (
+        after_activity_rows / forecast_rate_per_hour
+        if after_activity_rows > 0 and forecast_rate_per_hour > 0
+        else None
+    )
+    non_delete_backlog_reduction_rows = max(
+        0,
+        net_rows_removed - deleted_activity_rows,
+    )
+    forecast_basis = (
+        "smoothed_conservative"
+        if forecast_rate_per_hour > 0
+        and previous_cycle_valid
+        and previous_smoothed_gross_rate > 0
+        and previous_smoothed_net_rate > 0
+        else "current_conservative"
+        if forecast_rate_per_hour > 0
+        else ""
+    )
     gross_eta_hours = (
         after_activity_rows / gross_rate_per_hour
         if after_activity_rows > 0 and gross_rate_per_hour > 0
@@ -2697,6 +2773,14 @@ def _run_retention_cycle_locked(
         "net_backlog_change_rows": after_activity_rows - baseline_activity_rows,
         "gross_rate_per_hour": round(gross_rate_per_hour, 2),
         "net_rate_per_hour": round(net_rate_per_hour, 2),
+        "smoothed_gross_rate_per_hour": round(smoothed_gross_rate_per_hour, 2),
+        "smoothed_net_rate_per_hour": round(smoothed_net_rate_per_hour, 2),
+        "forecast_rate_per_hour": round(forecast_rate_per_hour, 2),
+        "forecast_eta_hours": (
+            round(forecast_eta_hours, 2) if forecast_eta_hours is not None else None
+        ),
+        "forecast_basis": forecast_basis,
+        "non_delete_backlog_reduction_rows": non_delete_backlog_reduction_rows,
         "gross_eta_hours": round(gross_eta_hours, 2) if gross_eta_hours is not None else None,
         "net_eta_hours": round(net_eta_hours, 2) if net_eta_hours is not None else None,
         "backlog_before": backlog_before,
@@ -2770,6 +2854,22 @@ def _previous_retention_cycle(path: Path | None) -> dict[str, Any]:
             0,
             int(payload.get("consecutive_zero_delete_yields") or 0),
         )
+        smoothed_gross_rate_per_hour = max(
+            0.0,
+            float(
+                payload.get("smoothed_gross_rate_per_hour")
+                or payload.get("gross_rate_per_hour")
+                or 0.0
+            ),
+        )
+        smoothed_net_rate_per_hour = max(
+            0.0,
+            float(
+                payload.get("smoothed_net_rate_per_hour")
+                or payload.get("net_rate_per_hour")
+                or 0.0
+            ),
+        )
     except (TypeError, ValueError):
         return _empty_previous_retention_cycle()
     except KeyError:
@@ -2781,6 +2881,8 @@ def _previous_retention_cycle(path: Path | None) -> dict[str, Any]:
         "backlog_after": normalized_backlog,
         "database_identity": normalized_identity,
         "consecutive_zero_delete_yields": consecutive_zero_delete_yields,
+        "smoothed_gross_rate_per_hour": smoothed_gross_rate_per_hour,
+        "smoothed_net_rate_per_hour": smoothed_net_rate_per_hour,
     }
 
 
@@ -2792,6 +2894,8 @@ def _empty_previous_retention_cycle() -> dict[str, Any]:
         "backlog_after": None,
         "database_identity": None,
         "consecutive_zero_delete_yields": 0,
+        "smoothed_gross_rate_per_hour": 0.0,
+        "smoothed_net_rate_per_hour": 0.0,
     }
 
 

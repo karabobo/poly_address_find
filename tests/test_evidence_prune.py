@@ -209,6 +209,15 @@ def test_retention_cycle_aggregates_batches_and_backlog(tmp_path):
     assert result["net_backlog_change_rows"] == -10
     assert result["gross_rate_per_hour"] > 0
     assert result["net_rate_per_hour"] > 0
+    assert result["smoothed_gross_rate_per_hour"] == result["gross_rate_per_hour"]
+    assert result["smoothed_net_rate_per_hour"] == result["net_rate_per_hour"]
+    assert result["forecast_rate_per_hour"] == min(
+        result["gross_rate_per_hour"],
+        result["net_rate_per_hour"],
+    )
+    assert result["forecast_eta_hours"] is not None
+    assert result["forecast_basis"] == "current_conservative"
+    assert result["non_delete_backlog_reduction_rows"] == 0
     assert result["net_eta_hours"] is not None
     assert result["sqlite_tuning_requested"] == {
         "cache_mib": 16,
@@ -411,7 +420,24 @@ def test_retention_cycle_uses_previous_report_to_measure_interval_inflow(tmp_pat
     assert result["eligible_rows_added"] == 5
     assert result["net_backlog_change_rows"] == 0
     assert result["net_rate_per_hour"] == 0
+    assert result["forecast_rate_per_hour"] == 0
+    assert result["forecast_eta_hours"] is None
     assert result["state"] == "inflow_outpacing_cleanup"
+
+
+def test_retention_rate_smoothing_dampens_spikes_and_survives_yields():
+    assert ops._smoothed_retention_rate(400_000, 200_000) == 250_000
+    assert ops._smoothed_retention_rate(0, 200_000) == 200_000
+    assert ops._smoothed_retention_rate(400_000, 0) == 400_000
+    assert (
+        ops._conservative_retention_rate(400_000, 500_000, 250_000, 300_000)
+        == 250_000
+    )
+    assert (
+        ops._conservative_retention_rate(100_000, 500_000, 250_000, 300_000)
+        == 100_000
+    )
+    assert ops._conservative_retention_rate(0, 500_000, 250_000, 300_000) == 0
 
 
 def test_retention_cycle_rejects_stale_or_wrong_database_baseline(tmp_path):

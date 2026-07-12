@@ -3561,7 +3561,14 @@ def _storage_maintenance_panel(values: dict[str, Any]) -> str:
     )
     retention_fresh = bool(retention.get("fresh"))
     retention_state = str(retention.get("state") or "")
+    forecast_eta_hours = retention.get("forecast_eta_hours")
+    forecast_rate_per_hour = float(retention.get("forecast_rate_per_hour") or 0)
+    forecast_basis = str(retention.get("forecast_basis") or "")
+    gross_eta_hours = retention.get("gross_eta_hours")
     net_eta_hours = retention.get("net_eta_hours")
+    non_delete_reduction = int(
+        retention.get("non_delete_backlog_reduction_rows") or 0
+    )
     live_total_bytes = (
         int(values.get("db_bytes") or 0)
         + int(values.get("wal_bytes") or 0)
@@ -3578,10 +3585,48 @@ def _storage_maintenance_panel(values: dict[str, Any]) -> str:
         retention_eta_label = "核心任务优先"
     elif retention_state == "retention_starved":
         retention_eta_label = "清理受阻"
-    elif net_eta_hours is not None:
-        retention_eta_label = _fmt_duration_hours(float(net_eta_hours)) or "已清完"
+    elif forecast_eta_hours is not None:
+        retention_eta_label = (
+            _fmt_duration_hours(float(forecast_eta_hours)) or "已清完"
+        )
     else:
         retention_eta_label = "待测算"
+    eta_detail = []
+    if retention_fresh:
+        if forecast_basis == "smoothed_conservative":
+            eta_detail.append("平滑值与本轮值取较慢速度")
+        elif forecast_basis:
+            eta_detail.append("按本轮较慢速度")
+        if net_eta_hours is not None:
+            eta_detail.append(
+                f"净趋势 {_fmt_duration_hours(float(net_eta_hours)) or '已清完'}"
+            )
+        if gross_eta_hours is not None:
+            eta_detail.append(
+                f"物理删除 {_fmt_duration_hours(float(gross_eta_hours)) or '已清完'}"
+            )
+        if non_delete_reduction:
+            eta_detail.append(f"阶段重分类退出 {_fmt_int(non_delete_reduction)} 行")
+    if retention.get("available"):
+        eta_detail.append(
+            f"报告于 {_duration_label(retention.get('age_seconds'))} 前更新"
+        )
+    else:
+        eta_detail.append("maintenance-loop 尚未生成周期报告")
+    if retention_fresh:
+        retention_rate_label = f"{_fmt_int(forecast_rate_per_hour)} 行/小时"
+        retention_rate_detail = (
+            f"本轮净 {_fmt_int(retention.get('net_rate_per_hour'))}"
+            f" / 删除 {_fmt_int(retention.get('gross_rate_per_hour'))}"
+            f" · 平滑净 {_fmt_int(retention.get('smoothed_net_rate_per_hour'))}"
+            f" / 删除 {_fmt_int(retention.get('smoothed_gross_rate_per_hour'))} 行/小时"
+        )
+    elif retention.get("available"):
+        retention_rate_label = "报告过期"
+        retention_rate_detail = eta_detail[-1]
+    else:
+        retention_rate_label = "等待首轮"
+        retention_rate_detail = eta_detail[-1]
     cards = [
         (
             "数据总占用",
@@ -3661,9 +3706,9 @@ def _storage_maintenance_panel(values: dict[str, Any]) -> str:
             "ok",
         ),
         (
-            "净清理速度",
-            f"{_fmt_int(retention.get('net_rate_per_hour'))} 行/小时",
-            f"毛速度 {_fmt_int(retention.get('gross_rate_per_hour'))} 行/小时",
+            "保守清理速度",
+            retention_rate_label,
+            retention_rate_detail,
             "warn"
             if not bool(retention.get("ok"))
             or retention_state in {
@@ -3674,13 +3719,9 @@ def _storage_maintenance_panel(values: dict[str, Any]) -> str:
             else "ok",
         ),
         (
-            "净 ETA",
+            "保守 ETA",
             retention_eta_label,
-            (
-                f"报告于 {_duration_label(retention.get('age_seconds'))} 前更新"
-                if retention.get("available")
-                else "maintenance-loop 尚未生成周期报告"
-            ),
+            " · ".join(eta_detail),
             "warn"
             if not retention_fresh
             or not bool(retention.get("ok"))
@@ -8033,6 +8074,12 @@ def _retention_cycle_summary(
         "net_backlog_change_rows": 0,
         "gross_rate_per_hour": 0.0,
         "net_rate_per_hour": 0.0,
+        "smoothed_gross_rate_per_hour": 0.0,
+        "smoothed_net_rate_per_hour": 0.0,
+        "forecast_rate_per_hour": 0.0,
+        "forecast_eta_hours": None,
+        "forecast_basis": "",
+        "non_delete_backlog_reduction_rows": 0,
         "gross_eta_hours": None,
         "net_eta_hours": None,
         "yielded_to_research": False,
@@ -8069,6 +8116,50 @@ def _retention_cycle_summary(
         summary["error"] = "retention_report_schema_unsupported"
         return summary
 
+    deleted_activity_rows = _optional_int(payload.get("deleted_activity_rows")) or 0
+    net_backlog_change_rows = (
+        _optional_int(payload.get("net_backlog_change_rows")) or 0
+    )
+    gross_rate_per_hour = _optional_float(payload.get("gross_rate_per_hour")) or 0.0
+    net_rate_per_hour = _optional_float(payload.get("net_rate_per_hour")) or 0.0
+    smoothed_gross_rate = _optional_float(
+        payload.get("smoothed_gross_rate_per_hour")
+    )
+    smoothed_net_rate = _optional_float(payload.get("smoothed_net_rate_per_hour"))
+    if smoothed_gross_rate is None:
+        smoothed_gross_rate = gross_rate_per_hour
+    if smoothed_net_rate is None:
+        smoothed_net_rate = net_rate_per_hour
+    forecast_rate = _optional_float(payload.get("forecast_rate_per_hour"))
+    forecast_basis = str(payload.get("forecast_basis") or "")
+    if forecast_rate is None:
+        forecast_rate = (
+            min(
+                gross_rate_per_hour,
+                net_rate_per_hour,
+                smoothed_gross_rate,
+                smoothed_net_rate,
+            )
+            if gross_rate_per_hour > 0
+            and net_rate_per_hour > 0
+            and smoothed_gross_rate > 0
+            and smoothed_net_rate > 0
+            else 0.0
+        )
+        if forecast_rate > 0:
+            forecast_basis = "current_conservative"
+    forecast_eta = _optional_float(payload.get("forecast_eta_hours"))
+    backlog_activity_rows = _optional_int(backlog_after.get("total_activity_rows")) or 0
+    if forecast_eta is None and backlog_activity_rows > 0 and forecast_rate > 0:
+        forecast_eta = backlog_activity_rows / forecast_rate
+    non_delete_reduction = _optional_int(
+        payload.get("non_delete_backlog_reduction_rows")
+    )
+    if non_delete_reduction is None:
+        non_delete_reduction = max(
+            0,
+            max(0, -net_backlog_change_rows) - deleted_activity_rows,
+        )
     age_seconds = max(0, int(now) - modified_at)
     summary.update(
         {
@@ -8078,11 +8169,17 @@ def _retention_cycle_summary(
             "ok": bool(payload.get("ok")),
             "dry_run": bool(payload.get("dry_run")),
             "state": str(payload.get("state") or ""),
-            "deleted_activity_rows": _optional_int(payload.get("deleted_activity_rows")) or 0,
+            "deleted_activity_rows": deleted_activity_rows,
             "eligible_rows_added": _optional_int(payload.get("eligible_rows_added")) or 0,
-            "net_backlog_change_rows": _optional_int(payload.get("net_backlog_change_rows")) or 0,
-            "gross_rate_per_hour": _optional_float(payload.get("gross_rate_per_hour")) or 0.0,
-            "net_rate_per_hour": _optional_float(payload.get("net_rate_per_hour")) or 0.0,
+            "net_backlog_change_rows": net_backlog_change_rows,
+            "gross_rate_per_hour": gross_rate_per_hour,
+            "net_rate_per_hour": net_rate_per_hour,
+            "smoothed_gross_rate_per_hour": smoothed_gross_rate,
+            "smoothed_net_rate_per_hour": smoothed_net_rate,
+            "forecast_rate_per_hour": forecast_rate,
+            "forecast_eta_hours": forecast_eta,
+            "forecast_basis": forecast_basis,
+            "non_delete_backlog_reduction_rows": non_delete_reduction,
             "gross_eta_hours": _optional_float(payload.get("gross_eta_hours")),
             "net_eta_hours": _optional_float(payload.get("net_eta_hours")),
             "yielded_to_research": bool(payload.get("yielded_to_research")),

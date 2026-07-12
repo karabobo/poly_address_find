@@ -3669,10 +3669,13 @@ def test_storage_maintenance_summary_exposes_retention_cycle_progress(tmp_path):
     assert "数据总占用" in html
     assert "安全待清理" in html
     assert "1,000,000" in html
-    assert "净清理速度" in html
+    assert "保守清理速度" in html
     assert "同期转入待清理 2,500 行" in html
     assert "30,000 行/小时" in html
+    assert "保守 ETA" in html
     assert "33.3 小时" in html
+    assert "净趋势 33.3 小时" in html
+    assert "物理删除 25.0 小时" in html
     assert "周期实际清理" in html
     assert "5 分钟" in html
     assert "等研究锁 45 秒" in html
@@ -3681,6 +3684,119 @@ def test_storage_maintenance_summary_exposes_retention_cycle_progress(tmp_path):
     assert "清理事务拆分" in html
     assert "水位 3 秒" in html
     assert "提交 10 秒" in html
+
+
+def test_storage_maintenance_eta_ignores_reclassification_spikes(tmp_path):
+    settings = RobotSettings(
+        db_path=tmp_path / "data" / "pm_robot.sqlite",
+        archive_dir=tmp_path / "data" / "parquet",
+        execution_mode="research",
+    )
+    conn = connect(settings.db_path)
+    try:
+        run_migrations(conn)
+        conn.commit()
+    finally:
+        conn.close()
+    report_path = tmp_path / "reports" / "retention_prune_status.json"
+    report_path.parent.mkdir(parents=True)
+    report_path.write_text(
+        json.dumps(
+            {
+                "ok": True,
+                "dry_run": False,
+                "state": "draining",
+                "deleted_activity_rows": 10_000,
+                "eligible_rows_added": 0,
+                "net_backlog_change_rows": -25_000,
+                "gross_rate_per_hour": 40_000,
+                "net_rate_per_hour": 100_000,
+                "smoothed_gross_rate_per_hour": 35_000,
+                "smoothed_net_rate_per_hour": 90_000,
+                "forecast_rate_per_hour": 35_000,
+                "forecast_eta_hours": 28.57,
+                "forecast_basis": "smoothed_conservative",
+                "non_delete_backlog_reduction_rows": 15_000,
+                "gross_eta_hours": 25.0,
+                "net_eta_hours": 10.0,
+                "backlog_after": {
+                    "total_wallets": 1_000,
+                    "total_activity_rows": 1_000_000,
+                },
+                "storage": {"total_data_bytes": 3_000},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    summary = _storage_maintenance_summary(
+        settings,
+        now=int(report_path.stat().st_mtime) + 60,
+        low_free_disk_bytes=1,
+        scheduled_backup_enabled=False,
+    )
+    html = _storage_maintenance_panel(summary)
+
+    retention = summary["retention_cycle"]
+    assert retention["forecast_rate_per_hour"] == 35_000
+    assert retention["forecast_eta_hours"] == 28.57
+    assert retention["non_delete_backlog_reduction_rows"] == 15_000
+    assert "28.6 小时" in html
+    assert "净趋势 10.0 小时" in html
+    assert "物理删除 25.0 小时" in html
+    assert "阶段重分类退出 15,000 行" in html
+    assert ">10.0 小时<" not in html
+
+
+def test_storage_maintenance_mixed_report_requires_current_net_progress(tmp_path):
+    settings = RobotSettings(
+        db_path=tmp_path / "data" / "pm_robot.sqlite",
+        execution_mode="research",
+    )
+    conn = connect(settings.db_path)
+    try:
+        run_migrations(conn)
+        conn.commit()
+    finally:
+        conn.close()
+    report_path = tmp_path / "reports" / "retention_prune_status.json"
+    report_path.parent.mkdir(parents=True)
+    report_path.write_text(
+        json.dumps(
+            {
+                "ok": True,
+                "dry_run": False,
+                "state": "inflow_outpacing_cleanup",
+                "deleted_activity_rows": 10_000,
+                "eligible_rows_added": 10_000,
+                "net_backlog_change_rows": 0,
+                "gross_rate_per_hour": 40_000,
+                "net_rate_per_hour": 0,
+                "smoothed_gross_rate_per_hour": 35_000,
+                "smoothed_net_rate_per_hour": 30_000,
+                "backlog_after": {
+                    "total_wallets": 1_000,
+                    "total_activity_rows": 1_000_000,
+                },
+                "storage": {"total_data_bytes": 3_000},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    summary = _storage_maintenance_summary(
+        settings,
+        now=int(report_path.stat().st_mtime) + 60,
+        low_free_disk_bytes=1,
+        scheduled_backup_enabled=False,
+    )
+    html = _storage_maintenance_panel(summary)
+
+    retention = summary["retention_cycle"]
+    assert retention["forecast_rate_per_hour"] == 0
+    assert retention["forecast_eta_hours"] is None
+    assert retention["forecast_basis"] == ""
+    assert "新增更快" in html
 
 
 def test_storage_maintenance_shows_retention_yield_as_expected_priority(tmp_path):
@@ -3812,6 +3928,7 @@ def test_storage_maintenance_does_not_present_stale_retention_eta_as_current(tmp
     assert summary["retention_cycle"]["fresh"] is False
     assert "报告过期" in html
     assert ">1.0 小时<" not in html
+    assert "净趋势 1.0 小时" not in html
 
 
 def test_discovery_data_builds_workbench_metrics(tmp_path):
