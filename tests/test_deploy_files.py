@@ -1794,6 +1794,19 @@ def test_nas_runtime_status_reports_paper_observer_evaluation_export_health():
     ]
 
 
+def test_nas_runtime_status_surfaces_bounded_retention_telemetry():
+    helper = Path("deploy/nas/pmrobot-nas.sh").read_text(encoding="utf-8")
+
+    assert 'storage_maintenance = dashboard.get("storage_maintenance") or {}' in helper
+    assert 'retention_cycle = storage_maintenance.get("retention_cycle") or {}' in helper
+    assert '"retention": {' in helper
+    assert '"backlog_activity_rows":' in helper
+    assert '"net_backlog_change_rows":' in helper
+    assert '"forecast_rate_per_hour":' in helper
+    assert '"forecast_eta_hours":' in helper
+    assert '"yielded_to_research":' in helper
+
+
 @pytest.mark.skipif(
     not all(
         Path(path).exists()

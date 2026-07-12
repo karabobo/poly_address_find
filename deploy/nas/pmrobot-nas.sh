@@ -177,10 +177,14 @@ try:
     production_readiness = dashboard.get("production_readiness") or {}
     copyability_lane = dashboard.get("copyability_lane") or {}
     score_policy = dashboard.get("score_policy") or {}
+    storage_maintenance = dashboard.get("storage_maintenance") or {}
+    retention_cycle = storage_maintenance.get("retention_cycle") or {}
 except Exception as exc:
     production_readiness = {"error": type(exc).__name__, "message": str(exc)[:160]}
     copyability_lane = {"error": type(exc).__name__, "message": str(exc)[:160]}
     score_policy = {"error": type(exc).__name__, "message": str(exc)[:160]}
+    storage_maintenance = {"error": type(exc).__name__, "message": str(exc)[:160]}
+    retention_cycle = {"error": type(exc).__name__, "message": str(exc)[:160]}
 
 
 def env_value(name):
@@ -738,6 +742,26 @@ print(json.dumps({
     "deployment": deployment,
     "production_readiness": production_readiness,
     "score_policy": score_policy,
+    "retention": {
+        "health": storage_maintenance.get("state", ""),
+        "next_action": storage_maintenance.get("next_action", ""),
+        "available": retention_cycle.get("available", False),
+        "fresh": retention_cycle.get("fresh", False),
+        "age_seconds": retention_cycle.get("age_seconds"),
+        "state": retention_cycle.get("state", ""),
+        "backlog_wallets": (retention_cycle.get("backlog_after") or {}).get("total_wallets", 0),
+        "backlog_activity_rows": (retention_cycle.get("backlog_after") or {}).get("total_activity_rows", 0),
+        "deleted_activity_rows": retention_cycle.get("deleted_activity_rows", 0),
+        "eligible_rows_added": retention_cycle.get("eligible_rows_added", 0),
+        "net_backlog_change_rows": retention_cycle.get("net_backlog_change_rows", 0),
+        "forecast_rate_per_hour": retention_cycle.get("forecast_rate_per_hour", 0),
+        "forecast_eta_hours": retention_cycle.get("forecast_eta_hours"),
+        "forecast_basis": retention_cycle.get("forecast_basis", ""),
+        "yielded_to_research": retention_cycle.get("yielded_to_research", False),
+        "duration_seconds": retention_cycle.get("duration_seconds", 0),
+        "batches_completed": retention_cycle.get("batches_completed", 0),
+        "error": retention_cycle.get("error", ""),
+    },
     "db": db,
 }, ensure_ascii=False, sort_keys=True, indent=2))
 PY
