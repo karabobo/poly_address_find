@@ -1723,9 +1723,11 @@ def test_nas_discovery_loop_runs_high_quality_sources_without_queue_planning():
     assert "rtds-discovery-loop.sh" in compose
     assert "PM_ROBOT_RTDS_MIN_TRADE_USDC=500" in env
     assert "PM_ROBOT_RTDS_WATCH_MIN_SCORE=65" in env
+    assert "PM_ROBOT_RTDS_MAX_IDLE_SECONDS=300" in env
     assert "discover-rtds" in rtds_loop
     assert "--min-trade-usdc" in rtds_loop
     assert "--watch-min-score" in rtds_loop
+    assert "--max-idle-seconds" in rtds_loop
     assert "PM_ROBOT_RTDS_ENDPOINT" in rtds_loop
     assert "DISCOVERY_SERVICES=\"discovery-loop rtds-discovery\"" in helper
     assert "discovery-up" in helper

@@ -731,6 +731,9 @@ def test_paper_handoff_ignores_stale_actionable_observer_rows(tmp_path):
     assert handoff["state_counts"] == [{"state": "awaiting_actionable_signal", "count": 1}]
     assert data["production_readiness"]["observer_current_window_sec"] == 600
     assert data["production_readiness"]["observer_actionable_signals"] == 0
+    assert data["production_readiness"]["observer_history_evaluations"] == 1
+    assert data["production_readiness"]["observer_history_actionable_signals"] == 1
+    assert data["production_readiness"]["observer_history_actionable_wallets"] == 1
     assert data["production_readiness"]["state"] == "paper_candidates_waiting_actionable_signals"
 
 

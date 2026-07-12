@@ -192,6 +192,12 @@ def main() -> int:
     discover_rtds.add_argument("--flush-interval", type=float, default=10.0)
     discover_rtds.add_argument("--ping-interval", type=float, default=5.0)
     discover_rtds.add_argument("--receive-timeout", type=float, default=1.0)
+    discover_rtds.add_argument(
+        "--max-idle-seconds",
+        type=float,
+        default=300.0,
+        help="Reconnect when RTDS delivers no non-heartbeat JSON messages for this long; 0 disables",
+    )
     discover_rtds.add_argument("--reconnect-sleep", type=float, default=5.0)
     discover_rtds.add_argument("--max-runtime-seconds", type=float, default=0.0)
     discover_rtds.add_argument("--max-messages", type=int, default=0)
@@ -1000,6 +1006,7 @@ def main() -> int:
                 flush_interval=args.flush_interval,
                 ping_interval=args.ping_interval,
                 receive_timeout=args.receive_timeout,
+                max_idle_seconds=args.max_idle_seconds,
                 reconnect_sleep=args.reconnect_sleep,
                 max_runtime_seconds=args.max_runtime_seconds,
                 max_messages=args.max_messages,

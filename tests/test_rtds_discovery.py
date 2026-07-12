@@ -34,6 +34,17 @@ class FakeWebSocket:
         return item
 
 
+class ClockedWebSocket(FakeWebSocket):
+    def __init__(self, messages, clock, *, step=1.0):
+        super().__init__(messages)
+        self.clock = clock
+        self.step = step
+
+    def recv_text(self, *, timeout=None):
+        self.clock["now"] += self.step
+        return super().recv_text(timeout=timeout)
+
+
 def _rtds_message(wallet: str, tx: str, *, size: float, price: float = 0.5, market: str = "market-1") -> str:
     return (
         "{"
@@ -135,6 +146,133 @@ def test_run_rtds_activity_discovery_writes_realtime_candidate(tmp_path):
         assert "selected=1" in heartbeat["error"]
         assert "paper_events=0" in heartbeat["error"]
         assert any("activity" in item for item in ws.sent)
+    finally:
+        conn.close()
+
+
+def test_rtds_reconnects_when_heartbeat_frames_mask_an_idle_stream(monkeypatch, tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    wallet = "0x" + "7" * 40
+    clock = {"now": 100.0}
+    idle_ws = ClockedWebSocket(["PONG", "PONG", "PONG"], clock)
+    live_ws = ClockedWebSocket([_rtds_message(wallet, "0xafter-idle", size=1200)], clock)
+    sockets = iter((idle_ws, live_ws))
+    monkeypatch.setattr(rtds_module.time, "monotonic", lambda: clock["now"])
+    try:
+        run_migrations(conn)
+
+        summary = run_rtds_activity_discovery(
+            conn,
+            min_trade_usdc=500,
+            batch_size=1,
+            ping_interval=5,
+            max_idle_seconds=3,
+            max_messages=1,
+            reconnect_sleep=0,
+            websocket_factory=lambda endpoint: next(sockets),
+        )
+
+        assert summary.connections_attempted == 2
+        assert summary.connections_succeeded == 2
+        assert summary.reconnects == 1
+        assert summary.messages_seen == 1
+        assert summary.trades_selected == 1
+        assert summary.status == "partial"
+        assert "rtds stream idle for 3.0s" in summary.error
+        assert conn.execute(
+            "SELECT 1 FROM candidate_wallets WHERE address = ?",
+            (wallet,),
+        ).fetchone() is not None
+    finally:
+        conn.close()
+
+
+def test_rtds_data_messages_reset_the_idle_timer(monkeypatch, tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    wallet = "0x" + "8" * 40
+    clock = {"now": 100.0}
+    ws = ClockedWebSocket(
+        [
+            '{"topic":"status","type":"subscribed"}',
+            "PONG",
+            _rtds_message(wallet, "0xafter-progress", size=1200),
+        ],
+        clock,
+        step=2.0,
+    )
+    monkeypatch.setattr(rtds_module.time, "monotonic", lambda: clock["now"])
+    try:
+        run_migrations(conn)
+
+        summary = run_rtds_activity_discovery(
+            conn,
+            min_trade_usdc=500,
+            batch_size=1,
+            ping_interval=5,
+            max_idle_seconds=3,
+            max_messages=2,
+            reconnect_sleep=0,
+            websocket_factory=lambda endpoint: ws,
+        )
+
+        assert summary.connections_attempted == 1
+        assert summary.reconnects == 0
+        assert summary.messages_seen == 2
+        assert summary.trades_selected == 1
+        assert summary.status == "ok"
+    finally:
+        conn.close()
+
+
+def test_rtds_idle_reconnect_can_be_disabled():
+    assert rtds_module._rtds_stream_idle_error(
+        last_message_at=10.0,
+        now=10_000.0,
+        max_idle_seconds=0,
+    ) is None
+
+
+def test_rtds_flushes_pending_rows_before_idle_reconnect(monkeypatch, tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    first_wallet = "0x" + "9" * 40
+    second_wallet = "0x" + "a" * 40
+    clock = {"now": 100.0}
+    idle_ws = ClockedWebSocket(
+        [
+            _rtds_message(first_wallet, "0xbefore-idle", size=1200),
+            "PONG",
+            "PONG",
+            "PONG",
+        ],
+        clock,
+    )
+    live_ws = ClockedWebSocket(
+        [_rtds_message(second_wallet, "0xafter-reconnect", size=1200)],
+        clock,
+    )
+    sockets = iter((idle_ws, live_ws))
+    monkeypatch.setattr(rtds_module.time, "monotonic", lambda: clock["now"])
+    try:
+        run_migrations(conn)
+
+        summary = run_rtds_activity_discovery(
+            conn,
+            min_trade_usdc=500,
+            batch_size=25,
+            ping_interval=5,
+            max_idle_seconds=3,
+            max_messages=2,
+            reconnect_sleep=0,
+            websocket_factory=lambda endpoint: next(sockets),
+        )
+
+        assert summary.reconnects == 1
+        assert summary.messages_seen == 2
+        assert summary.trades_selected == 2
+        assert conn.execute(
+            "SELECT COUNT(*) FROM candidate_wallets WHERE address IN (?, ?)",
+            (first_wallet, second_wallet),
+        ).fetchone()[0] == 2
     finally:
         conn.close()
 

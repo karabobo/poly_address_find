@@ -6445,6 +6445,23 @@ def _production_readiness_summary(
     observer_quote_errors = int(observer["quote_errors"] or 0) if observer else 0
     observer_actionable_wallets = int(observer["actionable_wallets"] or 0) if observer else 0
     observer_latest_evaluated_at = int(observer["latest_evaluated_at"] or 0) if observer else 0
+    observer_history = conn.execute(
+        """
+        SELECT
+            COUNT(*) AS evaluations,
+            COUNT(DISTINCT pse.wallet) AS wallets,
+            SUM(CASE WHEN pse.accepted = 1 THEN 1 ELSE 0 END) AS accepted_signals,
+            SUM(CASE WHEN pse.actionable = 1 THEN 1 ELSE 0 END) AS actionable_signals,
+            COUNT(DISTINCT CASE WHEN pse.actionable = 1 THEN pse.wallet END) AS actionable_wallets,
+            SUM(CASE WHEN pse.actionability_reason = 'signal_too_old' THEN 1 ELSE 0 END) AS stale_signals,
+            SUM(CASE WHEN pse.quote_error != '' THEN 1 ELSE 0 END) AS quote_errors,
+            MAX(pse.evaluated_at) AS latest_evaluated_at
+        FROM paper_signal_evaluations pse
+        JOIN candidate_wallets cw
+          ON cw.address = pse.wallet
+        WHERE cw.candidate_stage IN ('paper_candidate', 'paper_approved', 'live_eligible')
+        """
+    ).fetchone()
     formal_publish_gate = _formal_publish_gate_summary(conn, settings=settings, stage_counts=stage_counts)
     # Operator-facing blocker should point at the active manual-review queue;
     # archived blockers remain visible in the stage counts.
@@ -6536,6 +6553,14 @@ def _production_readiness_summary(
         "observer_quote_errors": observer_quote_errors,
         "observer_actionable_wallets": observer_actionable_wallets,
         "observer_latest_evaluated_at": observer_latest_evaluated_at,
+        "observer_history_evaluations": int(observer_history["evaluations"] or 0) if observer_history else 0,
+        "observer_history_wallets": int(observer_history["wallets"] or 0) if observer_history else 0,
+        "observer_history_accepted_signals": int(observer_history["accepted_signals"] or 0) if observer_history else 0,
+        "observer_history_actionable_signals": int(observer_history["actionable_signals"] or 0) if observer_history else 0,
+        "observer_history_actionable_wallets": int(observer_history["actionable_wallets"] or 0) if observer_history else 0,
+        "observer_history_stale_signals": int(observer_history["stale_signals"] or 0) if observer_history else 0,
+        "observer_history_quote_errors": int(observer_history["quote_errors"] or 0) if observer_history else 0,
+        "observer_history_latest_evaluated_at": int(observer_history["latest_evaluated_at"] or 0) if observer_history else 0,
         "formal_publish_gate": formal_publish_gate,
         "top_blocker_key": top_blocker_key,
         "top_blocker": top_blocker,
@@ -8896,16 +8921,28 @@ def _production_readiness_panel(values: dict[str, Any]) -> str:
         ),
         ("Copy 待补", _fmt_int(values.get("copyability_pending")), "copyability_evidence", "warn" if int(values.get("copyability_pending") or 0) else "ok"),
         (
-            "及时可跟",
+            "当前及时可跟",
             _fmt_int(values.get("observer_actionable_signals")),
-            f"{_fmt_int(values.get('observer_actionable_wallets'))} 钱包 · {_fmt_int(values.get('observer_evaluations'))} 评估",
+            f"{_duration_label(values.get('observer_current_window_sec'))}窗口 · "
+            f"{_fmt_int(values.get('observer_actionable_wallets'))} 钱包 · "
+            f"{_fmt_int(values.get('observer_evaluations'))} 评估",
             "ok" if int(values.get("observer_actionable_signals") or 0) else "warn",
         ),
         (
-            "过时/缺盘口",
-            f"{_fmt_int(values.get('observer_stale_signals'))}/{_fmt_int(values.get('observer_quote_errors'))}",
-            "stale / quote errors",
-            "warn" if int(values.get("observer_stale_signals") or 0) or int(values.get("observer_quote_errors") or 0) else "ok",
+            "当前 Paper 累计评估",
+            _fmt_int(values.get("observer_history_evaluations")),
+            f"接受 {_fmt_int(values.get('observer_history_accepted_signals'))} · "
+            f"及时 {_fmt_int(values.get('observer_history_actionable_signals'))}",
+            "ok" if int(values.get("observer_history_evaluations") or 0) else "warn",
+        ),
+        (
+            "当前 Paper 累计异常",
+            f"{_fmt_int(values.get('observer_history_stale_signals'))}/{_fmt_int(values.get('observer_history_quote_errors'))}",
+            "历史观察质量",
+            "warn"
+            if int(values.get("observer_history_stale_signals") or 0)
+            or int(values.get("observer_history_quote_errors") or 0)
+            else "ok",
         ),
     ]
     rows = [

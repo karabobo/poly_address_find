@@ -27,6 +27,7 @@ from pm_robot.storage.repository import persist_wallet_activity, record_runtime_
 
 RTDS_ENDPOINT = "wss://ws-live-data.polymarket.com"
 RTDS_HEARTBEAT_MIN_SECONDS = 60.0
+DEFAULT_RTDS_MAX_IDLE_SECONDS = 300.0
 RTDS_SQLITE_LOCK_RETRY_DELAYS = (0.25, 0.5, 1.0, 2.0)
 RTDS_WALLET_KEYS = ("proxyWallet", "proxy_wallet", "user", "address", "wallet", "trader")
 RTDS_WATCH_ACTIVITY_SOURCE = "polymarket_rtds_watch_activity"
@@ -36,6 +37,10 @@ DEFAULT_RTDS_WATCH_MIN_SCORE = 65.0
 class TextWebSocket(Protocol):
     def send_text(self, text: str) -> None: ...
     def recv_text(self, *, timeout: float | None = None) -> str: ...
+
+
+class RTDSStreamIdleError(RuntimeError):
+    """Raised when a connected RTDS stream stops delivering data messages."""
 
 
 @dataclass(frozen=True)
@@ -77,6 +82,7 @@ def run_rtds_activity_discovery(
     flush_interval: float = 10.0,
     ping_interval: float = 5.0,
     receive_timeout: float = 1.0,
+    max_idle_seconds: float = DEFAULT_RTDS_MAX_IDLE_SECONDS,
     reconnect_sleep: float = 5.0,
     max_runtime_seconds: float = 0.0,
     max_messages: int = 0,
@@ -147,6 +153,8 @@ def run_rtds_activity_discovery(
                     watch_eligible_wallets=watch_eligible_wallets,
                 )
                 last_heartbeat = time.monotonic()
+                last_message_at = last_heartbeat
+                stream_idle_error: RTDSStreamIdleError | None = None
                 while True:
                     now = time.monotonic()
                     if _deadline_reached(deadline) or (max_messages > 0 and messages_seen >= max_messages):
@@ -157,7 +165,8 @@ def run_rtds_activity_discovery(
                     try:
                         raw = ws.recv_text(timeout=receive_timeout)
                     except TimeoutError:
-                        if (discovery_batch or paper_batch) and now - last_flush >= flush_interval:
+                        timeout_now = time.monotonic()
+                        if (discovery_batch or paper_batch) and timeout_now - last_flush >= flush_interval:
                             result, paper_result, watch_result = _flush_realtime_batch(
                                 conn,
                                 discovery_batch,
@@ -210,7 +219,7 @@ def run_rtds_activity_discovery(
                                     watch_eligible_wallets=watch_eligible_wallets,
                                 )
                                 last_heartbeat = time.monotonic()
-                        elif now - last_heartbeat >= max(RTDS_HEARTBEAT_MIN_SECONDS, flush_interval):
+                        elif timeout_now - last_heartbeat >= max(RTDS_HEARTBEAT_MIN_SECONDS, flush_interval):
                             _record_rtds_heartbeat(
                                 conn,
                                 messages_seen=messages_seen,
@@ -229,13 +238,36 @@ def run_rtds_activity_discovery(
                                 watch_activity_matches=watch_activity_matches,
                                 watch_eligible_wallets=watch_eligible_wallets,
                             )
-                            last_heartbeat = now
+                            last_heartbeat = timeout_now
+                        stream_idle_error = _rtds_stream_idle_error(
+                            last_message_at=last_message_at,
+                            now=timeout_now,
+                            max_idle_seconds=max_idle_seconds,
+                        )
+                        if stream_idle_error is not None:
+                            break
                         continue
+                    message_now = time.monotonic()
                     if raw in {"PING", "PONG", ""}:
+                        stream_idle_error = _rtds_stream_idle_error(
+                            last_message_at=last_message_at,
+                            now=message_now,
+                            max_idle_seconds=max_idle_seconds,
+                        )
+                        if stream_idle_error is not None:
+                            break
                         continue
                     message = _json_message(raw)
                     if not message:
+                        stream_idle_error = _rtds_stream_idle_error(
+                            last_message_at=last_message_at,
+                            now=message_now,
+                            max_idle_seconds=max_idle_seconds,
+                        )
+                        if stream_idle_error is not None:
+                            break
                         continue
+                    last_message_at = message_now
                     messages_seen += 1
                     trade = rtds_trade_to_activity_row(message)
                     if not trade:
@@ -350,6 +382,8 @@ def run_rtds_activity_discovery(
                             watch_eligible_wallets=watch_eligible_wallets,
                         )
                         last_heartbeat = time.monotonic()
+                if stream_idle_error is not None:
+                    raise stream_idle_error
                 if _deadline_reached(deadline) or (max_messages > 0 and messages_seen >= max_messages):
                     break
         except Exception as exc:
@@ -429,6 +463,25 @@ def run_rtds_activity_discovery(
         status=status,
         error=error,
     )
+
+
+def _rtds_stream_idle_error(
+    *,
+    last_message_at: float,
+    now: float,
+    max_idle_seconds: float,
+) -> RTDSStreamIdleError | None:
+    """Return a reconnect signal after prolonged data-message silence."""
+
+    if max_idle_seconds <= 0:
+        return None
+    idle_seconds = max(0.0, now - last_message_at)
+    if idle_seconds >= max_idle_seconds:
+        return RTDSStreamIdleError(
+            f"rtds stream idle for {idle_seconds:.1f}s "
+            f"(limit {max_idle_seconds:.1f}s)"
+        )
+    return None
 
 
 def _record_rtds_heartbeat(
