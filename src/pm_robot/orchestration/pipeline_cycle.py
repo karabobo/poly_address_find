@@ -172,6 +172,7 @@ def run_pipeline_cycle(
             limit=options.feature_limit,
             min_activity_events=options.feature_min_activity_events,
             commit_every=options.feature_commit_every,
+            promotion_policy_version=policy_version,
         ),
         continue_on_error=options.continue_on_error,
         step_reporter=step_reporter,

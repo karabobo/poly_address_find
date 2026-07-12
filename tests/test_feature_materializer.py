@@ -8,6 +8,7 @@ from pm_robot.storage.repository import (
     get_wallet_features,
     persist_wallet_activity,
     rebuild_wallet_episodes,
+    seed_evidence_backfill_budget,
     upsert_candidate,
     upsert_wallet_feature,
 )
@@ -222,6 +223,82 @@ def test_materialize_wallet_features_prioritizes_missing_required_components(tmp
         assert features[missing_required].copy_event_count == 12.0
         assert features[missing_required].single_market_pnl_share is not None
         assert features[high_paper].copy_event_count is None
+    finally:
+        conn.close()
+
+
+def test_materialize_wallet_features_prioritizes_policy_promotion_waiter(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    promotion_waiter = "0x" + "a" * 40
+    missing_required = "0x" + "b" * 40
+    policy_version = "test-policy"
+    try:
+        run_migrations(conn)
+        _seed_wallet(conn, promotion_waiter, paper_roi=0.02)
+        _seed_wallet(conn, missing_required, paper_roi=0.30)
+        seed_evidence_backfill_budget(
+            conn,
+            promotion_waiter,
+            source="test",
+            priority=50,
+        )
+        conn.execute(
+            """
+            UPDATE evidence_backfill_budget
+            SET stage = 'medium_done',
+                target_depth = 1000,
+                current_depth = 40,
+                stop_reason = ?,
+                updated_at = 20000
+            WHERE wallet = ?
+            """,
+            (
+                f"promotion_recheck_required:deep_pending:{policy_version}",
+                promotion_waiter,
+            ),
+        )
+        upsert_wallet_feature(
+            conn,
+            WalletFeatures(
+                address=missing_required,
+                recent_30d_volume_usdc=1_000,
+                total_volume_usdc=5_000,
+                net_pnl_usdc=100,
+                cumulative_win_rate=0.5,
+                trade_win_rate=0.5,
+                avg_dca_entries=2,
+                sell_pct=20,
+                hygiene_status="incomplete",
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO leader_scores(
+                address, leader_score, review_stage, review_reason,
+                components_json, penalties_json, policy_version, scored_at
+            ) VALUES (?, 0.0, 'needs_data', ?, '{}', '{}', 'test', 20000)
+            """,
+            (
+                missing_required,
+                "missing_required_score_components:bot_score,leader_in_degree",
+            ),
+        )
+        conn.commit()
+
+        summary = materialize_wallet_features(
+            conn,
+            limit=1,
+            min_activity_events=25,
+            now=30_000,
+            promotion_policy_version=policy_version,
+        )
+        features = get_wallet_features(conn)
+
+        assert summary.wallets_updated == 1
+        assert features[promotion_waiter].extra["feature_materializer_version"] == (
+            feature_materializer.MATERIALIZER_VERSION
+        )
+        assert features[missing_required].bot_score is None
     finally:
         conn.close()
 

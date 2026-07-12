@@ -1432,6 +1432,9 @@ def main() -> int:
                 limit=args.limit,
                 min_activity_events=args.min_activity_events,
                 commit_every=max(1, args.commit_every),
+                promotion_policy_version=str(
+                    load_policy(settings.policy_path).get("version") or ""
+                ),
             )
         finally:
             conn.close()

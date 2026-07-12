@@ -36,6 +36,7 @@ def materialize_wallet_features(
     limit: int = 5,
     min_activity_events: int = 25,
     commit_every: int = 10,
+    promotion_policy_version: str = "",
     now: int | None = None,
 ) -> FeatureMaterializeSummary:
     ts = now or int(time.time())
@@ -43,6 +44,7 @@ def materialize_wallet_features(
         conn,
         limit=limit,
         min_activity_events=min_activity_events,
+        promotion_policy_version=promotion_policy_version,
         now=ts,
     )
     updated = 0
@@ -154,6 +156,7 @@ def _list_targets(
     *,
     limit: int,
     min_activity_events: int,
+    promotion_policy_version: str,
     now: int,
 ) -> list[str]:
     rows = conn.execute(
@@ -172,6 +175,10 @@ def _list_targets(
                 COALESCE(wps.next_action, '') AS next_action,
                 COALESCE(wps.priority, 100) AS pipeline_priority,
                 COALESCE(ebb.stage, '') AS backfill_stage,
+                COALESCE(ebb.stop_reason, '') AS backfill_stop_reason,
+                COALESCE(ebb.current_depth, 0) AS backfill_current_depth,
+                COALESCE(ebb.updated_at, 0) AS backfill_updated_at,
+                COALESCE(wf.updated_at, 0) AS feature_updated_at,
                 wf.maker_fraction,
                 wf.bot_score,
                 wf.leader_in_degree,
@@ -232,8 +239,27 @@ def _list_targets(
                 CAST(json_extract(extra_json, '$.feature_materialized_at') AS INTEGER),
                 0
             ) <= ?
-           )
+        )
         ORDER BY
+            CASE
+                WHEN ? != ''
+                 AND backfill_stage = 'medium_done'
+                 AND (
+                        backfill_stop_reason NOT LIKE
+                            'promotion_deferred:deep_pending:' || ? || ':%'
+                     OR feature_updated_at > backfill_updated_at
+                     OR wallet_activity_count != backfill_current_depth
+                 ) THEN 0
+                WHEN ? != ''
+                 AND backfill_stage = 'light_done'
+                 AND (
+                        backfill_stop_reason NOT LIKE
+                            'promotion_deferred:medium_pending:' || ? || ':%'
+                     OR feature_updated_at > backfill_updated_at
+                     OR wallet_activity_count != backfill_current_depth
+                 ) THEN 1
+                ELSE 2
+            END ASC,
             CASE
                 WHEN review_reason LIKE 'missing_required_score_components:%'
                  AND (
@@ -276,6 +302,10 @@ def _list_targets(
             min_activity_events,
             MATERIALIZER_VERSION,
             now - MATERIALIZER_REFRESH_SECONDS,
+            promotion_policy_version,
+            promotion_policy_version,
+            promotion_policy_version,
+            promotion_policy_version,
             limit,
         ),
     ).fetchall()

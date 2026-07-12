@@ -375,6 +375,14 @@ def test_stale_approval_is_invalidated_and_pending_state_is_normalized(tmp_path)
             "SELECT stage, stop_reason FROM evidence_backfill_budget WHERE wallet = ?",
             (wallet,),
         ).fetchone()
+        state = conn.execute(
+            """
+            SELECT current_stage, evidence_status, next_action
+            FROM wallet_processing_state
+            WHERE wallet = ?
+            """,
+            (wallet,),
+        ).fetchone()
         job = conn.execute(
             "SELECT status FROM pipeline_jobs WHERE wallet = ?",
             (wallet,),
@@ -383,11 +391,64 @@ def test_stale_approval_is_invalidated_and_pending_state_is_normalized(tmp_path)
         assert second.stale_approvals_invalidated == 1
         assert second.queued_jobs_superseded == 1
         assert second.pending_states_normalized == 1
+        assert second.processing_states_reconciled == 1
         assert budget["stage"] == EvidenceJobStage.LIGHT_DONE.value
         assert budget["stop_reason"].startswith(
             "promotion_recheck_required:medium_pending:"
         )
+        assert dict(state) == {
+            "current_stage": EvidenceJobStage.LIGHT_DONE.value,
+            "evidence_status": "summary_ready",
+            "next_action": "score_wallet",
+        }
         assert job["status"] == "superseded"
+    finally:
+        conn.close()
+
+
+def test_promotion_reconciles_preexisting_terminal_budget_state_mismatch(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    wallet = "0x" + "9" * 40
+    try:
+        run_migrations(conn)
+        _seed_stage(
+            conn,
+            wallet,
+            stage=EvidenceJobStage.MEDIUM_PENDING.value,
+            activity_count=80,
+        )
+        conn.execute(
+            """
+            UPDATE evidence_backfill_budget
+            SET stage = 'light_done', target_depth = 200
+            WHERE wallet = ?
+            """,
+            (wallet,),
+        )
+        conn.commit()
+
+        summary = promote_wallet_evidence(
+            conn,
+            policy_path=POLICY_PATH,
+            limit=0,
+            now=40_000,
+        )
+        state = conn.execute(
+            """
+            SELECT current_stage, evidence_status, next_action
+            FROM wallet_processing_state
+            WHERE wallet = ?
+            """,
+            (wallet,),
+        ).fetchone()
+
+        assert summary.pending_states_normalized == 0
+        assert summary.processing_states_reconciled == 1
+        assert dict(state) == {
+            "current_stage": EvidenceJobStage.LIGHT_DONE.value,
+            "evidence_status": "summary_ready",
+            "next_action": "score_wallet",
+        }
     finally:
         conn.close()
 

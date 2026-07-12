@@ -20,6 +20,7 @@ from pm_robot.orchestration.evidence_backfill import (
 from pm_robot.orchestration.feature_materializer import MATERIALIZER_VERSION
 from pm_robot.pipeline_terms import (
     EvidenceJobStage,
+    EvidenceStatus,
     PipelineJobType,
     evidence_promotion_approval_reason,
     evidence_promotion_deferred_reason,
@@ -44,6 +45,7 @@ class EvidencePromotionSummary:
     queued_jobs_superseded: int
     stale_approvals_invalidated: int
     pending_states_normalized: int
+    processing_states_reconciled: int
     waiting_for_fresh_features: int
     status: str
     error: str = ""
@@ -73,7 +75,7 @@ def promote_wallet_evidence(
     ts = now or int(time.time())
     policy = load_policy(policy_path)
     policy_version = str(policy.get("version") or "unknown")
-    invalidated, superseded, normalized = _prepare_promotion_state(
+    invalidated, superseded, normalized, reconciled = _prepare_promotion_state(
         conn,
         policy_version=policy_version,
         now=ts,
@@ -175,6 +177,7 @@ def promote_wallet_evidence(
         queued_jobs_superseded=superseded,
         stale_approvals_invalidated=invalidated,
         pending_states_normalized=normalized,
+        processing_states_reconciled=reconciled,
         waiting_for_fresh_features=waiting,
         status="partial" if errors else "ok",
         error="; ".join(errors[:3]),
@@ -186,10 +189,10 @@ def _prepare_promotion_state(
     *,
     policy_version: str,
     now: int,
-) -> tuple[int, int, int]:
+) -> tuple[int, int, int, int]:
     """Commit queue normalization before any expensive evidence reads."""
 
-    def operation() -> tuple[int, int, int]:
+    def operation() -> tuple[int, int, int, int]:
         invalidated = _invalidate_stale_approvals(
             conn,
             policy_version=policy_version,
@@ -201,8 +204,9 @@ def _prepare_promotion_state(
             policy_version=policy_version,
             now=now,
         )
+        reconciled = _reconcile_terminal_processing_states(conn, now=now)
         conn.commit()
-        return invalidated, superseded, normalized
+        return invalidated, superseded, normalized, reconciled
 
     return retry_sqlite_locked(
         operation,
@@ -667,7 +671,7 @@ def _normalize_unapproved_pending_states(
         if running is not None:
             continue
         terminal_stage, terminal_depth = transitions[job_action]
-        normalized += int(
+        updated = int(
             conn.execute(
                 """
                 UPDATE evidence_backfill_budget
@@ -689,4 +693,79 @@ def _normalize_unapproved_pending_states(
             ).rowcount
             or 0
         )
+        if not updated:
+            continue
+        normalized += updated
     return normalized
+
+
+def _reconcile_terminal_processing_states(
+    conn: sqlite3.Connection,
+    *,
+    now: int,
+) -> int:
+    """Repair stale queue-facing state after a budget returns to a completed tier."""
+
+    cursor = conn.execute(
+        """
+        UPDATE wallet_processing_state AS wps
+        SET current_stage = CASE wps.current_stage
+                WHEN 'medium_pending' THEN 'light_done'
+                WHEN 'deep_pending' THEN 'medium_done'
+                ELSE wps.current_stage
+            END,
+            evidence_status = CASE
+                WHEN wps.evidence_status = ? THEN wps.evidence_status
+                ELSE ?
+            END,
+            next_action = CASE
+                WHEN wps.evidence_status = ? THEN wps.next_action
+                ELSE 'score_wallet'
+            END,
+            next_action_at = 0,
+            updated_at = ?
+        WHERE (
+                (
+                    wps.current_stage = 'medium_pending'
+                    AND EXISTS (
+                        SELECT 1
+                        FROM evidence_backfill_budget ebb
+                        WHERE ebb.wallet = wps.wallet
+                          AND ebb.stage = 'light_done'
+                    )
+                )
+                OR (
+                    wps.current_stage = 'deep_pending'
+                    AND EXISTS (
+                        SELECT 1
+                        FROM evidence_backfill_budget ebb
+                        WHERE ebb.wallet = wps.wallet
+                          AND ebb.stage = 'medium_done'
+                    )
+                )
+            )
+          AND NOT EXISTS (
+              SELECT 1
+              FROM pipeline_jobs running_job
+              WHERE running_job.job_type = ?
+                AND running_job.wallet = wps.wallet
+                AND running_job.subject_key = wps.current_stage
+                AND running_job.status = 'running'
+          )
+          AND NOT EXISTS (
+              SELECT 1
+              FROM evidence_backfill_jobs running_legacy_job
+              WHERE running_legacy_job.wallet = wps.wallet
+                AND running_legacy_job.stage = wps.current_stage
+                AND running_legacy_job.status = 'running'
+          )
+        """,
+        (
+            EvidenceStatus.PAUSED.value,
+            EvidenceStatus.SUMMARY_READY.value,
+            EvidenceStatus.PAUSED.value,
+            now,
+            PipelineJobType.WALLET_EVIDENCE_BACKFILL.value,
+        ),
+    )
+    return int(cursor.rowcount or 0)
