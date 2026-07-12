@@ -50,6 +50,7 @@ runtime_heartbeat() {
 
 cycle_mode="full"
 catchup_cycles=0
+promotion_catchup_cycles=0
 
 while true; do
   sleep_interval="$INTERVAL"
@@ -58,6 +59,7 @@ while true; do
   features_attempted=0
   scores_considered=0
   wallet_jobs_enqueued=0
+  promotion_targets_seen=0
   control_output=""
   control_exit=0
   set --
@@ -138,9 +140,17 @@ def step_counter(step_name, key):
     raise ValueError(f"{step_name} summary is missing")
 
 
+def step_counter_or_skipped(step_name, key):
+    step = steps.get(step_name)
+    if isinstance(step, dict) and step.get("status") == "skipped":
+        return 0
+    return step_counter(step_name, key)
+
+
 features_attempted = step_counter("materialize_features", "wallets_attempted")
 scores_considered = step_counter("incremental_score", "score_candidates_considered")
 wallet_jobs_enqueued = 0
+promotion_targets_seen = 0
 if cycle_mode == "full":
     wallet_plan_data = (steps.get("wallet_pipeline_plan") or {}).get("data")
     if not isinstance(wallet_plan_data, dict) or "jobs_enqueued" not in wallet_plan_data:
@@ -149,19 +159,29 @@ if cycle_mode == "full":
     if isinstance(raw_jobs_enqueued, bool) or not isinstance(raw_jobs_enqueued, int):
         raise ValueError("wallet pipeline jobs_enqueued must be an integer")
     wallet_jobs_enqueued = raw_jobs_enqueued
-if wallet_jobs_enqueued < 0:
+    promotion_targets_seen = step_counter_or_skipped(
+        "evidence_promotion",
+        "targets_seen",
+    )
+if wallet_jobs_enqueued < 0 or promotion_targets_seen < 0:
     raise ValueError("pipeline cycle counters must be non-negative")
 report_status = "ok" if report_ok else "partial"
-print(f"{report_status} {features_attempted} {scores_considered} {wallet_jobs_enqueued}")
+print(
+    f"{report_status} {features_attempted} {scores_considered} "
+    f"{wallet_jobs_enqueued} {promotion_targets_seen}"
+)
 ' "$cycle_mode" "$control_exit" 2>/dev/null)"; then
     cycle_status="${control_state%% *}"
     remaining_state="${control_state#* }"
     features_attempted="${remaining_state%% *}"
     remaining_state="${remaining_state#* }"
     scores_considered="${remaining_state%% *}"
-    wallet_jobs_enqueued="${remaining_state#* }"
+    remaining_state="${remaining_state#* }"
+    wallet_jobs_enqueued="${remaining_state%% *}"
+    promotion_targets_seen="${remaining_state#* }"
     score_catchup_needed=0
     wallet_topup_needed=0
+    promotion_catchup_needed=0
     if { [ "$FEATURE_LIMIT" -gt 0 ] && [ "$features_attempted" -ge "$FEATURE_LIMIT" ]; } || \
        { [ "$SCORE_LIMIT" -gt 0 ] && [ "$scores_considered" -ge "$SCORE_LIMIT" ]; }; then
       score_catchup_needed=1
@@ -169,8 +189,26 @@ print(f"{report_status} {features_attempted} {scores_considered} {wallet_jobs_en
     if [ "$cycle_mode" = "full" ] && [ "$wallet_jobs_enqueued" -gt 0 ]; then
       wallet_topup_needed=1
     fi
-    if [ "$score_catchup_needed" = "1" ] || [ "$wallet_topup_needed" = "1" ]; then
+    if [ "$cycle_mode" = "full" ] && \
+       [ "$EVIDENCE_PROMOTION_LIMIT" -gt 0 ] && \
+       [ "$promotion_targets_seen" -ge "$EVIDENCE_PROMOTION_LIMIT" ]; then
+      promotion_catchup_needed=1
+    fi
+    if [ "$promotion_catchup_needed" = "1" ]; then
+      # Promotion runs before queue planning, so a bounded full-cycle burst advances
+      # local deferrals while preserving the planner waterline and maintenance window.
+      catchup_cycles=0
+      promotion_catchup_cycles=$((promotion_catchup_cycles + 1))
+      next_cycle_mode="full"
+      if [ "$promotion_catchup_cycles" -ge "$CATCHUP_BURST_LIMIT" ]; then
+        sleep_interval="$INTERVAL"
+        promotion_catchup_cycles=0
+      else
+        sleep_interval="$ACTIVE_INTERVAL"
+      fi
+    elif [ "$score_catchup_needed" = "1" ] || [ "$wallet_topup_needed" = "1" ]; then
       # One lightweight follow-up keeps wallet workers fed without removing the maintenance window.
+      promotion_catchup_cycles=0
       sleep_interval="$ACTIVE_INTERVAL"
       if [ "$cycle_mode" = "scoring_only" ]; then
         catchup_cycles=$((catchup_cycles + 1))
@@ -185,6 +223,7 @@ print(f"{report_status} {features_attempted} {scores_considered} {wallet_jobs_en
       fi
     else
       catchup_cycles=0
+      promotion_catchup_cycles=0
     fi
     if [ "$cycle_status" = "ok" ]; then
       echo "$(date -Iseconds) research control: ordered cycle ok (mode=${cycle_mode})"
@@ -218,7 +257,7 @@ print(f"{report_status} {features_attempted} {scores_considered} {wallet_jobs_en
     echo "$(date -Iseconds) research control: export paper handoff failed" >&2
     runtime_heartbeat loop_score_paper_handoff failed "paper-handoff-export failed from research control"
   fi
-  echo "$(date -Iseconds) research control: next cycle in ${sleep_interval}s (status=${cycle_status}, mode=${cycle_mode}, next_mode=${next_cycle_mode}, features_attempted=${features_attempted}, scores_considered=${scores_considered}, wallet_jobs_enqueued=${wallet_jobs_enqueued})"
+  echo "$(date -Iseconds) research control: next cycle in ${sleep_interval}s (status=${cycle_status}, mode=${cycle_mode}, next_mode=${next_cycle_mode}, features_attempted=${features_attempted}, scores_considered=${scores_considered}, wallet_jobs_enqueued=${wallet_jobs_enqueued}, promotion_targets_seen=${promotion_targets_seen})"
   if [ "$RUN_ONCE" = "1" ]; then
     break
   fi

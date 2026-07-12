@@ -693,6 +693,12 @@ def test_nas_research_control_selects_backlog_or_idle_interval(
             "data": {"jobs_enqueued": 0},
         }
     )
+    summary["steps"].append(
+        {
+            "name": "evidence_promotion",
+            "data": {"targets_seen": 0},
+        }
+    )
     result = _run_nas_research_control_once(tmp_path, json.dumps(summary))
 
     assert result.returncode == 0, result.stderr
@@ -736,6 +742,81 @@ def test_nas_research_control_uses_idle_interval_after_failed_cycle(tmp_path):
     assert "next cycle in 300s (status=failed" in result.stdout
 
 
+def test_nas_research_control_accepts_disabled_promotion_step(tmp_path):
+    payload = json.loads(
+        _research_control_summary(features_attempted=4, scores_considered=12)
+    )
+    promotion = next(
+        step for step in payload["steps"] if step["name"] == "evidence_promotion"
+    )
+    promotion.update({"status": "skipped", "data": {"reason": "limit_is_zero"}})
+
+    result = _run_nas_research_control_once(
+        tmp_path,
+        json.dumps(payload),
+        promotion_limit=0,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "next cycle in 300s (status=ok" in result.stdout
+    assert "promotion_targets_seen=0" in result.stdout
+
+
+@pytest.mark.parametrize("invalid_targets", [True, -1, "80", None])
+def test_nas_research_control_rejects_malformed_promotion_counter(
+    tmp_path,
+    invalid_targets,
+):
+    payload = json.loads(
+        _research_control_summary(features_attempted=4, scores_considered=12)
+    )
+    promotion = next(
+        step for step in payload["steps"] if step["name"] == "evidence_promotion"
+    )
+    promotion["data"]["targets_seen"] = invalid_targets
+
+    result = _run_nas_research_control_once(tmp_path, json.dumps(payload))
+
+    assert result.returncode == 0
+    assert "invalid JSON summary; using idle interval" in result.stderr
+    assert "next cycle in 300s (status=invalid" in result.stdout
+
+
+def test_nas_research_control_handles_partial_failed_promotion_without_catchup(
+    tmp_path,
+):
+    payload = json.loads(
+        _research_control_summary(features_attempted=4, scores_considered=12)
+    )
+    payload.update(
+        {
+            "ok": False,
+            "partial": True,
+            "failed_steps": ["evidence_promotion"],
+        }
+    )
+    promotion = next(
+        step for step in payload["steps"] if step["name"] == "evidence_promotion"
+    )
+    promotion.update(
+        {
+            "status": "failed",
+            "data": {"error": "database is locked"},
+        }
+    )
+
+    result = _run_nas_research_control_once(
+        tmp_path,
+        json.dumps(payload),
+        exit_code=1,
+    )
+
+    assert result.returncode == 0
+    assert "ordered cycle partial (mode=full)" in result.stderr
+    assert "next cycle in 300s (status=partial" in result.stdout
+    assert "promotion_targets_seen=0" in result.stdout
+
+
 def test_nas_research_control_switches_saturated_followup_to_scoring_only(tmp_path):
     saturated = _research_control_summary(features_attempted=80, scores_considered=300)
     idle = _research_control_summary(features_attempted=4, scores_considered=12)
@@ -776,6 +857,31 @@ def test_nas_research_control_runs_one_wallet_topup_after_full_plan_admission(tm
     assert "mode=full, next_mode=scoring_only" in result.stdout
     assert "wallet_jobs_enqueued=30" in result.stdout
     assert "mode=scoring_only, next_mode=full" in result.stdout
+
+
+def test_nas_research_control_runs_bounded_full_promotion_catchup(tmp_path):
+    saturated = _research_control_summary(
+        features_attempted=4,
+        scores_considered=12,
+        promotion_targets_seen=80,
+    )
+    idle = _research_control_summary(features_attempted=1, scores_considered=2)
+
+    result, commands, sleeps = _run_nas_research_control_sequence(
+        tmp_path,
+        [(saturated, 0), (saturated, 0), (idle, 0)],
+        burst_limit=2,
+    )
+
+    assert result.returncode == 73, result.stderr
+    assert ["--scoring-only" in command.split() for command in commands] == [
+        False,
+        False,
+        False,
+    ]
+    assert sleeps == ["60", "300", "300"]
+    assert result.stdout.count("promotion_targets_seen=80") == 2
+    assert result.stdout.count("mode=full, next_mode=full") == 3
 
 
 @pytest.mark.parametrize(
@@ -889,7 +995,13 @@ def test_nas_research_control_recovers_idle_failed_or_invalid_catchup_to_full_cy
     )
 
 
-def _research_control_summary(*, features_attempted, scores_considered, wallet_jobs_enqueued=0):
+def _research_control_summary(
+    *,
+    features_attempted,
+    scores_considered,
+    wallet_jobs_enqueued=0,
+    promotion_targets_seen=0,
+):
     steps = [
         {
             "name": "materialize_features",
@@ -898,6 +1010,10 @@ def _research_control_summary(*, features_attempted, scores_considered, wallet_j
         {
             "name": "incremental_score",
             "data": {"score_candidates_considered": scores_considered},
+        },
+        {
+            "name": "evidence_promotion",
+            "data": {"targets_seen": promotion_targets_seen},
         },
     ]
     steps.append(
@@ -977,6 +1093,7 @@ def _run_nas_research_control_sequence(tmp_path, cycles, *, burst_limit=4):
         "PM_ROBOT_RESEARCH_CONTROL_CATCHUP_BURST_LIMIT": str(burst_limit),
         "PM_ROBOT_SCORE_FEATURE_LIMIT": "80",
         "PM_ROBOT_SCORE_LIMIT": "300",
+        "PM_ROBOT_EVIDENCE_PROMOTION_LIMIT": "80",
     }
     result = subprocess.run(
         ["sh", "deploy/nas/research-control-loop.sh"],
@@ -992,7 +1109,13 @@ def _run_nas_research_control_sequence(tmp_path, cycles, *, burst_limit=4):
     return result, commands, sleeps
 
 
-def _run_nas_research_control_once(tmp_path, control_output, *, exit_code=0):
+def _run_nas_research_control_once(
+    tmp_path,
+    control_output,
+    *,
+    exit_code=0,
+    promotion_limit=80,
+):
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     python_wrapper = fake_bin / "python"
@@ -1033,6 +1156,7 @@ def _run_nas_research_control_once(tmp_path, control_output, *, exit_code=0):
         "PM_ROBOT_RESEARCH_CONTROL_INTERVAL": "300",
         "PM_ROBOT_SCORE_FEATURE_LIMIT": "80",
         "PM_ROBOT_SCORE_LIMIT": "300",
+        "PM_ROBOT_EVIDENCE_PROMOTION_LIMIT": str(promotion_limit),
     }
     return subprocess.run(
         ["sh", "deploy/nas/research-control-loop.sh"],
