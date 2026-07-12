@@ -81,6 +81,10 @@ compose() {
   exit 1
 }
 
+task_compose() {
+  compose --project-directory "$ROOT" -f "$ROOT/docker-compose.yml" run --rm --no-deps "$@"
+}
+
 execution_compose() {
   compose -f docker-compose.yml -f docker-compose.execution.yml --profile execution "$@"
 }
@@ -758,9 +762,9 @@ bounded_positive_int() {
 host_copyability_drain_once() {
   limit="$(bounded_positive_int "${1:-1}" 1 5)"
   worker_id="manual-host-drain-$(date +%s)"
-  PYTHONPATH="$ROOT/app/src" python3 -m pm_robot.cli \
-    --env "$ROOT/.env" \
-    --db "$DATA_DIR/pm_robot.sqlite" \
+  # Keep manual CLI runs on the same Python and dependency image as production.
+  task_compose task \
+    --db /app/data/pm_robot.sqlite \
     copyability-worker \
     --shard-index 0 \
     --shard-count 1 \
@@ -774,24 +778,23 @@ host_copyability_drain_once() {
 
 host_materialize_once() {
   limit="$(bounded_positive_int "${1:-50}" 50 500)"
-  PYTHONPATH="$ROOT/app/src" python3 -m pm_robot.cli \
-    --env "$ROOT/.env" \
-    --db "$DATA_DIR/pm_robot.sqlite" \
+  task_compose task \
+    --db /app/data/pm_robot.sqlite \
     materialize-features \
     --limit "$limit"
 }
 
 host_score_once() {
   limit="$(bounded_positive_int "${1:-50}" 50 500)"
-  PM_ROBOT_POLICY_PATH="$ROOT/config/leader_scoring_policy.json" \
-    PYTHONPATH="$ROOT/app/src" python3 -m pm_robot.cli \
-    --env "$ROOT/.env" \
-    --db "$DATA_DIR/pm_robot.sqlite" \
+  task_compose \
+    -e PM_ROBOT_POLICY_PATH=/app/config/leader_scoring_policy.json \
+    task \
+    --db /app/data/pm_robot.sqlite \
     build-review \
     --incremental \
     --limit "$limit" \
     --no-import-csv \
-    --out "$REPORTS_DIR/manual_incremental_review.csv"
+    --out /app/reports/manual_incremental_review.csv
 }
 
 host_policy_rescore_once() {

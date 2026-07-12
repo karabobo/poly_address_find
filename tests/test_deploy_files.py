@@ -1310,7 +1310,11 @@ def test_nas_runtime_is_research_scoring_only():
     assert "host_copyability_drain_once" in helper
     assert "host_materialize_once" in helper
     assert "host_score_once" in helper
-    assert 'PM_ROBOT_POLICY_PATH="$ROOT/config/leader_scoring_policy.json"' in helper
+    assert 'compose --project-directory "$ROOT" -f "$ROOT/docker-compose.yml" run --rm --no-deps "$@"' in helper
+    assert helper.count("task_compose") >= 4
+    assert "--db /app/data/pm_robot.sqlite" in helper
+    assert "PM_ROBOT_POLICY_PATH=/app/config/leader_scoring_policy.json" in helper
+    assert 'PYTHONPATH="$ROOT/app/src" python3 -m pm_robot.cli' not in helper
     assert "skipping feature materialization; policy rescore uses existing wallet features" in helper
     assert "matches_source" in helper
     assert "/api/runtime" in helper
