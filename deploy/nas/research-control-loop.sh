@@ -57,7 +57,9 @@ while true; do
   cycle_status="failed"
   features_attempted=0
   scores_considered=0
+  wallet_jobs_enqueued=0
   control_output=""
+  control_exit=0
   set --
   if [ "$cycle_mode" = "scoring_only" ]; then
     set -- \
@@ -96,68 +98,112 @@ while true; do
       --score-limit "$SCORE_LIMIT" \
       --policy "$POLICY_PATH" \
       "$@")"; then
+    control_exit=0
+  else
+    control_exit=$?
+  fi
+  if [ -n "$control_output" ]; then
     printf '%s\n' "$control_output"
-    control_state=""
-    if control_state="$(printf '%s' "$control_output" | python -c '
+  fi
+  control_state=""
+  if control_state="$(printf '%s' "$control_output" | python -c '
 import json
 import sys
 
 payload = json.load(sys.stdin)
-if payload.get("ok") is not True:
-    raise ValueError("pipeline cycle did not report ok")
+cycle_mode = sys.argv[1]
+command_exit = int(sys.argv[2])
+report_ok = payload.get("ok") is True
+report_partial = payload.get("partial") is True
+if not report_ok and not report_partial:
+    raise ValueError("pipeline cycle did not report ok or partial")
+if report_ok and command_exit != 0:
+    raise ValueError("successful report returned a nonzero exit")
 steps = {
     str(step.get("name") or ""): step
     for step in payload.get("steps") or []
     if isinstance(step, dict)
 }
-feature_data = (steps.get("materialize_features") or {}).get("data")
-score_data = (steps.get("incremental_score") or {}).get("data")
-if not isinstance(feature_data, dict) or "wallets_attempted" not in feature_data:
-    raise ValueError("materialize_features summary is missing")
-if not isinstance(score_data, dict) or "score_candidates_considered" not in score_data:
-    raise ValueError("incremental_score summary is missing")
-features_attempted = int(feature_data["wallets_attempted"])
-scores_considered = int(score_data["score_candidates_considered"])
-if features_attempted < 0 or scores_considered < 0:
+
+def step_counter(step_name, key):
+    step = steps.get(step_name)
+    data = step.get("data") if isinstance(step, dict) else None
+    if isinstance(data, dict) and key in data:
+        value = data[key]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(f"{step_name}.{key} must be a nonnegative integer")
+        return value
+    if report_partial and isinstance(step, dict) and step.get("status") == "failed":
+        return 0
+    raise ValueError(f"{step_name} summary is missing")
+
+
+features_attempted = step_counter("materialize_features", "wallets_attempted")
+scores_considered = step_counter("incremental_score", "score_candidates_considered")
+wallet_jobs_enqueued = 0
+if cycle_mode == "full":
+    wallet_plan_data = (steps.get("wallet_pipeline_plan") or {}).get("data")
+    if not isinstance(wallet_plan_data, dict) or "jobs_enqueued" not in wallet_plan_data:
+        raise ValueError("wallet pipeline plan summary is missing")
+    raw_jobs_enqueued = wallet_plan_data["jobs_enqueued"]
+    if isinstance(raw_jobs_enqueued, bool) or not isinstance(raw_jobs_enqueued, int):
+        raise ValueError("wallet pipeline jobs_enqueued must be an integer")
+    wallet_jobs_enqueued = raw_jobs_enqueued
+if wallet_jobs_enqueued < 0:
     raise ValueError("pipeline cycle counters must be non-negative")
-print(f"ok {features_attempted} {scores_considered}")
-' 2>/dev/null)"; then
-      cycle_status="${control_state%% *}"
-      remaining_state="${control_state#* }"
-      features_attempted="${remaining_state%% *}"
-      scores_considered="${remaining_state#* }"
-      if { [ "$FEATURE_LIMIT" -gt 0 ] && [ "$features_attempted" -ge "$FEATURE_LIMIT" ]; } || \
-         { [ "$SCORE_LIMIT" -gt 0 ] && [ "$scores_considered" -ge "$SCORE_LIMIT" ]; }; then
-        # Catch up scoring with only the bounded wallet queue top-up enabled.
-        sleep_interval="$ACTIVE_INTERVAL"
-        if [ "$cycle_mode" = "scoring_only" ]; then
-          catchup_cycles=$((catchup_cycles + 1))
-        else
-          catchup_cycles=0
-        fi
-        if [ "$cycle_mode" = "scoring_only" ] && [ "$catchup_cycles" -ge "$CATCHUP_BURST_LIMIT" ]; then
-          next_cycle_mode="full"
-          catchup_cycles=0
-        else
-          next_cycle_mode="scoring_only"
-        fi
+report_status = "ok" if report_ok else "partial"
+print(f"{report_status} {features_attempted} {scores_considered} {wallet_jobs_enqueued}")
+' "$cycle_mode" "$control_exit" 2>/dev/null)"; then
+    cycle_status="${control_state%% *}"
+    remaining_state="${control_state#* }"
+    features_attempted="${remaining_state%% *}"
+    remaining_state="${remaining_state#* }"
+    scores_considered="${remaining_state%% *}"
+    wallet_jobs_enqueued="${remaining_state#* }"
+    score_catchup_needed=0
+    wallet_topup_needed=0
+    if { [ "$FEATURE_LIMIT" -gt 0 ] && [ "$features_attempted" -ge "$FEATURE_LIMIT" ]; } || \
+       { [ "$SCORE_LIMIT" -gt 0 ] && [ "$scores_considered" -ge "$SCORE_LIMIT" ]; }; then
+      score_catchup_needed=1
+    fi
+    if [ "$cycle_mode" = "full" ] && [ "$wallet_jobs_enqueued" -gt 0 ]; then
+      wallet_topup_needed=1
+    fi
+    if [ "$score_catchup_needed" = "1" ] || [ "$wallet_topup_needed" = "1" ]; then
+      # One lightweight follow-up keeps wallet workers fed without removing the maintenance window.
+      sleep_interval="$ACTIVE_INTERVAL"
+      if [ "$cycle_mode" = "scoring_only" ]; then
+        catchup_cycles=$((catchup_cycles + 1))
       else
         catchup_cycles=0
       fi
+      if [ "$cycle_mode" = "scoring_only" ] && [ "$catchup_cycles" -ge "$CATCHUP_BURST_LIMIT" ]; then
+        next_cycle_mode="full"
+        catchup_cycles=0
+      else
+        next_cycle_mode="scoring_only"
+      fi
+    else
+      catchup_cycles=0
+    fi
+    if [ "$cycle_status" = "ok" ]; then
       echo "$(date -Iseconds) research control: ordered cycle ok (mode=${cycle_mode})"
       runtime_heartbeat loop_research_control ok
     else
+      echo "$(date -Iseconds) research control: ordered cycle partial (mode=${cycle_mode}); later phases used committed data" >&2
+      runtime_heartbeat loop_research_control partial "one or more isolated pipeline-cycle phases failed"
+    fi
+  else
+    summary_preview="$(printf '%.160s' "$control_output" | tr '\n\r' '  ')"
+    if [ "$control_exit" -ne 0 ]; then
+      cycle_status="failed"
+      echo "$(date -Iseconds) research control: ordered cycle partial; later phases used committed data; output=${summary_preview}" >&2
+      runtime_heartbeat loop_research_control partial "pipeline-cycle failed without a valid partial summary"
+    else
       cycle_status="invalid"
-      summary_preview="$(printf '%.160s' "$control_output" | tr '\n\r' '  ')"
       echo "$(date -Iseconds) research control: invalid JSON summary; using idle interval; output=${summary_preview}" >&2
       runtime_heartbeat loop_research_control partial "pipeline-cycle returned an invalid summary"
     fi
-  else
-    if [ -n "$control_output" ]; then
-      printf '%s\n' "$control_output"
-    fi
-    echo "$(date -Iseconds) research control: ordered cycle partial; later phases used committed data" >&2
-    runtime_heartbeat loop_research_control partial "one or more isolated pipeline-cycle phases failed"
   fi
 
   # Handoff freshness must not depend on every planning phase succeeding.
@@ -172,7 +218,7 @@ print(f"ok {features_attempted} {scores_considered}")
     echo "$(date -Iseconds) research control: export paper handoff failed" >&2
     runtime_heartbeat loop_score_paper_handoff failed "paper-handoff-export failed from research control"
   fi
-  echo "$(date -Iseconds) research control: next cycle in ${sleep_interval}s (status=${cycle_status}, mode=${cycle_mode}, next_mode=${next_cycle_mode}, features_attempted=${features_attempted}, scores_considered=${scores_considered})"
+  echo "$(date -Iseconds) research control: next cycle in ${sleep_interval}s (status=${cycle_status}, mode=${cycle_mode}, next_mode=${next_cycle_mode}, features_attempted=${features_attempted}, scores_considered=${scores_considered}, wallet_jobs_enqueued=${wallet_jobs_enqueued})"
   if [ "$RUN_ONCE" = "1" ]; then
     break
   fi

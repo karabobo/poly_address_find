@@ -402,6 +402,12 @@ def test_nas_research_control_selects_backlog_or_idle_interval(
     summary,
     expected_interval,
 ):
+    summary["steps"].append(
+        {
+            "name": "wallet_pipeline_plan",
+            "data": {"jobs_enqueued": 0},
+        }
+    )
     result = _run_nas_research_control_once(tmp_path, json.dumps(summary))
 
     assert result.returncode == 0, result.stderr
@@ -418,6 +424,19 @@ def test_nas_research_control_uses_idle_interval_for_malformed_summary(tmp_path)
 
 def test_nas_research_control_rejects_incomplete_success_summary(tmp_path):
     result = _run_nas_research_control_once(tmp_path, '{"ok": true, "steps": []}')
+
+    assert result.returncode == 0
+    assert "invalid JSON summary; using idle interval" in result.stderr
+    assert "next cycle in 300s (status=invalid" in result.stdout
+
+
+@pytest.mark.parametrize("planner_data", ["invalid", {}])
+def test_nas_research_control_rejects_malformed_full_planner_summary(tmp_path, planner_data):
+    payload = json.loads(_research_control_summary(features_attempted=0, scores_considered=0))
+    planner_step = next(step for step in payload["steps"] if step["name"] == "wallet_pipeline_plan")
+    planner_step["data"] = planner_data
+
+    result = _run_nas_research_control_once(tmp_path, json.dumps(payload))
 
     assert result.returncode == 0
     assert "invalid JSON summary; using idle interval" in result.stderr
@@ -451,6 +470,81 @@ def test_nas_research_control_switches_saturated_followup_to_scoring_only(tmp_pa
     assert sleeps == ["60", "300"]
     assert "mode=full, next_mode=scoring_only" in result.stdout
     assert "mode=scoring_only, next_mode=full" in result.stdout
+
+
+def test_nas_research_control_runs_one_wallet_topup_after_full_plan_admission(tmp_path):
+    admitted = _research_control_summary(
+        features_attempted=4,
+        scores_considered=12,
+        wallet_jobs_enqueued=30,
+    )
+    idle = _research_control_summary(features_attempted=0, scores_considered=0)
+
+    result, commands, sleeps = _run_nas_research_control_sequence(
+        tmp_path,
+        [(admitted, 0), (idle, 0)],
+    )
+
+    assert result.returncode == 73, result.stderr
+    assert ["--scoring-only" in command.split() for command in commands] == [False, True]
+    assert sleeps == ["60", "300"]
+    assert "mode=full, next_mode=scoring_only" in result.stdout
+    assert "wallet_jobs_enqueued=30" in result.stdout
+    assert "mode=scoring_only, next_mode=full" in result.stdout
+
+
+@pytest.mark.parametrize(
+    "failed_step",
+    ["copyability_plan", "materialize_features", "incremental_score"],
+)
+def test_nas_research_control_honors_committed_admission_from_partial_cycle(
+    tmp_path,
+    failed_step,
+):
+    partial_payload = json.loads(
+        _research_control_summary(
+            features_attempted=4,
+            scores_considered=12,
+            wallet_jobs_enqueued=30,
+        )
+    )
+    partial_payload.update(
+        {
+            "ok": False,
+            "partial": True,
+            "failed_steps": [failed_step],
+        }
+    )
+    failed_payload = {
+        "name": failed_step,
+        "status": "failed",
+        "data": {"error": "database is locked"},
+    }
+    existing_index = next(
+        (
+            index
+            for index, step in enumerate(partial_payload["steps"])
+            if step["name"] == failed_step
+        ),
+        None,
+    )
+    if existing_index is None:
+        partial_payload["steps"].append(failed_payload)
+    else:
+        partial_payload["steps"][existing_index] = failed_payload
+    idle = _research_control_summary(features_attempted=0, scores_considered=0)
+
+    result, commands, sleeps = _run_nas_research_control_sequence(
+        tmp_path,
+        [(json.dumps(partial_payload), 1), (idle, 0)],
+    )
+
+    assert result.returncode == 73, result.stderr
+    assert ["--scoring-only" in command.split() for command in commands] == [False, True]
+    assert sleeps == ["60", "300"]
+    assert "ordered cycle partial (mode=full)" in result.stderr
+    assert "status=partial, mode=full, next_mode=scoring_only" in result.stdout
+    assert "wallet_jobs_enqueued=30" in result.stdout
 
 
 def test_nas_research_control_forces_full_cycle_after_bounded_scoring_burst(tmp_path):
@@ -510,22 +604,24 @@ def test_nas_research_control_recovers_idle_failed_or_invalid_catchup_to_full_cy
     )
 
 
-def _research_control_summary(*, features_attempted, scores_considered):
-    return json.dumps(
+def _research_control_summary(*, features_attempted, scores_considered, wallet_jobs_enqueued=0):
+    steps = [
         {
-            "ok": True,
-            "steps": [
-                {
-                    "name": "materialize_features",
-                    "data": {"wallets_attempted": features_attempted},
-                },
-                {
-                    "name": "incremental_score",
-                    "data": {"score_candidates_considered": scores_considered},
-                },
-            ],
+            "name": "materialize_features",
+            "data": {"wallets_attempted": features_attempted},
+        },
+        {
+            "name": "incremental_score",
+            "data": {"score_candidates_considered": scores_considered},
+        },
+    ]
+    steps.append(
+        {
+            "name": "wallet_pipeline_plan",
+            "data": {"jobs_enqueued": wallet_jobs_enqueued},
         }
     )
+    return json.dumps({"ok": True, "steps": steps})
 
 
 def _run_nas_research_control_sequence(tmp_path, cycles, *, burst_limit=4):
