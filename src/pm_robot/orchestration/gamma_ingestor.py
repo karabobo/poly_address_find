@@ -110,7 +110,7 @@ def ingest_gamma_markets(
         episodes_rebuilt = _rebuild_closed_market_wallets(
             conn,
             closed_slugs,
-            max_wallets=max_episode_rebuild_wallets,
+            max_wallets=0 if paper_only else max_episode_rebuild_wallets,
         )
         return GammaIngestSummary(
             run_id,

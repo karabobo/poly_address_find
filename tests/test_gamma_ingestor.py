@@ -9,7 +9,9 @@ from pm_robot.orchestration.gamma_ingestor import ingest_gamma_markets
 from pm_robot.storage.db import connect, run_migrations
 from pm_robot.storage.repository import (
     gamma_market_cache_summary,
+    persist_paper_observer_trials,
     persist_wallet_activity,
+    rebuild_wallet_episodes,
     upsert_candidate,
 )
 
@@ -192,6 +194,71 @@ def test_gamma_market_ingestor_rebuilds_closed_market_episodes(tmp_path):
         assert summary.episodes_rebuilt == 1
         assert episode["status"] == "closed"
         assert episode["realized_pnl_est"] == 5
+    finally:
+        conn.close()
+
+
+def test_paper_only_gamma_refresh_does_not_rebuild_wallet_episodes(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    wallet = "0x" + "5" * 40
+    try:
+        run_migrations(conn)
+        upsert_candidate(conn, CandidateAddress(address=wallet, sources="test"))
+        persist_wallet_activity(
+            conn,
+            wallet,
+            [
+                {
+                    "timestamp": 1_000,
+                    "conditionId": "condition-1",
+                    "eventSlug": "event-1",
+                    "slug": "market-1",
+                    "asset": "token-yes",
+                    "outcome": "YES",
+                    "type": "TRADE",
+                    "side": "BUY",
+                    "price": 0.5,
+                    "size": 10,
+                    "usdcSize": 5,
+                    "transactionHash": "0xhash",
+                }
+            ],
+            ingested_at=2_000,
+        )
+        rebuild_wallet_episodes(conn, wallet)
+        persist_paper_observer_trials(
+            conn,
+            [
+                {
+                    "signal_id": "observer-signal",
+                    "wallet": wallet,
+                    "candidate_stage": "paper_approved",
+                    "market_slug": "market-1",
+                    "asset_id": "token-yes",
+                    "outcome": "YES",
+                    "side": "BUY",
+                    "detected_at": 1_000,
+                    "executable_price": 0.5,
+                    "stake_usd": 10,
+                    "fee_usd": 0,
+                    "accepted": True,
+                    "actionable": True,
+                }
+            ],
+            evaluated_at=2_000,
+        )
+
+        summary = ingest_gamma_markets(
+            conn,
+            limit=10,
+            paper_only=True,
+            client=ClosedGammaClient(),
+        )
+        episode = conn.execute("SELECT * FROM wallet_episodes WHERE address = ?", (wallet,)).fetchone()
+
+        assert summary.markets_attempted == 1
+        assert summary.episodes_rebuilt == 0
+        assert episode["status"] == "open"
     finally:
         conn.close()
 

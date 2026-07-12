@@ -199,6 +199,43 @@ def test_paper_gamma_targets_include_open_observer_trials(tmp_path):
         conn.close()
 
 
+def test_paper_gamma_targets_prioritize_observer_trials_over_legacy_fills(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    try:
+        run_migrations(conn)
+        persist_paper_observer_trials(conn, [_evaluation()], evaluated_at=1_000)
+        conn.execute(
+            """
+            INSERT INTO paper_orders(
+                order_id, signal_id, wallet, market_slug, asset_id, outcome,
+                side, price, stake_usd, route, accepted, reason, created_at
+            ) VALUES ('legacy-order', 'legacy-signal', ?, 'legacy-market',
+                      'legacy-token', 'Yes', 'BUY', 0.5, 10, 'paper', 1, 'test', 900)
+            """,
+            (WALLET,),
+        )
+        conn.execute(
+            """
+            INSERT INTO paper_fills(
+                order_id, wallet, market_slug, asset_id, outcome, side,
+                fill_price, stake_usd, shares, filled_at, source_order_created_at
+            ) VALUES ('legacy-order', ?, 'legacy-market', 'legacy-token',
+                      'Yes', 'BUY', 0.5, 10, 20, 900, 900)
+            """,
+            (WALLET,),
+        )
+        conn.commit()
+
+        assert list_gamma_market_backfill_targets(
+            conn,
+            paper_only=True,
+            now=1_100,
+            limit=1,
+        ) == ["market-1"]
+    finally:
+        conn.close()
+
+
 def test_observer_trial_migration_seeds_existing_actionable_evidence(tmp_path):
     conn = connect(tmp_path / "robot.sqlite")
     try:

@@ -2023,16 +2023,21 @@ def list_gamma_market_backfill_targets(
     if paper_only:
         rows = conn.execute(
             """
-            WITH paper_slugs AS (
-                SELECT DISTINCT market_slug
-                FROM paper_fills
-                WHERE market_slug IS NOT NULL AND market_slug != ''
-                UNION
-                SELECT DISTINCT market_slug
+            WITH targets AS (
+                SELECT market_slug, 0 AS priority
                 FROM paper_observer_trials
                 WHERE status = 'open'
                   AND market_slug IS NOT NULL
                   AND market_slug != ''
+                UNION ALL
+                SELECT market_slug, 1 AS priority
+                FROM paper_fills
+                WHERE market_slug IS NOT NULL AND market_slug != ''
+            ),
+            paper_slugs AS (
+                SELECT market_slug, MIN(priority) AS priority
+                FROM targets
+                GROUP BY market_slug
             )
             SELECT paper_slugs.market_slug
             FROM paper_slugs
@@ -2040,7 +2045,7 @@ def list_gamma_market_backfill_targets(
               ON gmc.market_slug = paper_slugs.market_slug
             WHERE gmc.market_slug IS NULL
                OR gmc.expires_at <= ?
-            ORDER BY COALESCE(gmc.expires_at, 0) ASC, paper_slugs.market_slug ASC
+            ORDER BY paper_slugs.priority ASC, COALESCE(gmc.expires_at, 0) ASC, paper_slugs.market_slug ASC
             LIMIT ?
             """,
             (now, limit),
