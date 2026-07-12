@@ -506,7 +506,7 @@ def archive_catalog_coverage(
             if not candidate.is_file():
                 continue
             resolved = candidate.resolve()
-            if not resolved.is_relative_to(root):
+            if not _path_is_within_root(resolved, root):
                 unsafe_file_count += 1
                 continue
             actual[resolved.relative_to(root).as_posix()] = int(
@@ -930,6 +930,14 @@ def _archive_path(archive_root: Path, relative_path: str) -> Path:
         raise ValueError(f"archive path must remain relative to its root: {relative_path}")
     root = archive_root.resolve()
     path = (root / relative).resolve()
-    if not path.is_relative_to(root):
+    if not _path_is_within_root(path, root):
         raise ValueError(f"archive path escapes its root: {relative_path}")
     return path
+
+
+def _path_is_within_root(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return False
+    return True

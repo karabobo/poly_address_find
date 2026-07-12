@@ -132,6 +132,141 @@ def test_light_done_requires_policy_materiality_before_medium(tmp_path):
         conn.close()
 
 
+def test_low_sample_light_done_defers_without_materialized_features(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    wallet = "0x" + "d" * 40
+    try:
+        run_migrations(conn)
+        _seed_stage(
+            conn,
+            wallet,
+            stage=EvidenceJobStage.LIGHT_DONE.value,
+            activity_count=10,
+        )
+        conn.commit()
+
+        summary = promote_wallet_evidence(
+            conn,
+            policy_path=POLICY_PATH,
+            limit=10,
+            now=40_000,
+        )
+        budget = conn.execute(
+            "SELECT stage, stop_reason FROM evidence_backfill_budget WHERE wallet = ?",
+            (wallet,),
+        ).fetchone()
+        state = conn.execute(
+            """
+            SELECT current_stage, evidence_status, next_action
+            FROM wallet_processing_state
+            WHERE wallet = ?
+            """,
+            (wallet,),
+        ).fetchone()
+
+        assert summary.targets_seen == 1
+        assert summary.waiting_for_fresh_features == 0
+        assert summary.deferred == 1
+        assert budget["stage"] == EvidenceJobStage.LIGHT_DONE.value
+        assert budget["stop_reason"].startswith(
+            f"promotion_deferred:medium_pending:{POLICY_VERSION}:light_activity_below_25"
+        )
+        assert dict(state) == {
+            "current_stage": EvidenceJobStage.LIGHT_DONE.value,
+            "evidence_status": "summary_ready",
+            "next_action": "score_wallet",
+        }
+    finally:
+        conn.close()
+
+
+def test_low_sample_medium_done_defers_with_stale_features(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    wallets = ["0x" + digit * 40 for digit in ("e", "c")]
+    try:
+        run_migrations(conn)
+        for wallet in wallets:
+            _seed_stage(
+                conn,
+                wallet,
+                stage=EvidenceJobStage.MEDIUM_DONE.value,
+                activity_count=100,
+            )
+        _seed_ready_features(conn, wallets[1], 99)
+        conn.commit()
+
+        summary = promote_wallet_evidence(
+            conn,
+            policy_path=POLICY_PATH,
+            limit=10,
+            now=40_000,
+        )
+        budgets = {
+            row["wallet"]: row
+            for row in conn.execute(
+                "SELECT wallet, stage, stop_reason FROM evidence_backfill_budget"
+            ).fetchall()
+        }
+
+        assert summary.targets_seen == 2
+        assert summary.waiting_for_fresh_features == 0
+        assert summary.deep_approved == 0
+        assert summary.deferred == 2
+        for wallet in wallets:
+            assert budgets[wallet]["stage"] == EvidenceJobStage.MEDIUM_DONE.value
+            assert budgets[wallet]["stop_reason"].startswith(
+                "promotion_deferred:deep_pending:"
+                f"{POLICY_VERSION}:medium_activity_below_300"
+            )
+    finally:
+        conn.close()
+
+
+def test_promotion_candidate_still_waits_for_current_features(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    light_wallet = "0x" + "f" * 40
+    medium_wallet = "0x" + "b" * 40
+    try:
+        run_migrations(conn)
+        _seed_stage(
+            conn,
+            light_wallet,
+            stage=EvidenceJobStage.LIGHT_DONE.value,
+            activity_count=25,
+        )
+        _seed_stage(
+            conn,
+            medium_wallet,
+            stage=EvidenceJobStage.MEDIUM_DONE.value,
+            activity_count=300,
+        )
+        _seed_ready_features(conn, medium_wallet, 299)
+        conn.commit()
+
+        summary = promote_wallet_evidence(
+            conn,
+            policy_path=POLICY_PATH,
+            limit=10,
+            now=40_000,
+        )
+        budgets = {
+            row["wallet"]: row
+            for row in conn.execute(
+                "SELECT wallet, stage, stop_reason FROM evidence_backfill_budget"
+            ).fetchall()
+        }
+
+        assert summary.targets_seen == 0
+        assert summary.waiting_for_fresh_features == 2
+        assert summary.medium_approved == 0
+        assert summary.deferred == 0
+        assert budgets[light_wallet]["stage"] == EvidenceJobStage.LIGHT_DONE.value
+        assert budgets[medium_wallet]["stage"] == EvidenceJobStage.MEDIUM_DONE.value
+        assert all(row["stop_reason"] == "legacy_transition" for row in budgets.values())
+    finally:
+        conn.close()
+
+
 def test_promotion_computes_evidence_outside_write_transaction(tmp_path, monkeypatch):
     conn = connect(tmp_path / "robot.sqlite")
     wallets = ["0x" + digit * 40 for digit in ("a", "b")]

@@ -98,22 +98,30 @@ def promote_wallet_evidence(
             source_stage
         )
         try:
-            feature_row = conn.execute(
-                "SELECT * FROM wallet_features WHERE address = ?",
-                (wallet,),
-            ).fetchone()
-            if feature_row is None:
-                raise ValueError("wallet_features_missing")
-            features = _feature_from_row(feature_row)
             evidence = summarize_wallet_evidence(conn, wallet)
-            reason = _promotion_block_reason(
-                features=features,
+            reason = _promotion_evidence_block_reason(
                 evidence=evidence,
                 job_action=job_action,
-                leader_score=row["leader_score"],
-                score_fresh=bool(row["score_fresh"]),
-                policy=policy,
             )
+            features_fresh = bool(row["features_fresh"])
+            if reason is None:
+                if not features_fresh:
+                    waiting += 1
+                    continue
+                feature_row = conn.execute(
+                    "SELECT * FROM wallet_features WHERE address = ?",
+                    (wallet,),
+                ).fetchone()
+                if feature_row is None:
+                    raise ValueError("wallet_features_missing")
+                reason = _promotion_block_reason(
+                    features=_feature_from_row(feature_row),
+                    evidence=evidence,
+                    job_action=job_action,
+                    leader_score=row["leader_score"],
+                    score_fresh=bool(row["score_fresh"]),
+                    policy=policy,
+                )
             approved = reason is None
             if reason is None:
                 next_stage = job_action
@@ -139,7 +147,10 @@ def promote_wallet_evidence(
                 "policy_version": policy_version,
                 "feature_updated_at": int(row["feature_updated_at"] or 0),
                 "activity_count": int(evidence["activity_count"]),
-                "materializer_version": MATERIALIZER_VERSION,
+                "features_fresh": features_fresh,
+                "materializer_version": (
+                    MATERIALIZER_VERSION if features_fresh else ""
+                ),
                 "evaluated_at": ts,
             }
             prepared.append(
@@ -289,6 +300,16 @@ def _promotion_targets(
             -1
         ) = COALESCE(waw.trade_count, 0)
     """
+    deterministic_low_activity_sql = """
+        (
+            ebb.stage = 'light_done'
+            AND COALESCE(waw.trade_count, 0) < 25
+        )
+        OR (
+            ebb.stage = 'medium_done'
+            AND COALESCE(waw.trade_count, 0) < 300
+        )
+    """
     needs_gate_sql = """
         (
             (
@@ -313,6 +334,7 @@ def _promotion_targets(
     """
     params: tuple[Any, ...] = (
         policy_version,
+        MATERIALIZER_VERSION,
         PipelineJobType.WALLET_EVIDENCE_BACKFILL.value,
         MATERIALIZER_VERSION,
         policy_version,
@@ -335,7 +357,8 @@ def _promotion_targets(
                      AND COALESCE(ls.policy_version, '') = ?
                 THEN 1
                 ELSE 0
-            END AS score_fresh
+            END AS score_fresh,
+            CASE WHEN {fresh_sql} THEN 1 ELSE 0 END AS features_fresh
         FROM evidence_backfill_budget ebb
         JOIN candidate_wallets cw
           ON cw.address = ebb.wallet
@@ -348,7 +371,7 @@ def _promotion_targets(
         LEFT JOIN wallet_registry wr
           ON wr.address = ebb.wallet
         WHERE {eligible_sql}
-          AND {fresh_sql}
+          AND (({fresh_sql}) OR ({deterministic_low_activity_sql}))
           AND {needs_gate_sql}
         ORDER BY
             CASE ebb.stage
@@ -378,6 +401,7 @@ def _promotion_targets(
             WHERE {eligible_sql}
               AND {needs_gate_sql}
               AND NOT ({fresh_sql})
+              AND NOT ({deterministic_low_activity_sql})
             """,
             (
                 PipelineJobType.WALLET_EVIDENCE_BACKFILL.value,
@@ -417,6 +441,39 @@ def _promotion_block_reason(
     score_fresh: bool,
     policy: dict[str, Any],
 ) -> str | None:
+    evidence_reason = _promotion_evidence_block_reason(
+        evidence=evidence,
+        job_action=job_action,
+    )
+    if evidence_reason:
+        return evidence_reason
+    risk_reason = hygiene_block_reason(features, policy) or hedge_block_reason(
+        features,
+        policy,
+    )
+    if risk_reason:
+        return risk_reason
+    materiality_reason = economic_materiality_reason(features, policy)
+    if materiality_reason:
+        return materiality_reason
+    if job_action == EvidenceJobStage.DEEP_PENDING.value:
+        if not score_fresh or leader_score is None:
+            return "medium_score_not_fresh"
+        minimum_score = float(
+            policy.get("review_bands", {}).get("formal_validation_candidate", 40.0)
+        )
+        if float(leader_score) < minimum_score:
+            return f"medium_score_below_{minimum_score:g}"
+    return None
+
+
+def _promotion_evidence_block_reason(
+    *,
+    evidence: dict[str, Any],
+    job_action: str,
+) -> str | None:
+    """Return deterministic evidence-depth blocks without requiring materialized features."""
+
     activity_count = int(evidence.get("activity_count") or 0)
     distinct_markets = int(evidence.get("distinct_markets") or 0)
     non_fast_trades = int(evidence.get("non_fast_trade_count") or 0)
@@ -436,20 +493,6 @@ def _promotion_block_reason(
             return "medium_markets_below_10"
         if non_fast_trades < 50:
             return "medium_non_fast_below_50"
-    risk_reason = hygiene_block_reason(features, policy) or hedge_block_reason(features, policy)
-    if risk_reason:
-        return risk_reason
-    materiality_reason = economic_materiality_reason(features, policy)
-    if materiality_reason:
-        return materiality_reason
-    if job_action == EvidenceJobStage.DEEP_PENDING.value:
-        if not score_fresh or leader_score is None:
-            return "medium_score_not_fresh"
-        minimum_score = float(
-            policy.get("review_bands", {}).get("formal_validation_candidate", 40.0)
-        )
-        if float(leader_score) < minimum_score:
-            return f"medium_score_below_{minimum_score:g}"
     return None
 
 
