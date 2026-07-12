@@ -156,7 +156,9 @@ default `up`, `restart`, `runtime-ensure`, or watchdog commands.
   planners may reopen them with a fresh attempt budget while retaining the previous error for diagnosis.
 - Retention catch-up is bounded. Maintenance runs up to four short passes only when newly classified eligible raw
   rows outpace completed deletion or when retention yielded to research-control; every batch still releases the
-  control lock so research remains the priority.
+  control lock so research remains the priority. While the backlog remains above the configured high-water mark,
+  `draining`, `inflow_outpacing_cleanup`, and `yielded_to_research` all schedule the next bounded cycle on the short
+  interval instead of falling back to the normal 15-minute maintenance cadence.
 - Planner backpressure limits queued/running wallet evidence and copyability jobs. Copyability planning keeps
   its per-pass batch limit separate from the active-queue waterline and only fills currently available slots.
 - Research control keeps feature and scoring transactions bounded. A full batch schedules a `scoring_only` pass on

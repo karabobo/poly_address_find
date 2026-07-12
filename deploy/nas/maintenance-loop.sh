@@ -151,7 +151,13 @@ while true; do
     runtime_heartbeat loop_maintenance failed "maintenance failed"
   fi
   next_interval="$INTERVAL"
-  if [ "$maintenance_ok" -eq 1 ] && [ "$PRUNE_ENABLED" = "1" ] && [ "$prune_state" = "draining" ] && [ "$prune_backlog_rows" -gt "$PRUNE_CATCHUP_BACKLOG_ROWS" ]; then
+  high_backlog_state=0
+  case "$prune_state" in
+    draining|inflow_outpacing_cleanup|yielded_to_research)
+      high_backlog_state=1
+      ;;
+  esac
+  if [ "$maintenance_ok" -eq 1 ] && [ "$PRUNE_ENABLED" = "1" ] && [ "$high_backlog_state" -eq 1 ] && [ "$prune_backlog_rows" -gt "$PRUNE_CATCHUP_BACKLOG_ROWS" ]; then
     next_interval="$PRUNE_HIGH_BACKLOG_INTERVAL"
     echo "$(date -Iseconds) maintenance loop: retention backlog ${prune_backlog_rows} remains high; next cycle in ${next_interval}s"
   fi

@@ -135,7 +135,8 @@ def test_nas_retention_prune_is_bounded_and_staggered():
     assert "inflow_outpacing_cleanup|yielded_to_research|retention_starved" in loop
     assert "retention backlog ${prune_backlog_rows} remains above" in loop
     assert 'next_interval="$PRUNE_HIGH_BACKLOG_INTERVAL"' in loop
-    assert '[ "$prune_state" = "draining" ]' in loop
+    assert "draining|inflow_outpacing_cleanup|yielded_to_research" in loop
+    assert '[ "$high_backlog_state" -eq 1 ]' in loop
     assert "*[!0-9]*) PRUNE_CATCHUP_BACKLOG_ROWS=1000000" in loop
     assert 'if [ "$PRUNE_HIGH_BACKLOG_INTERVAL" -lt 30 ]' in loop
     assert 'sleep "$PRUNE_CATCHUP_DELAY"' in loop
@@ -259,6 +260,24 @@ exit 99
             60,
             4,
             4,
+            ["1", "1", "1", "60"],
+        ),
+        (
+            "inflow_outpacing_cleanup",
+            1_500_000,
+            "1000000",
+            60,
+            4,
+            4,
+            ["1", "1", "1", "60"],
+        ),
+        (
+            "yielded_to_research",
+            1_000_000,
+            "1000000",
+            60,
+            4,
+            4,
             ["1", "1", "1", "900"],
         ),
         ("draining", 1_500_000, "invalid", 0, 4, 4, ["1", "1", "1", "30"]),
@@ -377,7 +396,11 @@ exit 0
     expected_retries = expected_retention_calls - 1
     expected_backlog_retries = expected_retries if retention_state == "draining" else 0
     assert result.stdout.count("remains above") == expected_backlog_retries
-    expected_acceleration = retention_state == "draining" and backlog_rows > 1_000_000
+    expected_acceleration = (
+        retention_state
+        in {"draining", "inflow_outpacing_cleanup", "yielded_to_research"}
+        and backlog_rows > 1_000_000
+    )
     assert ("remains high; next cycle" in result.stdout) is expected_acceleration
 
 
