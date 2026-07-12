@@ -7718,6 +7718,10 @@ def _needs_data_reason_rows(conn: sqlite3.Connection, *, limit: int = 8) -> list
                         THEN 'history_pending'
                     WHEN review_reason = ''
                         THEN 'not_scored'
+                    WHEN review_reason LIKE 'evidence_refinement_pending:%'
+                        THEN 'history_pending'
+                    WHEN review_reason LIKE 'insufficient_directional_trades:%'
+                        THEN 'insufficient_directional_trades'
                     WHEN review_reason = 'no_wallet_metrics_attached'
                         THEN 'missing_wallet_features'
                     WHEN review_reason LIKE 'missing_required_score_components:%'
@@ -7825,6 +7829,10 @@ def _needs_data_reason_rows(conn: sqlite3.Connection, *, limit: int = 8) -> list
 def _needs_data_reason_metadata(key: str) -> tuple[str, str]:
     return {
         "history_pending": ("历史证据不足", "继续 L1/L2/L3 补历史"),
+        "insufficient_directional_trades": (
+            "有效交易样本不足",
+            "证据已耗尽，保留摘要并停止昂贵补证据",
+        ),
         "not_scored": ("未评分", "触发评分常驻服务或检查评分输入"),
         "missing_wallet_features": ("缺钱包特征", "物化 wallet_features 后重评"),
         "missing_core_score_components": ("缺基础评分组件", "先物化 wallet_features，再分流补 copyability/hygiene"),

@@ -2586,6 +2586,10 @@ def test_dashboard_groups_needs_data_reasons_into_operator_actions(tmp_path):
                 "0x1000000000000000000000000000000000000004",
                 "missing_required_score_components:bot_score,leader_in_degree,copy_event_count,copy_market_count,single_market_pnl_share,net_to_gross_exposure",
             ),
+            (
+                "0x1000000000000000000000000000000000000005",
+                "insufficient_directional_trades:24<100",
+            ),
         ]
         for address, reason in seed_rows:
             conn.execute(
@@ -2633,9 +2637,11 @@ def test_dashboard_groups_needs_data_reasons_into_operator_actions(tmp_path):
     assert reasons["missing_core_score_components"]["reason"] == "缺基础评分组件"
     assert reasons["low_net_pnl"]["reason"] == "净收益不足"
     assert reasons["low_recent_volume"]["reason"] == "近期交易量不足"
+    assert reasons["insufficient_directional_trades"]["reason"] == "有效交易样本不足"
     assert "Needs Data 原因" in html
     assert "补 copyability 证据并重评" in html
     assert "先物化 wallet_features，再分流补 copyability/hygiene" in html
+    assert "证据已耗尽，保留摘要并停止昂贵补证据" in html
 
 
 def test_dashboard_ops_health_warns_on_invalid_wallet_addresses(tmp_path):

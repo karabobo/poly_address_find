@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, BinaryIO, Callable
 
 from pm_robot.config import RobotSettings
+from pm_robot.pipeline_terms import PENDING_EVIDENCE_JOB_STAGES, TERMINAL_EVIDENCE_JOB_STAGES
 from pm_robot.risk.eligibility import winner_library_eligibility_status
 from pm_robot.storage.api_rate_limit import (
     api_rate_limit_summary,
@@ -52,6 +53,20 @@ ACTIVE_CANDIDATE_REGISTRY_STAGES = (
     "paper_candidate",
     "paper_approved",
     "live_eligible",
+)
+ACTIONABLE_INCOMPLETE_REVIEW_REASONS = (
+    "no_wallet_metrics_attached",
+    "hygiene_evidence_incomplete",
+    "missing_required_score_components:",
+    "missing_economic_materiality:",
+)
+LOW_VALUE_REVIEW_REASONS = (
+    "insufficient_directional_trades:",
+    "insufficient_total_volume_usdc:",
+    "insufficient_recent_30d_volume_usdc:",
+    "insufficient_net_pnl_usdc:",
+    "insufficient_copy_backtest_net_pnl_usdc:",
+    "score_below_watchlist_after_evidence",
 )
 WALLET_REGISTRY_TABLE_COLUMNS = [
     "address",
@@ -3357,7 +3372,11 @@ def _wallet_registry_status(
     tags: list[str],
 ) -> tuple[str, str]:
     existing_status = str(row.get("existing_registry_status") or "")
-    if existing_status in {"archive_pending", "archived_raw_pruned"}:
+    evidence_stage = str(evidence.get("stage") or "")
+    if (
+        existing_status in {"archive_pending", "archived_raw_pruned"}
+        and evidence_stage not in PENDING_EVIDENCE_JOB_STAGES
+    ):
         return existing_status, "summary_only"
     stage = str(row.get("candidate_stage") or "")
     review_reason = str(score.get("review_reason") or "")
@@ -3380,20 +3399,33 @@ def _wallet_registry_status(
     if stage == "rejected":
         return "rejected", "summary_only"
     if stage == "needs_data":
-        if leader_score <= 0 and feature_materialized and evidence.get("stage") not in {
-            "light_pending",
-            "medium_pending",
-            "deep_pending",
-        }:
-            return "archive_low_value", "summary_only"
-        if evidence.get("stage") in {"light_pending", "medium_pending", "deep_pending"}:
+        activity_count = int(evidence.get("activity_count") or 0)
+        if evidence_stage in PENDING_EVIDENCE_JOB_STAGES:
             return "needs_evidence_backfill", "summary_and_recent"
+        if evidence_stage == "raw_pruned":
+            return "archive_low_value", "summary_only"
+        if _review_reason_matches(review_reason, LOW_VALUE_REVIEW_REASONS):
+            return "archive_low_value", "summary_only"
         if "low_profit" in tags or "low_volume" in tags:
+            return "archive_low_value", "summary_only"
+        if _review_reason_matches(review_reason, ACTIONABLE_INCOMPLETE_REVIEW_REASONS):
+            if evidence_stage in TERMINAL_EVIDENCE_JOB_STAGES and activity_count < 25:
+                return "archive_low_value", "summary_only"
+            return "needs_more_scoring_data", "summary_and_recent"
+        if (
+            leader_score <= 0
+            and feature_materialized
+            and evidence_stage in TERMINAL_EVIDENCE_JOB_STAGES
+        ):
             return "archive_low_value", "summary_only"
         return "needs_more_scoring_data", "summary_and_recent"
     if paper.get("production_ready"):
         return "ready_for_external_validation", "keep_full"
     return "observe", "summary_and_recent"
+
+
+def _review_reason_matches(reason: str, markers: tuple[str, ...]) -> bool:
+    return any(reason == marker or reason.startswith(marker) for marker in markers)
 
 
 def _wallet_registry_tags(

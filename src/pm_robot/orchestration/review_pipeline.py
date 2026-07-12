@@ -6,8 +6,9 @@ import sqlite3
 import time
 import json
 from pathlib import Path
+from typing import Any
 
-from pm_robot.config import load_policy
+from pm_robot.config import load_policy, threshold
 from pm_robot.io import load_candidate_addresses, load_wallet_features, write_rows
 from pm_robot.models import CandidateAddress, CandidateStage, ScoreBreakdown
 from pm_robot.orchestration.evidence_readiness import paper_evidence_ready, paper_evidence_ready_sql
@@ -21,6 +22,7 @@ from pm_robot.research.scoring import review_row, score_candidate
 from pm_robot.storage.repository import (
     apply_paper_quality_blocks,
     apply_copyability_no_signal_blocks,
+    consume_fresh_score_actions,
     get_wallet_features,
     latest_review_rows,
     list_candidates,
@@ -96,8 +98,7 @@ def score_database(
     scores = []
     for candidate in candidates:
         score = score_candidate(candidate, features_by_address.get(candidate.address), policy)
-        score = apply_evidence_lifecycle_guard(conn, score)
-        scores.append(apply_paper_evidence_guard(conn, score))
+        scores.append(apply_score_lifecycle_guards(conn, score, policy))
 
     def persist_scores() -> tuple[int, int, int]:
         skipped_incomplete = 0
@@ -119,18 +120,26 @@ def score_database(
         persist_scores,
     )
 
-    def finalize_scores() -> tuple[int, int, int, int, int]:
+    def finalize_scores() -> tuple[int, int, int, int, int, int]:
         restored = restore_masked_valid_scores(conn, policy_version=policy_version)
         blocked = apply_paper_quality_blocks(conn)
         no_signal_blocked = apply_copyability_no_signal_blocks(conn)
         evidence_guarded = repair_paper_stage_evidence_incomplete(conn, policy_version=policy_version)
         synced = sync_candidate_stages_from_latest_scores(conn)
-        return restored, blocked, no_signal_blocked, evidence_guarded, synced
+        score_actions_consumed = consume_fresh_score_actions(
+            conn,
+            policy_version=policy_version,
+        )
+        return restored, blocked, no_signal_blocked, evidence_guarded, synced, score_actions_consumed
 
-    restored, blocked, no_signal_blocked, evidence_guarded, synced = _write_with_retry(
-        conn,
-        finalize_scores,
-    )
+    (
+        restored,
+        blocked,
+        no_signal_blocked,
+        evidence_guarded,
+        synced,
+        score_actions_consumed,
+    ) = _write_with_retry(conn, finalize_scores)
     if export_path:
         write_rows(export_path, latest_review_rows(conn))
     counts = _candidate_stage_counts(conn)
@@ -150,6 +159,8 @@ def score_database(
         counts["paper_evidence_incomplete_downgraded"] = evidence_guarded
     if synced:
         counts["candidate_stage_synced_from_latest_score"] = synced
+    if score_actions_consumed:
+        counts["score_actions_consumed"] = score_actions_consumed
     return counts
 
 
@@ -178,6 +189,70 @@ PENDING_EVIDENCE_STATUSES = {
     EvidenceStatus.QUEUED.value,
 }
 BORDERLINE_LIFECYCLE_REPAIR_PENDING_STATUSES = tuple(sorted(PENDING_EVIDENCE_STATUSES))
+
+
+def apply_score_lifecycle_guards(
+    conn: sqlite3.Connection,
+    score: ScoreBreakdown,
+    policy: dict[str, Any],
+) -> ScoreBreakdown:
+    """Apply the shared evidence guards used by every database scoring path."""
+
+    score = apply_directional_history_guard(conn, score, policy)
+    score = apply_evidence_lifecycle_guard(conn, score)
+    return apply_paper_evidence_guard(conn, score)
+
+
+def apply_directional_history_guard(
+    conn: sqlite3.Connection,
+    score: ScoreBreakdown,
+    policy: dict[str, Any],
+) -> ScoreBreakdown:
+    """Require enough observed trades before expensive copyability review can matter."""
+
+    if score.stage in {
+        CandidateStage.REJECTED,
+        CandidateStage.BLOCKED_HYGIENE,
+        CandidateStage.BLOCKED_COPYABILITY,
+    }:
+        return score
+    if score.stage == CandidateStage.NEEDS_DATA and not score.reason.startswith(
+        "missing_required_score_components:"
+    ):
+        return score
+    minimum_trades = max(int(threshold(policy, "min_directional_trades", 100)), 0)
+    if minimum_trades <= 0:
+        return score
+    state = conn.execute(
+        """
+        SELECT current_stage, evidence_status, next_action, activity_count
+        FROM wallet_processing_state
+        WHERE wallet = ?
+        """,
+        (score.address,),
+    ).fetchone()
+    if state is None:
+        return score
+    activity_count = int(state["activity_count"] or 0)
+    if activity_count >= minimum_trades:
+        return score
+
+    evidence_status = str(state["evidence_status"] or "")
+    next_action = str(state["next_action"] or "")
+    current_stage = str(state["current_stage"] or "")
+    if next_action in PENDING_EVIDENCE_JOB_STAGES or evidence_status in PENDING_EVIDENCE_STATUSES:
+        pending_step = next_action or evidence_status or current_stage or "unknown"
+        reason = f"evidence_refinement_pending:{pending_step}"
+    else:
+        reason = f"insufficient_directional_trades:{activity_count}<{minimum_trades}"
+    return ScoreBreakdown(
+        address=score.address,
+        leader_score=0.0,
+        stage=CandidateStage.NEEDS_DATA,
+        reason=reason,
+        components=score.components,
+        penalties=score.penalties,
+    )
 
 
 def apply_evidence_lifecycle_guard(

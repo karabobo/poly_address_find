@@ -1,5 +1,6 @@
 import json
 import sqlite3
+from dataclasses import replace
 from pathlib import Path
 from typing import Optional
 
@@ -10,7 +11,9 @@ from pm_robot.orchestration.review_pipeline import score_database, sync_candidat
 from pm_robot.storage.db import connect, run_migrations
 from pm_robot.storage.repository import (
     apply_copyability_no_signal_blocks,
+    consume_fresh_score_actions,
     persist_score,
+    sync_wallet_processing_state,
     upsert_candidate,
     upsert_wallet_feature,
 )
@@ -128,6 +131,254 @@ def _borderline_score(candidate: CandidateAddress) -> ScoreBreakdown:
         components={"test": 39.0},
         penalties={},
     )
+
+
+def test_fresh_score_action_consumption_does_not_touch_evidence_freshness(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    address = "0x" + "1" * 40
+    try:
+        run_migrations(conn)
+        upsert_candidate(conn, CandidateAddress(address=address, sources="test"))
+        _insert_l3_state(conn, address, updated_at=50)
+        conn.commit()
+
+        persist_score(
+            conn,
+            ScoreBreakdown(
+                address=address,
+                leader_score=55.0,
+                stage=CandidateStage.NEEDS_REVIEW,
+                reason="watchlist_score",
+                components={"test": 55.0},
+                penalties={},
+            ),
+            policy_version=_policy_version(),
+        )
+        state = conn.execute(
+            "SELECT next_action, next_action_at, updated_at FROM wallet_processing_state WHERE wallet = ?",
+            (address,),
+        ).fetchone()
+
+        assert state["next_action"] == "score_wallet"
+        assert state["updated_at"] == 50
+
+        consumed = consume_fresh_score_actions(conn, policy_version=_policy_version())
+        state = conn.execute(
+            "SELECT next_action, next_action_at, updated_at FROM wallet_processing_state WHERE wallet = ?",
+            (address,),
+        ).fetchone()
+
+        assert consumed == 1
+        assert state["next_action"] == ""
+        assert state["next_action_at"] == 0
+        assert state["updated_at"] == 50
+
+        sync_wallet_processing_state(
+            conn,
+            address,
+            {
+                "activity_count": 1_200,
+                "distinct_markets": 40,
+                "non_fast_trade_count": 1_000,
+                "fast_market_share": 0.1,
+            },
+            now=200,
+        )
+        refreshed = conn.execute(
+            "SELECT next_action, updated_at FROM wallet_processing_state WHERE wallet = ?",
+            (address,),
+        ).fetchone()
+        assert refreshed["next_action"] == "score_wallet"
+        assert refreshed["updated_at"] == 200
+    finally:
+        conn.close()
+
+
+def test_persist_score_does_not_consume_newer_evidence_action(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    address = "0x" + "8" * 40
+    try:
+        run_migrations(conn)
+        upsert_candidate(conn, CandidateAddress(address=address, sources="test"))
+        _insert_l3_state(conn, address, updated_at=9_999_999_999)
+
+        persist_score(
+            conn,
+            ScoreBreakdown(
+                address=address,
+                leader_score=55.0,
+                stage=CandidateStage.NEEDS_REVIEW,
+                reason="watchlist_score",
+                components={"test": 55.0},
+                penalties={},
+            ),
+            policy_version=_policy_version(),
+        )
+        consumed = consume_fresh_score_actions(conn, policy_version=_policy_version())
+        state = conn.execute(
+            "SELECT next_action FROM wallet_processing_state WHERE wallet = ?",
+            (address,),
+        ).fetchone()
+
+        assert consumed == 0
+        assert state["next_action"] == "score_wallet"
+    finally:
+        conn.close()
+
+
+def test_consume_fresh_score_actions_only_clears_current_fresh_scores(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    fresh = "0x" + "2" * 40
+    old_policy = "0x" + "3" * 40
+    evidence_newer = "0x" + "4" * 40
+    try:
+        run_migrations(conn)
+        for address in (fresh, old_policy, evidence_newer):
+            upsert_candidate(conn, CandidateAddress(address=address, sources="test"))
+            conn.execute(
+                "UPDATE candidate_wallets SET updated_at = 10 WHERE address = ?",
+                (address,),
+            )
+            _insert_l3_state(conn, address, updated_at=50)
+        conn.execute(
+            "UPDATE wallet_processing_state SET updated_at = 200 WHERE wallet = ?",
+            (evidence_newer,),
+        )
+        conn.executemany(
+            """
+            INSERT INTO leader_scores(
+                address, leader_score, review_stage, review_reason,
+                components_json, penalties_json, policy_version, scored_at
+            ) VALUES (?, 55, 'needs_manual_review', 'watchlist_score', '{}', '{}', ?, 100)
+            """,
+            (
+                (fresh, _policy_version()),
+                (old_policy, "old-policy"),
+                (evidence_newer, _policy_version()),
+            ),
+        )
+
+        consumed = consume_fresh_score_actions(conn, policy_version=_policy_version())
+        actions = {
+            row["wallet"]: row["next_action"]
+            for row in conn.execute(
+                "SELECT wallet, next_action FROM wallet_processing_state ORDER BY wallet"
+            ).fetchall()
+        }
+
+        assert consumed == 1
+        assert actions[fresh] == ""
+        assert actions[old_policy] == "score_wallet"
+        assert actions[evidence_newer] == "score_wallet"
+    finally:
+        conn.close()
+
+
+def test_score_database_rejects_terminal_thin_history_before_copyability(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    address = "0x" + "5" * 40
+    try:
+        run_migrations(conn)
+        upsert_candidate(conn, CandidateAddress(address=address, sources="test"))
+        upsert_wallet_feature(conn, _strong_features(address))
+        _insert_l3_state(conn, address)
+        conn.execute(
+            "UPDATE wallet_processing_state SET activity_count = 10 WHERE wallet = ?",
+            (address,),
+        )
+        conn.commit()
+
+        counts = score_database(conn, policy_path=POLICY_PATH)
+        latest = _latest_score(conn, address)
+        state = conn.execute(
+            "SELECT next_action FROM wallet_processing_state WHERE wallet = ?",
+            (address,),
+        ).fetchone()
+
+        assert counts["scores_written"] == 1
+        assert latest["review_stage"] == CandidateStage.NEEDS_DATA.value
+        assert latest["review_reason"] == "insufficient_directional_trades:10<100"
+        assert state["next_action"] == ""
+    finally:
+        conn.close()
+
+
+def test_score_database_keeps_thin_pending_history_in_refinement(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    address = "0x" + "6" * 40
+    try:
+        run_migrations(conn)
+        upsert_candidate(conn, CandidateAddress(address=address, sources="test"))
+        upsert_wallet_feature(conn, _strong_features(address))
+        _insert_pending_medium_state(conn, address)
+        conn.execute(
+            "UPDATE wallet_processing_state SET activity_count = 10 WHERE wallet = ?",
+            (address,),
+        )
+        conn.commit()
+
+        score_database(conn, policy_path=POLICY_PATH)
+        latest = _latest_score(conn, address)
+
+        assert latest["review_stage"] == CandidateStage.NEEDS_DATA.value
+        assert latest["review_reason"] == "evidence_refinement_pending:medium_pending"
+    finally:
+        conn.close()
+
+
+def test_directional_history_guard_preserves_explicit_low_value_reason(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    address = "0x" + "9" * 40
+    try:
+        run_migrations(conn)
+        upsert_candidate(conn, CandidateAddress(address=address, sources="test"))
+        upsert_wallet_feature(
+            conn,
+            replace(
+                _strong_features(address),
+                total_volume_usdc=100,
+                recent_30d_volume_usdc=100,
+                net_pnl_usdc=20,
+            ),
+        )
+        _insert_l3_state(conn, address)
+        conn.execute(
+            "UPDATE wallet_processing_state SET activity_count = 10 WHERE wallet = ?",
+            (address,),
+        )
+        conn.commit()
+
+        score_database(conn, policy_path=POLICY_PATH)
+        latest = _latest_score(conn, address)
+
+        assert latest["review_stage"] == CandidateStage.NEEDS_DATA.value
+        assert latest["review_reason"] == "insufficient_total_volume_usdc:100.00<1000.00"
+    finally:
+        conn.close()
+
+
+def test_directional_history_guard_does_not_override_hard_hygiene_block(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    address = "0x" + "7" * 40
+    try:
+        run_migrations(conn)
+        upsert_candidate(conn, CandidateAddress(address=address, sources="test"))
+        features = replace(_strong_features(address), hygiene_status="wash")
+        upsert_wallet_feature(conn, features)
+        _insert_l3_state(conn, address)
+        conn.execute(
+            "UPDATE wallet_processing_state SET activity_count = 10 WHERE wallet = ?",
+            (address,),
+        )
+        conn.commit()
+
+        score_database(conn, policy_path=POLICY_PATH)
+        latest = _latest_score(conn, address)
+
+        assert latest["review_stage"] == CandidateStage.BLOCKED_HYGIENE.value
+        assert latest["review_reason"] == "hygiene_status=wash"
+    finally:
+        conn.close()
 
 
 def test_score_database_keeps_pending_borderline_wallet_out_of_manual_review(tmp_path, monkeypatch):

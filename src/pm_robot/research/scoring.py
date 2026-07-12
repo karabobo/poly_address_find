@@ -50,6 +50,17 @@ def score_candidate(
     if h_reason and h_reason not in INCOMPLETE_HYGIENE_REASONS:
         return ScoreBreakdown(address, 0.0, CandidateStage.BLOCKED_HYGIENE, h_reason, {}, {})
 
+    materiality_reason = economic_materiality_reason(features, policy)
+    if materiality_reason:
+        return ScoreBreakdown(
+            address=address,
+            leader_score=0.0,
+            stage=CandidateStage.NEEDS_DATA,
+            reason=materiality_reason,
+            components={},
+            penalties={},
+        )
+
     missing = _missing_required_components(features, policy)
     if missing:
         return ScoreBreakdown(
@@ -63,17 +74,6 @@ def score_candidate(
 
     if h_reason in INCOMPLETE_HYGIENE_REASONS:
         return ScoreBreakdown(address, 0.0, CandidateStage.NEEDS_DATA, h_reason, {}, {})
-
-    materiality_reason = economic_materiality_reason(features, policy)
-    if materiality_reason:
-        return ScoreBreakdown(
-            address=address,
-            leader_score=0.0,
-            stage=CandidateStage.NEEDS_DATA,
-            reason=materiality_reason,
-            components={},
-            penalties={},
-        )
 
     c_reason = hedge_block_reason(features, policy)
     blocked_copyability = bool(c_reason)

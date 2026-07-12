@@ -60,6 +60,9 @@ def test_missing_required_score_components_needs_data():
     features = WalletFeatures(
         address=candidate.address,
         cumulative_win_rate=0.72,
+        recent_30d_volume_usdc=5_000,
+        net_pnl_usdc=500,
+        total_volume_usdc=10_000,
         hygiene_status="clean",
     )
 
@@ -68,6 +71,23 @@ def test_missing_required_score_components_needs_data():
     assert score.stage == CandidateStage.NEEDS_DATA
     assert score.reason.startswith("missing_required_score_components:")
     assert "maker_fraction" not in score.reason
+
+
+def test_economic_materiality_precedes_missing_expensive_score_components():
+    candidate = CandidateAddress(address="0x" + "6" * 40)
+    features = WalletFeatures(
+        address=candidate.address,
+        cumulative_win_rate=0.72,
+        recent_30d_volume_usdc=100,
+        net_pnl_usdc=20,
+        total_volume_usdc=100,
+        hygiene_status="clean",
+    )
+
+    score = score_candidate(candidate, features, POLICY)
+
+    assert score.stage == CandidateStage.NEEDS_DATA
+    assert score.reason == "insufficient_total_volume_usdc:100.00<1000.00"
 
 
 def test_missing_maker_taker_evidence_does_not_block_paper_candidate():

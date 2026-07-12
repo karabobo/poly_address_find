@@ -10,6 +10,9 @@ def _candidate() -> CandidateAddress:
 def test_missing_hygiene_evidence_blocks_scoring():
     features = WalletFeatures(
         address=_candidate().address,
+        total_volume_usdc=10_000,
+        recent_30d_volume_usdc=5_000,
+        net_pnl_usdc=500,
         hygiene_status="incomplete",
         maker_fraction=None,
     )

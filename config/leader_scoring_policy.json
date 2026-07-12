@@ -1,6 +1,6 @@
 {
-  "version": "2026-07-09-copyability-containment-calibrated",
-  "description": "Paper-driven Polymarket leader scoring and review policy; paper candidates require validated copyability evidence with containment calibrated for multi-strategy followers.",
+  "version": "2026-07-12-evidence-sufficiency-first",
+  "description": "Paper-driven Polymarket leader scoring and review policy; economic materiality and directional history sufficiency are evaluated before expensive copyability evidence.",
   "papers": [
     {
       "file": "ssrn-6624899.pdf",

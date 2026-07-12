@@ -2879,6 +2879,41 @@ def persist_score(
         )
 
 
+def consume_fresh_score_actions(
+    conn: sqlite3.Connection,
+    *,
+    policy_version: str,
+    wallet: str = "",
+) -> int:
+    """Clear score actions only when the latest score covers every current input."""
+
+    wallet_clause = "AND wallet = ?" if wallet else ""
+    params = (wallet.lower(), policy_version) if wallet else (policy_version,)
+    cursor = conn.execute(
+        f"""
+        UPDATE wallet_processing_state
+        SET next_action = '', next_action_at = 0
+        WHERE next_action = 'score_wallet'
+          {wallet_clause}
+          AND EXISTS (
+              SELECT 1
+              FROM candidate_wallets cw
+              JOIN leader_latest_scores latest
+                ON latest.address = cw.address
+              LEFT JOIN wallet_features wf
+                ON wf.address = cw.address
+              WHERE cw.address = wallet_processing_state.wallet
+                AND latest.policy_version = ?
+                AND latest.scored_at >= COALESCE(cw.updated_at, 0)
+                AND latest.scored_at >= COALESCE(wf.updated_at, 0)
+                AND latest.scored_at >= COALESCE(wallet_processing_state.updated_at, 0)
+        )
+        """,
+        params,
+    )
+    return max(int(cursor.rowcount or 0), 0)
+
+
 BLOCKING_SCORE_STAGES = {"rejected", "blocked_hygiene", "blocked_copyability"}
 PAPER_READY_SCORE_STAGES = {"paper_candidate", "paper_approved", "live_eligible"}
 

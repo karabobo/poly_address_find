@@ -13,7 +13,7 @@ from typing import Any
 from pm_robot.config import load_policy
 from pm_robot.models import CandidateAddress
 from pm_robot.orchestration.feature_materializer import materialize_wallet_feature
-from pm_robot.orchestration.review_pipeline import apply_paper_evidence_guard
+from pm_robot.orchestration.review_pipeline import apply_score_lifecycle_guards
 from pm_robot.pipeline_terms import PipelineJobType
 from pm_robot.research.copy_backtest import backtest_copy_stream_for_leaders
 from pm_robot.research.copy_graph import (
@@ -28,6 +28,7 @@ from pm_robot.storage.repository import (
     activity_watermark,
     apply_copyability_no_signal_blocks,
     complete_pipeline_job,
+    consume_fresh_score_actions,
     enqueue_pipeline_job,
     finish_ingest_run,
     persist_score,
@@ -558,11 +559,17 @@ def _score_wallet_after_copyability(
         links=candidate_row["links"],
         status=candidate_row["status"],
     )
-    score = apply_paper_evidence_guard(
+    score = apply_score_lifecycle_guards(
         conn,
         score_candidate(candidate, _feature_from_row(feature_row), policy),
+        policy,
     )
     persist_score(conn, score, policy_version=policy_version)
+    consume_fresh_score_actions(
+        conn,
+        policy_version=policy_version,
+        wallet=wallet,
+    )
     return True
 
 

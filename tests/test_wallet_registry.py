@@ -3,6 +3,7 @@ import json
 from pm_robot.config import RobotSettings
 from pm_robot.models import CandidateAddress, CandidateStage, ScoreBreakdown, WalletFeatures
 from pm_robot.ops import (
+    _wallet_registry_status,
     build_wallet_registry,
     build_winner_library,
     refresh_active_candidate_registry,
@@ -13,6 +14,28 @@ from pm_robot.storage.repository import persist_score, persist_wallet_activity, 
 
 def _settings(db_path):
     return RobotSettings(db_path=db_path, execution_mode="research")
+
+
+def _needs_data_retention_status(
+    *,
+    review_reason: str,
+    evidence_stage: str,
+    activity_count: int,
+    tags: list[str] | None = None,
+    existing_registry_status: str = "",
+) -> tuple[str, str]:
+    return _wallet_registry_status(
+        {
+            "candidate_stage": CandidateStage.NEEDS_DATA.value,
+            "existing_registry_status": existing_registry_status,
+            "publish_status": "",
+        },
+        feature={"extra": {"feature_materializer_version": "test"}},
+        score={"leader_score": 0, "review_reason": review_reason},
+        evidence={"stage": evidence_stage, "activity_count": activity_count},
+        paper={"production_ready": False},
+        tags=tags or [],
+    )
 
 
 def _trade_events(count: int) -> list[dict]:
@@ -33,6 +56,57 @@ def _trade_events(count: int) -> list[dict]:
         }
         for idx in range(count)
     ]
+
+
+def test_needs_data_retention_keeps_pending_evidence_repairable():
+    status = _needs_data_retention_status(
+        review_reason="missing_required_score_components:copy_event_count",
+        evidence_stage="medium_pending",
+        activity_count=10,
+    )
+
+    assert status == ("needs_evidence_backfill", "summary_and_recent")
+
+
+def test_needs_data_retention_reactivates_archived_wallet_when_evidence_is_requeued():
+    status = _needs_data_retention_status(
+        review_reason="missing_required_score_components:copy_event_count",
+        evidence_stage="medium_pending",
+        activity_count=10,
+        existing_registry_status="archived_raw_pruned",
+    )
+
+    assert status == ("needs_evidence_backfill", "summary_and_recent")
+
+
+def test_needs_data_retention_keeps_actionable_terminal_history_with_enough_rows():
+    status = _needs_data_retention_status(
+        review_reason="missing_required_score_components:copy_event_count",
+        evidence_stage="light_done",
+        activity_count=25,
+    )
+
+    assert status == ("needs_more_scoring_data", "summary_and_recent")
+
+
+def test_needs_data_retention_archives_actionable_terminal_history_when_exhausted():
+    status = _needs_data_retention_status(
+        review_reason="hygiene_evidence_incomplete",
+        evidence_stage="light_done",
+        activity_count=24,
+    )
+
+    assert status == ("archive_low_value", "summary_only")
+
+
+def test_needs_data_retention_archives_explicit_economic_rejection():
+    status = _needs_data_retention_status(
+        review_reason="insufficient_net_pnl_usdc:20.00<50.00",
+        evidence_stage="deep_done",
+        activity_count=1_000,
+    )
+
+    assert status == ("archive_low_value", "summary_only")
 
 
 def _seed_publishable_winner(conn, wallet: str) -> None:
