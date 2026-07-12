@@ -85,6 +85,17 @@ execution_compose() {
   compose -f docker-compose.yml -f docker-compose.execution.yml --profile execution "$@"
 }
 
+compose_restart_services() {
+  # Source and config are bind-mounted; a restart must never force an image rebuild.
+  compose up -d --no-deps --no-build "$@"
+  compose restart "$@"
+}
+
+execution_compose_restart_services() {
+  execution_compose up -d --no-deps --no-build "$@"
+  execution_compose restart "$@"
+}
+
 remove_legacy_control_containers() {
   local container
   for container in pm-robot-pipeline-planner pm-robot-copyability-planner pm-robot-score-loop; do
@@ -973,8 +984,7 @@ case "$cmd" in
     compose up -d --build $CORE_SERVICES
     ;;
   web-restart)
-    compose up -d --no-deps web
-    compose restart web
+    compose_restart_services web
     ;;
   pipeline-up)
     echo "Starting the shared research control loop and wallet evidence workers."
@@ -1007,8 +1017,7 @@ case "$cmd" in
     compose stop $CONTROL_SERVICES
     ;;
   research-control-restart)
-    compose up -d --build $CONTROL_SERVICES
-    compose restart $CONTROL_SERVICES
+    compose_restart_services $CONTROL_SERVICES
     ;;
   score-up)
     echo "score-up is a compatibility alias for research-control-up."
@@ -1048,8 +1057,7 @@ case "$cmd" in
     ;;
   execution-restart)
     echo "Restarting the opt-in execution profile."
-    execution_compose up -d --build $EXECUTION_SERVICES
-    execution_compose restart $EXECUTION_SERVICES
+    execution_compose_restart_services $EXECUTION_SERVICES
     ;;
   execution-status)
     echo "pm-robot execution profile is opt-in; default research/scoring commands do not start these services."
@@ -1066,12 +1074,10 @@ case "$cmd" in
     compose down
     ;;
   restart)
-    compose up -d --build $RESEARCH_SERVICES
-    compose restart $RESEARCH_SERVICES
+    compose_restart_services $RESEARCH_SERVICES
     ;;
   app-restart)
-    compose up -d --no-deps $APP_SERVICES
-    compose restart $APP_SERVICES
+    compose_restart_services $APP_SERVICES
     ;;
   runtime-ensure)
     compose up -d --no-deps --no-recreate $RESEARCH_SERVICES
@@ -1089,16 +1095,13 @@ case "$cmd" in
     watchdog_enable
     ;;
   discovery-restart)
-    compose up -d --build $DISCOVERY_SERVICES
-    compose restart $DISCOVERY_SERVICES
+    compose_restart_services $DISCOVERY_SERVICES
     ;;
   pipeline-restart)
-    compose up -d --build $CONTROL_SERVICES $PIPELINE_SERVICES
-    compose restart $CONTROL_SERVICES $PIPELINE_SERVICES
+    compose_restart_services $CONTROL_SERVICES $PIPELINE_SERVICES
     ;;
   copyability-restart)
-    compose up -d --build $COPYABILITY_SERVICES
-    compose restart $COPYABILITY_SERVICES
+    compose_restart_services $COPYABILITY_SERVICES
     ;;
   copyability-ensure-workers)
     compose up -d --no-deps --no-recreate copyability-worker-0 copyability-worker-1
@@ -1134,20 +1137,16 @@ PY
   score-restart)
     echo "score-restart is a compatibility alias for research-control-restart."
     echo "The shared control loop also owns wallet/copyability admission and handoff export."
-    compose up -d --build $SCORE_SERVICES
-    compose restart $SCORE_SERVICES
+    compose_restart_services $SCORE_SERVICES
     ;;
   observer-restart)
-    compose up -d --build $PAPER_OBSERVER_SERVICES
-    compose restart $PAPER_OBSERVER_SERVICES
+    compose_restart_services $PAPER_OBSERVER_SERVICES
     ;;
   maintenance-restart)
-    compose up -d --build $MAINTENANCE_SERVICES
-    compose restart $MAINTENANCE_SERVICES
+    compose_restart_services $MAINTENANCE_SERVICES
     ;;
   backup-restart)
-    compose up -d --build $BACKUP_SERVICES
-    compose restart $BACKUP_SERVICES
+    compose_restart_services $BACKUP_SERVICES
     ;;
   logs)
     service="${2:-web}"

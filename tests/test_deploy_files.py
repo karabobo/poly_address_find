@@ -1153,6 +1153,53 @@ def test_nas_helper_exposes_shared_control_lifecycle_and_cleans_legacy_loops():
     assert "research-control may admit jobs up to the configured waterline" in helper
 
 
+def test_nas_restart_commands_never_force_image_builds():
+    helper = Path("deploy/nas/pmrobot-nas.sh").read_text(encoding="utf-8")
+
+    def command_body(command: str) -> str:
+        start = helper.index(f"  {command})")
+        end = helper.index("\n    ;;", start)
+        return helper[start:end]
+
+    assert "compose_restart_services()" in helper
+    assert 'compose up -d --no-deps --no-build "$@"' in helper
+    assert "execution_compose_restart_services()" in helper
+    assert 'execution_compose up -d --no-deps --no-build "$@"' in helper
+
+    for command in (
+        "restart",
+        "app-restart",
+        "web-restart",
+        "discovery-restart",
+        "research-control-restart",
+        "pipeline-restart",
+        "copyability-restart",
+        "score-restart",
+        "observer-restart",
+        "maintenance-restart",
+        "backup-restart",
+        "execution-restart",
+    ):
+        body = command_body(command)
+        assert "--build" not in body
+        assert "_restart_services" in body
+
+    for command in (
+        "up",
+        "web-up",
+        "pipeline-up",
+        "copyability-up",
+        "discovery-up",
+        "research-control-up",
+        "score-up",
+        "observer-up",
+        "maintenance-up",
+        "backup-up",
+        "execution-up",
+    ):
+        assert "--build" in command_body(command)
+
+
 def test_nas_copyability_workers_have_stable_unique_ids():
     compose = Path("deploy/nas/docker-compose.yml").read_text(encoding="utf-8")
 
