@@ -3598,6 +3598,15 @@ def test_storage_maintenance_summary_exposes_retention_cycle_progress(tmp_path):
                 "net_rate_per_hour": 30_000,
                 "gross_eta_hours": 25.0,
                 "net_eta_hours": 33.33,
+                "duration_seconds": 420.0,
+                "batches_completed": 6,
+                "timings": {
+                    "control_lock_wait_seconds": 45.0,
+                    "prune_work_seconds": 325.0,
+                    "inter_batch_sleep_seconds": 50.0,
+                    "other_seconds": 0.0,
+                },
+                "sqlite_tuning_requested": {"cache_mib": 128, "mmap_mib": 256},
                 "backlog_after": {
                     "terminal_wallets": 100,
                     "terminal_activity_rows": 200_000,
@@ -3631,6 +3640,8 @@ def test_storage_maintenance_summary_exposes_retention_cycle_progress(tmp_path):
     assert retention["fresh"] is True
     assert retention["backlog_after"]["total_activity_rows"] == 1_000_000
     assert retention["net_rate_per_hour"] == 30_000
+    assert retention["timings"]["prune_work_seconds"] == 325.0
+    assert retention["sqlite_tuning_requested"]["cache_mib"] == 128
     assert summary["next_action"] == "低价值原始证据正在净减少，继续由 retention cycle 分批消化。"
     assert "数据总占用" in html
     assert "安全待清理" in html
@@ -3639,6 +3650,10 @@ def test_storage_maintenance_summary_exposes_retention_cycle_progress(tmp_path):
     assert "同期转入待清理 2,500 行" in html
     assert "30,000 行/小时" in html
     assert "33.3 小时" in html
+    assert "周期实际清理" in html
+    assert "5 分钟" in html
+    assert "等研究锁 45 秒" in html
+    assert "cache 128 MiB" in html
 
 
 def test_storage_maintenance_shows_retention_yield_as_expected_priority(tmp_path):

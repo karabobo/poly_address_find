@@ -47,6 +47,7 @@ DAY_SECONDS = 86_400
 WAL_CHECKPOINT_MODES = ("none", "passive", "truncate")
 DEFAULT_FAILED_JOB_COOLDOWN_SECONDS = 21_600
 RETENTION_STARVATION_YIELD_THRESHOLD = 3
+MAX_RETENTION_SQLITE_MEMORY_MIB = 1_024
 ACTIVE_CANDIDATE_REGISTRY_STAGES = (
     "paper_candidate",
     "paper_approved",
@@ -2039,6 +2040,8 @@ def _prune_low_value_evidence_locked(
     vacuum: bool = False,
     archive: bool = False,
     archive_dir: Path | None = None,
+    sqlite_cache_mib: int = 0,
+    sqlite_mmap_mib: int = 0,
 ) -> dict[str, Any]:
     """Archive and prune raw evidence after a wallet decision is summarized.
 
@@ -2154,9 +2157,15 @@ def _prune_low_value_evidence_locked(
                 "storage": storage_report(settings),
             }
 
+    sqlite_tuning: dict[str, int | float] = {}
     conn = connect(settings.db_path)
     try:
         run_migrations(conn)
+        sqlite_tuning = _configure_retention_connection(
+            conn,
+            cache_mib=sqlite_cache_mib,
+            mmap_mib=sqlite_mmap_mib,
+        )
         conn.execute("PRAGMA foreign_keys = OFF")
         archive_run_id = str(archive_result.get("run_id") or "")
         if not dry_run and not archive_run_id:
@@ -2236,6 +2245,7 @@ def _prune_low_value_evidence_locked(
         ),
         "deleted": deleted,
         "archive": archive_result,
+        "sqlite_tuning": sqlite_tuning,
         "storage": storage_report(settings),
     }
 
@@ -2248,6 +2258,42 @@ def retention_backlog_snapshot(settings: RobotSettings) -> dict[str, Any]:
         return _retention_backlog_snapshot_from_conn(conn)
     finally:
         conn.close()
+
+
+def _bounded_retention_memory_mib(value: int) -> int:
+    return min(MAX_RETENTION_SQLITE_MEMORY_MIB, max(0, int(value)))
+
+
+def _configure_retention_connection(
+    conn: sqlite3.Connection,
+    *,
+    cache_mib: int,
+    mmap_mib: int,
+) -> dict[str, int | float]:
+    """Tune only the bounded retention connection; other workers remain unchanged."""
+
+    bounded_cache_mib = _bounded_retention_memory_mib(cache_mib)
+    bounded_mmap_mib = _bounded_retention_memory_mib(mmap_mib)
+    if bounded_cache_mib:
+        conn.execute(f"PRAGMA cache_size = -{bounded_cache_mib * 1024}")
+    if bounded_mmap_mib:
+        conn.execute(f"PRAGMA mmap_size = {bounded_mmap_mib * 1024 * 1024}")
+
+    page_size = int(conn.execute("PRAGMA page_size").fetchone()[0])
+    cache_setting = int(conn.execute("PRAGMA cache_size").fetchone()[0])
+    cache_bytes = (
+        abs(cache_setting) * 1024
+        if cache_setting < 0
+        else cache_setting * page_size
+    )
+    mmap_row = conn.execute("PRAGMA mmap_size").fetchone()
+    mmap_bytes = int(mmap_row[0] or 0) if mmap_row is not None else 0
+    return {
+        "cache_mib_requested": bounded_cache_mib,
+        "cache_mib_effective": round(cache_bytes / (1024 * 1024), 3),
+        "mmap_mib_requested": bounded_mmap_mib,
+        "mmap_mib_effective": round(mmap_bytes / (1024 * 1024), 3),
+    }
 
 
 def _retention_backlog_snapshot_from_conn(conn: sqlite3.Connection) -> dict[str, Any]:
@@ -2291,6 +2337,8 @@ def run_retention_cycle(
     batch_delay_seconds: float = 10.0,
     cycle_interval_seconds: int = 900,
     control_lock_timeout_seconds: float = 60.0,
+    sqlite_cache_mib: int = 0,
+    sqlite_mmap_mib: int = 0,
     dry_run: bool = True,
     archive: bool = False,
     archive_dir: Path | None = None,
@@ -2325,6 +2373,8 @@ def run_retention_cycle(
             batch_delay_seconds=batch_delay_seconds,
             cycle_interval_seconds=cycle_interval_seconds,
             control_lock_timeout_seconds=control_lock_timeout_seconds,
+            sqlite_cache_mib=sqlite_cache_mib,
+            sqlite_mmap_mib=sqlite_mmap_mib,
             dry_run=dry_run,
             archive=archive,
             archive_dir=archive_dir,
@@ -2345,6 +2395,8 @@ def _run_retention_cycle_locked(
     batch_delay_seconds: float = 10.0,
     cycle_interval_seconds: int = 900,
     control_lock_timeout_seconds: float = 60.0,
+    sqlite_cache_mib: int = 0,
+    sqlite_mmap_mib: int = 0,
     dry_run: bool = True,
     archive: bool = False,
     archive_dir: Path | None = None,
@@ -2385,11 +2437,16 @@ def _run_retention_cycle_locked(
     ok = True
     yielded_to_research = False
     yielded_batch: int | None = None
+    control_lock_wait_seconds = 0.0
+    prune_work_seconds = 0.0
+    inter_batch_sleep_seconds = 0.0
 
     # Repeating a dry-run would preview the same oldest wallet set each time.
     batch_attempts = min(requested_batches, 1) if dry_run else requested_batches
     for batch_index in range(batch_attempts):
+        batch_started = time.monotonic()
         control_stack = contextlib.ExitStack()
+        control_wait_started = time.monotonic()
         if not dry_run:
             try:
                 control_stack.enter_context(
@@ -2402,9 +2459,13 @@ def _run_retention_cycle_locked(
                     )
                 )
             except TimeoutError:
+                control_lock_wait_seconds += time.monotonic() - control_wait_started
                 yielded_to_research = True
                 yielded_batch = batch_index + 1
                 break
+        batch_control_wait_seconds = time.monotonic() - control_wait_started
+        control_lock_wait_seconds += batch_control_wait_seconds
+        prune_started = time.monotonic()
         with control_stack:
             result = _prune_low_value_evidence_locked(
                 settings,
@@ -2414,7 +2475,11 @@ def _run_retention_cycle_locked(
                 dry_run=dry_run,
                 archive=archive,
                 archive_dir=archive_dir,
+                sqlite_cache_mib=sqlite_cache_mib,
+                sqlite_mmap_mib=sqlite_mmap_mib,
             )
+        batch_prune_seconds = time.monotonic() - prune_started
+        prune_work_seconds += batch_prune_seconds
         batch_deleted = result.get("deleted") or {}
         for table in planned:
             row_count = int(batch_deleted.get(table) or 0)
@@ -2430,6 +2495,12 @@ def _run_retention_cycle_locked(
                 "activity_budget_exceeded": bool(result.get("activity_budget_exceeded")),
                 "deleted": batch_deleted,
                 "archive": result.get("archive") or {},
+                "sqlite_tuning": result.get("sqlite_tuning") or {},
+                "timings": {
+                    "control_lock_wait_seconds": round(batch_control_wait_seconds, 3),
+                    "prune_work_seconds": round(batch_prune_seconds, 3),
+                    "batch_total_seconds": round(time.monotonic() - batch_started, 3),
+                },
             }
         )
         if not result.get("ok"):
@@ -2442,7 +2513,9 @@ def _run_retention_cycle_locked(
             and batch_index + 1 < batch_attempts
             and float(batch_delay_seconds) > 0
         ):
+            sleep_started = time.monotonic()
             time.sleep(float(batch_delay_seconds))
+            inter_batch_sleep_seconds += time.monotonic() - sleep_started
 
     backlog_after, database_identity_after = _retention_snapshot_with_identity(
         settings.db_path
@@ -2551,6 +2624,25 @@ def _run_retention_cycle_locked(
         "backlog_before": backlog_before,
         "backlog_after": backlog_after,
         "batch_results": batch_results,
+        "timings": {
+            "control_lock_wait_seconds": round(control_lock_wait_seconds, 3),
+            "prune_work_seconds": round(prune_work_seconds, 3),
+            "inter_batch_sleep_seconds": round(inter_batch_sleep_seconds, 3),
+            "other_seconds": round(
+                max(
+                    0.0,
+                    duration_seconds
+                    - control_lock_wait_seconds
+                    - prune_work_seconds
+                    - inter_batch_sleep_seconds,
+                ),
+                3,
+            ),
+        },
+        "sqlite_tuning_requested": {
+            "cache_mib": _bounded_retention_memory_mib(sqlite_cache_mib),
+            "mmap_mib": _bounded_retention_memory_mib(sqlite_mmap_mib),
+        },
         "database_identity": database_identity_after,
         "storage": _retention_storage_snapshot(settings),
     }

@@ -159,6 +159,9 @@ default `up`, `restart`, `runtime-ensure`, or watchdog commands.
   control lock so research remains the priority. While the backlog remains above the configured high-water mark,
   `draining`, `inflow_outpacing_cleanup`, and `yielded_to_research` all schedule the next bounded cycle on the short
   interval instead of falling back to the normal 15-minute maintenance cadence.
+- Retention reports control-lock wait, prune work, inter-batch sleep, and unclassified overhead separately. Its
+  SQLite page cache and mmap window are private to the single retention connection, bounded to 1 GiB each, and do
+  not change discovery, worker, scoring, or web connections. NAS defaults are 128 MiB cache and 256 MiB mmap.
 - Planner backpressure limits queued/running wallet evidence and copyability jobs. Copyability planning keeps
   its per-pass batch limit separate from the active-queue waterline and only fills currently available slots.
 - Research control keeps feature and scoring transactions bounded. A full batch schedules a `scoring_only` pass on

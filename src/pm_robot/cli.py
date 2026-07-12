@@ -821,6 +821,18 @@ def main() -> int:
         help="Wait briefly for the high-priority research control cycle before yielding",
     )
     retention_cycle_cmd.add_argument(
+        "--sqlite-cache-mib",
+        type=int,
+        default=128,
+        help="Private page cache for the retention connection only",
+    )
+    retention_cycle_cmd.add_argument(
+        "--sqlite-mmap-mib",
+        type=int,
+        default=256,
+        help="Read-only mmap window for the retention connection only",
+    )
+    retention_cycle_cmd.add_argument(
         "--execute", action="store_true", help="Actually delete rows; default is dry-run"
     )
     retention_cycle_cmd.add_argument(
@@ -1751,6 +1763,8 @@ def main() -> int:
             batch_delay_seconds=args.batch_delay_seconds,
             cycle_interval_seconds=args.cycle_interval_seconds,
             control_lock_timeout_seconds=args.control_lock_timeout_seconds,
+            sqlite_cache_mib=args.sqlite_cache_mib,
+            sqlite_mmap_mib=args.sqlite_mmap_mib,
             dry_run=not args.execute,
             archive=args.archive,
             archive_dir=Path(args.archive_dir) if args.archive_dir else None,

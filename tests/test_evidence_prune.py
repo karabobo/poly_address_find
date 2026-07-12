@@ -6,6 +6,7 @@ import pytest
 from pm_robot.config import RobotSettings
 from pm_robot.models import CandidateAddress, CandidateStage, ScoreBreakdown, WalletFeatures
 from pm_robot.ops import (
+    _configure_retention_connection,
     _previous_retention_cycle,
     _prune_wallet_evidence_batch,
     _retention_backlog_snapshot_from_conn,
@@ -190,6 +191,8 @@ def test_retention_cycle_aggregates_batches_and_backlog(tmp_path):
         max_activity_rows=5,
         batch_delay_seconds=0,
         cycle_interval_seconds=900,
+        sqlite_cache_mib=16,
+        sqlite_mmap_mib=32,
         dry_run=False,
         archive=False,
     )
@@ -206,6 +209,18 @@ def test_retention_cycle_aggregates_batches_and_backlog(tmp_path):
     assert result["gross_rate_per_hour"] > 0
     assert result["net_rate_per_hour"] > 0
     assert result["net_eta_hours"] is not None
+    assert result["sqlite_tuning_requested"] == {"cache_mib": 16, "mmap_mib": 32}
+    assert result["timings"]["control_lock_wait_seconds"] >= 0
+    assert result["timings"]["prune_work_seconds"] >= 0
+    assert result["timings"]["inter_batch_sleep_seconds"] >= 0
+    assert result["timings"]["other_seconds"] >= 0
+    assert len(result["batch_results"]) == 2
+    for batch in result["batch_results"]:
+        assert batch["timings"]["control_lock_wait_seconds"] >= 0
+        assert batch["timings"]["prune_work_seconds"] >= 0
+        assert batch["sqlite_tuning"]["cache_mib_requested"] == 16
+        assert batch["sqlite_tuning"]["cache_mib_effective"] == 16
+        assert batch["sqlite_tuning"]["mmap_mib_requested"] == 32
     assert result["database_identity"]["database_id"] == identity_before["database_id"]
     assert result["database_identity"]["mutation_generation"] == (
         identity_before["mutation_generation"] + 2
@@ -250,6 +265,30 @@ def test_retention_backlog_uses_exact_watermarks_without_raw_table_count(
         assert snapshot["activity_count_exact"] is True
     finally:
         conn.close()
+
+
+def test_retention_sqlite_tuning_is_connection_local_and_bounded(tmp_path):
+    db_path = tmp_path / "robot.sqlite"
+    conn = connect(db_path)
+    try:
+        run_migrations(conn)
+        tuning = _configure_retention_connection(
+            conn,
+            cache_mib=16,
+            mmap_mib=32,
+        )
+        assert tuning["cache_mib_requested"] == 16
+        assert tuning["cache_mib_effective"] == 16
+        assert tuning["mmap_mib_requested"] == 32
+        assert tuning["mmap_mib_effective"] >= 0
+    finally:
+        conn.close()
+
+    fresh = connect(db_path)
+    try:
+        assert int(fresh.execute("PRAGMA cache_size").fetchone()[0]) != -(16 * 1024)
+    finally:
+        fresh.close()
 
 
 def test_retention_cycle_dry_run_reports_plan_without_deleting(tmp_path):
@@ -829,6 +868,10 @@ def test_retention_cycle_cli_forwards_previous_report(tmp_path, monkeypatch, cap
             str(previous_report),
             "--report-path",
             str(report_path),
+            "--sqlite-cache-mib",
+            "64",
+            "--sqlite-mmap-mib",
+            "128",
         ],
     )
 
@@ -836,6 +879,8 @@ def test_retention_cycle_cli_forwards_previous_report(tmp_path, monkeypatch, cap
     assert captured["previous_report_path"] == previous_report
     assert captured["report_path"] == report_path
     assert captured["control_lock_timeout_seconds"] == 60.0
+    assert captured["sqlite_cache_mib"] == 64
+    assert captured["sqlite_mmap_mib"] == 128
     assert json.loads(capsys.readouterr().out)["ok"] is True
 
 
