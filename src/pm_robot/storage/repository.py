@@ -2391,6 +2391,23 @@ def persist_wallet_activity(
             [row[:2] + row[3:] for row in rows],
         )
     inserted = conn.total_changes - before_insert
+    watermark_row = conn.execute(
+        """
+        SELECT activity_count
+        FROM wallet_activity_watermarks
+        WHERE address = ?
+        """,
+        (address,),
+    ).fetchone()
+    if watermark_row is None:
+        activity_count = int(
+            conn.execute(
+                "SELECT COUNT(*) FROM wallet_activity WHERE address = ?",
+                (address,),
+            ).fetchone()[0]
+        )
+    else:
+        activity_count = int(watermark_row["activity_count"] or 0) + inserted
     trade_count = int(
         conn.execute(
             "SELECT COUNT(*) FROM wallet_activity WHERE address = ? AND type = 'TRADE'",
@@ -2403,6 +2420,7 @@ def persist_wallet_activity(
         events,
         updated_at=ingested_at,
         trade_count=trade_count,
+        activity_count=activity_count,
         evidence_changed=inserted > 0,
     )
     conn.execute(
@@ -2436,7 +2454,12 @@ def _raw_evidence_write_suppressed(conn: sqlite3.Connection, address: str) -> bo
 def activity_watermark(conn: sqlite3.Connection, address: str) -> dict[str, Any]:
     row = conn.execute(
         """
-        SELECT newest_timestamp, newest_activity_key, trade_count, last_full_backfill_at
+        SELECT
+            newest_timestamp,
+            newest_activity_key,
+            trade_count,
+            activity_count,
+            last_full_backfill_at
         FROM wallet_activity_watermarks
         WHERE address = ?
         """,
@@ -2447,6 +2470,7 @@ def activity_watermark(conn: sqlite3.Connection, address: str) -> dict[str, Any]
             "newest_timestamp": 0,
             "newest_activity_key": "",
             "trade_count": 0,
+            "activity_count": 0,
             "last_full_backfill_at": None,
         }
     return dict(row)
@@ -2459,6 +2483,7 @@ def update_activity_watermark(
     *,
     updated_at: int,
     trade_count: int,
+    activity_count: int,
     evidence_changed: bool = True,
 ) -> None:
     address = address.lower()
@@ -2473,8 +2498,9 @@ def update_activity_watermark(
     conn.execute(
         """
         INSERT INTO wallet_activity_watermarks(
-            address, newest_timestamp, newest_activity_key, trade_count, updated_at
-        ) VALUES (?, ?, ?, ?, ?)
+            address, newest_timestamp, newest_activity_key, trade_count,
+            activity_count, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?)
         ON CONFLICT(address) DO UPDATE SET
             newest_timestamp = CASE
                 WHEN ? = 1
@@ -2489,9 +2515,11 @@ def update_activity_watermark(
                 ELSE wallet_activity_watermarks.newest_activity_key
             END,
             trade_count = excluded.trade_count,
+            activity_count = excluded.activity_count,
             updated_at = CASE
                 WHEN ? = 1
                   OR excluded.trade_count != wallet_activity_watermarks.trade_count
+                  OR excluded.activity_count != wallet_activity_watermarks.activity_count
                 THEN excluded.updated_at
                 ELSE wallet_activity_watermarks.updated_at
             END
@@ -2501,6 +2529,7 @@ def update_activity_watermark(
             newest_ts,
             newest_key,
             max(0, int(trade_count)),
+            max(0, int(activity_count)),
             updated_at,
             1 if evidence_changed else 0,
             1 if evidence_changed else 0,
@@ -2516,6 +2545,7 @@ def refresh_activity_watermark(conn: sqlite3.Connection, address: str, *, update
     row = conn.execute(
         """
         SELECT
+            COUNT(*) AS activity_count,
             SUM(CASE WHEN type = 'TRADE' THEN 1 ELSE 0 END) AS trade_count,
             COALESCE(MAX(timestamp), 0) AS newest_timestamp
         FROM wallet_activity
@@ -2523,6 +2553,7 @@ def refresh_activity_watermark(conn: sqlite3.Connection, address: str, *, update
         """,
         (address,),
     ).fetchone()
+    activity_count = int(row["activity_count"] or 0)
     trade_count = int(row["trade_count"] or 0)
     newest_timestamp = int(row["newest_timestamp"] or 0)
     newest = conn.execute(
@@ -2539,21 +2570,31 @@ def refresh_activity_watermark(conn: sqlite3.Connection, address: str, *, update
     conn.execute(
         """
         INSERT INTO wallet_activity_watermarks(
-            address, newest_timestamp, newest_activity_key, trade_count, updated_at
-        ) VALUES (?, ?, ?, ?, ?)
+            address, newest_timestamp, newest_activity_key, trade_count,
+            activity_count, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?)
         ON CONFLICT(address) DO UPDATE SET
             newest_timestamp = excluded.newest_timestamp,
             newest_activity_key = excluded.newest_activity_key,
             trade_count = excluded.trade_count,
+            activity_count = excluded.activity_count,
             updated_at = CASE
                 WHEN excluded.newest_timestamp != wallet_activity_watermarks.newest_timestamp
                   OR excluded.newest_activity_key != wallet_activity_watermarks.newest_activity_key
                   OR excluded.trade_count != wallet_activity_watermarks.trade_count
+                  OR excluded.activity_count != wallet_activity_watermarks.activity_count
                 THEN excluded.updated_at
                 ELSE wallet_activity_watermarks.updated_at
             END
         """,
-        (address, newest_timestamp, newest_key, trade_count, updated_at),
+        (
+            address,
+            newest_timestamp,
+            newest_key,
+            trade_count,
+            activity_count,
+            updated_at,
+        ),
     )
     return trade_count
 

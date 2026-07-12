@@ -1257,9 +1257,9 @@ def _build_compact_evidence_database(
             """
             INSERT OR IGNORE INTO wallet_activity_watermarks(
                 address, newest_timestamp, newest_activity_key, trade_count,
-                updated_at, last_full_backfill_at
+                activity_count, updated_at, last_full_backfill_at
             )
-            SELECT wallet, 0, '', 0, ?, NULL
+            SELECT wallet, 0, '', 0, 0, ?, NULL
             FROM temp_prune_wallets
             """,
             (now,),
@@ -1270,6 +1270,7 @@ def _build_compact_evidence_database(
             SET newest_timestamp = 0,
                 newest_activity_key = '',
                 trade_count = 0,
+                activity_count = 0,
                 updated_at = ?
             WHERE address IN (SELECT wallet FROM temp_prune_wallets)
             """,
@@ -1470,6 +1471,7 @@ def _validate_compact_evidence_database(
                   AND newest_timestamp = 0
                   AND newest_activity_key = ''
                   AND trade_count = 0
+                  AND activity_count = 0
                 """
             ).fetchone()[0]
         )
@@ -1564,6 +1566,40 @@ def _wallet_activity_count_chunked(
         _wallet_activity_count(conn, wallets[start : start + bounded_batch])
         for start in range(0, len(wallets), bounded_batch)
     )
+
+
+def _wallet_activity_watermark_count_chunked(
+    conn: sqlite3.Connection,
+    wallets: list[str],
+    *,
+    batch_size: int = 400,
+) -> tuple[int, int]:
+    """Sum exact maintained counts, scanning raw rows only for missing watermarks."""
+
+    total = 0
+    fallback_wallets = 0
+    bounded_batch = max(1, int(batch_size))
+    for start in range(0, len(wallets), bounded_batch):
+        batch = [wallet.lower() for wallet in wallets[start : start + bounded_batch]]
+        placeholders = ", ".join("?" for _ in batch)
+        rows = conn.execute(
+            f"""
+            SELECT address, activity_count
+            FROM wallet_activity_watermarks
+            WHERE address IN ({placeholders})
+            """,
+            tuple(batch),
+        ).fetchall()
+        counts = {
+            str(row["address"]).lower(): int(row["activity_count"] or 0)
+            for row in rows
+        }
+        total += sum(counts.values())
+        missing = [wallet for wallet in batch if wallet not in counts]
+        if missing:
+            fallback_wallets += len(missing)
+            total += _wallet_activity_count(conn, missing)
+    return total, fallback_wallets
 
 
 def _copyable_table_columns(
@@ -2123,10 +2159,19 @@ def _retention_backlog_snapshot_from_conn(conn: sqlite3.Connection) -> dict[str,
         str(row["address"])
         for row in _needs_data_low_value_wallet_rows(conn, limit=None)
     ]
-    terminal_activity_rows = _wallet_activity_count_chunked(conn, terminal_wallets)
-    needs_data_activity_rows = _wallet_activity_count_chunked(conn, needs_data_wallets)
+    terminal_activity_rows, terminal_fallback_wallets = (
+        _wallet_activity_watermark_count_chunked(conn, terminal_wallets)
+    )
+    needs_data_activity_rows, needs_data_fallback_wallets = (
+        _wallet_activity_watermark_count_chunked(conn, needs_data_wallets)
+    )
     return {
         "generated_at": int(time.time()),
+        "activity_count_source": "wallet_activity_watermarks.activity_count",
+        "activity_count_exact": True,
+        "activity_count_fallback_wallets": (
+            terminal_fallback_wallets + needs_data_fallback_wallets
+        ),
         "terminal_wallets": len(terminal_wallets),
         "terminal_activity_rows": terminal_activity_rows,
         "needs_data_wallets": len(needs_data_wallets),

@@ -294,19 +294,25 @@ def test_retention_migrations_backfill_counts_and_compact_copy_links(tmp_path):
         )
         conn.commit()
 
-        assert run_migrations(conn) == [46, 47, 48, 49]
+        assert run_migrations(conn) == [46, 47, 48, 49, 50, 51]
         counts = {
-            row["address"]: int(row["trade_count"])
+            row["address"]: (
+                int(row["trade_count"]),
+                int(row["activity_count"]),
+            )
             for row in conn.execute(
-                "SELECT address, trade_count FROM wallet_activity_watermarks"
+                """
+                SELECT address, trade_count, activity_count
+                FROM wallet_activity_watermarks
+                """
             )
         }
 
         assert counts == {
-            wallets["existing"]: 2,
-            wallets["missing"]: 1,
-            wallets["non_trade"]: 0,
-            wallets["empty"]: 0,
+            wallets["existing"]: (2, 3),
+            wallets["missing"]: (1, 1),
+            wallets["non_trade"]: (0, 1),
+            wallets["empty"]: (0, 0),
         }
         assert [
             (int(row["link_id"]), str(row["follower_wallet"]))
@@ -326,6 +332,50 @@ def test_retention_migrations_backfill_counts_and_compact_copy_links(tmp_path):
         assert len(retention_state["database_id"]) == 32
         assert retention_state["mutation_generation"] == 0
         assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+        assert run_migrations(conn) == []
+    finally:
+        conn.close()
+
+
+def test_activity_count_column_migration_recovers_after_interrupted_version_record(
+    tmp_path,
+):
+    db_path = tmp_path / "robot.sqlite"
+    conn = connect(db_path)
+    wallet = "0x" + "5" * 40
+    try:
+        run_migrations(conn)
+        upsert_candidate(conn, CandidateAddress(address=wallet, sources="test"))
+        persist_wallet_activity(
+            conn,
+            wallet,
+            [
+                {
+                    "timestamp": 1_000,
+                    "type": "TRADE",
+                    "transactionHash": "0xinterrupted-migration",
+                }
+            ],
+            ingested_at=1_000,
+        )
+        conn.execute(
+            "UPDATE wallet_activity_watermarks SET activity_count = 0 WHERE address = ?",
+            (wallet,),
+        )
+        conn.execute("DELETE FROM schema_migrations WHERE version IN (50, 51)")
+        conn.commit()
+
+        assert run_migrations(conn) == [50, 51]
+        row = conn.execute(
+            """
+            SELECT activity_count
+            FROM wallet_activity_watermarks
+            WHERE address = ?
+            """,
+            (wallet,),
+        ).fetchone()
+
+        assert row["activity_count"] == 1
         assert run_migrations(conn) == []
     finally:
         conn.close()
@@ -663,6 +713,7 @@ def test_persist_wallet_activity_hashes_keys_and_skips_legacy_duplicates(tmp_pat
         assert watermark["newest_timestamp"] == 1_000
         assert watermark["newest_activity_key"].startswith("sha256:")
         assert watermark["trade_count"] == 2
+        assert watermark["activity_count"] == 2
     finally:
         conn.close()
 
@@ -697,7 +748,11 @@ def test_noop_activity_reingest_does_not_dirty_evidence_timestamps(tmp_path):
 
         assert persist_wallet_activity(conn, wallet, [event], ingested_at=2_100) == 0
         watermark = conn.execute(
-            "SELECT trade_count, updated_at FROM wallet_activity_watermarks WHERE address = ?",
+            """
+            SELECT trade_count, activity_count, updated_at
+            FROM wallet_activity_watermarks
+            WHERE address = ?
+            """,
             (wallet,),
         ).fetchone()
         candidate = conn.execute(
@@ -706,6 +761,7 @@ def test_noop_activity_reingest_does_not_dirty_evidence_timestamps(tmp_path):
         ).fetchone()
 
         assert watermark["trade_count"] == 1
+        assert watermark["activity_count"] == 1
         assert watermark["updated_at"] == first_watermark_updated
         assert candidate["updated_at"] == first_candidate_updated
         assert candidate["last_ingested_at"] == 2_100

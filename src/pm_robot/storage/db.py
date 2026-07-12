@@ -13,6 +13,9 @@ MIGRATIONS_DIR = Path(__file__).resolve().parents[1] / "migrations"
 T = TypeVar("T")
 DATABASE_ACCESS_LOCK_SUFFIX = ".access.lock"
 CONTROL_PLANE_LOCK_SUFFIX = ".control-plane"
+MIGRATION_SCHEMA_POSTCONDITIONS = {
+    50: ("wallet_activity_watermarks", "activity_count"),
+}
 
 
 class _AccessLockedConnection(sqlite3.Connection):
@@ -238,6 +241,22 @@ def pending_migration_versions(conn: sqlite3.Connection) -> list[int]:
     return [version for version, _path in _migration_paths() if version not in applied]
 
 
+def _migration_schema_postcondition_satisfied(
+    conn: sqlite3.Connection,
+    version: int,
+) -> bool:
+    """Recognize a completed non-idempotent schema step after an interrupted marker write."""
+
+    postcondition = MIGRATION_SCHEMA_POSTCONDITIONS.get(version)
+    if postcondition is None:
+        return False
+    table, column = postcondition
+    return any(
+        str(row[1]) == column
+        for row in conn.execute(f'PRAGMA table_info("{table}")').fetchall()
+    )
+
+
 @contextlib.contextmanager
 def _migration_lock(conn: sqlite3.Connection, *, timeout_seconds: float = 120.0) -> Iterator[None]:
     """Serialize schema changes across CLI processes sharing one database."""
@@ -284,6 +303,15 @@ def run_migrations(conn: sqlite3.Connection) -> list[int]:
         newly_applied: list[int] = []
         for version, path in migrations:
             if version in applied:
+                continue
+            if _migration_schema_postcondition_satisfied(conn, version):
+                conn.execute(
+                    "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+                    (version, int(time.time())),
+                )
+                conn.commit()
+                applied.add(version)
+                newly_applied.append(version)
                 continue
             foreign_keys = int(conn.execute("PRAGMA foreign_keys").fetchone()[0])
             try:

@@ -8,6 +8,7 @@ from pm_robot.models import CandidateAddress, CandidateStage, ScoreBreakdown, Wa
 from pm_robot.ops import (
     _previous_retention_cycle,
     _prune_wallet_evidence_batch,
+    _retention_backlog_snapshot_from_conn,
     _retention_cycle_lock_key,
     _retention_database_identity,
     build_wallet_registry,
@@ -128,10 +129,16 @@ def test_prune_evidence_dry_run_and_execute_low_value_only(tmp_path):
         assert conn.execute(
             "SELECT COUNT(*) FROM wallet_activity WHERE address = ?", (low,)
         ).fetchone()[0] == 2
-        assert conn.execute(
-            "SELECT trade_count FROM wallet_activity_watermarks WHERE address = ?",
-            (low,),
-        ).fetchone()[0] == 2
+        assert tuple(
+            conn.execute(
+                """
+                SELECT trade_count, activity_count
+                FROM wallet_activity_watermarks
+                WHERE address = ?
+                """,
+                (low,),
+            ).fetchone()
+        ) == (2, 2)
         assert conn.execute(
             "SELECT COUNT(*) FROM wallet_activity WHERE address = ?", (high,)
         ).fetchone()[0] == 5
@@ -207,6 +214,40 @@ def test_retention_cycle_aggregates_batches_and_backlog(tmp_path):
     conn = connect(db_path)
     try:
         assert conn.execute("SELECT COUNT(*) FROM wallet_activity").fetchone()[0] == 5
+    finally:
+        conn.close()
+
+
+def test_retention_backlog_uses_exact_watermarks_without_raw_table_count(
+    tmp_path,
+    monkeypatch,
+):
+    db_path = tmp_path / "robot.sqlite"
+    wallet = "0x" + "7" * 40
+    conn = connect(db_path)
+    try:
+        run_migrations(conn)
+        _seed_candidate(conn, wallet, materialized=True)
+        conn.execute(
+            "UPDATE candidate_wallets SET candidate_stage = 'blocked_hygiene' WHERE address = ?",
+            (wallet,),
+        )
+        conn.commit()
+        monkeypatch.setattr(
+            "pm_robot.ops._wallet_activity_count_chunked",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("retention backlog scanned wallet_activity")
+            ),
+        )
+
+        snapshot = _retention_backlog_snapshot_from_conn(conn)
+
+        assert snapshot["terminal_activity_rows"] == 5
+        assert snapshot["total_activity_rows"] == 5
+        assert snapshot["activity_count_source"] == (
+            "wallet_activity_watermarks.activity_count"
+        )
+        assert snapshot["activity_count_exact"] is True
     finally:
         conn.close()
 
@@ -805,6 +846,14 @@ def test_prune_selection_is_bounded_by_activity_rows(tmp_path):
                 "INSERT INTO wallet_processing_state(wallet, activity_count) VALUES (?, 1)",
                 (wallet,),
             )
+            conn.execute(
+                """
+                UPDATE wallet_activity_watermarks
+                SET activity_count = 0
+                WHERE address = ?
+                """,
+                (wallet,),
+            )
         conn.commit()
     finally:
         conn.close()
@@ -973,10 +1022,16 @@ def test_prune_terminal_wallet_freezes_summary_and_stops_automatic_work(tmp_path
         assert conn.execute(
             "SELECT COUNT(*) FROM wallet_activity WHERE address = ?", (wallet,)
         ).fetchone()[0] == 0
-        assert conn.execute(
-            "SELECT trade_count FROM wallet_activity_watermarks WHERE address = ?",
-            (wallet,),
-        ).fetchone()[0] == 0
+        assert tuple(
+            conn.execute(
+                """
+                SELECT trade_count, activity_count
+                FROM wallet_activity_watermarks
+                WHERE address = ?
+                """,
+                (wallet,),
+            ).fetchone()
+        ) == (0, 0)
         assert conn.execute(
             "SELECT COUNT(*) FROM copy_pair_stats WHERE follower_wallet = ?", (wallet,)
         ).fetchone()[0] == 0
