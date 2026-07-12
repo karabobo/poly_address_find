@@ -3427,12 +3427,25 @@ def test_storage_maintenance_summary_exposes_parquet_archive_state(tmp_path):
             INSERT INTO evidence_archive_runs(
                 run_id, status, archive_path, wallet_count, row_count,
                 file_count, byte_size, created_at, pruned_at, updated_at
-            ) VALUES ('archive-test', 'pruned', 'evidence/test', 3, 120, 4, 4096, 100, 200, 200)
+            ) VALUES ('archive-test', 'pruned', 'evidence/test', 3, 120, 1, 4096, 100, 200, 200)
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO evidence_archive_files(
+                run_id, table_name, relative_path, row_count, byte_size, checksum
+            ) VALUES (
+                'archive-test', 'wallet_activity',
+                'evidence/test/wallet_activity.parquet', 120, 4096, 'test'
+            )
             """
         )
         conn.commit()
     finally:
         conn.close()
+    managed_export = settings.archive_dir / "evidence" / "test" / "wallet_activity.parquet"
+    managed_export.parent.mkdir(parents=True)
+    managed_export.write_bytes(b"m" * 4096)
     legacy_export = settings.archive_dir / "activities" / "wallet_activity.parquet"
     legacy_export.parent.mkdir(parents=True)
     legacy_export.write_bytes(b"x" * 8192)
@@ -3447,9 +3460,15 @@ def test_storage_maintenance_summary_exposes_parquet_archive_state(tmp_path):
     assert summary["evidence_archive"]["wallet_count"] == 3
     assert summary["evidence_archive"]["row_count"] == 120
     assert summary["evidence_archive"]["byte_size"] == 4096
-    assert summary["parquet_total_bytes"] == 8192
+    assert summary["parquet_total_bytes"] == 12_288
+    assert summary["archive_catalog"]["state"] == "partial"
+    assert summary["archive_catalog"]["cataloged_on_disk_bytes"] == 4096
+    assert summary["archive_catalog"]["untracked_bytes"] == 8192
     assert "Parquet 总占用" in html
     assert "证据冷归档" in html
+    assert "受管 Parquet" in html
+    assert "未登记 Parquet" in html
+    assert "最近受管归档" in html
     assert "3 钱包 / 120 行" in html
 
 
@@ -3552,6 +3571,50 @@ def test_directory_size_snapshot_falls_back_to_last_complete_scan(tmp_path, monk
     assert stale["measured_at"] == 100
     assert stale["age_seconds"] == 11
     assert stale["error"].startswith("OSError:")
+
+
+def test_storage_maintenance_reuses_archive_catalog_scan_within_ttl(
+    tmp_path,
+    monkeypatch,
+):
+    settings = RobotSettings(
+        db_path=tmp_path / "data" / "pm_robot.sqlite",
+        archive_dir=tmp_path / "data" / "parquet",
+        execution_mode="research",
+    )
+    conn = connect(settings.db_path)
+    try:
+        run_migrations(conn)
+        conn.commit()
+    finally:
+        conn.close()
+    settings.archive_dir.mkdir(parents=True)
+    with web_module._ARCHIVE_CATALOG_CACHE_LOCK:
+        web_module._ARCHIVE_CATALOG_CACHE.clear()
+
+    real_coverage = web_module.archive_catalog_coverage
+    calls = 0
+
+    def counted_coverage(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return real_coverage(*args, **kwargs)
+
+    monkeypatch.setattr(web_module, "archive_catalog_coverage", counted_coverage)
+    first = _storage_maintenance_summary(
+        settings,
+        low_free_disk_bytes=1,
+        scheduled_backup_enabled=False,
+    )
+    second = _storage_maintenance_summary(
+        settings,
+        low_free_disk_bytes=1,
+        scheduled_backup_enabled=False,
+    )
+
+    assert calls == 1
+    assert first["archive_catalog"]["cached"] is False
+    assert second["archive_catalog"]["cached"] is True
 
 
 def test_storage_panel_uses_live_files_instead_of_stale_retention_size():

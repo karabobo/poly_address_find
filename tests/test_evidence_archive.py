@@ -9,7 +9,12 @@ from pm_robot.config import RobotSettings
 from pm_robot.models import CandidateAddress, CandidateStage, ScoreBreakdown, WalletFeatures
 from pm_robot.ops import prune_low_value_evidence
 from pm_robot.storage.db import connect, run_migrations
-from pm_robot.storage.evidence_archive import archived_wallet_summary, verify_archive_manifest
+from pm_robot.storage.evidence_archive import (
+    archive_catalog_coverage,
+    archived_wallet_summary,
+    query_archived_wallet_activity,
+    verify_archive_manifest,
+)
 from pm_robot.storage.repository import (
     persist_score,
     persist_wallet_activity,
@@ -831,6 +836,162 @@ def test_verified_archive_resume_reuses_original_keep_recent_scope(tmp_path, mon
 def test_archive_manifest_rejects_paths_outside_archive_root(tmp_path):
     with pytest.raises(ValueError, match="must remain relative"):
         verify_archive_manifest(tmp_path, "../outside/manifest.json")
+
+
+def test_archived_wallet_activity_reads_only_cataloged_verified_parquet(tmp_path):
+    settings = _settings(tmp_path)
+    wallet = "0x" + "6" * 40
+    _seed_low_value_wallet(settings, wallet)
+    result = prune_low_value_evidence(
+        settings,
+        limit=5,
+        dry_run=False,
+        archive=True,
+    )
+    assert result["archive"]["status"] == "pruned"
+
+    conn = connect(settings.db_path)
+    try:
+        archived = query_archived_wallet_activity(
+            conn,
+            settings.archive_dir,
+            wallet,
+            limit=2,
+            since=1_001,
+            until=1_004,
+        )
+        conn.execute(
+            "UPDATE evidence_archive_runs SET status = 'failed' WHERE run_id = ?",
+            (result["archive"]["run_id"],),
+        )
+        excluded = query_archived_wallet_activity(
+            conn,
+            settings.archive_dir,
+            wallet,
+        )
+    finally:
+        conn.close()
+
+    assert archived["ok"] is True
+    assert archived["state"] == "ready"
+    assert archived["matching_row_count"] == 4
+    assert archived["returned_row_count"] == 2
+    assert [row["timestamp"] for row in archived["rows"]] == [1_004, 1_003]
+    assert {row["address"] for row in archived["rows"]} == {wallet}
+    assert all(row["archive_run_id"] == result["archive"]["run_id"] for row in archived["rows"])
+    assert excluded["state"] == "not_archived"
+    assert excluded["rows"] == []
+
+
+def test_archive_catalog_coverage_distinguishes_managed_and_untracked_files(tmp_path):
+    settings = _settings(tmp_path)
+    wallet = "0x" + "7" * 40
+    _seed_low_value_wallet(settings, wallet)
+    prune_low_value_evidence(
+        settings,
+        limit=5,
+        dry_run=False,
+        archive=True,
+    )
+
+    conn = connect(settings.db_path)
+    try:
+        managed = archive_catalog_coverage(conn, settings.archive_dir)
+        managed_path = settings.archive_dir / conn.execute(
+            """
+            SELECT relative_path
+            FROM evidence_archive_files
+            ORDER BY relative_path
+            LIMIT 1
+            """
+        ).fetchone()[0]
+        legacy_path = settings.archive_dir / "legacy" / "wallet_activity.parquet"
+        legacy_path.parent.mkdir(parents=True)
+        legacy_path.write_bytes(managed_path.read_bytes())
+        mixed = archive_catalog_coverage(conn, settings.archive_dir)
+        managed_path.unlink()
+        broken = archive_catalog_coverage(conn, settings.archive_dir)
+    finally:
+        conn.close()
+
+    assert managed["state"] == "complete"
+    assert managed["cataloged_file_count"] > 0
+    assert managed["untracked_file_count"] == 0
+    assert managed["missing_file_count"] == 0
+    assert mixed["state"] == "partial"
+    assert mixed["untracked_file_count"] == 1
+    assert mixed["untracked_bytes"] == legacy_path.stat().st_size
+    assert mixed["catalog_coverage_ratio"] < 1.0
+    assert mixed["untracked_examples"] == ["legacy/wallet_activity.parquet"]
+    assert broken["state"] == "broken"
+    assert broken["healthy"] is False
+    assert broken["missing_file_count"] == 1
+
+
+def test_archived_wallet_activity_rejects_catalog_path_escape(tmp_path):
+    settings = _settings(tmp_path)
+    wallet = "0x" + "8" * 40
+    _seed_low_value_wallet(settings, wallet)
+    prune_low_value_evidence(
+        settings,
+        limit=5,
+        dry_run=False,
+        archive=True,
+    )
+    conn = connect(settings.db_path)
+    try:
+        conn.execute(
+            """
+            UPDATE evidence_archive_files
+            SET relative_path = '../outside.parquet'
+            WHERE table_name = 'wallet_activity'
+            """
+        )
+        with pytest.raises(ValueError, match="must remain relative"):
+            query_archived_wallet_activity(conn, settings.archive_dir, wallet)
+        coverage = archive_catalog_coverage(conn, settings.archive_dir)
+    finally:
+        conn.close()
+    assert coverage["state"] == "broken"
+    assert coverage["invalid_catalog_path_count"] == 1
+
+
+def test_archive_wallet_activity_cli_returns_bounded_json(tmp_path, monkeypatch, capsys):
+    from pm_robot.cli import main
+
+    settings = _settings(tmp_path)
+    wallet = "0x" + "9" * 40
+    _seed_low_value_wallet(settings, wallet)
+    prune_low_value_evidence(
+        settings,
+        limit=5,
+        dry_run=False,
+        archive=True,
+    )
+    monkeypatch.setenv("PM_ROBOT_MODE", "research")
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "pm-robot",
+            "--env",
+            str(tmp_path / "missing.env"),
+            "--db",
+            str(settings.db_path),
+            "archive-wallet-activity",
+            "--wallet",
+            wallet,
+            "--limit",
+            "1",
+            "--archive-dir",
+            str(settings.archive_dir),
+        ],
+    )
+
+    assert main() == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["state"] == "ready"
+    assert payload["matching_row_count"] == 5
+    assert payload["returned_row_count"] == 1
 
 
 def test_post_export_write_is_not_deleted_outside_captured_scope(tmp_path, monkeypatch):

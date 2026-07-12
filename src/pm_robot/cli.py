@@ -85,7 +85,12 @@ from pm_robot.storage.db import (
     initialize_database,
     run_migrations,
 )
-from pm_robot.storage.evidence_archive import archived_wallet_summary, evidence_archive_summary
+from pm_robot.storage.evidence_archive import (
+    archive_catalog_coverage,
+    archived_wallet_summary,
+    evidence_archive_summary,
+    query_archived_wallet_activity,
+)
 from pm_robot.storage.repository import (
     activity_coverage,
     activity_coverage_summary,
@@ -876,10 +881,32 @@ def main() -> int:
 
     archive_status_cmd = sub.add_parser("archive-status", help="Print Parquet evidence archive status")
     archive_status_cmd.add_argument("--db", dest="command_db", default=None, help="SQLite database path")
+    archive_status_cmd.add_argument(
+        "--archive-dir",
+        default="",
+        help="Parquet archive root; defaults to PM_ROBOT_ARCHIVE_DIR",
+    )
 
     archive_wallet_cmd = sub.add_parser("archive-wallet", help="Resolve all Parquet archives for one wallet")
     archive_wallet_cmd.add_argument("--db", dest="command_db", default=None, help="SQLite database path")
     archive_wallet_cmd.add_argument("--wallet", required=True)
+
+    archive_activity_cmd = sub.add_parser(
+        "archive-wallet-activity",
+        help="Read one wallet's verified Parquet activity through DuckDB",
+    )
+    archive_activity_cmd.add_argument(
+        "--db", dest="command_db", default=None, help="SQLite database path"
+    )
+    archive_activity_cmd.add_argument("--wallet", required=True)
+    archive_activity_cmd.add_argument("--limit", type=int, default=100)
+    archive_activity_cmd.add_argument("--since", type=int, default=None)
+    archive_activity_cmd.add_argument("--until", type=int, default=None)
+    archive_activity_cmd.add_argument(
+        "--archive-dir",
+        default="",
+        help="Parquet archive root; defaults to PM_ROBOT_ARCHIVE_DIR",
+    )
 
     web_cmd = sub.add_parser("web", help="Run the read-only research web console")
     web_cmd.add_argument("--db", dest="command_db", default=None, help="SQLite database path")
@@ -1801,6 +1828,10 @@ def main() -> int:
         conn = connect_readonly(settings.db_path)
         try:
             data = evidence_archive_summary(conn)
+            data["catalog_coverage"] = archive_catalog_coverage(
+                conn,
+                Path(args.archive_dir) if args.archive_dir else settings.archive_dir,
+            )
         finally:
             conn.close()
         print(json.dumps(data, ensure_ascii=False, indent=2))
@@ -1809,6 +1840,21 @@ def main() -> int:
         conn = connect_readonly(settings.db_path)
         try:
             data = archived_wallet_summary(conn, args.wallet)
+        finally:
+            conn.close()
+        print(json.dumps(data, ensure_ascii=False, indent=2))
+        return 0
+    if args.command == "archive-wallet-activity":
+        conn = connect_readonly(settings.db_path)
+        try:
+            data = query_archived_wallet_activity(
+                conn,
+                Path(args.archive_dir) if args.archive_dir else settings.archive_dir,
+                args.wallet,
+                limit=args.limit,
+                since=args.since,
+                until=args.until,
+            )
         finally:
             conn.close()
         print(json.dumps(data, ensure_ascii=False, indent=2))

@@ -65,7 +65,10 @@ from pm_robot.storage.api_rate_limit import (
     api_rate_limit_summary_from_path,
 )
 from pm_robot.storage.db import connect_readonly
-from pm_robot.storage.evidence_archive import evidence_archive_summary
+from pm_robot.storage.evidence_archive import (
+    archive_catalog_coverage,
+    evidence_archive_summary,
+)
 from pm_robot.storage.repository import evidence_backfill_summary
 
 
@@ -92,6 +95,8 @@ _DASHBOARD_CACHE: dict[tuple[str, bool, bool], tuple[float, dict[str, Any]]] = {
 _DASHBOARD_REFRESHING: set[tuple[str, bool, bool]] = set()
 _DIRECTORY_SIZE_CACHE_LOCK = threading.Lock()
 _DIRECTORY_SIZE_CACHE: dict[str, tuple[float, int]] = {}
+_ARCHIVE_CATALOG_CACHE_LOCK = threading.Lock()
+_ARCHIVE_CATALOG_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 
 _CANDIDATE_STAGE_LABELS = {
     CandidateStage.IMPORTED.value: "已导入",
@@ -3544,6 +3549,7 @@ def _storage_maintenance_panel(values: dict[str, Any]) -> str:
     wal_checkpoint = values.get("wal_checkpoint") or {}
     free_ratio = float(values.get("free_disk_ratio") or 0)
     archive = values.get("evidence_archive") or {}
+    archive_catalog = values.get("archive_catalog") or {}
     parquet_total_bytes = int(values.get("parquet_total_bytes") or 0)
     parquet_storage = values.get("parquet_storage") or {}
     retention_registry = values.get("retention_registry") or {}
@@ -3682,6 +3688,35 @@ def _storage_maintenance_panel(values: dict[str, Any]) -> str:
             "warn" if int(archive.get("failed_count") or 0) else "ok",
         ),
         (
+            "受管 Parquet",
+            _fmt_bytes(int(archive_catalog.get("cataloged_on_disk_bytes") or 0)),
+            (
+                f"{_fmt_int(archive_catalog.get('cataloged_on_disk_file_count'))} 文件"
+                f" · {_fmt_pct(archive_catalog.get('catalog_coverage_ratio'))} of Parquet"
+            ),
+            "ok" if bool(archive_catalog.get("healthy", True)) else "warn",
+        ),
+        (
+            "未登记 Parquet",
+            _fmt_bytes(int(archive_catalog.get("untracked_bytes") or 0)),
+            (
+                f"{_fmt_int(archive_catalog.get('untracked_file_count'))} 文件"
+                " · 历史导出不能按归档目录自动恢复"
+            ),
+            "warn" if int(archive_catalog.get("untracked_file_count") or 0) else "ok",
+        ),
+        (
+            "归档目录索引",
+            "一致" if bool(archive_catalog.get("healthy", True)) else "异常",
+            (
+                f"缺失 {_fmt_int(archive_catalog.get('missing_file_count'))}"
+                f" · 大小不符 {_fmt_int(archive_catalog.get('size_mismatch_count'))}"
+                f" · 路径异常 {_fmt_int(archive_catalog.get('invalid_catalog_path_count'))}"
+                f" · 目录记录不符 {_fmt_int(archive_catalog.get('run_metadata_mismatch_count'))}"
+            ),
+            "ok" if bool(archive_catalog.get("healthy", True)) else "warn",
+        ),
+        (
             "已完成原始清理",
             _fmt_int(retention_registry.get("raw_pruned_wallets")),
             "保留钱包摘要、评分、标签和来源",
@@ -3775,6 +3810,19 @@ def _storage_maintenance_panel(values: dict[str, Any]) -> str:
         {"command": values.get("safe_command"), "when": "普通维护窗口"},
         {"command": values.get("long_window_command"), "when": "WAL 很大或 NAS 较忙"},
     ]
+    recent_archive_runs = [
+        {
+            "run_id": row.get("run_id"),
+            "status": row.get("status"),
+            "wallet_count": row.get("wallet_count"),
+            "row_count": row.get("row_count"),
+            "file_count": row.get("file_count"),
+            "byte_size": _fmt_bytes(int(row.get("byte_size") or 0)),
+            "manifest_path": row.get("manifest_path") or "-",
+            "updated_at": row.get("updated_at"),
+        }
+        for row in archive.get("recent_runs") or []
+    ]
     return (
         f'<div class="health-banner {banner_state}"><strong>{_e(values.get("next_action"))}</strong>'
         f'<span>{_e(values.get("maintenance_boundary"))}</span></div>'
@@ -3784,6 +3832,21 @@ def _storage_maintenance_panel(values: dict[str, Any]) -> str:
             for label, value, note, card_state in cards
         )
         + "</div>"
+        + '<h3 class="subhead">最近受管归档</h3>'
+        + _simple_table(
+            recent_archive_runs,
+            [
+                "run_id",
+                "status",
+                "wallet_count",
+                "row_count",
+                "file_count",
+                "byte_size",
+                "manifest_path",
+                "updated_at",
+            ],
+            ["归档批次", "状态", "钱包", "行", "文件", "大小", "清单", "更新"],
+        )
         + '<h3 class="subhead">维护命令</h3>'
         + _simple_table(commands, ["command", "when"], ["命令", "使用场景"])
     )
@@ -7984,6 +8047,69 @@ def _directory_size_snapshot(
     }
 
 
+def _archive_catalog_coverage_snapshot(
+    conn: sqlite3.Connection,
+    archive_root: Path,
+    *,
+    now: float | None = None,
+    ttl_seconds: int = PARQUET_SIZE_CACHE_TTL_SEC,
+) -> dict[str, Any]:
+    """Cache recursive Parquet catalog scans on the read-only dashboard path."""
+
+    measured_now = time.time() if now is None else float(now)
+    database_row = conn.execute("PRAGMA database_list").fetchone()
+    database_path = str(database_row[2] or "") if database_row is not None else ""
+    cache_key = f"{Path(database_path).resolve() if database_path else ''}|{archive_root.resolve()}"
+    with _ARCHIVE_CATALOG_CACHE_LOCK:
+        cached = _ARCHIVE_CATALOG_CACHE.get(cache_key)
+    if cached and measured_now - cached[0] <= max(0, int(ttl_seconds)):
+        result = dict(cached[1])
+        result.update(
+            {
+                "fresh": True,
+                "cached": True,
+                "measured_at": int(cached[0]),
+                "age_seconds": max(0, int(measured_now - cached[0])),
+            }
+        )
+        return result
+    try:
+        result = archive_catalog_coverage(conn, archive_root)
+    except OSError as exc:
+        if cached:
+            result = dict(cached[1])
+            result.update(
+                {
+                    "fresh": False,
+                    "cached": True,
+                    "measured_at": int(cached[0]),
+                    "age_seconds": max(0, int(measured_now - cached[0])),
+                    "error": f"{type(exc).__name__}:{exc}",
+                }
+            )
+            return result
+        unavailable = archive_catalog_coverage_unavailable()
+        unavailable.update(
+            {
+                "healthy": False,
+                "error": f"{type(exc).__name__}:{exc}",
+            }
+        )
+        return unavailable
+    result.update(
+        {
+            "fresh": True,
+            "cached": False,
+            "measured_at": int(measured_now),
+            "age_seconds": 0,
+            "error": "",
+        }
+    )
+    with _ARCHIVE_CATALOG_CACHE_LOCK:
+        _ARCHIVE_CATALOG_CACHE[cache_key] = (measured_now, dict(result))
+    return result
+
+
 def _maintenance_checkpoint_summary(
     settings: RobotSettings,
     *,
@@ -8329,6 +8455,7 @@ def _storage_maintenance_summary(
         and latest_backup_age_seconds <= int(backup_max_age_seconds)
     )
     archive_summary: dict[str, Any]
+    archive_catalog = archive_catalog_coverage_unavailable()
     retention_registry = {
         "wallet_count": 0,
         "summary_only_wallets": 0,
@@ -8346,6 +8473,10 @@ def _storage_maintenance_summary(
         archive_conn = connect_readonly(settings.db_path)
         try:
             archive_summary = evidence_archive_summary(archive_conn)
+            archive_catalog = _archive_catalog_coverage_snapshot(
+                archive_conn,
+                settings.archive_dir,
+            )
             page_size = int(archive_conn.execute("PRAGMA page_size").fetchone()[0] or 0)
             page_count = int(archive_conn.execute("PRAGMA page_count").fetchone()[0] or 0)
             freelist_count = int(
@@ -8390,7 +8521,7 @@ def _storage_maintenance_summary(
             }
         finally:
             archive_conn.close()
-    except (OSError, sqlite3.Error):
+    except (OSError, sqlite3.Error, ValueError):
         archive_summary = evidence_archive_summary_unavailable()
     parquet_storage = _directory_size_snapshot(settings.archive_dir)
     parquet_total_bytes = int(parquet_storage.get("bytes") or 0)
@@ -8403,6 +8534,9 @@ def _storage_maintenance_summary(
     elif low_free_disk:
         state = "low_free_disk"
         next_action = "NAS 数据卷可用空间偏低，优先归档或清理低价值原始证据。"
+    elif not bool(archive_catalog.get("healthy", True)):
+        state = "archive_catalog_broken"
+        next_action = "受管 Parquet 目录与 SQLite 归档清单不一致，先核对缺失或大小异常文件。"
     elif scheduled_backup_enabled and not latest_backup:
         state = "backup_missing"
         next_action = "尚无可验证数据库备份，立即执行 ./pmrobot-nas.sh backup-now。"
@@ -8471,6 +8605,7 @@ def _storage_maintenance_summary(
         "backup_fresh": backup_fresh,
         "scheduled_backup_enabled": bool(scheduled_backup_enabled),
         "evidence_archive": archive_summary,
+        "archive_catalog": archive_catalog,
         "parquet_total_bytes": parquet_total_bytes,
         "parquet_storage": parquet_storage,
         "retention_registry": retention_registry,
@@ -8485,7 +8620,7 @@ def _storage_maintenance_summary(
     }
 
 
-def evidence_archive_summary_unavailable() -> dict[str, int]:
+def evidence_archive_summary_unavailable() -> dict[str, Any]:
     return {
         "run_count": 0,
         "wallet_count": 0,
@@ -8495,6 +8630,32 @@ def evidence_archive_summary_unavailable() -> dict[str, int]:
         "failed_count": 0,
         "pending_count": 0,
         "latest_pruned_at": 0,
+        "recent_runs": [],
+    }
+
+
+def archive_catalog_coverage_unavailable() -> dict[str, Any]:
+    return {
+        "available": False,
+        "state": "unavailable",
+        "healthy": True,
+        "parquet_file_count": 0,
+        "parquet_total_bytes": 0,
+        "cataloged_file_count": 0,
+        "cataloged_on_disk_file_count": 0,
+        "cataloged_on_disk_bytes": 0,
+        "catalog_coverage_ratio": 0.0,
+        "untracked_file_count": 0,
+        "untracked_bytes": 0,
+        "missing_file_count": 0,
+        "size_mismatch_count": 0,
+        "invalid_catalog_path_count": 0,
+        "run_metadata_mismatch_count": 0,
+        "fresh": False,
+        "cached": False,
+        "measured_at": 0,
+        "age_seconds": None,
+        "error": "",
     }
 
 

@@ -17,6 +17,8 @@ from pm_robot.storage.db import connect
 
 ARCHIVE_VERSION = "evidence_parquet_v1"
 RESUMABLE_ARCHIVE_STATUSES = ("pending", "exporting", "failed", "verified")
+QUERYABLE_ARCHIVE_STATUSES = ("verified", "pruned_partial", "pruned")
+MAX_ARCHIVE_QUERY_LIMIT = 10_000
 
 
 @dataclass(frozen=True)
@@ -377,6 +379,7 @@ def evidence_archive_summary(conn: sqlite3.Connection) -> dict[str, Any]:
             "failed_count": 0,
             "pending_count": 0,
             "latest_pruned_at": 0,
+            "recent_runs": [],
         }
     row = conn.execute(
         """
@@ -392,7 +395,182 @@ def evidence_archive_summary(conn: sqlite3.Connection) -> dict[str, Any]:
         FROM evidence_archive_runs
         """
     ).fetchone()
-    return dict(row)
+    result = dict(row)
+    result["recent_runs"] = recent_archive_runs(conn)
+    return result
+
+
+def recent_archive_runs(
+    conn: sqlite3.Connection,
+    *,
+    limit: int = 8,
+) -> list[dict[str, Any]]:
+    """Return bounded run-level audit details without verifying file contents again."""
+
+    if not _table_exists(conn, "evidence_archive_runs"):
+        return []
+    rows = conn.execute(
+        """
+        SELECT
+            run_id,
+            status,
+            manifest_path,
+            wallet_count,
+            row_count,
+            file_count,
+            byte_size,
+            error,
+            created_at,
+            verified_at,
+            pruned_at,
+            updated_at
+        FROM evidence_archive_runs
+        ORDER BY updated_at DESC, run_id DESC
+        LIMIT ?
+        """,
+        (max(1, min(int(limit), 100)),),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def archive_catalog_coverage(
+    conn: sqlite3.Connection,
+    archive_root: Path,
+    *,
+    sample_limit: int = 5,
+) -> dict[str, Any]:
+    """Compare queryable archive catalog entries with Parquet files on disk."""
+
+    catalog_rows: list[sqlite3.Row] = []
+    run_metadata_mismatches: list[str] = []
+    if _table_exists(conn, "evidence_archive_files") and _table_exists(
+        conn, "evidence_archive_runs"
+    ):
+        placeholders = ",".join("?" for _ in QUERYABLE_ARCHIVE_STATUSES)
+        catalog_rows = conn.execute(
+            f"""
+            SELECT files.run_id, files.table_name, files.relative_path, files.byte_size
+            FROM evidence_archive_files files
+            JOIN evidence_archive_runs runs ON runs.run_id = files.run_id
+            WHERE runs.status IN ({placeholders})
+            ORDER BY files.relative_path, files.run_id, files.table_name
+            """,
+            QUERYABLE_ARCHIVE_STATUSES,
+        ).fetchall()
+        run_rows = conn.execute(
+            f"""
+            SELECT
+                runs.run_id,
+                runs.file_count AS expected_file_count,
+                runs.byte_size AS expected_byte_size,
+                COUNT(files.relative_path) AS catalog_file_count,
+                COALESCE(SUM(files.byte_size), 0) AS catalog_byte_size
+            FROM evidence_archive_runs runs
+            LEFT JOIN evidence_archive_files files ON files.run_id = runs.run_id
+            WHERE runs.status IN ({placeholders})
+            GROUP BY runs.run_id, runs.file_count, runs.byte_size
+            ORDER BY runs.run_id
+            """,
+            QUERYABLE_ARCHIVE_STATUSES,
+        ).fetchall()
+        run_metadata_mismatches = [
+            str(row["run_id"])
+            for row in run_rows
+            if int(row["expected_file_count"] or 0)
+            != int(row["catalog_file_count"] or 0)
+            or int(row["expected_byte_size"] or 0)
+            != int(row["catalog_byte_size"] or 0)
+        ]
+
+    root = archive_root.resolve()
+    catalog: dict[str, int] = {}
+    duplicate_catalog_paths = 0
+    invalid_catalog_paths: list[str] = []
+    for row in catalog_rows:
+        relative_path = str(row["relative_path"])
+        try:
+            path = _archive_path(archive_root, relative_path)
+        except ValueError:
+            invalid_catalog_paths.append(relative_path)
+            continue
+        normalized = path.relative_to(root).as_posix()
+        if normalized in catalog:
+            duplicate_catalog_paths += 1
+            continue
+        catalog[normalized] = int(row["byte_size"] or 0)
+
+    actual: dict[str, int] = {}
+    unsafe_file_count = 0
+    if archive_root.exists():
+        for candidate in archive_root.rglob("*.parquet"):
+            if not candidate.is_file():
+                continue
+            resolved = candidate.resolve()
+            if not resolved.is_relative_to(root):
+                unsafe_file_count += 1
+                continue
+            actual[resolved.relative_to(root).as_posix()] = int(
+                resolved.stat().st_size
+            )
+
+    catalog_paths = set(catalog)
+    actual_paths = set(actual)
+    matched_paths = catalog_paths & actual_paths
+    missing_paths = sorted(catalog_paths - actual_paths)
+    untracked_paths = sorted(actual_paths - catalog_paths)
+    size_mismatch_paths = sorted(
+        path for path in matched_paths if actual[path] != catalog[path]
+    )
+    parquet_total_bytes = sum(actual.values())
+    cataloged_on_disk_bytes = sum(actual[path] for path in matched_paths)
+    if (
+        missing_paths
+        or size_mismatch_paths
+        or unsafe_file_count
+        or duplicate_catalog_paths
+        or run_metadata_mismatches
+        or invalid_catalog_paths
+    ):
+        state = "broken"
+    elif untracked_paths:
+        state = "partial"
+    elif actual_paths or catalog_paths:
+        state = "complete"
+    else:
+        state = "empty"
+    bounded_samples = max(0, min(int(sample_limit), 20))
+    return {
+        "available": True,
+        "state": state,
+        "healthy": state not in {"broken"},
+        "parquet_file_count": len(actual),
+        "parquet_total_bytes": parquet_total_bytes,
+        "catalog_entry_count": len(catalog_rows),
+        "cataloged_file_count": len(catalog),
+        "cataloged_expected_bytes": sum(catalog.values()),
+        "cataloged_on_disk_file_count": len(matched_paths),
+        "cataloged_on_disk_bytes": cataloged_on_disk_bytes,
+        "catalog_coverage_ratio": round(
+            cataloged_on_disk_bytes / parquet_total_bytes,
+            4,
+        )
+        if parquet_total_bytes > 0
+        else 0.0,
+        "untracked_file_count": len(untracked_paths),
+        "untracked_bytes": sum(actual[path] for path in untracked_paths),
+        "missing_file_count": len(missing_paths),
+        "missing_expected_bytes": sum(catalog[path] for path in missing_paths),
+        "size_mismatch_count": len(size_mismatch_paths),
+        "unsafe_file_count": unsafe_file_count,
+        "duplicate_catalog_path_count": duplicate_catalog_paths,
+        "invalid_catalog_path_count": len(invalid_catalog_paths),
+        "run_metadata_mismatch_count": len(run_metadata_mismatches),
+        "untracked_examples": untracked_paths[:bounded_samples],
+        "missing_examples": missing_paths[:bounded_samples],
+        "size_mismatch_examples": size_mismatch_paths[:bounded_samples],
+        "invalid_catalog_path_examples": invalid_catalog_paths[:bounded_samples],
+        "run_metadata_mismatch_examples": run_metadata_mismatches[:bounded_samples],
+    }
 
 
 def archived_wallet_summary(conn: sqlite3.Connection, wallet: str) -> dict[str, Any]:
@@ -436,6 +614,131 @@ def archived_wallet_summary(conn: sqlite3.Connection, wallet: str) -> dict[str, 
         "file_count": sum(int(row["file_count"] or 0) for row in runs),
         "byte_size": sum(int(row["byte_size"] or 0) for row in runs),
         "runs": runs,
+    }
+
+
+def query_archived_wallet_activity(
+    conn: sqlite3.Connection,
+    archive_root: Path,
+    wallet: str,
+    *,
+    limit: int = 100,
+    since: int | None = None,
+    until: int | None = None,
+) -> dict[str, Any]:
+    """Read one wallet's verified cold activity through DuckDB without mutating storage."""
+
+    ensure_archive_backend()
+    normalized = wallet.strip().lower()
+    if not normalized:
+        raise ValueError("wallet must not be empty")
+    bounded_limit = max(1, min(int(limit), MAX_ARCHIVE_QUERY_LIMIT))
+    if not _table_exists(conn, "evidence_archive_files"):
+        return _empty_archived_activity(normalized, bounded_limit, since, until)
+    placeholders = ",".join("?" for _ in QUERYABLE_ARCHIVE_STATUSES)
+    file_rows = conn.execute(
+        f"""
+        SELECT files.run_id, files.relative_path
+        FROM evidence_archive_wallets wallets
+        JOIN evidence_archive_runs runs ON runs.run_id = wallets.run_id
+        JOIN evidence_archive_files files ON files.run_id = runs.run_id
+        WHERE wallets.wallet = ?
+          AND files.table_name = 'wallet_activity'
+          AND runs.status IN ({placeholders})
+        ORDER BY runs.created_at, files.run_id
+        """,
+        (normalized, *QUERYABLE_ARCHIVE_STATUSES),
+    ).fetchall()
+    if not file_rows:
+        return _empty_archived_activity(normalized, bounded_limit, since, until)
+
+    parquet_paths: list[str] = []
+    run_ids: set[str] = set()
+    for row in file_rows:
+        path = _archive_path(archive_root, str(row["relative_path"]))
+        if not path.is_file():
+            raise RuntimeError(f"cataloged archive file missing: {row['relative_path']}")
+        parquet_paths.append(str(path))
+        run_ids.add(str(row["run_id"]))
+
+    filters = ["lower(address) = ?"]
+    parameters: list[Any] = [parquet_paths, normalized]
+    if since is not None:
+        filters.append("timestamp >= ?")
+        parameters.append(int(since))
+    if until is not None:
+        filters.append("timestamp <= ?")
+        parameters.append(int(until))
+    parameters.append(bounded_limit)
+    query = f"""
+        SELECT
+            activity_id,
+            address,
+            timestamp,
+            condition_id,
+            event_slug,
+            market_slug,
+            asset_id,
+            outcome,
+            type,
+            side,
+            price,
+            size,
+            usdc_size,
+            transaction_hash,
+            ingested_at,
+            _archive_run_id AS archive_run_id,
+            _archived_at AS archived_at,
+            COUNT(*) OVER () AS matching_row_count
+        FROM read_parquet(?, union_by_name = true)
+        WHERE {' AND '.join(filters)}
+        ORDER BY timestamp DESC, activity_id DESC
+        LIMIT ?
+    """
+    import duckdb
+
+    with duckdb.connect(":memory:") as archive_db:
+        cursor = archive_db.execute(query, parameters)
+        columns = [str(item[0]) for item in cursor.description or []]
+        rows = [dict(zip(columns, row)) for row in cursor.fetchall()]
+    matching_row_count = int(rows[0].pop("matching_row_count")) if rows else 0
+    for row in rows[1:]:
+        row.pop("matching_row_count", None)
+    return {
+        "ok": True,
+        "state": "ready",
+        "wallet": normalized,
+        "locator": f"parquet-wallet://{normalized}",
+        "run_count": len(run_ids),
+        "file_count": len(parquet_paths),
+        "matching_row_count": matching_row_count,
+        "returned_row_count": len(rows),
+        "limit": bounded_limit,
+        "since": since,
+        "until": until,
+        "rows": rows,
+    }
+
+
+def _empty_archived_activity(
+    wallet: str,
+    limit: int,
+    since: int | None,
+    until: int | None,
+) -> dict[str, Any]:
+    return {
+        "ok": True,
+        "state": "not_archived",
+        "wallet": wallet,
+        "locator": f"parquet-wallet://{wallet}",
+        "run_count": 0,
+        "file_count": 0,
+        "matching_row_count": 0,
+        "returned_row_count": 0,
+        "limit": limit,
+        "since": since,
+        "until": until,
+        "rows": [],
     }
 
 
