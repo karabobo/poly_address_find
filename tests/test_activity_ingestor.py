@@ -100,6 +100,7 @@ def test_ingest_activity_can_refresh_only_paper_stage_wallets(tmp_path):
         assert summary.status == "ok"
         assert summary.wallets_attempted == 1
         assert summary.events_written == 1
+        assert summary.episodes_rebuilt == 1
         assert client.calls == [(paper_wallet, 10, 0)]
         raw = conn.execute(
             "SELECT raw_json FROM wallet_activity WHERE address = ?",
@@ -117,6 +118,100 @@ def test_ingest_activity_can_refresh_only_paper_stage_wallets(tmp_path):
                 (review_wallet,),
             ).fetchone()[0]
             == 0
+        )
+    finally:
+        conn.close()
+
+
+def test_ingest_activity_skips_episode_rebuild_when_poll_has_no_new_events(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    try:
+        run_migrations(conn)
+        wallet = "0x" + "f" * 40
+        upsert_candidate(conn, CandidateAddress(address=wallet, sources="test"))
+        conn.execute(
+            "UPDATE candidate_wallets SET candidate_stage = ? WHERE address = ?",
+            (CandidateStage.PAPER_APPROVED.value, wallet),
+        )
+        conn.commit()
+        event = _event(1_400, "0xfresh")
+
+        first = ingest_activity(
+            conn,
+            wallet_limit=1,
+            page_limit=10,
+            max_events_per_wallet=10,
+            paper_stage_only=True,
+            sleep_seconds=0,
+            client=FakeActivityClient({0: [event]}),
+        )
+        rebuilt_at = conn.execute(
+            "SELECT rebuilt_at FROM wallet_episodes WHERE address = ?",
+            (wallet,),
+        ).fetchone()["rebuilt_at"]
+
+        second = ingest_activity(
+            conn,
+            wallet_limit=1,
+            page_limit=10,
+            max_events_per_wallet=10,
+            paper_stage_only=True,
+            sleep_seconds=0,
+            client=FakeActivityClient({0: [event]}),
+        )
+
+        assert first.events_written == 1
+        assert first.episodes_rebuilt == 1
+        assert second.events_written == 0
+        assert second.episodes_rebuilt == 0
+        assert (
+            conn.execute(
+                "SELECT rebuilt_at FROM wallet_episodes WHERE address = ?",
+                (wallet,),
+            ).fetchone()["rebuilt_at"]
+            == rebuilt_at
+        )
+    finally:
+        conn.close()
+
+
+def test_ingest_activity_recovers_missing_episode_snapshot_without_new_events(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    try:
+        run_migrations(conn)
+        wallet = "0x" + "9" * 40
+        upsert_candidate(conn, CandidateAddress(address=wallet, sources="test"))
+        conn.commit()
+        event = _event(1_500, "0xrecover")
+        first = ingest_activity(
+            conn,
+            wallet_limit=1,
+            page_limit=10,
+            max_events_per_wallet=10,
+            sleep_seconds=0,
+            client=FakeActivityClient({0: [event]}),
+        )
+        assert first.episodes_rebuilt == 1
+        conn.execute("DELETE FROM wallet_episodes WHERE address = ?", (wallet,))
+        conn.commit()
+
+        recovered = ingest_activity(
+            conn,
+            wallet_limit=1,
+            page_limit=10,
+            max_events_per_wallet=10,
+            sleep_seconds=0,
+            client=FakeActivityClient({0: [event]}),
+        )
+
+        assert recovered.events_written == 0
+        assert recovered.episodes_rebuilt == 1
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM wallet_episodes WHERE address = ?",
+                (wallet,),
+            ).fetchone()[0]
+            == 1
         )
     finally:
         conn.close()

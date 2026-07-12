@@ -84,14 +84,19 @@ def ingest_activity(
                     stop_at_key=str(watermark.get("newest_activity_key") or ""),
                 )
                 now = int(time.time())
-                events_written += persist_wallet_activity(
+                wallet_events_written = persist_wallet_activity(
                     conn,
                     wallet,
                     events,
                     ingested_at=now,
                     source=activity_source,
                 )
-                episodes_rebuilt += rebuild_wallet_episodes(conn, wallet)
+                events_written += wallet_events_written
+                if wallet_events_written > 0 or _wallet_episode_snapshot_missing(
+                    conn,
+                    wallet,
+                ):
+                    episodes_rebuilt += rebuild_wallet_episodes(conn, wallet)
                 succeeded += 1
             except HttpClientError as exc:
                 error = f"{wallet}: {exc}"
@@ -119,6 +124,28 @@ def ingest_activity(
             rows_written=events_written,
             error=error,
         )
+
+
+def _wallet_episode_snapshot_missing(conn: sqlite3.Connection, wallet: str) -> bool:
+    """Recover a missing derived snapshot without rebuilding unchanged wallets."""
+
+    row = conn.execute(
+        """
+        SELECT
+            EXISTS(
+                SELECT 1
+                FROM wallet_activity
+                WHERE address = ? AND type = 'TRADE'
+            ) AS has_trade_activity,
+            EXISTS(
+                SELECT 1
+                FROM wallet_episodes
+                WHERE address = ?
+            ) AS has_episode_snapshot
+        """,
+        (wallet.lower(), wallet.lower()),
+    ).fetchone()
+    return bool(row["has_trade_activity"] and not row["has_episode_snapshot"])
 
 
 def _fetch_wallet_activity(

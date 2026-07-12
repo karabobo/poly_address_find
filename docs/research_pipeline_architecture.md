@@ -206,6 +206,9 @@ This status is descriptive: it never rewrites `candidate_stage` and never grants
   alerts during retry backoff or after attempts are exhausted.
 - Public Polymarket HTTP clients reserve global and endpoint request slots atomically through the shared
   `api_rate_limit_state` table, while retaining the existing per-process limiter.
+- Activity polling rebuilds wallet episodes only when new rows were stored or an existing trade history has no
+  episode snapshot. Zero-change paper-observer polls therefore remain read-mostly instead of rewriting derived
+  evidence every minute.
 - HTTP `429 Retry-After` cooldowns are shared across containers. Short waits are handled in the HTTP client;
   waits longer than 30 seconds return to the queue scheduler so workers do not hold leases while sleeping.
 - Upstream cooldown and coordination deferrals do not consume a wallet job's failure-attempt budget, and the
