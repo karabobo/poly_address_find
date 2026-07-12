@@ -87,12 +87,12 @@ execution_compose() {
 
 compose_restart_services() {
   # Source and config are bind-mounted; a restart must never force an image rebuild.
-  compose up -d --no-deps --no-build "$@"
+  compose up -d --no-deps --no-build --no-recreate "$@"
   compose restart "$@"
 }
 
 execution_compose_restart_services() {
-  execution_compose up -d --no-deps --no-build "$@"
+  execution_compose up -d --no-deps --no-build --no-recreate "$@"
   execution_compose restart "$@"
 }
 

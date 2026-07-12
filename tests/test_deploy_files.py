@@ -1162,9 +1162,9 @@ def test_nas_restart_commands_never_force_image_builds():
         return helper[start:end]
 
     assert "compose_restart_services()" in helper
-    assert 'compose up -d --no-deps --no-build "$@"' in helper
+    assert 'compose up -d --no-deps --no-build --no-recreate "$@"' in helper
     assert "execution_compose_restart_services()" in helper
-    assert 'execution_compose up -d --no-deps --no-build "$@"' in helper
+    assert 'execution_compose up -d --no-deps --no-build --no-recreate "$@"' in helper
 
     for command in (
         "restart",
