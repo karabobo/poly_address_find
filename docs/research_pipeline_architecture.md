@@ -19,7 +19,9 @@ leaderboards / large trades / RTDS / curated imports
   -> candidate_wallets.candidate_stage
   -> wallet_registry (durable decision summary)
   -> verified Parquet archive before low-value raw evidence leaves SQLite
-  -> paper observer / read-only handoff
+  -> paper observer quoteability evidence
+  -> paper_observer_trials (research-only marks and resolved outcomes)
+  -> read-only handoff
   -> leader_publish for explicit downstream consumption
 ```
 
@@ -47,6 +49,8 @@ promising scored wallet
 | `wallet_registry` | Durable wallet decision, retention policy, and archive pointer | Raw event storage |
 | `evidence_archive_*` | Archive run, wallet, file, checksum, and recovery state | Candidate or queue authority |
 | Parquet files | Compressed cold evidence removed from the SQLite hot store | Mutable workflow state |
+| `paper_signal_evaluations` | Point-in-time quote, latency, slippage, and actionability evidence | Strategy return evidence or an order ledger |
+| `paper_observer_trials` | First actionable quote plus Gamma mark/resolution PnL for a research-only trial | `paper_orders`, execution permission, or publication permission |
 | `leader_publish` | Explicit read-only output for downstream consumers | Permission to trade from this repository |
 
 The historical database column `wallet_processing_state.discovery_tier` is called `evidence_tier` in code.
@@ -127,7 +131,7 @@ The default Compose stack runs:
 - polling and RTDS discovery;
 - one ordered research control loop for eligibility, queue admission, features, scoring, and handoff export;
 - sharded wallet and copyability workers;
-- the read-only paper-observer loop;
+- the read-only paper-observer loop, including bounded Gamma refresh and research-trial outcome tracking;
 - lightweight maintenance with bounded, archive-aware evidence pruning.
 
 Full SQLite backups are manual in the current development phase. The default research stack does not start the
@@ -136,6 +140,12 @@ remains the only workflow truth source.
 
 The opt-in execution profile contains paper-run, paper-settle, and publish loops. It is not started by the
 default `up`, `restart`, `runtime-ensure`, or watchdog commands.
+
+The observer loop has a separate result lifecycle from paper execution. An actionable CLOB quote fixes one
+`paper_observer_trials` entry at the first observed executable price. The loop then refreshes only referenced Gamma
+markets and records marks or final 0/1 settlements. It never writes `paper_orders`, `paper_fills`, `paper_positions`,
+or `leader_publish`. Observer ROI is research evidence about signal timeliness and outcome quality; it is not a claim
+that an order was submitted or filled by an execution system.
 
 ## Reliability Rules
 

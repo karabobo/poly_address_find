@@ -1923,6 +1923,23 @@ def test_nas_wallet_pipeline_control_plane_has_one_owner():
     assert owners == ["research-control-loop.sh"]
 
 
+def test_nas_paper_observer_tracks_research_outcomes_without_execution_commands():
+    env = Path("deploy/nas/env.example").read_text(encoding="utf-8")
+    loop = Path("deploy/nas/paper-observer-loop.sh").read_text(encoding="utf-8")
+
+    assert "PM_ROBOT_PAPER_OBSERVER_OUTCOME_INTERVAL=900" in env
+    assert "PM_ROBOT_PAPER_OBSERVER_GAMMA_LIMIT=50" in env
+    assert "ingest-gamma-markets" in loop
+    assert "--paper-only" in loop
+    assert "paper-observer-settle" in loop
+    assert "/app/reports/paper_observer_outcomes.json" in loop
+    assert "loop_paper_observer_gamma" in loop
+    assert "loop_paper_observer_outcomes" in loop
+    assert "paper-run" not in loop
+    assert "paper-settle" not in loop
+    assert "publish-leaders" not in loop
+
+
 @pytest.mark.skipif(not Path("deploy/nas/README.md").exists(), reason="README files are intentionally excluded")
 def test_nas_paper_observer_loop_runs_fast_readonly_quote_evaluation():
     compose = Path("deploy/nas/docker-compose.yml").read_text(encoding="utf-8")

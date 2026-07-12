@@ -464,10 +464,13 @@ def test_paper_observer_evaluate_can_persist_quoteability_evidence(tmp_path):
         )
         order_count = conn.execute("SELECT COUNT(*) AS n FROM paper_orders").fetchone()["n"]
         evidence = conn.execute("SELECT * FROM paper_signal_evaluations WHERE wallet = ?", (address,)).fetchone()
+        trial = conn.execute("SELECT * FROM paper_observer_trials WHERE wallet = ?", (address,)).fetchone()
 
         assert evaluation.evaluations_persisted == 1
+        assert evaluation.trials_opened == 1
         assert order_count == 0
         assert evidence is not None
+        assert trial is not None
         assert evidence["signal_id"] == evaluation.evaluations[0]["signal_id"]
         assert evidence["accepted"] == 1
         assert evidence["actionable"] == 1
@@ -475,6 +478,9 @@ def test_paper_observer_evaluate_can_persist_quoteability_evidence(tmp_path):
         assert evidence["decision_reason"] == "paper_clob_vwap"
         assert evidence["best_ask"] == 0.55
         assert evidence["executable_price"] == 0.55
+        assert trial["entry_price"] == 0.55
+        assert trial["stake_usd"] == 25
+        assert trial["status"] == "open"
     finally:
         conn.close()
 
@@ -505,9 +511,11 @@ def test_paper_observer_evaluate_marks_old_quoteable_signals_not_actionable(tmp_
             client=BOOK_CLIENT,
         )
         evidence = conn.execute("SELECT * FROM paper_signal_evaluations WHERE wallet = ?", (address,)).fetchone()
+        trial_count = conn.execute("SELECT COUNT(*) FROM paper_observer_trials WHERE wallet = ?", (address,)).fetchone()[0]
 
         assert evaluation.accepted_signals == 1
         assert evaluation.actionable_signals == 0
+        assert evaluation.trials_opened == 0
         assert evaluation.stale_signal_rejections == 1
         assert evaluation.evaluations[0]["accepted"] is True
         assert evaluation.evaluations[0]["actionable"] is False
@@ -515,6 +523,7 @@ def test_paper_observer_evaluate_marks_old_quoteable_signals_not_actionable(tmp_
         assert evidence["accepted"] == 1
         assert evidence["actionable"] == 0
         assert evidence["actionability_reason"] == "signal_too_old"
+        assert trial_count == 0
     finally:
         conn.close()
 
@@ -559,6 +568,7 @@ def test_paper_observer_evaluate_cli_exports_json_without_writing_orders(tmp_pat
     try:
         count = conn.execute("SELECT COUNT(*) AS n FROM paper_orders").fetchone()["n"]
         evidence_count = conn.execute("SELECT COUNT(*) AS n FROM paper_signal_evaluations").fetchone()["n"]
+        trial_count = conn.execute("SELECT COUNT(*) AS n FROM paper_observer_trials").fetchone()["n"]
     finally:
         conn.close()
 
@@ -570,6 +580,7 @@ def test_paper_observer_evaluate_cli_exports_json_without_writing_orders(tmp_pat
     assert captured["schema_version"] == payload["schema_version"]
     assert count == 0
     assert evidence_count == 0
+    assert trial_count == 0
 
 
 def test_paper_observer_evaluate_cli_can_persist_without_writing_orders(tmp_path, monkeypatch, capsys):
@@ -612,13 +623,16 @@ def test_paper_observer_evaluate_cli_can_persist_without_writing_orders(tmp_path
     try:
         order_count = conn.execute("SELECT COUNT(*) AS n FROM paper_orders").fetchone()["n"]
         evidence_count = conn.execute("SELECT COUNT(*) AS n FROM paper_signal_evaluations").fetchone()["n"]
+        trial_count = conn.execute("SELECT COUNT(*) AS n FROM paper_observer_trials").fetchone()["n"]
     finally:
         conn.close()
 
     assert payload["evaluations_persisted"] == 1
+    assert payload["trials_opened"] == 1
     assert payload["actionable_signals"] == 1
     assert order_count == 0
     assert evidence_count == 1
+    assert trial_count == 1
 
 
 def test_paper_runner_blocks_negative_settled_roi_wallet(tmp_path):

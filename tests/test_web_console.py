@@ -1297,6 +1297,17 @@ def test_paper_observer_evaluation_route_serves_export_file():
     assert "dashboard_data" not in route
 
 
+def test_paper_observer_outcomes_route_is_read_only_summary():
+    source = Path("src/pm_robot/web.py").read_text(encoding="utf-8")
+    route_start = source.index('if parsed.path == "/api/paper-observer-outcomes":')
+    route_end = source.index('if parsed.path == "/api/execution-preflight":')
+    route = source[route_start:route_end]
+
+    assert "paper_observer_trials_data" in route
+    assert "settle_paper_observer_trials" not in route
+    assert "dashboard_data" not in route
+
+
 def test_dashboard_prioritizes_actionable_manual_blocker_over_archived_blocks(tmp_path):
     settings = _settings(tmp_path)
     _seed(settings)
@@ -2564,6 +2575,34 @@ def test_evidence_mode_cards_ignore_unrelated_research_gate_failures():
         '<div class="health-card ok"><span>证据模式</span><strong>完整 L3</strong>'
         in detail_html
     )
+
+
+def test_paper_observer_trials_panel_keeps_research_execution_boundary_visible():
+    html = web_module._paper_observer_trials_panel(
+        {
+            "available": True,
+            "total_trials": 5,
+            "wallets": 2,
+            "open_trials": 3,
+            "resolved_trials": 2,
+            "marked_trials": 5,
+            "marked_pnl_usd": 12.5,
+            "marked_roi_pct": 6.25,
+            "settled_pnl_usd": 8.0,
+            "settled_roi_pct": 10.0,
+            "wins": 1,
+            "win_rate_pct": 50.0,
+            "latest_updated_at": 1_800_000_000,
+            "boundary": "只读研究试验，不写 paper_orders。",
+            "wallet_summaries": [],
+        }
+    )
+
+    assert "Paper Observer" not in html
+    assert "研究试验" in html
+    assert "不写 paper_orders" in html
+    assert "已有市场价" in html
+    assert "已结算盈亏" in html
 
 
 def test_dashboard_groups_needs_data_reasons_into_operator_actions(tmp_path):

@@ -16,7 +16,7 @@ from pm_robot.models import TradeSignal
 from pm_robot.orchestration.retry_policy import is_upstream_scheduling_error
 from pm_robot.pipeline_terms import PAPER_ELIGIBLE_CANDIDATE_STAGES, PROVISIONAL_CANDIDATE_STAGES
 from pm_robot.risk.eligibility import paper_eligibility_status
-from pm_robot.storage.repository import persist_paper_signal_evaluations
+from pm_robot.storage.repository import persist_paper_observer_trials, persist_paper_signal_evaluations
 
 
 PAPER_STAGES = PAPER_ELIGIBLE_CANDIDATE_STAGES
@@ -80,6 +80,7 @@ class PaperObserverEvaluation:
     average_slippage_bps: float | None
     average_latency_ms: float | None
     evaluations_persisted: int
+    trials_opened: int
     evaluations: list[dict[str, object]]
 
 
@@ -167,11 +168,11 @@ def evaluate_paper_observer(
                 max_actionable_signal_age_sec=safe_max_actionable_signal_age_sec,
             )
         )
-    evaluations_persisted = (
-        persist_paper_signal_evaluations(conn, evaluations, evaluated_at=generated_at)
-        if persist
-        else 0
-    )
+    evaluations_persisted = 0
+    trials_opened = 0
+    if persist:
+        evaluations_persisted = persist_paper_signal_evaluations(conn, evaluations, evaluated_at=generated_at)
+        trials_opened = persist_paper_observer_trials(conn, evaluations, evaluated_at=generated_at)
     accepted = [row for row in evaluations if row.get("accepted")]
     actionable = [row for row in evaluations if row.get("actionable")]
     stale = [row for row in evaluations if row.get("actionability_reason") == "signal_too_old"]
@@ -196,6 +197,7 @@ def evaluate_paper_observer(
         average_slippage_bps=_average(slippages),
         average_latency_ms=_average(latencies),
         evaluations_persisted=evaluations_persisted,
+        trials_opened=trials_opened,
         evaluations=evaluations,
     )
 

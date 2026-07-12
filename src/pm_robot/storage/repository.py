@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import math
 import sqlite3
 import time
 from dataclasses import asdict
@@ -2026,6 +2027,12 @@ def list_gamma_market_backfill_targets(
                 SELECT DISTINCT market_slug
                 FROM paper_fills
                 WHERE market_slug IS NOT NULL AND market_slug != ''
+                UNION
+                SELECT DISTINCT market_slug
+                FROM paper_observer_trials
+                WHERE status = 'open'
+                  AND market_slug IS NOT NULL
+                  AND market_slug != ''
             )
             SELECT paper_slugs.market_slug
             FROM paper_slugs
@@ -2042,6 +2049,9 @@ def list_gamma_market_backfill_targets(
     rows = conn.execute(
         """
         WITH slugs AS (
+            SELECT market_slug, 0 AS priority FROM paper_observer_trials
+            WHERE status = 'open' AND market_slug IS NOT NULL AND market_slug != ''
+            UNION
             SELECT DISTINCT wa.market_slug, 0 AS priority
             FROM copy_trade_links ctl
             JOIN copy_pair_stats cps
@@ -2206,16 +2216,27 @@ def gamma_market_cache_summary(conn: sqlite3.Connection) -> dict[str, Any]:
         paper_slugs AS (
             SELECT DISTINCT market_slug FROM paper_fills
             WHERE market_slug IS NOT NULL AND market_slug != ''
+        ),
+        observer_slugs AS (
+            SELECT DISTINCT market_slug FROM paper_observer_trials
+            WHERE market_slug IS NOT NULL AND market_slug != ''
         )
         SELECT
             (SELECT COUNT(*) FROM slugs) AS referenced_market_slugs,
             (SELECT COUNT(*) FROM paper_slugs) AS paper_market_slugs,
+            (SELECT COUNT(*) FROM observer_slugs) AS observer_market_slugs,
             (
                 SELECT COUNT(*)
                 FROM paper_slugs ps
                 JOIN gamma_market_cache gmc ON gmc.market_slug = ps.market_slug
                 WHERE gmc.expires_at > strftime('%s','now')
             ) AS cached_paper_markets,
+            (
+                SELECT COUNT(*)
+                FROM observer_slugs os
+                JOIN gamma_market_cache gmc ON gmc.market_slug = os.market_slug
+                WHERE gmc.expires_at > strftime('%s','now')
+            ) AS cached_observer_markets,
             (SELECT COUNT(*) FROM gamma_market_cache) AS cached_markets,
             (SELECT COUNT(*) FROM gamma_market_cache WHERE closed = 1) AS cached_closed_markets,
             (SELECT COUNT(*) FROM gamma_market_cache WHERE raw_json LIKE '{"error":%') AS cached_error_markets,
@@ -3364,6 +3385,84 @@ def persist_paper_signal_evaluations(
     )
     conn.commit()
     return len(rows)
+
+
+def persist_paper_observer_trials(
+    conn: sqlite3.Connection,
+    evaluations: list[dict[str, Any]],
+    *,
+    evaluated_at: int,
+) -> int:
+    """Fix the first actionable quote as a research trial without writing orders."""
+
+    rows = []
+    for item in evaluations:
+        signal_id = str(item.get("signal_id") or "")
+        wallet = str(item.get("wallet") or "").lower()
+        market_slug = str(item.get("market_slug") or "")
+        asset_id = str(item.get("asset_id") or "")
+        side = str(item.get("side") or "").upper()
+        entry_price = _float(item.get("executable_price"))
+        stake_usd = _float(item.get("stake_usd")) or 0.0
+        fee_usd = _float(item.get("fee_usd")) or 0.0
+        if (
+            not item.get("accepted")
+            or not item.get("actionable")
+            or not signal_id
+            or not wallet
+            or not market_slug
+            or not asset_id
+            or side != "BUY"
+            or entry_price is None
+            or not math.isfinite(entry_price)
+            or entry_price <= 0
+            or entry_price > 1
+            or not math.isfinite(stake_usd)
+            or stake_usd <= 0
+            or not math.isfinite(fee_usd)
+            or fee_usd < 0
+        ):
+            continue
+        rows.append(
+            (
+                signal_id,
+                wallet,
+                str(item.get("candidate_stage") or ""),
+                str(item.get("validation_cohort") or ""),
+                market_slug,
+                asset_id,
+                str(item.get("outcome") or ""),
+                side,
+                _int(item.get("detected_at")),
+                int(evaluated_at),
+                _float(item.get("leader_price")),
+                entry_price,
+                stake_usd,
+                fee_usd,
+                stake_usd + fee_usd,
+                stake_usd / entry_price,
+                _float(item.get("slippage_bps")),
+                _int(item.get("signal_age_sec")),
+                int(evaluated_at),
+            )
+        )
+    if not rows:
+        return 0
+    changes_before = conn.total_changes
+    conn.executemany(
+        """
+        INSERT OR IGNORE INTO paper_observer_trials(
+            signal_id, wallet, candidate_stage, validation_cohort, market_slug,
+            asset_id, outcome, side, detected_at, entry_evaluated_at,
+            leader_price, entry_price, stake_usd, fee_usd, cost_usd, shares,
+            slippage_bps, signal_age_sec, status, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?)
+        """,
+        rows,
+    )
+    inserted = conn.total_changes - changes_before
+    conn.commit()
+    return inserted
 
 
 def _feature_from_row(row: sqlite3.Row) -> WalletFeatures:

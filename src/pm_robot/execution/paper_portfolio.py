@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from pm_robot.execution.paper_broker import PAPER_MAX_PRICE, PAPER_MIN_PRICE
+from pm_robot.execution.market_marks import gamma_market_mark
 from pm_robot.risk.gates import stable_readiness_status
 from pm_robot.storage.repository import apply_paper_quality_blocks
 
@@ -265,44 +266,14 @@ def _mark_position(
             (market_slug,),
         ).fetchone()
     gamma_row = mark_cache[market_slug]
-    gamma_mark = _gamma_asset_mark(gamma_row, str(position["asset_id"])) if gamma_row else None
+    gamma_mark = gamma_market_mark(gamma_row, str(position["asset_id"]))
     if gamma_mark is not None:
-        is_settlement = _is_settlement_mark(gamma_row, gamma_mark)
         return Mark(
-            price=gamma_mark,
-            source="gamma_settlement" if is_settlement else "gamma_outcome_price",
-            is_settlement=is_settlement,
+            price=gamma_mark.price,
+            source=gamma_mark.source,
+            is_settlement=gamma_mark.is_settlement,
         )
     return Mark(price=float(position["avg_price"]), source="entry_price_fallback")
-
-
-def _gamma_asset_mark(row: sqlite3.Row, asset_id: str) -> float | None:
-    token_ids = [str(item) for item in _json_list(row["clob_token_ids_json"])]
-    prices = [_to_float(item) for item in _json_list(row["outcome_prices_json"])]
-    if asset_id in token_ids:
-        idx = token_ids.index(asset_id)
-        if idx < len(prices) and prices[idx] is not None:
-            return prices[idx]
-
-    raw = _json_object(row["raw_json"])
-    tokens = raw.get("tokens")
-    if isinstance(tokens, list):
-        for token in tokens:
-            if not isinstance(token, dict):
-                continue
-            token_id = str(token.get("token_id") or token.get("tokenId") or token.get("id") or "")
-            if token_id != asset_id:
-                continue
-            price = _to_float(token.get("price") or token.get("last_price") or token.get("lastPrice"))
-            if price is not None:
-                return price
-    return None
-
-
-def _is_settlement_mark(row: sqlite3.Row | None, price: float) -> bool:
-    if row is None or int(row["closed"] or 0) != 1:
-        return False
-    return price <= 0.001 or price >= 0.999
 
 
 def _write_wallet_performance(conn: sqlite3.Connection, updated_at: int) -> int:
@@ -674,46 +645,3 @@ def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
         (table,),
     ).fetchone()
     return row is not None
-
-
-def _json_list(value: Any) -> list[Any]:
-    parsed = _json_value(value)
-    if isinstance(parsed, list):
-        return parsed
-    return []
-
-
-def _json_object(value: Any) -> dict[str, Any]:
-    parsed = _json_value(value)
-    if isinstance(parsed, dict):
-        return parsed
-    return {}
-
-
-def _json_value(value: Any) -> Any:
-    if value in (None, ""):
-        return None
-    if isinstance(value, (list, dict)):
-        return value
-    try:
-        parsed = json.loads(str(value))
-    except json.JSONDecodeError:
-        return None
-    if isinstance(parsed, str):
-        try:
-            return json.loads(parsed)
-        except json.JSONDecodeError:
-            return parsed
-    return parsed
-
-
-def _to_float(value: Any) -> float | None:
-    if value in (None, ""):
-        return None
-    try:
-        number = float(value)
-    except (TypeError, ValueError):
-        return None
-    if number < 0 or number > 1:
-        return None
-    return number

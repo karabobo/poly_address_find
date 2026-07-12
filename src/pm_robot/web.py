@@ -38,6 +38,7 @@ from pm_robot.orchestration.pipeline_audit import (
     PENDING_EVIDENCE_ACTIONS,
 )
 from pm_robot.orchestration.paper_runner import preview_paper_observer
+from pm_robot.orchestration.paper_observer_outcomes import paper_observer_trial_summary
 from pm_robot.orchestration.evidence_readiness import (
     PaperEvidenceMode,
     paper_evidence_mode,
@@ -167,6 +168,8 @@ _RUNTIME_LOOP_SPECS = (
     RuntimeLoopSpec("paper_observer_activity", "Paper 活动快刷", "loop_paper_observer_activity", 300),
     RuntimeLoopSpec("paper_observer_preview", "Paper 预览快刷", "loop_paper_observer_preview", 300),
     RuntimeLoopSpec("paper_observer_evaluation", "Paper 报价快评", "loop_paper_observer_evaluation", 300),
+    RuntimeLoopSpec("paper_observer_gamma", "Observer 市场结果", "loop_paper_observer_gamma", 3_600),
+    RuntimeLoopSpec("paper_observer_outcomes", "Observer 结果结算", "loop_paper_observer_outcomes", 3_600),
     RuntimeLoopSpec("maintenance", "维护循环", "loop_maintenance", 7_200),
     RuntimeLoopSpec("rtds_discovery", "RTDS 实时发现", "loop_rtds_discovery", 900),
 )
@@ -491,6 +494,20 @@ def paper_observer_evaluation_data(settings: RobotSettings) -> dict[str, Any]:
     return _paper_observer_evaluation_file(settings)
 
 
+def paper_observer_trials_data(settings: RobotSettings) -> dict[str, Any]:
+    conn = connect_readonly(settings.db_path)
+    try:
+        payload = paper_observer_trial_summary(conn)
+    finally:
+        conn.close()
+    payload["read_only"] = True
+    payload["boundary"] = (
+        "研究侧观察试验只固定及时可跟报价并计算 Gamma 标记/结算结果；"
+        "不写 paper_orders，不启动执行或发布。"
+    )
+    return payload
+
+
 @lru_cache(maxsize=1)
 def _runtime_build_info() -> dict[str, Any]:
     package_root = Path(__file__).resolve().parent
@@ -672,6 +689,9 @@ def _handler_factory(config: WebConsoleConfig) -> type[BaseHTTPRequestHandler]:
                 return
             if parsed.path == "/api/paper-observer-evaluation":
                 self._send_json(paper_observer_evaluation_data(config.settings))
+                return
+            if parsed.path == "/api/paper-observer-outcomes":
+                self._send_json(paper_observer_trials_data(config.settings))
                 return
             if parsed.path == "/api/execution-preflight":
                 params = parse_qs(parsed.query)
@@ -907,6 +927,12 @@ def _dashboard_data(
     paper_observer_preview = _paper_observer_preview_summary(conn, limit=8)
     paper_observer_evaluation = paper_observer_evaluation_data(settings)
     paper_observer_evaluation["history"] = _paper_signal_evaluation_history(conn)
+    paper_observer_trials = paper_observer_trial_summary(conn)
+    paper_observer_trials["read_only"] = True
+    paper_observer_trials["boundary"] = (
+        "研究侧观察试验只固定及时可跟报价并计算 Gamma 标记/结算结果；"
+        "不写 paper_orders，不启动执行或发布。"
+    )
     readiness = _production_readiness_summary(
         conn,
         settings=settings,
@@ -972,6 +998,7 @@ def _dashboard_data(
         "paper_handoff": paper_handoff,
         "paper_observer_preview": paper_observer_preview,
         "paper_observer_evaluation": paper_observer_evaluation,
+        "paper_observer_trials": paper_observer_trials,
         "copyability_lane": _copyability_lane_summary(
             conn,
             settings=settings,
@@ -2975,6 +3002,7 @@ def _render_dashboard(settings: RobotSettings) -> str:
         _panel("Paper 交接观察", _paper_handoff_panel(data["paper_handoff"])),
         _panel("Paper Observer 预览", _paper_observer_preview_panel(data["paper_observer_preview"])),
         _panel("Paper Observer 报价评估", _paper_observer_evaluation_panel(data["paper_observer_evaluation"])),
+        _panel("Paper Observer 结果证据", _paper_observer_trials_panel(data["paper_observer_trials"])),
         '<section class="grid two">',
         _panel("外部验证质量", _dict_table(data["paper_quality"])),
         _panel("本地发布库", _simple_table(data["published_leaders"], ["name", "count", "latest_at"], ["状态", "数量", "最近发布"])),
@@ -5816,6 +5844,11 @@ def _paper_handoff_csv(summary: dict[str, Any]) -> str:
         "observer_quality_avg_slippage_bps",
         "observer_quality_latest_at",
         "observer_quality_next_action",
+        "observer_trials",
+        "observer_open_trials",
+        "observer_resolved_trials",
+        "observer_marked_pnl_usd",
+        "observer_marked_roi_pct",
         "paper_orders",
         "paper_execution_state",
         "publish_status",
@@ -5875,12 +5908,18 @@ def _paper_handoff_state_counts(conn: sqlite3.Connection, *, observer_current_cu
             WHERE evaluated_at >= ?
             GROUP BY wallet
         ),
+        observer_trials AS (
+            SELECT wallet, COUNT(*) AS trials
+            FROM paper_observer_trials
+            GROUP BY wallet
+        ),
         handoff AS (
             SELECT
                 CASE
                     WHEN cw.candidate_stage = 'live_eligible' AND COALESCE(lp.status, '') = 'active' THEN 'published'
                     WHEN COALESCE(pq.production_ready, 0) > 0 THEN 'paper_passed'
                     WHEN COALESCE(pq.orders, 0) > 0 THEN 'paper_observing'
+                    WHEN cw.candidate_stage = 'paper_approved' AND COALESCE(observer_trials.trials, 0) > 0 THEN 'observer_outcome_tracking'
                     WHEN cw.candidate_stage = 'paper_approved' AND COALESCE(observer.actionable_signals, 0) = 0 THEN 'awaiting_actionable_signal'
                     WHEN cw.candidate_stage = 'paper_approved' THEN 'awaiting_external_paper'
                     WHEN cw.candidate_stage = 'paper_candidate' THEN 'awaiting_pre_paper_review'
@@ -5893,6 +5932,8 @@ def _paper_handoff_state_counts(conn: sqlite3.Connection, *, observer_current_cu
               ON lp.wallet = cw.address
             LEFT JOIN observer
               ON observer.wallet = cw.address
+            LEFT JOIN observer_trials
+              ON observer_trials.wallet = cw.address
             WHERE cw.candidate_stage IN ('paper_candidate', 'paper_approved', 'live_eligible')
         )
         SELECT handoff_state AS state, COUNT(*) AS count
@@ -5953,6 +5994,22 @@ def _paper_handoff_rows(
             FROM paper_signal_evaluations
             WHERE evaluated_at >= ?
             GROUP BY wallet
+        ),
+        observer_trials AS (
+            SELECT
+                wallet,
+                COUNT(*) AS observer_trials,
+                SUM(CASE WHEN status = 'open' THEN 1 ELSE 0 END) AS observer_open_trials,
+                SUM(CASE WHEN status = 'resolved' THEN 1 ELSE 0 END) AS observer_resolved_trials,
+                SUM(CASE WHEN mark_price IS NOT NULL THEN pnl_usd ELSE 0 END) AS observer_marked_pnl_usd,
+                CASE
+                    WHEN SUM(CASE WHEN mark_price IS NOT NULL THEN cost_usd ELSE 0 END) > 0
+                    THEN 100.0 * SUM(CASE WHEN mark_price IS NOT NULL THEN pnl_usd ELSE 0 END)
+                        / SUM(CASE WHEN mark_price IS NOT NULL THEN cost_usd ELSE 0 END)
+                    ELSE 0
+                END AS observer_marked_roi_pct
+            FROM paper_observer_trials
+            GROUP BY wallet
         )
         SELECT
             cw.address,
@@ -5991,6 +6048,11 @@ def _paper_handoff_rows(
             COALESCE(oq.observer_quality_max_signal_age_sec, 0) AS observer_quality_max_signal_age_sec,
             COALESCE(oq.observer_quality_avg_slippage_bps, 0) AS observer_quality_avg_slippage_bps,
             COALESCE(oq.observer_quality_latest_at, 0) AS observer_quality_latest_at,
+            COALESCE(ot.observer_trials, 0) AS observer_trials,
+            COALESCE(ot.observer_open_trials, 0) AS observer_open_trials,
+            COALESCE(ot.observer_resolved_trials, 0) AS observer_resolved_trials,
+            COALESCE(ot.observer_marked_pnl_usd, 0) AS observer_marked_pnl_usd,
+            COALESCE(ot.observer_marked_roi_pct, 0) AS observer_marked_roi_pct,
             CASE WHEN pq.wallet IS NULL THEN 0 ELSE 1 END AS paper_quality_present,
             COALESCE(pq.orders, 0) AS paper_orders,
             COALESCE(pq.settled_positions, 0) AS paper_settled_positions,
@@ -6017,6 +6079,8 @@ def _paper_handoff_rows(
           ON observer.wallet = cw.address
         LEFT JOIN observer_quality oq
           ON oq.wallet = cw.address
+        LEFT JOIN observer_trials ot
+          ON ot.wallet = cw.address
         WHERE cw.candidate_stage IN ('paper_candidate', 'paper_approved', 'live_eligible')
           {address_clause}
         ORDER BY
@@ -6071,7 +6135,7 @@ def _paper_handoff_observer_quality(row: dict[str, Any]) -> None:
         action = "等待 paper observer 捕捉这个钱包的新 BUY 信号。"
     elif actionable > 0:
         state = "actionable_seen"
-        action = "已出现可及时跟信号；下一步需要独立 paper runner 生成纸面订单和结算质量。"
+        action = "已出现可及时跟信号；只读研究试验会固定首个报价并等待 Gamma 标记/结算。"
     elif accepted > 0 and stale >= accepted:
         state = "accepted_but_stale"
         action = "报价可成交但信号过时；需要更及时的发现/观察链路。"
@@ -6203,12 +6267,19 @@ def _paper_handoff_state(row: dict[str, Any]) -> tuple[str, str]:
     paper_ready = int(row.get("paper_ready") or 0) > 0
     observer_evaluations = int(row.get("observer_evaluations") or 0)
     observer_actionable = int(row.get("observer_actionable_signals") or 0)
+    observer_trials = int(row.get("observer_trials") or 0)
+    observer_resolved = int(row.get("observer_resolved_trials") or 0)
     if stage == "live_eligible" and publish_status == "active":
         return ("published", "已发布给外部执行系统，继续监控撤销条件。")
     if paper_ready:
         return ("paper_passed", "paper 质量已达发布前条件，进入发布前复核。")
     if paper_orders > 0:
         return ("paper_observing", "已有 paper 成交，继续等待结算和质量指标。")
+    if stage == "paper_approved" and observer_trials > 0:
+        return (
+            "observer_outcome_tracking",
+            f"已有 {observer_trials} 条只读研究试验、{observer_resolved} 条已结算；继续累计结果证据。",
+        )
     if stage == "paper_approved" and observer_actionable <= 0:
         if observer_evaluations > 0:
             return ("awaiting_actionable_signal", "最近信号缺盘口或已过可跟窗口；继续等待新的及时 BUY 信号，不进入发布。")
@@ -6228,8 +6299,8 @@ def _paper_observer_evaluation_file(settings: RobotSettings) -> dict[str, Any]:
         "json_path": str(path),
         "json_exists": path.exists(),
         "read_only": True,
-        "write_scope": "no_orders",
-        "boundary": "只读盘口评估：查 CLOB 深度、滑点和延迟，不写 paper_orders。",
+        "write_scope": "evaluations_and_research_trials",
+        "boundary": "只读盘口评估：保存报价证据，并固定首次及时可跟报价为研究试验；不写 paper_orders。",
         "next_action": "等待 paper-observer-loop 生成 paper_observer_evaluation.json。",
     }
     if not path.exists():
@@ -6261,7 +6332,7 @@ def _paper_observer_evaluation_file(settings: RobotSettings) -> dict[str, Any]:
         "json_exists": True,
         "age_seconds": age_seconds,
         "read_only": True,
-        "write_scope": "no_orders",
+        "write_scope": "evaluations_and_research_trials",
         "boundary": base["boundary"],
         "next_action": next_action,
     }
@@ -6559,7 +6630,7 @@ def _production_readiness_summary(
         next_action = "已有 paper 候选，但当前没有可及时跟信号；继续 observer 收集，不发布。"
     elif paper_stage_wallets:
         state = "paper_candidates_present"
-        next_action = "已有 paper 候选且出现可及时跟信号；外部 paper 验证应记录结果，仍不直接发布。"
+        next_action = "已有 paper 候选且出现可及时跟信号；只读观察试验会累计结果，正式 paper 与发布仍保持独立。"
     elif at_threshold and operator_review_wallets:
         state = "manual_gate"
         next_action = "有钱包的证据和分数均已达线，当前确实需要人工决定是否升级。"
@@ -9190,6 +9261,7 @@ def _paper_handoff_panel(values: dict[str, Any]) -> str:
     waiting = sum(int(row.get("count") or 0) for row in state_counts if row.get("state") == "awaiting_external_paper")
     waiting_actionable = sum(int(row.get("count") or 0) for row in state_counts if row.get("state") == "awaiting_actionable_signal")
     observing = sum(int(row.get("count") or 0) for row in state_counts if row.get("state") == "paper_observing")
+    outcome_tracking = sum(int(row.get("count") or 0) for row in state_counts if row.get("state") == "observer_outcome_tracking")
     passed = sum(int(row.get("count") or 0) for row in state_counts if row.get("state") in {"paper_passed", "published"})
     paper_loop_label = "未启用" if values.get("nas_paper_loop_enabled") is False else "未验证"
     cards = [
@@ -9201,6 +9273,7 @@ def _paper_handoff_panel(values: dict[str, Any]) -> str:
         ("NAS Paper Loop", paper_loop_label, values.get("paper_loop_status") or "", "ok" if values.get("nas_paper_loop_enabled") is False else "warn"),
         ("等待新信号", _fmt_int(waiting_actionable), "actionable BUY", "warn" if waiting_actionable else "ok"),
         ("等待外部 paper", _fmt_int(waiting), "研究已批准但未观察", "warn" if waiting else "ok"),
+        ("只读结果观察", _fmt_int(outcome_tracking), "不写 paper_orders", "ok" if outcome_tracking else "warn"),
         ("paper 观察中", _fmt_int(observing), "已有纸面成交", "ok" if observing else "warn"),
         ("发布前通过", _fmt_int(passed), "paper_passed/published", "ok" if passed else "warn"),
     ]
@@ -9245,6 +9318,12 @@ def _paper_handoff_detail_panel(row: dict[str, Any]) -> str:
         ("Paper 成交", _fmt_int(row.get("paper_orders")), f"{_fmt_int(row.get('paper_settled_positions'))} settled", "ok" if int(row.get("paper_orders") or 0) else "warn"),
         ("及时可跟", _fmt_int(row.get("observer_actionable_signals")), f"{_fmt_int(row.get('observer_evaluations'))} observer evals", "ok" if int(row.get("observer_actionable_signals") or 0) else "warn"),
         (
+            "观察结果",
+            f"{_fmt_int(row.get('observer_resolved_trials'))}/{_fmt_int(row.get('observer_trials'))}",
+            f"ROI {_fmt_num(row.get('observer_marked_roi_pct'))}%",
+            "ok" if int(row.get("observer_trials") or 0) else "warn",
+        ),
+        (
             "只读质量",
             row.get("observer_quality_state") or "none",
             f"{_fmt_int(row.get('observer_quality_evaluations'))} eval · {_fmt_num(row.get('observer_quality_actionable_rate_pct'))}% actionable",
@@ -9282,6 +9361,11 @@ def _paper_handoff_detail_panel(row: dict[str, Any]) -> str:
                 {"key": "observer_quality_quote_errors", "value": row.get("observer_quality_quote_errors") or 0},
                 {"key": "observer_quality_stale", "value": row.get("observer_quality_stale") or 0},
                 {"key": "observer_quality_next_action", "value": row.get("observer_quality_next_action") or ""},
+                {"key": "observer_trials", "value": row.get("observer_trials") or 0},
+                {"key": "observer_open_trials", "value": row.get("observer_open_trials") or 0},
+                {"key": "observer_resolved_trials", "value": row.get("observer_resolved_trials") or 0},
+                {"key": "observer_marked_pnl_usd", "value": row.get("observer_marked_pnl_usd") or 0},
+                {"key": "observer_marked_roi_pct", "value": f"{_fmt_num(row.get('observer_marked_roi_pct'))}%"},
             ],
             ["key", "value"],
             ["只读 observer 质量", "值"],
@@ -9309,7 +9393,8 @@ def _paper_handoff_wallets_table(rows: list[dict[str, Any]]) -> str:
             f'<small>{_e(row.get("research_check_summary") or "")} · {_badge(row.get("paper_execution_state") or "")}</small></td>'
             f'<td><div class="numline">{_fmt_int(row.get("observer_actionable_signals"))} actionable</div>'
             f'<small>{_fmt_int(row.get("observer_accepted_signals"))} accepted · {_fmt_int(row.get("observer_stale_signals"))} stale · {_fmt_int(row.get("observer_quote_errors"))} errors</small>'
-            f'<small>{_badge(row.get("observer_quality_state") or "")} quality {_fmt_int(row.get("observer_quality_evaluations"))} eval · {_fmt_num(row.get("observer_quality_actionable_rate_pct"))}% actionable</small></td>'
+            f'<small>{_badge(row.get("observer_quality_state") or "")} quality {_fmt_int(row.get("observer_quality_evaluations"))} eval · {_fmt_num(row.get("observer_quality_actionable_rate_pct"))}% actionable</small>'
+            f'<small>{_fmt_int(row.get("observer_resolved_trials"))}/{_fmt_int(row.get("observer_trials"))} resolved · {_fmt_num(row.get("observer_marked_roi_pct"))}% ROI</small></td>'
             f'<td><div class="numline">{_fmt_int(row.get("paper_orders"))} orders</div>'
             f'<small>{_fmt_pct(row.get("paper_total_roi"))} ROI · ready {_fmt_int(row.get("paper_ready"))}</small></td>'
             f'<td>{_e(row.get("formal_next_action") or row.get("next_action") or "")}'
@@ -9422,6 +9507,46 @@ def _paper_observer_evaluation_panel(values: dict[str, Any]) -> str:
         + _simple_table(history.get("reason_counts") or [], ["reason", "count"], ["原因", "数量"])
         + '<h3 class="subhead">当前报价样本</h3>'
         + _paper_observer_evaluation_table(values.get("evaluations") or [])
+    )
+
+
+def _paper_observer_trials_panel(values: dict[str, Any]) -> str:
+    if not values or not values.get("available"):
+        return '<p class="empty">观察结果表尚未初始化。</p>'
+    total = int(values.get("total_trials") or 0)
+    if total <= 0:
+        return (
+            f'<div class="health-banner attention"><strong>{_e(values.get("boundary"))}</strong>'
+            '<span>等待 paper observer 捕捉首个可及时跟信号。</span></div>'
+        )
+    resolved = int(values.get("resolved_trials") or 0)
+    marked = int(values.get("marked_trials") or 0)
+    cards = [
+        ("研究试验", _fmt_int(total), f"{_fmt_int(values.get('wallets'))} 个钱包", "ok"),
+        ("待结算", _fmt_int(values.get("open_trials")), "Gamma 持续标记", "warn" if int(values.get("open_trials") or 0) else "ok"),
+        ("已有市场价", _fmt_int(marked), f"覆盖 {marked}/{total}", "ok" if marked else "warn"),
+        ("已结算", _fmt_int(resolved), "只认 closed + 0/1 结果", "ok" if resolved else "warn"),
+        ("当前模拟盈亏", f"${_fmt_num(values.get('marked_pnl_usd'))}", f"ROI {_fmt_num(values.get('marked_roi_pct'))}%", "ok" if float(values.get("marked_pnl_usd") or 0) >= 0 else "warn"),
+        ("已结算盈亏", f"${_fmt_num(values.get('settled_pnl_usd'))}", f"ROI {_fmt_num(values.get('settled_roi_pct'))}%", "ok" if resolved and float(values.get("settled_pnl_usd") or 0) >= 0 else "warn"),
+        ("已结算胜率", f"{_fmt_num(values.get('win_rate_pct'))}%", f"{_fmt_int(values.get('wins'))}/{_fmt_int(resolved)}", "ok" if resolved else "warn"),
+        ("最近更新", _fmt_ts(values.get("latest_updated_at")), "observer outcome loop", "ok"),
+    ]
+    return (
+        f'<div class="health-banner {"ok" if resolved else "attention"}"><strong>{_e(values.get("boundary"))}</strong>'
+        '<span>结果证据与正式 paper 订单、发布资格相互独立。</span></div>'
+        '<p class="muted"><a class="button secondary" href="/api/paper-observer-outcomes">JSON 结果证据</a></p>'
+        '<div class="health-grid">'
+        + "".join(
+            f'<div class="health-card {state}"><span>{_e(label)}</span><strong>{_e(value)}</strong><small>{_e(note)}</small></div>'
+            for label, value, note, state in cards
+        )
+        + "</div>"
+        + '<h3 class="subhead">按钱包汇总</h3>'
+        + _simple_table(
+            values.get("wallet_summaries") or [],
+            ["wallet", "total_trials", "open_trials", "resolved_trials", "marked_pnl_usd", "marked_roi_pct", "settled_pnl_usd", "settled_roi_pct", "win_rate_pct", "latest_updated_at"],
+            ["钱包", "试验", "待结算", "已结算", "当前盈亏", "当前 ROI %", "结算盈亏", "结算 ROI %", "胜率 %", "最近更新"],
+        )
     )
 
 

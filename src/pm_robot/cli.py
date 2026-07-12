@@ -51,6 +51,7 @@ from pm_robot.orchestration.feature_materializer import materialize_wallet_featu
 from pm_robot.orchestration.gamma_ingestor import ingest_gamma_markets
 from pm_robot.orchestration.leaderboard_discovery import discover_leaderboard_candidates
 from pm_robot.orchestration.paper_runner import evaluate_paper_observer, preview_paper_observer, run_paper
+from pm_robot.orchestration.paper_observer_outcomes import settle_paper_observer_trials
 from pm_robot.orchestration.pipeline_cycle import PipelineCycleOptions, run_pipeline_cycle
 from pm_robot.orchestration.pipeline_audit import pipeline_audit_report
 from pm_robot.orchestration.pipeline_smoothness import pipeline_smoothness_report
@@ -238,7 +239,11 @@ def main() -> int:
     ingest_gamma_cmd.add_argument("--ttl-seconds", type=int, default=21_600)
     ingest_gamma_cmd.add_argument("--failure-ttl-seconds", type=int, default=604_800)
     ingest_gamma_cmd.add_argument("--sleep", type=float, default=0.1)
-    ingest_gamma_cmd.add_argument("--paper-only", action="store_true", help="Only backfill markets referenced by paper fills")
+    ingest_gamma_cmd.add_argument(
+        "--paper-only",
+        action="store_true",
+        help="Only backfill markets referenced by paper fills or open observer trials",
+    )
 
     copy_graph_cmd = sub.add_parser("mine-copy-graph", help="Mine leader/follower copy relationships")
     copy_graph_cmd.add_argument("--db", dest="command_db", default=None, help="SQLite database path")
@@ -630,6 +635,14 @@ def main() -> int:
         help="Persist quoteability evidence to paper_signal_evaluations without writing paper_orders",
     )
     paper_observer_eval_cmd.add_argument("--out", default="", help="Optional JSON export path")
+
+    paper_observer_settle_cmd = sub.add_parser(
+        "paper-observer-settle",
+        help="Mark and settle research-only observer trials without writing paper orders",
+    )
+    paper_observer_settle_cmd.add_argument("--db", dest="command_db", default=None, help="SQLite database path")
+    paper_observer_settle_cmd.add_argument("--limit", type=int, default=1_000)
+    paper_observer_settle_cmd.add_argument("--out", default="", help="Optional JSON export path")
 
     paper_handoff_cmd = sub.add_parser(
         "paper-handoff-export",
@@ -1639,6 +1652,20 @@ def main() -> int:
                 max_actionable_signal_age_sec=args.max_actionable_signal_age_sec,
                 persist=args.persist,
             )
+        finally:
+            conn.close()
+        payload = summary.__dict__
+        if args.out:
+            out = Path(args.out)
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0
+    if args.command == "paper-observer-settle":
+        conn = connect(db_path)
+        try:
+            run_migrations(conn)
+            summary = settle_paper_observer_trials(conn, limit=args.limit)
         finally:
             conn.close()
         payload = summary.__dict__

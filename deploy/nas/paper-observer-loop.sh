@@ -12,6 +12,11 @@ PAPER_OBSERVER_MAX_ACTIONABLE_SIGNAL_AGE_SEC="${PM_ROBOT_PAPER_OBSERVER_MAX_ACTI
 PAPER_OBSERVER_EVALUATION_MAX_SIGNAL_AGE_SEC="${PM_ROBOT_PAPER_OBSERVER_EVALUATION_MAX_SIGNAL_AGE_SEC:-$PAPER_OBSERVER_MAX_ACTIONABLE_SIGNAL_AGE_SEC}"
 PAPER_OBSERVER_EVALUATION_LIMIT="${PM_ROBOT_PAPER_OBSERVER_EVALUATION_LIMIT:-25}"
 PAPER_OBSERVER_MAX_STAKE_USD="${PM_ROBOT_PAPER_OBSERVER_MAX_STAKE_USD:-40}"
+PAPER_OBSERVER_OUTCOME_INTERVAL="${PM_ROBOT_PAPER_OBSERVER_OUTCOME_INTERVAL:-900}"
+PAPER_OBSERVER_GAMMA_LIMIT="${PM_ROBOT_PAPER_OBSERVER_GAMMA_LIMIT:-50}"
+PAPER_OBSERVER_GAMMA_TTL_SECONDS="${PM_ROBOT_PAPER_OBSERVER_GAMMA_TTL_SECONDS:-3600}"
+PAPER_OBSERVER_GAMMA_SLEEP="${PM_ROBOT_PAPER_OBSERVER_GAMMA_SLEEP:-0.03}"
+PAPER_OBSERVER_OUTCOME_LIMIT="${PM_ROBOT_PAPER_OBSERVER_OUTCOME_LIMIT:-1000}"
 
 runtime_heartbeat() {
   name="$1"
@@ -22,6 +27,8 @@ runtime_heartbeat() {
     --status "$status" \
     --error "$error" >/dev/null 2>&1 || true
 }
+
+last_outcome_refresh=0
 
 while true; do
   echo "$(date -Iseconds) paper observer loop: refresh paper-stage activity start"
@@ -63,6 +70,35 @@ while true; do
   else
     echo "$(date -Iseconds) paper observer loop: evaluate quotes failed" >&2
     runtime_heartbeat loop_paper_observer_evaluation failed "paper-observer-evaluate failed from paper observer loop"
+  fi
+
+  current_epoch="$(date +%s)"
+  if [ "$PAPER_OBSERVER_OUTCOME_INTERVAL" -le 0 ] || \
+     [ $((current_epoch - last_outcome_refresh)) -ge "$PAPER_OBSERVER_OUTCOME_INTERVAL" ]; then
+    echo "$(date -Iseconds) paper observer loop: refresh outcome markets start"
+    if python -m pm_robot.cli --env /app/.env ingest-gamma-markets \
+        --paper-only \
+        --limit "$PAPER_OBSERVER_GAMMA_LIMIT" \
+        --ttl-seconds "$PAPER_OBSERVER_GAMMA_TTL_SECONDS" \
+        --sleep "$PAPER_OBSERVER_GAMMA_SLEEP"; then
+      echo "$(date -Iseconds) paper observer loop: refresh outcome markets ok"
+      runtime_heartbeat loop_paper_observer_gamma ok
+    else
+      echo "$(date -Iseconds) paper observer loop: refresh outcome markets failed" >&2
+      runtime_heartbeat loop_paper_observer_gamma failed "observer Gamma refresh failed"
+    fi
+
+    echo "$(date -Iseconds) paper observer loop: settle research trials start"
+    if python -m pm_robot.cli --env /app/.env paper-observer-settle \
+        --limit "$PAPER_OBSERVER_OUTCOME_LIMIT" \
+        --out /app/reports/paper_observer_outcomes.json; then
+      echo "$(date -Iseconds) paper observer loop: settle research trials ok"
+      runtime_heartbeat loop_paper_observer_outcomes ok
+    else
+      echo "$(date -Iseconds) paper observer loop: settle research trials failed" >&2
+      runtime_heartbeat loop_paper_observer_outcomes failed "paper-observer-settle failed"
+    fi
+    last_outcome_refresh="$current_epoch"
   fi
 
   sleep "$INTERVAL"
