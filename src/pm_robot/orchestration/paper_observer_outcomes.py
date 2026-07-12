@@ -22,12 +22,40 @@ class PaperObserverSettlementSummary:
     open_trials: int
     resolved_trials: int
     wallets: int
+    market_samples: int
+    open_markets: int
+    resolved_markets: int
+    winning_markets: int
     marked_pnl_usd: float
     marked_roi_pct: float
     settled_pnl_usd: float
     settled_roi_pct: float
     win_rate_pct: float
+    trial_win_rate_pct: float
+    max_market_cost_share_pct: float
+    validation_policy: dict[str, Any]
+    validation_counts: dict[str, int]
     wallet_summaries: list[dict[str, Any]]
+
+
+@dataclass(frozen=True)
+class ObserverValidationThresholds:
+    version: str = "observer_market_sample_v1"
+    min_resolved_markets: int = 20
+    min_settled_cost_usd: float = 500.0
+    min_promising_roi_pct: float = 3.0
+    max_negative_roi_pct: float = -5.0
+    max_market_cost_share_pct: float = 25.0
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "version": self.version,
+            "min_resolved_markets": self.min_resolved_markets,
+            "min_settled_cost_usd": self.min_settled_cost_usd,
+            "min_promising_roi_pct": self.min_promising_roi_pct,
+            "max_negative_roi_pct": self.max_negative_roi_pct,
+            "max_market_cost_share_pct": self.max_market_cost_share_pct,
+        }
 
 
 def settle_paper_observer_trials(
@@ -35,6 +63,7 @@ def settle_paper_observer_trials(
     *,
     limit: int = 1_000,
     now: int | None = None,
+    policy: dict[str, Any] | None = None,
 ) -> PaperObserverSettlementSummary:
     """Mark or resolve research trials without creating orders, fills, or positions."""
 
@@ -115,7 +144,7 @@ def settle_paper_observer_trials(
             trials_resolved += 1
 
     conn.commit()
-    summary = paper_observer_trial_summary(conn)
+    summary = paper_observer_trial_summary(conn, policy=policy)
     return PaperObserverSettlementSummary(
         generated_at=generated_at,
         trials_seen=len(rows),
@@ -127,18 +156,31 @@ def settle_paper_observer_trials(
         open_trials=int(summary.get("open_trials") or 0),
         resolved_trials=int(summary.get("resolved_trials") or 0),
         wallets=int(summary.get("wallets") or 0),
+        market_samples=int(summary.get("market_samples") or 0),
+        open_markets=int(summary.get("open_markets") or 0),
+        resolved_markets=int(summary.get("resolved_markets") or 0),
+        winning_markets=int(summary.get("winning_markets") or 0),
         marked_pnl_usd=float(summary.get("marked_pnl_usd") or 0),
         marked_roi_pct=float(summary.get("marked_roi_pct") or 0),
         settled_pnl_usd=float(summary.get("settled_pnl_usd") or 0),
         settled_roi_pct=float(summary.get("settled_roi_pct") or 0),
         win_rate_pct=float(summary.get("win_rate_pct") or 0),
+        trial_win_rate_pct=float(summary.get("trial_win_rate_pct") or 0),
+        max_market_cost_share_pct=float(summary.get("max_market_cost_share_pct") or 0),
+        validation_policy=dict(summary.get("validation_policy") or {}),
+        validation_counts=dict(summary.get("validation_counts") or {}),
         wallet_summaries=list(summary.get("wallet_summaries") or []),
     )
 
 
-def paper_observer_trial_summary(conn: sqlite3.Connection) -> dict[str, Any]:
-    """Summarize durable observer trials without changing candidate or execution state."""
+def paper_observer_trial_summary(
+    conn: sqlite3.Connection,
+    *,
+    policy: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Summarize trials by independent wallet-market samples without changing stages."""
 
+    thresholds = observer_validation_thresholds(policy)
     if not _table_exists(conn, "paper_observer_trials"):
         return {
             "available": False,
@@ -146,96 +188,193 @@ def paper_observer_trial_summary(conn: sqlite3.Connection) -> dict[str, Any]:
             "open_trials": 0,
             "resolved_trials": 0,
             "wallets": 0,
+            "market_samples": 0,
+            "open_markets": 0,
+            "resolved_markets": 0,
+            "winning_markets": 0,
+            "validation_policy": thresholds.as_dict(),
+            "validation_counts": {},
             "wallet_summaries": [],
         }
-    row = conn.execute(
+    rows = conn.execute(
         """
         SELECT
+            wallet,
+            market_slug,
             COUNT(*) AS total_trials,
-            COUNT(DISTINCT wallet) AS wallets,
             SUM(CASE WHEN status = 'open' THEN 1 ELSE 0 END) AS open_trials,
             SUM(CASE WHEN status = 'resolved' THEN 1 ELSE 0 END) AS resolved_trials,
             SUM(CASE WHEN mark_price IS NOT NULL THEN 1 ELSE 0 END) AS marked_trials,
+            SUM(CASE WHEN status = 'resolved' AND pnl_usd > 0 THEN 1 ELSE 0 END) AS trial_wins,
             SUM(CASE WHEN mark_price IS NOT NULL THEN cost_usd ELSE 0 END) AS marked_cost_usd,
             SUM(CASE WHEN mark_price IS NOT NULL THEN pnl_usd ELSE 0 END) AS marked_pnl_usd,
             SUM(CASE WHEN status = 'resolved' THEN cost_usd ELSE 0 END) AS settled_cost_usd,
             SUM(CASE WHEN status = 'resolved' THEN pnl_usd ELSE 0 END) AS settled_pnl_usd,
-            SUM(CASE WHEN status = 'resolved' AND pnl_usd > 0 THEN 1 ELSE 0 END) AS wins,
             MAX(updated_at) AS latest_updated_at
         FROM paper_observer_trials
+        GROUP BY wallet, market_slug
+        ORDER BY wallet ASC, market_slug ASC
         """
-    ).fetchone()
-    marked_cost = float(row["marked_cost_usd"] or 0) if row else 0.0
-    marked_pnl = float(row["marked_pnl_usd"] or 0) if row else 0.0
-    settled_cost = float(row["settled_cost_usd"] or 0) if row else 0.0
-    settled_pnl = float(row["settled_pnl_usd"] or 0) if row else 0.0
-    resolved = int(row["resolved_trials"] or 0) if row else 0
-    wins = int(row["wins"] or 0) if row else 0
+    ).fetchall()
+    market_rows = [dict(row) for row in rows]
+    summary = _summarize_market_samples(market_rows)
+    by_wallet: dict[str, list[dict[str, Any]]] = {}
+    for row in market_rows:
+        by_wallet.setdefault(str(row.get("wallet") or ""), []).append(row)
+    wallet_summaries = []
+    validation_counts: dict[str, int] = {}
+    for wallet, wallet_rows in by_wallet.items():
+        wallet_summary = {"wallet": wallet, **_summarize_market_samples(wallet_rows)}
+        wallet_summary.update(_observer_validation(wallet_summary, thresholds))
+        status = str(wallet_summary["validation_status"])
+        validation_counts[status] = validation_counts.get(status, 0) + 1
+        wallet_summaries.append(wallet_summary)
+    wallet_summaries.sort(
+        key=lambda item: (
+            -int(item.get("resolved_markets") or 0),
+            -float(item.get("settled_roi_pct") or 0),
+            str(item.get("wallet") or ""),
+        )
+    )
     return {
         "available": True,
-        "total_trials": int(row["total_trials"] or 0) if row else 0,
-        "wallets": int(row["wallets"] or 0) if row else 0,
-        "open_trials": int(row["open_trials"] or 0) if row else 0,
-        "resolved_trials": resolved,
-        "marked_trials": int(row["marked_trials"] or 0) if row else 0,
+        **summary,
+        "wallets": len(by_wallet),
+        "validation_policy": thresholds.as_dict(),
+        "validation_counts": validation_counts,
+        "wallet_summaries": wallet_summaries,
+    }
+
+
+def observer_validation_thresholds(policy: dict[str, Any] | None) -> ObserverValidationThresholds:
+    section = policy.get("observer_validation", {}) if isinstance(policy, dict) else {}
+    if not isinstance(section, dict):
+        section = {}
+    defaults = ObserverValidationThresholds()
+    return ObserverValidationThresholds(
+        version=str(section.get("version") or defaults.version),
+        min_resolved_markets=max(
+            1,
+            _safe_int(section.get("min_resolved_markets"), defaults.min_resolved_markets),
+        ),
+        min_settled_cost_usd=max(
+            0.0,
+            _safe_float(section.get("min_settled_cost_usd"), defaults.min_settled_cost_usd),
+        ),
+        min_promising_roi_pct=_safe_float(
+            section.get("min_promising_roi_pct"),
+            defaults.min_promising_roi_pct,
+        ),
+        max_negative_roi_pct=_safe_float(
+            section.get("max_negative_roi_pct"),
+            defaults.max_negative_roi_pct,
+        ),
+        max_market_cost_share_pct=min(
+            100.0,
+            max(
+                0.0,
+                _safe_float(
+                    section.get("max_market_cost_share_pct"),
+                    defaults.max_market_cost_share_pct,
+                ),
+            ),
+        ),
+    )
+
+
+def _summarize_market_samples(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    total_trials = sum(int(row.get("total_trials") or 0) for row in rows)
+    open_trials = sum(int(row.get("open_trials") or 0) for row in rows)
+    resolved_trials = sum(int(row.get("resolved_trials") or 0) for row in rows)
+    marked_trials = sum(int(row.get("marked_trials") or 0) for row in rows)
+    trial_wins = sum(int(row.get("trial_wins") or 0) for row in rows)
+    marked_cost = sum(float(row.get("marked_cost_usd") or 0) for row in rows)
+    marked_pnl = sum(float(row.get("marked_pnl_usd") or 0) for row in rows)
+    resolved_rows = [
+        row
+        for row in rows
+        if int(row.get("open_trials") or 0) == 0 and int(row.get("resolved_trials") or 0) > 0
+    ]
+    # A wallet-market sample is final only after every trial in that market resolves.
+    settled_cost = sum(float(row.get("settled_cost_usd") or 0) for row in resolved_rows)
+    settled_pnl = sum(float(row.get("settled_pnl_usd") or 0) for row in resolved_rows)
+    winning_markets = sum(
+        1 for row in resolved_rows if float(row.get("settled_pnl_usd") or 0) > 0
+    )
+    max_market_cost = max(
+        (float(row.get("settled_cost_usd") or 0) for row in resolved_rows),
+        default=0.0,
+    )
+    return {
+        "total_trials": total_trials,
+        "open_trials": open_trials,
+        "resolved_trials": resolved_trials,
+        "marked_trials": marked_trials,
+        "trial_wins": trial_wins,
+        "trial_win_rate_pct": _ratio_pct(trial_wins, resolved_trials),
+        "market_samples": len(rows),
+        "open_markets": sum(1 for row in rows if int(row.get("open_trials") or 0) > 0),
+        "resolved_markets": len(resolved_rows),
+        "winning_markets": winning_markets,
+        "wins": winning_markets,
+        "win_rate_pct": _ratio_pct(winning_markets, len(resolved_rows)),
         "marked_cost_usd": round(marked_cost, 6),
         "marked_pnl_usd": round(marked_pnl, 6),
         "marked_roi_pct": _ratio_pct(marked_pnl, marked_cost),
         "settled_cost_usd": round(settled_cost, 6),
         "settled_pnl_usd": round(settled_pnl, 6),
         "settled_roi_pct": _ratio_pct(settled_pnl, settled_cost),
-        "wins": wins,
-        "win_rate_pct": _ratio_pct(wins, resolved),
-        "latest_updated_at": int(row["latest_updated_at"] or 0) if row else 0,
-        "wallet_summaries": _wallet_summaries(conn),
+        "max_market_cost_share_pct": _ratio_pct(max_market_cost, settled_cost),
+        "latest_updated_at": max(
+            (int(row.get("latest_updated_at") or 0) for row in rows),
+            default=0,
+        ),
     }
 
 
-def _wallet_summaries(conn: sqlite3.Connection) -> list[dict[str, Any]]:
-    rows = conn.execute(
-        """
-        SELECT
-            wallet,
-            COUNT(*) AS total_trials,
-            SUM(CASE WHEN status = 'open' THEN 1 ELSE 0 END) AS open_trials,
-            SUM(CASE WHEN status = 'resolved' THEN 1 ELSE 0 END) AS resolved_trials,
-            SUM(CASE WHEN mark_price IS NOT NULL THEN 1 ELSE 0 END) AS marked_trials,
-            SUM(CASE WHEN mark_price IS NOT NULL THEN cost_usd ELSE 0 END) AS marked_cost_usd,
-            SUM(CASE WHEN mark_price IS NOT NULL THEN pnl_usd ELSE 0 END) AS marked_pnl_usd,
-            SUM(CASE WHEN status = 'resolved' THEN cost_usd ELSE 0 END) AS settled_cost_usd,
-            SUM(CASE WHEN status = 'resolved' THEN pnl_usd ELSE 0 END) AS settled_pnl_usd,
-            SUM(CASE WHEN status = 'resolved' AND pnl_usd > 0 THEN 1 ELSE 0 END) AS wins,
-            MAX(updated_at) AS latest_updated_at
-        FROM paper_observer_trials
-        GROUP BY wallet
-        ORDER BY resolved_trials DESC, marked_trials DESC, total_trials DESC, wallet ASC
-        """
-    ).fetchall()
-    summaries: list[dict[str, Any]] = []
-    for row in rows:
-        marked_cost = float(row["marked_cost_usd"] or 0)
-        marked_pnl = float(row["marked_pnl_usd"] or 0)
-        settled_cost = float(row["settled_cost_usd"] or 0)
-        settled_pnl = float(row["settled_pnl_usd"] or 0)
-        resolved = int(row["resolved_trials"] or 0)
-        wins = int(row["wins"] or 0)
-        summaries.append(
-            {
-                "wallet": str(row["wallet"] or ""),
-                "total_trials": int(row["total_trials"] or 0),
-                "open_trials": int(row["open_trials"] or 0),
-                "resolved_trials": resolved,
-                "marked_trials": int(row["marked_trials"] or 0),
-                "marked_pnl_usd": round(marked_pnl, 6),
-                "marked_roi_pct": _ratio_pct(marked_pnl, marked_cost),
-                "settled_pnl_usd": round(settled_pnl, 6),
-                "settled_roi_pct": _ratio_pct(settled_pnl, settled_cost),
-                "wins": wins,
-                "win_rate_pct": _ratio_pct(wins, resolved),
-                "latest_updated_at": int(row["latest_updated_at"] or 0),
-            }
+def _observer_validation(
+    summary: dict[str, Any],
+    thresholds: ObserverValidationThresholds,
+) -> dict[str, str]:
+    resolved_markets = int(summary.get("resolved_markets") or 0)
+    settled_cost = float(summary.get("settled_cost_usd") or 0)
+    settled_roi = float(summary.get("settled_roi_pct") or 0)
+    concentration = float(summary.get("max_market_cost_share_pct") or 0)
+    if resolved_markets <= 0:
+        direction = "unknown"
+    elif settled_roi >= thresholds.min_promising_roi_pct:
+        direction = "positive"
+    elif settled_roi <= thresholds.max_negative_roi_pct:
+        direction = "negative"
+    else:
+        direction = "mixed"
+
+    if resolved_markets < thresholds.min_resolved_markets:
+        status = "collecting_outcomes"
+        reason = f"resolved_markets:{resolved_markets}<{thresholds.min_resolved_markets}"
+    elif settled_cost < thresholds.min_settled_cost_usd:
+        status = "collecting_outcomes"
+        reason = f"settled_cost_usd:{settled_cost:.2f}<{thresholds.min_settled_cost_usd:.2f}"
+    elif concentration > thresholds.max_market_cost_share_pct:
+        status = "validation_concentrated"
+        reason = f"max_market_cost_share_pct:{concentration:.2f}>{thresholds.max_market_cost_share_pct:.2f}"
+    elif settled_roi >= thresholds.min_promising_roi_pct:
+        status = "validated_promising"
+        reason = f"settled_roi_pct:{settled_roi:.2f}>={thresholds.min_promising_roi_pct:.2f}"
+    elif settled_roi <= thresholds.max_negative_roi_pct:
+        status = "validated_negative"
+        reason = f"settled_roi_pct:{settled_roi:.2f}<={thresholds.max_negative_roi_pct:.2f}"
+    else:
+        status = "validated_mixed"
+        reason = (
+            f"settled_roi_pct:{thresholds.max_negative_roi_pct:.2f}"
+            f"<{settled_roi:.2f}<{thresholds.min_promising_roi_pct:.2f}"
         )
-    return summaries
+    return {
+        "validation_status": status,
+        "validation_reason": reason,
+        "provisional_direction": direction,
+    }
 
 
 def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
@@ -248,3 +387,17 @@ def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
 
 def _ratio_pct(numerator: float | int, denominator: float | int) -> float:
     return round((float(numerator) / float(denominator)) * 100, 2) if denominator else 0.0
+
+
+def _safe_int(value: Any, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_float(value: Any, default: float) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default

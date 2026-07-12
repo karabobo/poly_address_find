@@ -21,13 +21,19 @@ from pm_robot.storage.repository import (
 WALLET = "0x" + "a" * 40
 
 
-def _evaluation(*, entry_price=0.55, signal_id="activity-1"):
+def _evaluation(
+    *,
+    entry_price=0.55,
+    signal_id="activity-1",
+    market_slug="market-1",
+    stake_usd=40.0,
+):
     return {
         "signal_id": signal_id,
         "wallet": WALLET,
         "candidate_stage": "paper_approved",
         "validation_cohort": "validation",
-        "market_slug": "market-1",
+        "market_slug": market_slug,
         "asset_id": "token-yes",
         "outcome": "Yes",
         "side": "BUY",
@@ -35,7 +41,7 @@ def _evaluation(*, entry_price=0.55, signal_id="activity-1"):
         "signal_age_sec": 10,
         "leader_price": 0.5,
         "executable_price": entry_price,
-        "stake_usd": 40.0,
+        "stake_usd": stake_usd,
         "fee_usd": 0.04,
         "slippage_bps": 1_000.0,
         "accepted": True,
@@ -158,11 +164,125 @@ def test_observer_trial_marks_then_resolves_from_gamma_without_execution_rows(tm
         assert trial["pnl_usd"] == pytest.approx(expected_pnl)
         assert trial["resolved_at"] == 1_400
         assert summary["resolved_trials"] == 1
+        assert summary["resolved_markets"] == 1
         assert summary["settled_pnl_usd"] == pytest.approx(expected_pnl)
         assert summary["wallet_summaries"][0]["wallet"] == WALLET
         assert conn.execute("SELECT COUNT(*) FROM paper_orders").fetchone()[0] == 0
         assert conn.execute("SELECT COUNT(*) FROM paper_fills").fetchone()[0] == 0
         assert conn.execute("SELECT COUNT(*) FROM paper_positions").fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+def test_observer_summary_counts_repeated_trades_as_two_market_samples(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    try:
+        run_migrations(conn)
+        evaluations = [
+            _evaluation(signal_id=f"winning-{index}", market_slug="winning-market")
+            for index in range(3)
+        ]
+        evaluations.append(_evaluation(signal_id="losing-1", market_slug="losing-market"))
+        assert persist_paper_observer_trials(conn, evaluations, evaluated_at=1_000) == 4
+        upsert_gamma_market_cache(
+            conn,
+            market_slug="winning-market",
+            market=_gamma_market(closed=True, yes_price="1"),
+            fetched_at=1_100,
+            ttl_seconds=3_600,
+        )
+        upsert_gamma_market_cache(
+            conn,
+            market_slug="losing-market",
+            market=_gamma_market(closed=True, yes_price="0"),
+            fetched_at=1_100,
+            ttl_seconds=3_600,
+        )
+
+        settle_paper_observer_trials(conn, now=1_200)
+        summary = paper_observer_trial_summary(conn)
+        wallet = summary["wallet_summaries"][0]
+
+        assert summary["total_trials"] == 4
+        assert summary["resolved_trials"] == 4
+        assert summary["market_samples"] == 2
+        assert summary["resolved_markets"] == 2
+        assert summary["winning_markets"] == 1
+        assert summary["win_rate_pct"] == 50.0
+        assert summary["trial_win_rate_pct"] == 75.0
+        assert wallet["market_samples"] == 2
+        assert wallet["win_rate_pct"] == 50.0
+        assert wallet["trial_win_rate_pct"] == 75.0
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize(
+    ("market_count", "win_count", "concentrated", "expected_status", "expected_direction"),
+    [
+        (19, 19, False, "collecting_outcomes", "positive"),
+        (20, 15, False, "validated_promising", "positive"),
+        (20, 10, False, "validated_mixed", "mixed"),
+        (20, 5, False, "validated_negative", "negative"),
+        (20, 15, True, "validation_concentrated", "positive"),
+    ],
+)
+def test_observer_validation_requires_diverse_resolved_markets(
+    tmp_path,
+    market_count,
+    win_count,
+    concentrated,
+    expected_status,
+    expected_direction,
+):
+    conn = connect(tmp_path / "robot.sqlite")
+    try:
+        run_migrations(conn)
+        evaluations = []
+        for index in range(market_count):
+            market_slug = f"market-{index:02d}"
+            stake_usd = 800.0 if concentrated and index == 0 else 40.0
+            evaluations.append(
+                _evaluation(
+                    entry_price=0.5,
+                    signal_id=f"signal-{index:02d}",
+                    market_slug=market_slug,
+                    stake_usd=stake_usd,
+                )
+            )
+            upsert_gamma_market_cache(
+                conn,
+                market_slug=market_slug,
+                market=_gamma_market(
+                    closed=True,
+                    yes_price="1" if index < win_count else "0",
+                ),
+                fetched_at=1_100,
+                ttl_seconds=3_600,
+            )
+        assert persist_paper_observer_trials(conn, evaluations, evaluated_at=1_000) == market_count
+
+        settled = settle_paper_observer_trials(
+            conn,
+            now=1_200,
+            policy={
+                "observer_validation": {
+                    "version": "test-market-samples",
+                    "min_resolved_markets": 20,
+                    "min_settled_cost_usd": 500,
+                    "min_promising_roi_pct": 3,
+                    "max_negative_roi_pct": -5,
+                    "max_market_cost_share_pct": 25,
+                }
+            },
+        )
+        wallet = settled.wallet_summaries[0]
+
+        assert wallet["resolved_markets"] == market_count
+        assert wallet["validation_status"] == expected_status
+        assert wallet["provisional_direction"] == expected_direction
+        assert settled.validation_policy["version"] == "test-market-samples"
+        assert settled.validation_counts == {expected_status: 1}
     finally:
         conn.close()
 

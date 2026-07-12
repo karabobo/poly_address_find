@@ -1665,7 +1665,11 @@ def main() -> int:
         conn = connect(db_path)
         try:
             run_migrations(conn)
-            summary = settle_paper_observer_trials(conn, limit=args.limit)
+            summary = settle_paper_observer_trials(
+                conn,
+                limit=args.limit,
+                policy=load_policy(settings.policy_path),
+            )
         finally:
             conn.close()
         payload = summary.__dict__

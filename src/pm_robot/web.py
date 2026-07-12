@@ -497,7 +497,7 @@ def paper_observer_evaluation_data(settings: RobotSettings) -> dict[str, Any]:
 def paper_observer_trials_data(settings: RobotSettings) -> dict[str, Any]:
     conn = connect_readonly(settings.db_path)
     try:
-        payload = paper_observer_trial_summary(conn)
+        payload = paper_observer_trial_summary(conn, policy=load_policy(settings.policy_path))
     finally:
         conn.close()
     payload["read_only"] = True
@@ -927,7 +927,10 @@ def _dashboard_data(
     paper_observer_preview = _paper_observer_preview_summary(conn, limit=8)
     paper_observer_evaluation = paper_observer_evaluation_data(settings)
     paper_observer_evaluation["history"] = _paper_signal_evaluation_history(conn)
-    paper_observer_trials = paper_observer_trial_summary(conn)
+    paper_observer_trials = paper_observer_trial_summary(
+        conn,
+        policy=load_policy(settings.policy_path),
+    )
     paper_observer_trials["read_only"] = True
     paper_observer_trials["boundary"] = (
         "研究侧观察试验只固定及时可跟报价并计算 Gamma 标记/结算结果；"
@@ -5735,6 +5738,35 @@ def _paper_handoff_summary(conn: sqlite3.Connection, settings: RobotSettings, *,
         observer_current_cutoff=observer_current_cutoff,
         research_only=research_only,
     )
+    observer_summary = paper_observer_trial_summary(
+        conn,
+        policy=load_policy(settings.policy_path),
+    )
+    observer_by_wallet = {
+        str(item.get("wallet") or ""): item
+        for item in observer_summary.get("wallet_summaries") or []
+    }
+    for row in rows:
+        validation = observer_by_wallet.get(str(row.get("address") or ""), {})
+        row.update(
+            {
+                "observer_market_samples": int(validation.get("market_samples") or 0),
+                "observer_open_markets": int(validation.get("open_markets") or 0),
+                "observer_resolved_markets": int(validation.get("resolved_markets") or 0),
+                "observer_winning_markets": int(validation.get("winning_markets") or 0),
+                "observer_market_win_rate_pct": float(validation.get("win_rate_pct") or 0),
+                "observer_settled_pnl_usd": float(validation.get("settled_pnl_usd") or 0),
+                "observer_settled_roi_pct": float(validation.get("settled_roi_pct") or 0),
+                "observer_max_market_cost_share_pct": float(
+                    validation.get("max_market_cost_share_pct") or 0
+                ),
+                "observer_validation_status": str(validation.get("validation_status") or "no_trials"),
+                "observer_validation_reason": str(validation.get("validation_reason") or "no_trials"),
+                "observer_provisional_direction": str(
+                    validation.get("provisional_direction") or "unknown"
+                ),
+            }
+        )
     stage_counts = _paper_handoff_stage_counts(conn)
     state_counts = _paper_handoff_state_counts(conn, observer_current_cutoff=observer_current_cutoff)
     candidate_count = sum(int(row.get("count") or 0) for row in stage_counts)
@@ -5790,6 +5822,8 @@ def _paper_handoff_summary(conn: sqlite3.Connection, settings: RobotSettings, *,
         "incomplete_research_wallets": incomplete_research_wallets,
         "stage_counts": stage_counts,
         "state_counts": state_counts,
+        "observer_validation_policy": observer_summary.get("validation_policy") or {},
+        "observer_validation_counts": observer_summary.get("validation_counts") or {},
         "wallets": rows,
     }
 
@@ -5849,6 +5883,17 @@ def _paper_handoff_csv(summary: dict[str, Any]) -> str:
         "observer_resolved_trials",
         "observer_marked_pnl_usd",
         "observer_marked_roi_pct",
+        "observer_market_samples",
+        "observer_open_markets",
+        "observer_resolved_markets",
+        "observer_winning_markets",
+        "observer_market_win_rate_pct",
+        "observer_settled_pnl_usd",
+        "observer_settled_roi_pct",
+        "observer_max_market_cost_share_pct",
+        "observer_validation_status",
+        "observer_validation_reason",
+        "observer_provisional_direction",
         "paper_orders",
         "paper_execution_state",
         "publish_status",
@@ -9319,8 +9364,8 @@ def _paper_handoff_detail_panel(row: dict[str, Any]) -> str:
         ("及时可跟", _fmt_int(row.get("observer_actionable_signals")), f"{_fmt_int(row.get('observer_evaluations'))} observer evals", "ok" if int(row.get("observer_actionable_signals") or 0) else "warn"),
         (
             "观察结果",
-            f"{_fmt_int(row.get('observer_resolved_trials'))}/{_fmt_int(row.get('observer_trials'))}",
-            f"ROI {_fmt_num(row.get('observer_marked_roi_pct'))}%",
+            f"{_fmt_int(row.get('observer_resolved_markets'))}/{_fmt_int(row.get('observer_market_samples'))}",
+            f"{_status_label(row.get('observer_validation_status'))} · ROI {_fmt_num(row.get('observer_settled_roi_pct'))}%",
             "ok" if int(row.get("observer_trials") or 0) else "warn",
         ),
         (
@@ -9366,6 +9411,13 @@ def _paper_handoff_detail_panel(row: dict[str, Any]) -> str:
                 {"key": "observer_resolved_trials", "value": row.get("observer_resolved_trials") or 0},
                 {"key": "observer_marked_pnl_usd", "value": row.get("observer_marked_pnl_usd") or 0},
                 {"key": "observer_marked_roi_pct", "value": f"{_fmt_num(row.get('observer_marked_roi_pct'))}%"},
+                {"key": "observer_market_samples", "value": row.get("observer_market_samples") or 0},
+                {"key": "observer_resolved_markets", "value": row.get("observer_resolved_markets") or 0},
+                {"key": "observer_market_win_rate_pct", "value": f"{_fmt_num(row.get('observer_market_win_rate_pct'))}%"},
+                {"key": "observer_settled_roi_pct", "value": f"{_fmt_num(row.get('observer_settled_roi_pct'))}%"},
+                {"key": "observer_max_market_cost_share_pct", "value": f"{_fmt_num(row.get('observer_max_market_cost_share_pct'))}%"},
+                {"key": "observer_validation_status", "value": _status_label(row.get("observer_validation_status"))},
+                {"key": "observer_validation_reason", "value": row.get("observer_validation_reason") or ""},
             ],
             ["key", "value"],
             ["只读 observer 质量", "值"],
@@ -9394,7 +9446,9 @@ def _paper_handoff_wallets_table(rows: list[dict[str, Any]]) -> str:
             f'<td><div class="numline">{_fmt_int(row.get("observer_actionable_signals"))} actionable</div>'
             f'<small>{_fmt_int(row.get("observer_accepted_signals"))} accepted · {_fmt_int(row.get("observer_stale_signals"))} stale · {_fmt_int(row.get("observer_quote_errors"))} errors</small>'
             f'<small>{_badge(row.get("observer_quality_state") or "")} quality {_fmt_int(row.get("observer_quality_evaluations"))} eval · {_fmt_num(row.get("observer_quality_actionable_rate_pct"))}% actionable</small>'
-            f'<small>{_fmt_int(row.get("observer_resolved_trials"))}/{_fmt_int(row.get("observer_trials"))} resolved · {_fmt_num(row.get("observer_marked_roi_pct"))}% ROI</small></td>'
+            f'<small>{_badge(row.get("observer_validation_status") or "no_trials")} · '
+            f'{_fmt_int(row.get("observer_resolved_markets"))}/{_fmt_int(row.get("observer_market_samples"))} markets · '
+            f'{_fmt_num(row.get("observer_settled_roi_pct"))}% ROI</small></td>'
             f'<td><div class="numline">{_fmt_int(row.get("paper_orders"))} orders</div>'
             f'<small>{_fmt_pct(row.get("paper_total_roi"))} ROI · ready {_fmt_int(row.get("paper_ready"))}</small></td>'
             f'<td>{_e(row.get("formal_next_action") or row.get("next_action") or "")}'
@@ -9520,20 +9574,40 @@ def _paper_observer_trials_panel(values: dict[str, Any]) -> str:
             '<span>等待 paper observer 捕捉首个可及时跟信号。</span></div>'
         )
     resolved = int(values.get("resolved_trials") or 0)
-    marked = int(values.get("marked_trials") or 0)
+    resolved_markets = int(values.get("resolved_markets") or 0)
+    market_samples = int(values.get("market_samples") or 0)
+    validation_counts = values.get("validation_counts") or {}
+    validation_summary = " · ".join(
+        f"{_status_label(status)} {_fmt_int(count)}"
+        for status, count in sorted(validation_counts.items())
+    ) or "尚无钱包验证结论"
+    wallet_rows = [
+        {
+            **row,
+            "validation_label": _status_label(row.get("validation_status")),
+            "direction_label": _status_label(row.get("provisional_direction")),
+            "validation_reason_label": _observer_validation_reason_label(
+                row,
+                values.get("validation_policy") or {},
+            ),
+        }
+        for row in values.get("wallet_summaries") or []
+    ]
     cards = [
         ("研究试验", _fmt_int(total), f"{_fmt_int(values.get('wallets'))} 个钱包", "ok"),
         ("待结算", _fmt_int(values.get("open_trials")), "Gamma 持续标记", "warn" if int(values.get("open_trials") or 0) else "ok"),
-        ("已有市场价", _fmt_int(marked), f"覆盖 {marked}/{total}", "ok" if marked else "warn"),
-        ("已结算", _fmt_int(resolved), "只认 closed + 0/1 结果", "ok" if resolved else "warn"),
+        ("独立市场样本", _fmt_int(market_samples), "同市场重复买入只算一个样本", "ok" if market_samples else "warn"),
+        ("已结算市场", _fmt_int(resolved_markets), f"试验 {resolved}/{total}", "ok" if resolved_markets else "warn"),
         ("当前模拟盈亏", f"${_fmt_num(values.get('marked_pnl_usd'))}", f"ROI {_fmt_num(values.get('marked_roi_pct'))}%", "ok" if float(values.get("marked_pnl_usd") or 0) >= 0 else "warn"),
         ("已结算盈亏", f"${_fmt_num(values.get('settled_pnl_usd'))}", f"ROI {_fmt_num(values.get('settled_roi_pct'))}%", "ok" if resolved and float(values.get("settled_pnl_usd") or 0) >= 0 else "warn"),
-        ("已结算胜率", f"{_fmt_num(values.get('win_rate_pct'))}%", f"{_fmt_int(values.get('wins'))}/{_fmt_int(resolved)}", "ok" if resolved else "warn"),
+        ("市场胜率", f"{_fmt_num(values.get('win_rate_pct'))}%", f"{_fmt_int(values.get('winning_markets'))}/{_fmt_int(resolved_markets)}", "ok" if resolved_markets else "warn"),
+        ("最大市场占比", f"{_fmt_num(values.get('max_market_cost_share_pct'))}%", "验证门限制集中度", "ok" if resolved_markets else "warn"),
         ("最近更新", _fmt_ts(values.get("latest_updated_at")), "observer outcome loop", "ok"),
     ]
     return (
         f'<div class="health-banner {"ok" if resolved else "attention"}"><strong>{_e(values.get("boundary"))}</strong>'
         '<span>结果证据与正式 paper 订单、发布资格相互独立。</span></div>'
+        f'<p class="muted">{_e(validation_summary)}</p>'
         '<p class="muted"><a class="button secondary" href="/api/paper-observer-outcomes">JSON 结果证据</a></p>'
         '<div class="health-grid">'
         + "".join(
@@ -9543,11 +9617,46 @@ def _paper_observer_trials_panel(values: dict[str, Any]) -> str:
         + "</div>"
         + '<h3 class="subhead">按钱包汇总</h3>'
         + _simple_table(
-            values.get("wallet_summaries") or [],
-            ["wallet", "total_trials", "open_trials", "resolved_trials", "marked_pnl_usd", "marked_roi_pct", "settled_pnl_usd", "settled_roi_pct", "win_rate_pct", "latest_updated_at"],
-            ["钱包", "试验", "待结算", "已结算", "当前盈亏", "当前 ROI %", "结算盈亏", "结算 ROI %", "胜率 %", "最近更新"],
+            wallet_rows,
+            [
+                "wallet",
+                "validation_label",
+                "direction_label",
+                "total_trials",
+                "market_samples",
+                "resolved_markets",
+                "settled_pnl_usd",
+                "settled_roi_pct",
+                "win_rate_pct",
+                "max_market_cost_share_pct",
+                "validation_reason_label",
+                "latest_updated_at",
+            ],
+            ["钱包", "验证状态", "初步方向", "试验", "市场样本", "已结算市场", "结算盈亏", "结算 ROI %", "市场胜率 %", "最大市场占比 %", "判定依据", "最近更新"],
         )
     )
+
+
+def _observer_validation_reason_label(
+    row: dict[str, Any],
+    policy: dict[str, Any],
+) -> str:
+    status = str(row.get("validation_status") or "no_trials")
+    if status == "collecting_outcomes":
+        resolved = int(row.get("resolved_markets") or 0)
+        required = int(policy.get("min_resolved_markets") or 0)
+        if required and resolved < required:
+            return f"已结算市场 {resolved}/{required}"
+        settled_cost = float(row.get("settled_cost_usd") or 0)
+        required_cost = float(policy.get("min_settled_cost_usd") or 0)
+        return f"结算样本金额 ${_fmt_num(settled_cost)}/${_fmt_num(required_cost)}"
+    if status == "validation_concentrated":
+        concentration = float(row.get("max_market_cost_share_pct") or 0)
+        maximum = float(policy.get("max_market_cost_share_pct") or 0)
+        return f"最大市场占比 {_fmt_num(concentration)}%，门槛 {_fmt_num(maximum)}%"
+    if status in {"validated_promising", "validated_mixed", "validated_negative"}:
+        return f"市场级结算 ROI {_fmt_num(row.get('settled_roi_pct'))}%"
+    return "尚无可验证市场"
 
 
 def _paper_observer_evaluation_table(rows: list[dict[str, Any]]) -> str:
@@ -10516,11 +10625,27 @@ def _badge(value: Any) -> str:
         "screened",
         PaperEvidenceMode.FULL_L3.value,
         PaperEvidenceMode.BOUNDED_DEEP.value,
+        "validated_promising",
     }:
         style = " positive"
-    elif text in {"needs_data", "needs_manual_review", "incomplete", "queued", "running"}:
+    elif text in {
+        "needs_data",
+        "needs_manual_review",
+        "incomplete",
+        "queued",
+        "running",
+        "collecting_outcomes",
+        "validation_concentrated",
+        "validated_mixed",
+    }:
         style = " attention"
-    elif text in {"rejected", "blocked_hygiene", "blocked_copyability", "failed"}:
+    elif text in {
+        "rejected",
+        "blocked_hygiene",
+        "blocked_copyability",
+        "failed",
+        "validated_negative",
+    }:
         style = " blocked"
     label = _status_label(text)
     title = f' title="{_e(text)}"' if label != text else ""
@@ -10555,6 +10680,15 @@ def _status_label(value: Any) -> str:
         "default": "标准",
         PaperEvidenceMode.FULL_L3.value: "完整 L3",
         PaperEvidenceMode.BOUNDED_DEEP.value: "有限深度",
+        "no_trials": "暂无试验",
+        "collecting_outcomes": "继续积累市场样本",
+        "validation_concentrated": "样本过度集中",
+        "validated_promising": "结果验证良好",
+        "validated_mixed": "结果表现混合",
+        "validated_negative": "结果验证不佳",
+        "positive": "正向",
+        "negative": "负向",
+        "mixed": "混合",
     }
     return labels.get(text, text)
 

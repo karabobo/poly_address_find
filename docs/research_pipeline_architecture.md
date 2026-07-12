@@ -147,6 +147,13 @@ markets and records marks or final 0/1 settlements. It never writes `paper_order
 or `leader_publish`. Observer ROI is research evidence about signal timeliness and outcome quality; it is not a claim
 that an order was submitted or filled by an execution system.
 
+Observer validation uses `wallet + market_slug` as the independent sample. Repeated actionable trades in the same
+market remain visible as trials but contribute only one market result, one market-level win/loss, and one share of
+capital concentration. A market contributes to settled ROI only after all of that wallet's trials in the market are
+resolved. Configured minimum resolved markets, settled cost, ROI, and maximum one-market cost share produce a
+separate research status such as `collecting_outcomes`, `validated_promising`, or `validation_concentrated`.
+This status is descriptive: it never rewrites `candidate_stage` and never grants execution or publication permission.
+
 ## Reliability Rules
 
 - Queue claims use SQLite write serialization and leases.

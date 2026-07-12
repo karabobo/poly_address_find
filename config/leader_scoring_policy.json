@@ -67,6 +67,14 @@
     "watchlist": 50,
     "reject_below": 35
   },
+  "observer_validation": {
+    "version": "2026-07-13-market-sample-v1",
+    "min_resolved_markets": 20,
+    "min_settled_cost_usd": 500,
+    "min_promising_roi_pct": 3,
+    "max_negative_roi_pct": -5,
+    "max_market_cost_share_pct": 25
+  },
   "required_score_components": [
     "hygiene_status",
     "cumulative_win_rate",

@@ -2586,22 +2586,49 @@ def test_paper_observer_trials_panel_keeps_research_execution_boundary_visible()
             "open_trials": 3,
             "resolved_trials": 2,
             "marked_trials": 5,
+            "market_samples": 3,
+            "open_markets": 1,
+            "resolved_markets": 2,
+            "winning_markets": 1,
             "marked_pnl_usd": 12.5,
             "marked_roi_pct": 6.25,
             "settled_pnl_usd": 8.0,
             "settled_roi_pct": 10.0,
+            "max_market_cost_share_pct": 60.0,
             "wins": 1,
             "win_rate_pct": 50.0,
+            "validation_counts": {"collecting_outcomes": 2},
+            "validation_policy": {"min_resolved_markets": 20},
             "latest_updated_at": 1_800_000_000,
             "boundary": "只读研究试验，不写 paper_orders。",
-            "wallet_summaries": [],
+            "wallet_summaries": [
+                {
+                    "wallet": "0x1111111111111111111111111111111111111111",
+                    "validation_status": "collecting_outcomes",
+                    "provisional_direction": "positive",
+                    "total_trials": 3,
+                    "market_samples": 2,
+                    "resolved_markets": 2,
+                    "settled_pnl_usd": 8.0,
+                    "settled_roi_pct": 10.0,
+                    "win_rate_pct": 50.0,
+                    "max_market_cost_share_pct": 60.0,
+                    "latest_updated_at": 1_800_000_000,
+                }
+            ],
         }
     )
 
     assert "Paper Observer" not in html
     assert "研究试验" in html
     assert "不写 paper_orders" in html
-    assert "已有市场价" in html
+    assert "独立市场样本" in html
+    assert "已结算市场" in html
+    assert "市场胜率" in html
+    assert "最大市场占比" in html
+    assert "继续积累市场样本" in html
+    assert "已结算市场 2/20" in html
+    assert "resolved_markets:2&lt;20" not in html
     assert "已结算盈亏" in html
 
 
