@@ -529,6 +529,8 @@ def test_dashboard_shows_paper_handoff_without_implying_auto_execution(tmp_path)
     assert handoff["candidate_count"] == 1
     assert handoff["visible_wallet_count"] == 1
     assert handoff["visible_research_ready"] == 1
+    assert handoff["visible_full_l3"] == 1
+    assert handoff["visible_bounded_deep"] == 0
     assert handoff["stage_counts"] == [{"stage": "paper_approved", "count": 1}]
     assert handoff["wallets"][0]["address"] == wallet
     assert handoff["wallets"][0]["handoff_state"] == "awaiting_actionable_signal"
@@ -538,9 +540,12 @@ def test_dashboard_shows_paper_handoff_without_implying_auto_execution(tmp_path)
     assert handoff["wallets"][0]["observer_quality_evaluations"] == 0
     assert handoff["wallets"][0]["observer_quality_actionable_rate_pct"] == 0.0
     assert handoff["wallets"][0]["research_ready"] is True
+    assert handoff["wallets"][0]["paper_evidence_mode"] == "full_l3"
     assert handoff["wallets"][0]["research_check_passed"] == 4
     assert handoff["wallets"][0]["research_check_total"] == 4
     assert handoff["wallets"][0]["research_check_summary"] == "研究证据完整"
+    assert handoff["wallets"][0]["research_checks"][1]["label"] == "L3 深证据完成"
+    assert handoff["wallets"][0]["research_checks"][1]["mode"] == "full_l3"
     assert handoff["wallets"][0]["research_checks"][2]["value"] == "screened"
     assert handoff["wallets"][0]["paper_execution_state"] == "not_started_on_nas"
     assert "runtime_research_only" in handoff["wallets"][0]["formal_blocker_list"]
@@ -570,10 +575,12 @@ def test_dashboard_shows_paper_handoff_without_implying_auto_execution(tmp_path)
     assert publish_gate["paper_stage_gap_wallets"][0]["address"] == wallet
     assert publish_gate["paper_stage_gap_wallets"][0]["formal_next_action"] == "当前 NAS 只做 research/scoring；正式化需要独立 paper/settle/publish 运行面。"
     assert "runtime_research_only" in publish_gate["paper_stage_gap_wallets"][0]["formal_blocker_list"]
+    assert "paper_evidence_tier_incomplete" not in publish_gate["paper_stage_gap_wallets"][0]["formal_blocker_list"]
     publish_blockers = {row["blocker"]: row for row in publish_gate["formal_blocker_rows"]}
     assert publish_gate["top_formal_blocker"] == "missing_paper_wallet_quality"
     assert publish_blockers["runtime_research_only"]["count"] == 1
     assert publish_blockers["stage_not_live_eligible"]["count"] == 1
+    assert "paper_evidence_tier_incomplete" not in publish_blockers
     assert publish_blockers["missing_paper_wallet_quality"]["count"] == 1
     assert publish_blockers["no_paper_orders"]["count"] == 1
     assert publish_blockers["publish_not_active"]["count"] == 1
@@ -599,6 +606,7 @@ def test_dashboard_shows_paper_handoff_without_implying_auto_execution(tmp_path)
     assert csv_rows[0]["observer_quality_state"] == "no_observer_quality"
     assert csv_rows[0]["observer_quality_evaluations"] == "0"
     assert csv_rows[0]["research_ready"] == "True"
+    assert csv_rows[0]["paper_evidence_mode"] == "full_l3"
     assert csv_rows[0]["paper_execution_state"] == "not_started_on_nas"
     assert "missing_paper_wallet_quality" in csv_rows[0]["formal_blockers"]
     assert csv_rows[0]["formal_next_action"] == "当前 NAS 只做 research/scoring；正式化需要独立 paper/settle/publish 运行面。"
@@ -643,6 +651,9 @@ def test_dashboard_shows_paper_handoff_without_implying_auto_execution(tmp_path)
     assert "未启用" in html
     assert "not_started_in_nas_research_stack" in html
     assert "研究证据完整" in html
+    assert "完整 L3" in html
+    assert "有限历史达标" in html
+    assert '<div class="health-card ok"><span>有限历史达标</span><strong>0</strong>' in html
     assert "等待新信号" in html
     assert "actionable" in html
     assert "not_started_on_nas" in html
@@ -721,6 +732,127 @@ def test_paper_handoff_ignores_stale_actionable_observer_rows(tmp_path):
     assert data["production_readiness"]["observer_current_window_sec"] == 600
     assert data["production_readiness"]["observer_actionable_signals"] == 0
     assert data["production_readiness"]["state"] == "paper_candidates_waiting_actionable_signals"
+
+
+def test_formal_publish_gate_requires_evidence_on_the_same_live_wallet(tmp_path):
+    settings = RobotSettings(
+        db_path=tmp_path / "pm_robot.sqlite",
+        execution_mode="paper",
+    )
+    wallet = "0xabc00000000000000000000000000000000000fe"
+    now = 1_800_000_000
+    conn = connect(settings.db_path)
+    try:
+        run_migrations(conn)
+        conn.execute(
+            """
+            INSERT INTO candidate_wallets(
+                address, sources, labels, notes, links, status,
+                candidate_stage, first_seen_at, updated_at
+            ) VALUES (?, 'formal-gate-test', '', '', '', 'active',
+                      'live_eligible', ?, ?)
+            """,
+            (wallet, now - 100, now),
+        )
+        conn.execute(
+            """
+            INSERT INTO wallet_processing_state(
+                wallet, discovery_tier, evidence_status, evidence_depth,
+                evidence_confidence, priority, current_stage, next_action,
+                next_action_at, activity_count, distinct_markets,
+                non_fast_trade_count, updated_at
+            ) VALUES (?, 'l1_light', 'summary_ready', 500, 0.9, 1,
+                      'deep_done', 'score_wallet', 0, 500, 20, 100, ?)
+            """,
+            (wallet, now),
+        )
+        conn.execute(
+            """
+            INSERT INTO paper_wallet_quality(
+                wallet, orders, open_positions, settled_positions,
+                gamma_marked_positions, fallback_marked_positions,
+                mark_coverage, settled_cost_usd, settled_pnl_usd,
+                settled_roi, total_pnl_usd, total_roi, production_ready,
+                blockers_json, updated_at
+            ) VALUES (?, 5, 0, 5, 5, 0, 1.0, 100, 20, 0.2,
+                      20, 0.2, 1, '[]', ?)
+            """,
+            (wallet, now),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    blocked_gate = dashboard_data(settings)["production_readiness"]["formal_publish_gate"]
+
+    assert blocked_gate["state"] == "waiting_paper_evidence"
+    assert blocked_gate["root_formal_blocker"] == "paper_evidence_tier_incomplete"
+    assert blocked_gate["live_quality_ready_wallets"] == 1
+    assert blocked_gate["live_evidence_incomplete_wallets"] == 1
+    assert blocked_gate["publish_ready_wallets"] == 0
+
+    conn = connect(settings.db_path)
+    try:
+        conn.execute(
+            """
+            UPDATE wallet_processing_state
+            SET discovery_tier = 'l2_medium'
+            WHERE wallet = ?
+            """,
+            (wallet,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    ready_gate = dashboard_data(settings)["production_readiness"]["formal_publish_gate"]
+
+    assert ready_gate["state"] == "publish_loop_needed"
+    assert ready_gate["root_formal_blocker"] == "publish_not_active"
+    assert ready_gate["publish_ready_wallets"] == 1
+
+    conn = connect(settings.db_path)
+    try:
+        conn.execute(
+            """
+            INSERT INTO leader_publish(
+                wallet, publish_stage, status, leader_score, review_reason,
+                paper_quality_json, readiness_json, evidence_json,
+                blockers_json, published_at, expires_at, revoked_at,
+                revoke_reason
+            ) VALUES (?, 'live_eligible', 'active', 80, '', '{}', '{}', '{}',
+                      '[]', ?, ?, NULL, '')
+            """,
+            (wallet, now, now + 10_000),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    active_gate = dashboard_data(settings)["production_readiness"]["formal_publish_gate"]
+
+    assert active_gate["state"] == "published_active"
+    assert active_gate["root_formal_blocker"] == ""
+
+    conn = connect(settings.db_path)
+    try:
+        conn.execute(
+            """
+            UPDATE wallet_processing_state
+            SET discovery_tier = 'l1_light'
+            WHERE wallet = ?
+            """,
+            (wallet,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    invalid_active_gate = dashboard_data(settings)["production_readiness"]["formal_publish_gate"]
+
+    assert invalid_active_gate["state"] == "published_active_with_blockers"
+    assert invalid_active_gate["root_formal_blocker"] == "paper_evidence_tier_incomplete"
+    assert invalid_active_gate["active_evidence_incomplete_wallets"] == 1
 
 
 def test_paper_handoff_route_is_a_dedicated_lightweight_export():
@@ -2300,10 +2432,12 @@ def test_dashboard_groups_paper_evidence_incomplete_review(tmp_path):
     signal_counts = {row["signal"]: row["count"] for row in discovery["signal_counts"]}
 
     assert data["top_review_candidates"][0]["blocker_key"] == "paper_evidence_incomplete"
-    assert data["top_review_candidates"][0]["blocker_label"] == "L3 证据未完成"
-    assert data["production_readiness"]["manual_review_actions"][0]["blocker"] == "L3 证据未完成"
-    assert data["production_readiness"]["manual_review_actions"][0]["next_action"] == "保持复核；L3 未达 summary_ready，不进入 paper"
-    assert "保持复核；L3 未达 summary_ready，不进入 paper" in html
+    assert data["top_review_candidates"][0]["blocker_label"] == "Paper 证据门槛未完成"
+    assert data["production_readiness"]["manual_review_actions"][0]["blocker"] == "Paper 证据门槛未完成"
+    assert data["production_readiness"]["manual_review_actions"][0]["next_action"] == (
+        "继续补深度证据；达到 L3 或有限历史深度门槛前不进入 paper"
+    )
+    assert "继续补深度证据；达到 L3 或有限历史深度门槛前不进入 paper" in html
     assert signal_counts["review_paper_evidence_incomplete"] == 1
     assert len(rows) == 1
     assert rows[0]["evidence_tier"] == "l2_medium"
@@ -2320,6 +2454,22 @@ def test_dashboard_does_not_group_bounded_deep_summary_as_paper_incomplete(tmp_p
             UPDATE leader_scores
             SET leader_score = 71.91,
                 review_reason = 'paper_evidence_tier_incomplete'
+            WHERE address = ?
+            """,
+            (wallet,),
+        )
+        conn.execute(
+            """
+            UPDATE candidate_wallets
+            SET candidate_stage = 'paper_approved'
+            WHERE address = ?
+            """,
+            (wallet,),
+        )
+        conn.execute(
+            """
+            UPDATE wallet_features
+            SET hygiene_status = 'screened'
             WHERE address = ?
             """,
             (wallet,),
@@ -2354,10 +2504,63 @@ def test_dashboard_does_not_group_bounded_deep_summary_as_paper_incomplete(tmp_p
 
     rows = wallet_table_rows(settings, signal="review_paper_evidence_incomplete")
     discovery = discovery_data(settings)
+    handoff = paper_handoff_data(settings)
+    dashboard = dashboard_data(settings)
     signal_counts = {row["signal"]: row["count"] for row in discovery["signal_counts"]}
 
     assert signal_counts.get("review_paper_evidence_incomplete", 0) == 0
     assert rows == []
+    assert handoff["visible_full_l3"] == 0
+    assert handoff["visible_bounded_deep"] == 1
+    assert handoff["wallets"][0]["paper_evidence_mode"] == "bounded_deep"
+    assert handoff["wallets"][0]["research_check_summary"] == "研究证据可用（有限历史）"
+    assert handoff["wallets"][0]["research_checks"][1]["label"] == "有限历史深度完成"
+    assert handoff["wallets"][0]["research_checks"][1]["mode"] == "bounded_deep"
+    handoff_html = web_module._paper_handoff_panel(handoff)
+    assert '<div class="health-card ok"><span>完整 L3</span><strong>0</strong>' in handoff_html
+    publish_gate = dashboard["production_readiness"]["formal_publish_gate"]
+    gap = publish_gate["paper_stage_gap_wallets"][0]
+    assert gap["paper_evidence_mode"] == "bounded_deep"
+    assert "paper_evidence_tier_incomplete" not in gap["formal_blocker_list"]
+    assert "paper_evidence_tier_incomplete" not in {
+        row["blocker"] for row in publish_gate["formal_blocker_rows"]
+    }
+
+
+def test_evidence_mode_cards_ignore_unrelated_research_gate_failures():
+    panel_html = web_module._paper_handoff_panel(
+        {
+            "candidate_count": 1,
+            "visible_wallet_count": 1,
+            "visible_research_ready": 0,
+            "visible_full_l3": 1,
+            "visible_bounded_deep": 0,
+            "visible_research_incomplete": 1,
+            "paper_min_score": 70,
+            "nas_paper_loop_enabled": False,
+            "stage_counts": [],
+            "state_counts": [],
+            "incomplete_research_wallets": [],
+            "wallets": [],
+        }
+    )
+    detail_html = web_module._paper_handoff_detail_panel(
+        {
+            "paper_evidence_mode": "full_l3",
+            "evidence_tier": "l3_deep",
+            "research_ready": False,
+            "research_check_passed": 3,
+            "research_check_total": 4,
+            "research_check_summary": "缺 Copyability 已验证",
+            "research_checks": [],
+        }
+    )
+
+    assert '<div class="health-card ok"><span>完整 L3</span><strong>1</strong>' in panel_html
+    assert (
+        '<div class="health-card ok"><span>证据模式</span><strong>完整 L3</strong>'
+        in detail_html
+    )
 
 
 def test_dashboard_groups_needs_data_reasons_into_operator_actions(tmp_path):

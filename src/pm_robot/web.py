@@ -38,7 +38,12 @@ from pm_robot.orchestration.pipeline_audit import (
     PENDING_EVIDENCE_ACTIONS,
 )
 from pm_robot.orchestration.paper_runner import preview_paper_observer
-from pm_robot.orchestration.evidence_readiness import paper_evidence_ready, paper_evidence_ready_sql
+from pm_robot.orchestration.evidence_readiness import (
+    PaperEvidenceMode,
+    paper_evidence_mode,
+    paper_evidence_ready,
+    paper_evidence_ready_sql,
+)
 from pm_robot.risk.eligibility import ELIGIBLE_HYGIENE_STATUSES
 from pm_robot.orchestration.feature_materializer import MATERIALIZER_VERSION
 from pm_robot.orchestration.review_disposition import review_disposition
@@ -2485,7 +2490,7 @@ def _discovery_signal_counts(
         {"signal": "review_copy_light_no_signal", "name": "复核: 轻扫无信号", "count": _wallet_signal_count(conn, stage=stage, source=source, query=query, signal="review_copy_light_no_signal")},
         {"signal": "review_copy_near_miss", "name": "观察: 深扫近失", "count": _wallet_signal_count(conn, stage=stage, source=source, query=query, signal="review_copy_near_miss")},
         {"signal": "review_copy_unvalidated", "name": "自动: Copy 待验证", "count": _wallet_signal_count(conn, stage=stage, source=source, query=query, signal="review_copy_unvalidated")},
-        {"signal": "review_paper_evidence_incomplete", "name": "复核: L3 未完成", "count": _wallet_signal_count(conn, stage=stage, source=source, query=query, signal="review_paper_evidence_incomplete")},
+        {"signal": "review_paper_evidence_incomplete", "name": "复核: Paper 证据未达门槛", "count": _wallet_signal_count(conn, stage=stage, source=source, query=query, signal="review_paper_evidence_incomplete")},
         {"signal": "review_thin_evidence", "name": "复核: 历史偏薄", "count": _wallet_signal_count(conn, stage=stage, source=source, query=query, signal="review_thin_evidence")},
         {"signal": "review_missing_copyability", "name": "复核: 缺 Copy", "count": _wallet_signal_count(conn, stage=stage, source=source, query=query, signal="review_missing_copyability")},
         {"signal": "copy_signal", "name": "Copy 结构", "count": _wallet_signal_count(conn, stage=stage, source=source, query=query, signal="copy_signal")},
@@ -5486,6 +5491,7 @@ def _paper_candidate_min_score(settings: RobotSettings) -> float:
 def _apply_review_disposition(row: dict[str, Any], *, paper_min_score: float) -> None:
     """Attach read-only handling metadata; persisted candidate_stage is unchanged."""
 
+    row["paper_evidence_mode"] = paper_evidence_mode(row).value
     row["paper_evidence_ready"] = paper_evidence_ready(row)
     disposition = review_disposition(row, paper_min_score=paper_min_score)
     row["blocker_key"] = disposition.key
@@ -5526,7 +5532,7 @@ def _top_review_blocker_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]
 def _review_blocker_next_action(key: str) -> str:
     actions = {
         "paper_ready": "进入外部 paper 验证或发布前复核",
-        "paper_evidence_incomplete": "保持复核；L3 未达 summary_ready，不进入 paper",
+        "paper_evidence_incomplete": "继续补深度证据；达到 L3 或有限历史深度门槛前不进入 paper",
         "hygiene_blocked": "保持阻断；只在风险证据修正后复核",
         "copyability_blocked": "保持阻断；只在新增 copyability 证据后复核",
         "rejected": "保持拒绝；不进入自动队列",
@@ -5559,6 +5565,16 @@ def _paper_handoff_summary(conn: sqlite3.Connection, settings: RobotSettings, *,
     state_counts = _paper_handoff_state_counts(conn, observer_current_cutoff=observer_current_cutoff)
     candidate_count = sum(int(row.get("count") or 0) for row in stage_counts)
     visible_research_ready = sum(1 for row in rows if row.get("research_ready"))
+    visible_full_l3 = sum(
+        1
+        for row in rows
+        if row.get("paper_evidence_mode") == PaperEvidenceMode.FULL_L3.value
+    )
+    visible_bounded_deep = sum(
+        1
+        for row in rows
+        if row.get("paper_evidence_mode") == PaperEvidenceMode.BOUNDED_DEEP.value
+    )
     incomplete_research_wallets = [
         {
             "address": row.get("address") or "",
@@ -5594,6 +5610,8 @@ def _paper_handoff_summary(conn: sqlite3.Connection, settings: RobotSettings, *,
         "paper_min_score": paper_min_score,
         "observer_current_window_sec": PAPER_OBSERVER_CURRENT_EVALUATION_MAX_AGE_SEC,
         "visible_research_ready": visible_research_ready,
+        "visible_full_l3": visible_full_l3,
+        "visible_bounded_deep": visible_bounded_deep,
         "visible_research_incomplete": len(incomplete_research_wallets),
         "incomplete_research_wallets": incomplete_research_wallets,
         "stage_counts": stage_counts,
@@ -5657,6 +5675,7 @@ def _paper_handoff_csv(summary: dict[str, Any]) -> str:
         "publish_status",
         "formal_blockers",
         "formal_next_action",
+        "paper_evidence_mode",
     ]
     out = io.StringIO()
     writer = csv.DictWriter(out, fieldnames=fields, extrasaction="ignore")
@@ -5872,6 +5891,7 @@ def _paper_handoff_rows(
         state, action = _paper_handoff_state(row)
         row["handoff_state"] = state
         row["next_action"] = action
+        row["paper_evidence_mode"] = paper_evidence_mode(row).value
         checks = _paper_handoff_research_checks(row, paper_min_score=paper_min_score)
         row["research_checks"] = checks
         row["research_check_passed"] = sum(1 for check in checks if check["passed"])
@@ -5932,6 +5952,12 @@ def _paper_handoff_research_checks(row: dict[str, Any], *, paper_min_score: floa
     backtest_trades = int(row.get("backtest_trade_count") or 0)
     edge_retention = float(row.get("edge_retention_pct") or 0)
     walk_forward = float(row.get("walk_forward_consistency_pct") or 0)
+    evidence_mode = paper_evidence_mode(row)
+    evidence_labels = {
+        PaperEvidenceMode.FULL_L3: "L3 深证据完成",
+        PaperEvidenceMode.BOUNDED_DEEP: "有限历史深度完成",
+        PaperEvidenceMode.INCOMPLETE: "深证据不足",
+    }
     return [
         {
             "key": "score_ready",
@@ -5941,9 +5967,14 @@ def _paper_handoff_research_checks(row: dict[str, Any], *, paper_min_score: floa
         },
         {
             "key": "l3_summary",
-            "label": "深证据完成",
-            "passed": paper_evidence_ready(row),
-            "value": f"{evidence_tier or 'none'}:{evidence_status or 'none'}:{evidence_current_stage or 'none'}",
+            "label": evidence_labels[evidence_mode],
+            "passed": evidence_mode is not PaperEvidenceMode.INCOMPLETE,
+            "mode": evidence_mode.value,
+            "value": (
+                f"{evidence_mode.value} | "
+                f"{evidence_tier or 'none'}:{evidence_status or 'none'}:"
+                f"{evidence_current_stage or 'none'}"
+            ),
         },
         {
             "key": "hygiene_clean",
@@ -5963,6 +5994,12 @@ def _paper_handoff_research_checks(row: dict[str, Any], *, paper_min_score: floa
 def _paper_handoff_check_summary(checks: list[dict[str, Any]]) -> str:
     missing = [str(check.get("label") or check.get("key") or "") for check in checks if not check.get("passed")]
     if not missing:
+        evidence_check = next(
+            (check for check in checks if check.get("key") == "l3_summary"),
+            {},
+        )
+        if evidence_check.get("mode") == PaperEvidenceMode.BOUNDED_DEEP.value:
+            return "研究证据可用（有限历史）"
         return "研究证据完整"
     return "缺 " + "、".join(missing)
 
@@ -5997,7 +6034,7 @@ def _paper_handoff_formal_blockers(row: dict[str, Any], *, research_only: bool) 
 
     priority_actions = {
         "runtime_research_only": "当前 NAS 只做 research/scoring；正式化需要独立 paper/settle/publish 运行面。",
-        "paper_evidence_tier_incomplete": "先完成 L3 深度证据，再进入 paper 和正式发布链路。",
+        "paper_evidence_tier_incomplete": "先完成 L3 或达到有限历史深度门槛，再进入 paper 和正式发布链路。",
         "missing_paper_wallet_quality": "等待及时信号后生成 paper_orders，并通过 settle 形成 paper_wallet_quality。",
         "paper_quality_not_production_ready": "继续累计纸面订单、结算和风险观察，直到 production_ready。",
         "no_paper_orders": "先让 paper observer 捕捉可及时跟的 BUY 信号，再进入纸面订单验证。",
@@ -6453,6 +6490,52 @@ def _formal_publish_gate_summary(
         WHERE cw.candidate_stage IN ('paper_candidate', 'paper_approved', 'live_eligible')
         """
     ).fetchone()
+    live_gate_row = conn.execute(
+        f"""
+        WITH live_gate AS (
+            SELECT
+                cw.address,
+                COALESCE(pwq.production_ready, 0) AS quality_ready,
+                CASE
+                    WHEN lp.status = 'active'
+                     AND lp.revoked_at IS NULL
+                     AND (lp.expires_at = 0 OR lp.expires_at > ?)
+                    THEN 1 ELSE 0
+                END AS active_publish,
+                CASE
+                    WHEN {paper_evidence_ready_sql('wps')} THEN 1
+                    ELSE 0
+                END AS evidence_ready
+            FROM candidate_wallets cw
+            LEFT JOIN wallet_processing_state wps
+              ON wps.wallet = cw.address
+            LEFT JOIN paper_wallet_quality pwq
+              ON pwq.wallet = cw.address
+            LEFT JOIN leader_publish lp
+              ON lp.wallet = cw.address
+            WHERE cw.candidate_stage = 'live_eligible'
+        )
+        SELECT
+            SUM(CASE WHEN evidence_ready = 1 THEN 1 ELSE 0 END) AS evidence_ready_wallets,
+            SUM(CASE WHEN evidence_ready = 0 THEN 1 ELSE 0 END) AS evidence_incomplete_wallets,
+            SUM(CASE WHEN quality_ready = 1 THEN 1 ELSE 0 END) AS quality_ready_wallets,
+            SUM(CASE
+                    WHEN evidence_ready = 1 AND quality_ready = 1
+                    THEN 1 ELSE 0
+                END) AS publish_ready_wallets,
+            SUM(CASE WHEN active_publish = 1 THEN 1 ELSE 0 END) AS active_live_wallets,
+            SUM(CASE
+                    WHEN active_publish = 1 AND evidence_ready = 0
+                    THEN 1 ELSE 0
+                END) AS active_evidence_incomplete_wallets,
+            SUM(CASE
+                    WHEN active_publish = 1 AND quality_ready = 0
+                    THEN 1 ELSE 0
+                END) AS active_quality_incomplete_wallets
+        FROM live_gate
+        """,
+        (now,),
+    ).fetchone()
     publish_row = conn.execute(
         """
         SELECT
@@ -6473,6 +6556,13 @@ def _formal_publish_gate_summary(
     paper_stage_with_quality = int(paper_stage_quality["paper_stage_with_quality"] or 0) if paper_stage_quality else 0
     paper_stage_missing_quality = int(paper_stage_quality["paper_stage_missing_quality"] or 0) if paper_stage_quality else 0
     paper_stage_production_ready = int(paper_stage_quality["paper_stage_production_ready"] or 0) if paper_stage_quality else 0
+    live_evidence_ready_wallets = int(live_gate_row["evidence_ready_wallets"] or 0) if live_gate_row else 0
+    live_evidence_incomplete_wallets = int(live_gate_row["evidence_incomplete_wallets"] or 0) if live_gate_row else 0
+    live_quality_ready_wallets = int(live_gate_row["quality_ready_wallets"] or 0) if live_gate_row else 0
+    publish_ready_wallets = int(live_gate_row["publish_ready_wallets"] or 0) if live_gate_row else 0
+    active_live_wallets = int(live_gate_row["active_live_wallets"] or 0) if live_gate_row else 0
+    active_evidence_incomplete_wallets = int(live_gate_row["active_evidence_incomplete_wallets"] or 0) if live_gate_row else 0
+    active_quality_incomplete_wallets = int(live_gate_row["active_quality_incomplete_wallets"] or 0) if live_gate_row else 0
     active_published_leaders = int(publish_row["active_published_leaders"] or 0) if publish_row else 0
     revoked_published_leaders = int(publish_row["revoked_published_leaders"] or 0) if publish_row else 0
     latest_published_at = int(publish_row["latest_published_at"] or 0) if publish_row else 0
@@ -6482,9 +6572,22 @@ def _formal_publish_gate_summary(
     paper_stage_gap_wallets = _paper_stage_formal_gap_rows(conn, research_only=research_only)
 
     if active_published_leaders:
-        state = "published_active"
-        next_action = "已有 active published leader；继续监控过期、撤销和纸面质量回撤。"
-        root_formal_blocker = ""
+        if active_live_wallets < active_published_leaders:
+            state = "published_active_with_blockers"
+            next_action = "存在不再属于 live_eligible 的 active 发布；应先撤销或重新验证。"
+            root_formal_blocker = "stage_not_live_eligible"
+        elif active_evidence_incomplete_wallets > 0:
+            state = "published_active_with_blockers"
+            next_action = "active 发布钱包的研究证据已失效；应先撤销，补足证据后再发布。"
+            root_formal_blocker = "paper_evidence_tier_incomplete"
+        elif active_quality_incomplete_wallets > 0:
+            state = "published_active_with_blockers"
+            next_action = "active 发布钱包的 paper quality 已失效；应先撤销并重新观察。"
+            root_formal_blocker = "paper_quality_not_production_ready"
+        else:
+            state = "published_active"
+            next_action = "已有 active published leader；继续监控过期、撤销和纸面质量回撤。"
+            root_formal_blocker = ""
         root_formal_next_action = next_action
     elif research_only:
         state = "research_mode_publish_disabled"
@@ -6496,15 +6599,22 @@ def _formal_publish_gate_summary(
         next_action = "还没有 live_eligible 钱包；先让 paper 质量证据稳定后再开放发布。"
         root_formal_blocker = "stage_not_live_eligible"
         root_formal_next_action = next_action
-    elif paper_stage_production_ready <= 0:
+    elif publish_ready_wallets > 0:
+        state = "publish_loop_needed"
+        next_action = "存在同时满足证据与纸面质量的钱包但没有 active 发布；检查 publish-leaders 运行面。"
+        root_formal_blocker = "publish_not_active"
+        root_formal_next_action = next_action
+    elif live_evidence_ready_wallets <= 0 or (
+        live_quality_ready_wallets > 0 and live_evidence_incomplete_wallets > 0
+    ):
+        state = "waiting_paper_evidence"
+        next_action = "live_eligible 钱包仍缺 paper 研究证据；先完成 L3 或有限历史深度门槛。"
+        root_formal_blocker = "paper_evidence_tier_incomplete"
+        root_formal_next_action = next_action
+    else:
         state = "waiting_paper_quality"
         next_action = "已有候选但没有 production_ready 纸面质量；需要 paper orders、settlement 和稳定观察证据。"
         root_formal_blocker = "paper_quality_not_production_ready"
-        root_formal_next_action = next_action
-    else:
-        state = "publish_loop_needed"
-        next_action = "存在 production_ready 钱包但没有 active 发布；检查 publish-leaders 运行面和 publish eligibility。"
-        root_formal_blocker = "publish_not_active"
         root_formal_next_action = next_action
 
     gate_rows = [
@@ -6525,6 +6635,12 @@ def _formal_publish_gate_summary(
             "status": "缺失" if paper_stage_missing_quality else "已有",
             "count": f"{paper_stage_with_quality}/{paper_stage_wallets}",
             "next_action": "需要 paper_orders/settle 生成 paper_wallet_quality" if paper_stage_missing_quality else "继续看 production_ready",
+        },
+        {
+            "gate": "Live 证据门槛",
+            "status": "通过" if live_evidence_ready_wallets else "未通过",
+            "count": f"{live_evidence_ready_wallets}/{live_eligible_wallets}",
+            "next_action": "继续检查纸面质量" if live_evidence_ready_wallets else "完成 L3 或有限历史深度门槛",
         },
         {
             "gate": "Production ready",
@@ -6566,6 +6682,13 @@ def _formal_publish_gate_summary(
         "paper_stage_with_quality": paper_stage_with_quality,
         "paper_stage_missing_quality": paper_stage_missing_quality,
         "paper_stage_production_ready": paper_stage_production_ready,
+        "live_evidence_ready_wallets": live_evidence_ready_wallets,
+        "live_evidence_incomplete_wallets": live_evidence_incomplete_wallets,
+        "live_quality_ready_wallets": live_quality_ready_wallets,
+        "publish_ready_wallets": publish_ready_wallets,
+        "active_live_wallets": active_live_wallets,
+        "active_evidence_incomplete_wallets": active_evidence_incomplete_wallets,
+        "active_quality_incomplete_wallets": active_quality_incomplete_wallets,
         "active_published_leaders": active_published_leaders,
         "revoked_published_leaders": revoked_published_leaders,
         "latest_published_at": latest_published_at,
@@ -6626,6 +6749,12 @@ def _paper_stage_formal_gap_rows(
             cw.candidate_stage,
             ROUND(COALESCE(ls.leader_score, 0), 2) AS leader_score,
             COALESCE(ls.review_reason, '') AS review_reason,
+            COALESCE(wps.discovery_tier, '') AS evidence_tier,
+            COALESCE(wps.evidence_status, '') AS evidence_status,
+            COALESCE(wps.current_stage, '') AS evidence_current_stage,
+            COALESCE(wps.activity_count, 0) AS activity_count,
+            COALESCE(wps.distinct_markets, 0) AS distinct_markets,
+            COALESCE(wps.non_fast_trade_count, 0) AS non_fast_trade_count,
             CASE WHEN pwq.wallet IS NULL THEN 0 ELSE 1 END AS paper_quality_present,
             COALESCE(pwq.orders, 0) AS paper_orders,
             COALESCE(pwq.settled_positions, 0) AS paper_settled_positions,
@@ -6634,6 +6763,8 @@ def _paper_stage_formal_gap_rows(
         FROM candidate_wallets cw
         LEFT JOIN leader_latest_scores ls
           ON ls.address = cw.address
+        LEFT JOIN wallet_processing_state wps
+          ON wps.wallet = cw.address
         LEFT JOIN paper_wallet_quality pwq
           ON pwq.wallet = cw.address
         LEFT JOIN leader_publish lp
@@ -6654,6 +6785,7 @@ def _paper_stage_formal_gap_rows(
         (min(max(int(limit), 1), MAX_LIST_LIMIT),),
     )
     for row in rows:
+        row["paper_evidence_mode"] = paper_evidence_mode(row).value
         blockers, formal_action = _paper_handoff_formal_blockers(row, research_only=research_only)
         row["formal_blocker_list"] = blockers
         row["formal_blockers"] = " | ".join(blockers)
@@ -6684,8 +6816,14 @@ def _formal_publish_blocker_rows(conn: sqlite3.Connection, *, research_only: boo
                 COALESCE(pwq.production_ready, 0) AS production_ready,
                 COALESCE(lp.status, '') AS publish_status,
                 COALESCE(lp.revoked_at, 0) AS revoked_at,
-                COALESCE(lp.expires_at, 0) AS expires_at
+                COALESCE(lp.expires_at, 0) AS expires_at,
+                CASE
+                    WHEN {paper_evidence_ready_sql('wps')} THEN 1
+                    ELSE 0
+                END AS paper_evidence_ready
             FROM candidate_wallets cw
+            LEFT JOIN wallet_processing_state wps
+              ON wps.wallet = cw.address
             LEFT JOIN paper_wallet_quality pwq
               ON pwq.wallet = cw.address
             LEFT JOIN leader_publish lp
@@ -6696,6 +6834,8 @@ def _formal_publish_blocker_rows(conn: sqlite3.Connection, *, research_only: boo
             {runtime_select}
             UNION ALL
             SELECT address, 'stage_not_live_eligible' FROM scoped WHERE candidate_stage != 'live_eligible'
+            UNION ALL
+            SELECT address, 'paper_evidence_tier_incomplete' FROM scoped WHERE paper_evidence_ready = 0
             UNION ALL
             SELECT address, 'missing_paper_wallet_quality' FROM scoped WHERE paper_quality_present = 0
             UNION ALL
@@ -6714,6 +6854,7 @@ def _formal_publish_blocker_rows(conn: sqlite3.Connection, *, research_only: boo
             CASE blocker
                 WHEN 'runtime_research_only' THEN '当前 NAS 是 research/scoring，不会自动 paper/settle/publish。'
                 WHEN 'stage_not_live_eligible' THEN '先通过稳定 paper 质量升级到 live_eligible。'
+                WHEN 'paper_evidence_tier_incomplete' THEN '先完成 L3 或达到有限历史深度门槛。'
                 WHEN 'missing_paper_wallet_quality' THEN '等待及时 BUY 信号后生成 paper_orders 和 paper_wallet_quality。'
                 WHEN 'paper_quality_not_production_ready' THEN '继续累计纸面订单、结算、ROI 和风险观察。'
                 WHEN 'no_paper_orders' THEN '先捕捉可及时跟的 BUY，再进入纸面订单验证。'
@@ -8663,8 +8804,9 @@ def _paper_handoff_panel(values: dict[str, Any]) -> str:
     cards = [
         ("交接钱包", _fmt_int(values.get("candidate_count")), "paper_candidate+", "ok" if wallets else "warn"),
         ("当前显示", _fmt_int(values.get("visible_wallet_count")), "页面样本", "ok"),
-        ("研究证据完整", _fmt_int(values.get("visible_research_ready")), f"当前显示 / 阈值 {_fmt_num(values.get('paper_min_score'))}", "ok" if int(values.get("visible_research_ready") or 0) else "warn"),
-        ("证据不完整", _fmt_int(values.get("visible_research_incomplete")), "paper-stage 但未过 4/4", "warn" if int(values.get("visible_research_incomplete") or 0) else "ok"),
+        ("完整 L3", _fmt_int(values.get("visible_full_l3")), "证据层级达到 l3_deep", "ok"),
+        ("有限历史达标", _fmt_int(values.get("visible_bounded_deep")), "保留真实 L2，不伪装成 L3", "ok"),
+        ("研究门槛未通过", _fmt_int(values.get("visible_research_incomplete")), "paper-stage 但未过 4/4", "warn" if int(values.get("visible_research_incomplete") or 0) else "ok"),
         ("NAS Paper Loop", paper_loop_label, values.get("paper_loop_status") or "", "ok" if values.get("nas_paper_loop_enabled") is False else "warn"),
         ("等待新信号", _fmt_int(waiting_actionable), "actionable BUY", "warn" if waiting_actionable else "ok"),
         ("等待外部 paper", _fmt_int(waiting), "研究已批准但未观察", "warn" if waiting else "ok"),
@@ -8685,7 +8827,7 @@ def _paper_handoff_panel(values: dict[str, Any]) -> str:
         + "</div>"
         + '<h3 class="subhead">候选阶段分布</h3>'
         + _simple_table(values.get("stage_counts") or [], ["stage", "count"], ["阶段", "数量"])
-        + '<h3 class="subhead">证据不完整告警</h3>'
+        + '<h3 class="subhead">研究门槛告警</h3>'
         + _simple_table(values.get("incomplete_research_wallets") or [], ["address", "candidate_stage", "leader_score", "missing"], ["钱包", "阶段", "分数", "缺口"])
         + '<h3 class="subhead">交接状态分布</h3>'
         + _simple_table(state_counts, ["state", "count"], ["状态", "数量"])
@@ -8700,8 +8842,14 @@ def _paper_handoff_detail_panel(row: dict[str, Any]) -> str:
     checks = row.get("research_checks") or []
     ready = bool(row.get("research_ready"))
     observer_quality_actionable = int(row.get("observer_quality_actionable") or 0)
+    evidence_mode = str(row.get("paper_evidence_mode") or PaperEvidenceMode.INCOMPLETE.value)
+    evidence_mode_ready = evidence_mode in {
+        PaperEvidenceMode.FULL_L3.value,
+        PaperEvidenceMode.BOUNDED_DEEP.value,
+    }
     cards = [
         ("研究检查", f"{_fmt_int(row.get('research_check_passed'))}/{_fmt_int(row.get('research_check_total'))}", row.get("research_check_summary") or "", "ok" if ready else "warn"),
+        ("证据模式", _status_label(evidence_mode), row.get("evidence_tier") or "", "ok" if evidence_mode_ready else "warn"),
         ("NAS Paper 状态", row.get("paper_execution_state") or "unknown", "research/scoring 不自动下单", "ok" if row.get("paper_execution_state") == "not_started_on_nas" else "warn"),
         ("Paper 成交", _fmt_int(row.get("paper_orders")), f"{_fmt_int(row.get('paper_settled_positions'))} settled", "ok" if int(row.get("paper_orders") or 0) else "warn"),
         ("及时可跟", _fmt_int(row.get("observer_actionable_signals")), f"{_fmt_int(row.get('observer_evaluations'))} observer evals", "ok" if int(row.get("observer_actionable_signals") or 0) else "warn"),
@@ -8763,7 +8911,7 @@ def _paper_handoff_wallets_table(rows: list[dict[str, Any]]) -> str:
             f'<td class="num">{_fmt_num(row.get("leader_score"))}</td>'
             f'<td>{_badge(row.get("candidate_stage"))}<small>{_badge(row.get("handoff_state"))}</small></td>'
             f'<td><div class="numline">{_fmt_int(row.get("activity_count"))} events</div>'
-            f'<small>{_e(row.get("evidence_tier") or "")} · {_e(row.get("hygiene_status") or "hygiene?")}</small></td>'
+            f'<small>{_badge(row.get("paper_evidence_mode") or "incomplete")} · {_e(row.get("evidence_tier") or "")} · {_e(row.get("hygiene_status") or "hygiene?")}</small></td>'
             f'<td><div class="numline">{_fmt_int(row.get("copy_event_count"))} links</div>'
             f'<small>{_fmt_int(row.get("qualified_follower_count"))} followers · {_fmt_pct(row.get("copy_backtest_roi"))}</small></td>'
             f'<td><div class="numline">{_fmt_int(row.get("research_check_passed"))}/{_fmt_int(row.get("research_check_total"))}</div>'
@@ -9844,7 +9992,15 @@ def _short(address: str) -> str:
 def _badge(value: Any) -> str:
     text = str(value or "")
     style = ""
-    if text in {"paper_candidate", "paper_approved", "live_eligible", "ok", "screened"}:
+    if text in {
+        "paper_candidate",
+        "paper_approved",
+        "live_eligible",
+        "ok",
+        "screened",
+        PaperEvidenceMode.FULL_L3.value,
+        PaperEvidenceMode.BOUNDED_DEEP.value,
+    }:
         style = " positive"
     elif text in {"needs_data", "needs_manual_review", "incomplete", "queued", "running"}:
         style = " attention"
@@ -9881,6 +10037,8 @@ def _status_label(value: Any) -> str:
         "light": "轻量",
         "deep": "深度",
         "default": "标准",
+        PaperEvidenceMode.FULL_L3.value: "完整 L3",
+        PaperEvidenceMode.BOUNDED_DEEP.value: "有限深度",
     }
     return labels.get(text, text)
 

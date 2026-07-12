@@ -10,6 +10,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Mapping
 
+from pm_robot.orchestration.evidence_readiness import paper_evidence_ready
+
 
 HANDLING_AUTOMATIC = "automatic"
 HANDLING_WATCH = "watch"
@@ -119,12 +121,11 @@ def review_disposition(
             "保留自动观察，等待新证据触发下一轮评分。",
         )
 
-    review_reason = _text(row.get("review_reason"))
-    if review_reason == "paper_evidence_tier_incomplete" or not _paper_evidence_ready(row):
+    if not _paper_evidence_ready(row):
         return _automatic(
             "paper_evidence_incomplete",
-            "L3 证据未完成",
-            "保持复核；L3 未达 summary_ready，不进入 paper",
+            "Paper 证据门槛未完成",
+            "继续补深度证据；达到 L3 或有限历史深度门槛前不进入 paper",
         )
     if stage == "needs_manual_review":
         return _result(
@@ -174,9 +175,7 @@ def _paper_evidence_ready(row: Mapping[str, Any]) -> bool:
     explicit = row.get("paper_evidence_ready")
     if explicit is not None:
         return bool(explicit)
-    evidence_status = _text(row.get("evidence_status"))
-    evidence_tier = _text(row.get("evidence_tier") or row.get("discovery_tier"))
-    return evidence_status == "summary_ready" and evidence_tier == "l3_deep"
+    return paper_evidence_ready(row)
 
 
 def _automatic(key: str, label: str, next_action: str) -> ReviewDisposition:

@@ -94,6 +94,18 @@ for this repository's current research/scoring deployment.
 There is no L4. `candidate_stage` is a separate scoring/research lifecycle and must not be used to infer an
 evidence tier.
 
+Paper-stage evidence readiness is reported separately from the persisted tier:
+
+- `full_l3`: `l3_deep` with `summary_ready`.
+- `bounded_deep`: the deep-history request completed with finite source history, while the wallet remains
+  truthfully labeled `l2_medium`; it requires `deep_done`, `summary_ready`, at least 500 activities, 20 markets,
+  and 100 non-fast trades.
+- `incomplete`: neither evidence path is sufficient for paper-stage research.
+
+`deep_done` means the deep job finished; it does not by itself promote a wallet to `l3_deep`. The bounded path is
+a conservative paper-research exception for finite histories. It never rewrites `wallet_processing_state`, never
+claims full L3 coverage, and does not grant live execution or publication permission.
+
 ## Candidate Stages
 
 - `needs_data`: evidence or scoring inputs are incomplete.

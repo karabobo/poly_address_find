@@ -64,3 +64,23 @@ def test_explicit_paper_readiness_prevents_false_manual_review():
     assert disposition.key == "paper_evidence_incomplete"
     assert disposition.handling == "automatic"
     assert disposition.operator_required is False
+
+
+def test_current_bounded_evidence_overrides_stale_incomplete_reason():
+    disposition = review_disposition(
+        _base_row(
+            leader_score=72,
+            qualified_follower_count=2,
+            backtest_trade_count=8,
+            review_reason="paper_evidence_tier_incomplete",
+            evidence_tier="l2_medium",
+            evidence_status="summary_ready",
+            evidence_current_stage="deep_done",
+            evidence_activity_count=500,
+            distinct_markets=20,
+            non_fast_trade_count=100,
+        )
+    )
+
+    assert disposition.key == "manual_review"
+    assert disposition.operator_required is True
