@@ -138,8 +138,9 @@ default `up`, `restart`, `runtime-ensure`, or watchdog commands.
 - Maintenance marks expired or queued jobs failed once their attempt budget is exhausted, so unclaimable jobs
   cannot occupy planner queue capacity indefinitely. Failed jobs respect `next_attempt_at`; after the cooldown,
   planners may reopen them with a fresh attempt budget while retaining the previous error for diagnosis.
-- Retention catch-up is bounded. Maintenance runs another short pass only when new eligible raw rows outpace the
-  completed deletion or when retention yielded to research-control; it never turns cleanup into an unbounded loop.
+- Retention catch-up is bounded. Maintenance runs up to four short passes only when newly classified eligible raw
+  rows outpace completed deletion or when retention yielded to research-control; every batch still releases the
+  control lock so research remains the priority.
 - Planner backpressure limits queued/running wallet evidence and copyability jobs. Copyability planning keeps
   its per-pass batch limit separate from the active-queue waterline and only fills currently available slots.
 - When queue capacity is tight, the planner allocates slots across light, medium, and deep evidence stages by

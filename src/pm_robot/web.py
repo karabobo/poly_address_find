@@ -73,6 +73,7 @@ PAPER_OBSERVER_QUALITY_LOOKBACK_SEC = 7 * 86_400
 PAPER_RTDS_BRIDGE_FRESH_SEC = 600
 PAPER_RTDS_BRIDGE_RECENT_SEC = 86_400
 DASHBOARD_CACHE_TTL_SEC = 30
+PARQUET_SIZE_CACHE_TTL_SEC = 300
 WAL_WARN_BYTES = 1_000_000_000
 WAL_CRITICAL_BYTES = 3_000_000_000
 MAINTENANCE_REPORT_MAX_AGE_SEC = 7_500
@@ -83,6 +84,8 @@ BACKUP_MAX_AGE_SECONDS = 26 * 3_600
 _DASHBOARD_CACHE_LOCK = threading.Lock()
 _DASHBOARD_CACHE: dict[tuple[str, bool, bool], tuple[float, dict[str, Any]]] = {}
 _DASHBOARD_REFRESHING: set[tuple[str, bool, bool]] = set()
+_DIRECTORY_SIZE_CACHE_LOCK = threading.Lock()
+_DIRECTORY_SIZE_CACHE: dict[str, tuple[float, int]] = {}
 
 _CANDIDATE_STAGE_LABELS = {
     CandidateStage.IMPORTED.value: "已导入",
@@ -3535,12 +3538,21 @@ def _storage_maintenance_panel(values: dict[str, Any]) -> str:
     wal_checkpoint = values.get("wal_checkpoint") or {}
     free_ratio = float(values.get("free_disk_ratio") or 0)
     archive = values.get("evidence_archive") or {}
+    parquet_total_bytes = int(values.get("parquet_total_bytes") or 0)
+    parquet_storage = values.get("parquet_storage") or {}
+    retention_registry = values.get("retention_registry") or {}
+    sqlite_pages = values.get("sqlite_pages") or {}
     retention = values.get("retention_cycle") or {}
     retention_backlog = retention.get("backlog_after") or {}
-    retention_storage = retention.get("storage") or {}
     retention_fresh = bool(retention.get("fresh"))
     retention_state = str(retention.get("state") or "")
     net_eta_hours = retention.get("net_eta_hours")
+    live_total_bytes = (
+        int(values.get("db_bytes") or 0)
+        + int(values.get("wal_bytes") or 0)
+        + int(values.get("shm_bytes") or 0)
+        + parquet_total_bytes
+    )
     if not retention_fresh:
         retention_eta_label = "报告过期" if retention.get("available") else "等待首轮"
     elif retention_state == "caught_up":
@@ -3556,14 +3568,7 @@ def _storage_maintenance_panel(values: dict[str, Any]) -> str:
     cards = [
         (
             "数据总占用",
-            _fmt_bytes(
-                int(retention_storage.get("total_data_bytes") or 0)
-                if retention_fresh
-                else int(values.get("db_bytes") or 0)
-                + int(values.get("wal_bytes") or 0)
-                + int(values.get("shm_bytes") or 0)
-                + int(archive.get("byte_size") or 0)
-            ),
+            _fmt_bytes(live_total_bytes),
             "DB + WAL + SHM + Parquet",
             "ok",
         ),
@@ -3580,6 +3585,12 @@ def _storage_maintenance_panel(values: dict[str, Any]) -> str:
         ),
         ("SHM", _fmt_bytes(int(values.get("shm_bytes") or 0)), "共享内存索引", "ok"),
         (
+            "SQLite 可复用页",
+            _fmt_bytes(int(sqlite_pages.get("reusable_bytes") or 0)),
+            f"{_fmt_pct(sqlite_pages.get('reusable_ratio'))} of DB · 删除后先复用，队列清空后再压缩",
+            "ok",
+        ),
+        (
             "可用空间",
             _fmt_bytes(int(values.get("free_disk_bytes") or 0)),
             f"{_fmt_pct(free_ratio)} free",
@@ -3593,10 +3604,26 @@ def _storage_maintenance_panel(values: dict[str, Any]) -> str:
         ),
         ("手动恢复点", _fmt_int(values.get("backup_count")), "仅在明确需要时创建", "ok"),
         (
-            "Parquet 冷归档",
+            "Parquet 总占用",
+            _fmt_bytes(parquet_total_bytes),
+            (
+                "包含受管证据归档和历史导出"
+                if parquet_storage.get("fresh", True)
+                else "目录读取异常，沿用上次完整测量"
+            ),
+            "ok" if parquet_storage.get("fresh", True) else "warn",
+        ),
+        (
+            "证据冷归档",
             _fmt_bytes(int(archive.get("byte_size") or 0)),
             f"{_fmt_int(archive.get('wallet_count'))} 钱包 / {_fmt_int(archive.get('row_count'))} 行",
             "warn" if int(archive.get("failed_count") or 0) else "ok",
+        ),
+        (
+            "已完成原始清理",
+            _fmt_int(retention_registry.get("raw_pruned_wallets")),
+            "保留钱包摘要、评分、标签和来源",
+            "ok",
         ),
         (
             "待恢复归档",
@@ -3613,7 +3640,7 @@ def _storage_maintenance_panel(values: dict[str, Any]) -> str:
         (
             "最近周期删除",
             _fmt_int(retention.get("deleted_activity_rows")),
-            f"同期新增 {_fmt_int(retention.get('eligible_rows_added'))} 行",
+            f"同期转入待清理 {_fmt_int(retention.get('eligible_rows_added'))} 行",
             "ok",
         ),
         (
@@ -7639,6 +7666,56 @@ def _storage_health(settings: RobotSettings) -> dict[str, Any]:
     return storage
 
 
+def _scan_directory_size_bytes(path: Path) -> int:
+    if not path.exists():
+        return 0
+    return sum(child.stat().st_size for child in path.rglob("*") if child.is_file())
+
+
+def _directory_size_snapshot(
+    path: Path,
+    *,
+    now: float | None = None,
+    ttl_seconds: int = PARQUET_SIZE_CACHE_TTL_SEC,
+) -> dict[str, Any]:
+    """Cache recursive storage scans and preserve the last complete result on errors."""
+
+    measured_now = time.time() if now is None else float(now)
+    cache_key = str(path.resolve())
+    with _DIRECTORY_SIZE_CACHE_LOCK:
+        cached = _DIRECTORY_SIZE_CACHE.get(cache_key)
+    if cached and measured_now - cached[0] <= max(0, int(ttl_seconds)):
+        return {
+            "available": True,
+            "fresh": True,
+            "bytes": cached[1],
+            "measured_at": int(cached[0]),
+            "age_seconds": max(0, int(measured_now - cached[0])),
+            "error": "",
+        }
+    try:
+        size_bytes = _scan_directory_size_bytes(path)
+    except OSError as exc:
+        return {
+            "available": cached is not None,
+            "fresh": False,
+            "bytes": cached[1] if cached else 0,
+            "measured_at": int(cached[0]) if cached else 0,
+            "age_seconds": max(0, int(measured_now - cached[0])) if cached else None,
+            "error": f"{type(exc).__name__}:{exc}",
+        }
+    with _DIRECTORY_SIZE_CACHE_LOCK:
+        _DIRECTORY_SIZE_CACHE[cache_key] = (measured_now, size_bytes)
+    return {
+        "available": True,
+        "fresh": True,
+        "bytes": size_bytes,
+        "measured_at": int(measured_now),
+        "age_seconds": 0,
+        "error": "",
+    }
+
+
 def _maintenance_checkpoint_summary(
     settings: RobotSettings,
     *,
@@ -7878,14 +7955,71 @@ def _storage_maintenance_summary(
         and latest_backup_age_seconds <= int(backup_max_age_seconds)
     )
     archive_summary: dict[str, Any]
+    retention_registry = {
+        "wallet_count": 0,
+        "summary_only_wallets": 0,
+        "raw_pruned_wallets": 0,
+    }
+    sqlite_pages = {
+        "page_size": 0,
+        "page_count": 0,
+        "freelist_count": 0,
+        "allocated_bytes": 0,
+        "reusable_bytes": 0,
+        "reusable_ratio": 0.0,
+    }
     try:
         archive_conn = connect_readonly(settings.db_path)
         try:
             archive_summary = evidence_archive_summary(archive_conn)
+            page_size = int(archive_conn.execute("PRAGMA page_size").fetchone()[0] or 0)
+            page_count = int(archive_conn.execute("PRAGMA page_count").fetchone()[0] or 0)
+            freelist_count = int(
+                archive_conn.execute("PRAGMA freelist_count").fetchone()[0] or 0
+            )
+            allocated_bytes = page_size * page_count
+            reusable_bytes = page_size * freelist_count
+            sqlite_pages = {
+                "page_size": page_size,
+                "page_count": page_count,
+                "freelist_count": freelist_count,
+                "allocated_bytes": allocated_bytes,
+                "reusable_bytes": reusable_bytes,
+                "reusable_ratio": round(
+                    reusable_bytes / allocated_bytes,
+                    4,
+                )
+                if allocated_bytes > 0
+                else 0.0,
+            }
+            registry_row = archive_conn.execute(
+                """
+                SELECT
+                    COUNT(*) AS wallet_count,
+                    SUM(CASE WHEN raw_retention_tier = 'summary_only' THEN 1 ELSE 0 END)
+                        AS summary_only_wallets,
+                    SUM(
+                        CASE
+                            WHEN registry_status = 'archived_raw_pruned'
+                              AND raw_retention_tier = 'summary_only'
+                              AND raw_pruned_at IS NOT NULL
+                            THEN 1 ELSE 0
+                        END
+                    ) AS raw_pruned_wallets
+                FROM wallet_registry
+                """
+            ).fetchone()
+            retention_registry = {
+                "wallet_count": int(registry_row["wallet_count"] or 0),
+                "summary_only_wallets": int(registry_row["summary_only_wallets"] or 0),
+                "raw_pruned_wallets": int(registry_row["raw_pruned_wallets"] or 0),
+            }
         finally:
             archive_conn.close()
     except (OSError, sqlite3.Error):
         archive_summary = evidence_archive_summary_unavailable()
+    parquet_storage = _directory_size_snapshot(settings.archive_dir)
+    parquet_total_bytes = int(parquet_storage.get("bytes") or 0)
     if critical_wal:
         state = "wal_critical"
         next_action = "WAL 已明显偏大，安排维护窗口执行 ./pmrobot-nas.sh wal-truncate-window 900。"
@@ -7915,7 +8049,7 @@ def _storage_maintenance_summary(
             next_action = "最近低价值证据清理周期失败，检查 maintenance-loop 报告和写锁竞争。"
         elif retention_state == "inflow_outpacing_cleanup":
             state = "retention_attention"
-            next_action = "低价值证据新增速度高于清理速度；先观察连续周期，再安全提高批次数。"
+            next_action = "低价值证据转入清理队列的速度高于删除速度；继续在研究任务间隙追赶。"
         elif retention_state == "yielded_to_research":
             next_action = "研究评分周期正在运行，低价值清理已主动让路并将在短延迟后重试。"
         elif retention_state == "no_progress" and int(
@@ -7954,6 +8088,10 @@ def _storage_maintenance_summary(
         "backup_fresh": backup_fresh,
         "scheduled_backup_enabled": bool(scheduled_backup_enabled),
         "evidence_archive": archive_summary,
+        "parquet_total_bytes": parquet_total_bytes,
+        "parquet_storage": parquet_storage,
+        "retention_registry": retention_registry,
+        "sqlite_pages": sqlite_pages,
         "retention_cycle": retention_cycle,
         "backup_now_command": "./pmrobot-nas.sh backup-now",
         "safe_command": "./pmrobot-nas.sh wal-truncate-window",

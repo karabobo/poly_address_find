@@ -3220,6 +3220,9 @@ def test_storage_maintenance_summary_exposes_parquet_archive_state(tmp_path):
         conn.commit()
     finally:
         conn.close()
+    legacy_export = settings.archive_dir / "activities" / "wallet_activity.parquet"
+    legacy_export.parent.mkdir(parents=True)
+    legacy_export.write_bytes(b"x" * 8192)
 
     summary = _storage_maintenance_summary(
         settings,
@@ -3231,8 +3234,137 @@ def test_storage_maintenance_summary_exposes_parquet_archive_state(tmp_path):
     assert summary["evidence_archive"]["wallet_count"] == 3
     assert summary["evidence_archive"]["row_count"] == 120
     assert summary["evidence_archive"]["byte_size"] == 4096
-    assert "Parquet 冷归档" in html
+    assert summary["parquet_total_bytes"] == 8192
+    assert "Parquet 总占用" in html
+    assert "证据冷归档" in html
     assert "3 钱包 / 120 行" in html
+
+
+def test_storage_maintenance_explains_pruned_wallets_and_reusable_pages(tmp_path):
+    settings = RobotSettings(
+        db_path=tmp_path / "data" / "pm_robot.sqlite",
+        archive_dir=tmp_path / "data" / "parquet",
+        execution_mode="research",
+    )
+    wallet = "0x00000000000000000000000000000000000000aa"
+    legacy_wallet = "0x00000000000000000000000000000000000000bb"
+    conn = connect(settings.db_path)
+    try:
+        run_migrations(conn)
+        conn.execute(
+            """
+            INSERT INTO candidate_wallets(address, first_seen_at, updated_at)
+            VALUES (?, 1, 1)
+            """,
+            (wallet,),
+        )
+        conn.execute(
+            """
+            INSERT INTO candidate_wallets(address, first_seen_at, updated_at)
+            VALUES (?, 1, 1)
+            """,
+            (legacy_wallet,),
+        )
+        conn.execute(
+            """
+            INSERT INTO wallet_registry(
+                address, candidate_stage, registry_status, raw_retention_tier,
+                raw_prune_version, raw_pruned_at, last_evaluated_at, updated_at
+            ) VALUES (?, 'needs_data', 'archived_raw_pruned', 'summary_only',
+                      'v2_zero_raw', 2, 2, 2)
+            """,
+            (wallet,),
+        )
+        conn.execute(
+            """
+            INSERT INTO wallet_registry(
+                address, candidate_stage, registry_status, raw_retention_tier,
+                raw_prune_version, last_evaluated_at, updated_at
+            ) VALUES (?, 'needs_data', 'archived_raw_pruned', 'summary_only',
+                      'legacy_incomplete', 2, 2)
+            """,
+            (legacy_wallet,),
+        )
+        conn.execute("CREATE TABLE disposable_pages(payload BLOB)")
+        conn.executemany(
+            "INSERT INTO disposable_pages(payload) VALUES (zeroblob(4096))",
+            [() for _ in range(64)],
+        )
+        conn.commit()
+        conn.execute("DROP TABLE disposable_pages")
+        conn.commit()
+    finally:
+        conn.close()
+
+    summary = _storage_maintenance_summary(
+        settings,
+        low_free_disk_bytes=1,
+        scheduled_backup_enabled=False,
+    )
+    html = _storage_maintenance_panel(summary)
+
+    assert summary["retention_registry"]["raw_pruned_wallets"] == 1
+    assert summary["sqlite_pages"]["reusable_bytes"] > 0
+    assert "已完成原始清理" in html
+    assert "SQLite 可复用页" in html
+    assert "删除后先复用" in html
+
+
+def test_directory_size_snapshot_falls_back_to_last_complete_scan(tmp_path, monkeypatch):
+    archive_dir = tmp_path / "parquet"
+    archive_dir.mkdir()
+    (archive_dir / "part.parquet").write_bytes(b"x" * 4096)
+    with web_module._DIRECTORY_SIZE_CACHE_LOCK:
+        web_module._DIRECTORY_SIZE_CACHE.clear()
+
+    current = web_module._directory_size_snapshot(archive_dir, now=100, ttl_seconds=10)
+    monkeypatch.setattr(
+        web_module,
+        "_scan_directory_size_bytes",
+        lambda _path: (_ for _ in ()).throw(OSError("storage unavailable")),
+    )
+    stale = web_module._directory_size_snapshot(archive_dir, now=111, ttl_seconds=10)
+
+    assert current == {
+        "available": True,
+        "fresh": True,
+        "bytes": 4096,
+        "measured_at": 100,
+        "age_seconds": 0,
+        "error": "",
+    }
+    assert stale["available"] is True
+    assert stale["fresh"] is False
+    assert stale["bytes"] == 4096
+    assert stale["measured_at"] == 100
+    assert stale["age_seconds"] == 11
+    assert stale["error"].startswith("OSError:")
+
+
+def test_storage_panel_uses_live_files_instead_of_stale_retention_size():
+    html = _storage_maintenance_panel(
+        {
+            "state": "ok",
+            "next_action": "ok",
+            "db_bytes": 1024,
+            "wal_bytes": 1024,
+            "shm_bytes": 0,
+            "parquet_total_bytes": 1024,
+            "free_disk_bytes": 1024,
+            "total_disk_bytes": 2048,
+            "free_disk_ratio": 0.5,
+            "retention_cycle": {
+                "available": True,
+                "fresh": True,
+                "state": "draining",
+                "storage": {"total_data_bytes": 34 * 1024**3},
+                "backlog_after": {},
+            },
+        }
+    )
+
+    assert "3.0 KB" in html
+    assert "34.0 GB" not in html
 
 
 def test_storage_maintenance_summary_exposes_retention_cycle_progress(tmp_path):
@@ -3300,6 +3432,7 @@ def test_storage_maintenance_summary_exposes_retention_cycle_progress(tmp_path):
     assert "安全待清理" in html
     assert "1,000,000" in html
     assert "净清理速度" in html
+    assert "同期转入待清理 2,500 行" in html
     assert "30,000 行/小时" in html
     assert "33.3 小时" in html
 

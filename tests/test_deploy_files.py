@@ -98,7 +98,7 @@ def test_nas_retention_prune_is_bounded_and_staggered():
     assert "PM_ROBOT_RETENTION_PRUNE_MAX_ACTIVITY_ROWS=5000" in env
     assert "PM_ROBOT_RETENTION_PRUNE_BATCH_DELAY=10" in env
     assert "PM_ROBOT_RETENTION_CONTROL_LOCK_TIMEOUT=0" in env
-    assert "PM_ROBOT_RETENTION_CATCHUP_PASSES=2" in env
+    assert "PM_ROBOT_RETENTION_CATCHUP_PASSES=4" in env
     assert "PM_ROBOT_RETENTION_CATCHUP_DELAY=60" in env
     assert 'CLEANUP_BATCH_LIMIT="${PM_ROBOT_MAINTENANCE_CLEANUP_BATCH_LIMIT:-500}"' in loop
     assert 'PRUNE_BATCHES="${PM_ROBOT_RETENTION_PRUNE_BATCHES:-6}"' in loop
@@ -106,7 +106,7 @@ def test_nas_retention_prune_is_bounded_and_staggered():
     assert 'PRUNE_MAX_ACTIVITY_ROWS="${PM_ROBOT_RETENTION_PRUNE_MAX_ACTIVITY_ROWS:-5000}"' in loop
     assert 'PRUNE_BATCH_DELAY="${PM_ROBOT_RETENTION_PRUNE_BATCH_DELAY:-10}"' in loop
     assert 'PRUNE_CONTROL_LOCK_TIMEOUT="${PM_ROBOT_RETENTION_CONTROL_LOCK_TIMEOUT:-0}"' in loop
-    assert 'PRUNE_CATCHUP_PASSES="${PM_ROBOT_RETENTION_CATCHUP_PASSES:-2}"' in loop
+    assert 'PRUNE_CATCHUP_PASSES="${PM_ROBOT_RETENTION_CATCHUP_PASSES:-4}"' in loop
     assert 'PRUNE_CATCHUP_DELAY="${PM_ROBOT_RETENTION_CATCHUP_DELAY:-60}"' in loop
     assert '--cleanup-batch-limit "$CLEANUP_BATCH_LIMIT"' in loop
     assert "retention-cycle" in loop
