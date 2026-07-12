@@ -3606,7 +3606,11 @@ def test_storage_maintenance_summary_exposes_retention_cycle_progress(tmp_path):
                     "inter_batch_sleep_seconds": 50.0,
                     "other_seconds": 0.0,
                 },
-                "sqlite_tuning_requested": {"cache_mib": 128, "mmap_mib": 256},
+                "sqlite_tuning_requested": {
+                    "cache_mib": 128,
+                    "mmap_mib": 256,
+                    "secure_delete_mode": "fast",
+                },
                 "prune_phase_timings": {
                     "selection_seconds": 2.0,
                     "archive_seconds": 0.0,
@@ -3653,6 +3657,7 @@ def test_storage_maintenance_summary_exposes_retention_cycle_progress(tmp_path):
     assert retention["net_rate_per_hour"] == 30_000
     assert retention["timings"]["prune_work_seconds"] == 325.0
     assert retention["sqlite_tuning_requested"]["cache_mib"] == 128
+    assert retention["sqlite_tuning_requested"]["secure_delete_mode"] == "fast"
     assert retention["prune_phase_timings"]["delete_seconds"] == 250.0
     assert summary["next_action"] == "低价值原始证据正在净减少，继续由 retention cycle 分批消化。"
     assert "数据总占用" in html
@@ -3666,6 +3671,7 @@ def test_storage_maintenance_summary_exposes_retention_cycle_progress(tmp_path):
     assert "5 分钟" in html
     assert "等研究锁 45 秒" in html
     assert "cache 128 MiB" in html
+    assert "secure FAST" in html
     assert "清理事务拆分" in html
     assert "水位 3 秒" in html
     assert "提交 10 秒" in html

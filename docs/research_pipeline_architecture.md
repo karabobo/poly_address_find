@@ -166,6 +166,8 @@ default `up`, `restart`, `runtime-ensure`, or watchdog commands.
   watermarks in one batch and skips the redundant post-delete evidence scan. Archive or keep-recent modes retain
   exact per-wallet watermark reconciliation and residual checks. Reports split delete, watermark, residual,
   finalization, and commit time so later tuning remains evidence-led.
+- The retention connection uses SQLite `secure_delete=FAST`: public market evidence is zeroed when SQLite can do so
+  without extra I/O, while discovery, scoring, web, and other database connections keep their normal setting.
 - Planner backpressure limits queued/running wallet evidence and copyability jobs. Copyability planning keeps
   its per-pass batch limit separate from the active-queue waterline and only fills currently available slots.
 - Research control keeps feature and scoring transactions bounded. A full batch schedules a `scoring_only` pass on

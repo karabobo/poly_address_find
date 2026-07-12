@@ -210,7 +210,11 @@ def test_retention_cycle_aggregates_batches_and_backlog(tmp_path):
     assert result["gross_rate_per_hour"] > 0
     assert result["net_rate_per_hour"] > 0
     assert result["net_eta_hours"] is not None
-    assert result["sqlite_tuning_requested"] == {"cache_mib": 16, "mmap_mib": 32}
+    assert result["sqlite_tuning_requested"] == {
+        "cache_mib": 16,
+        "mmap_mib": 32,
+        "secure_delete_mode": "fast",
+    }
     assert result["timings"]["control_lock_wait_seconds"] >= 0
     assert result["timings"]["prune_work_seconds"] >= 0
     assert result["timings"]["inter_batch_sleep_seconds"] >= 0
@@ -275,8 +279,13 @@ def test_retention_backlog_uses_exact_watermarks_without_raw_table_count(
 def test_retention_sqlite_tuning_is_connection_local_and_bounded(tmp_path):
     db_path = tmp_path / "robot.sqlite"
     conn = connect(db_path)
+    observer = None
     try:
         run_migrations(conn)
+        observer = connect(db_path)
+        observer_secure_delete = int(
+            observer.execute("PRAGMA secure_delete").fetchone()[0]
+        )
         tuning = _configure_retention_connection(
             conn,
             cache_mib=16,
@@ -286,12 +295,21 @@ def test_retention_sqlite_tuning_is_connection_local_and_bounded(tmp_path):
         assert tuning["cache_mib_effective"] == 16
         assert tuning["mmap_mib_requested"] == 32
         assert tuning["mmap_mib_effective"] >= 0
+        assert tuning["secure_delete_effective"] == 2
+        assert int(observer.execute("PRAGMA secure_delete").fetchone()[0]) == (
+            observer_secure_delete
+        )
     finally:
+        if observer is not None:
+            observer.close()
         conn.close()
 
     fresh = connect(db_path)
     try:
         assert int(fresh.execute("PRAGMA cache_size").fetchone()[0]) != -(16 * 1024)
+        assert int(fresh.execute("PRAGMA secure_delete").fetchone()[0]) == (
+            observer_secure_delete
+        )
     finally:
         fresh.close()
 

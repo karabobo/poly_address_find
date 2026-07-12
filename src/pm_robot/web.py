@@ -3553,6 +3553,12 @@ def _storage_maintenance_panel(values: dict[str, Any]) -> str:
     retention_timings = retention.get("timings") or {}
     retention_tuning = retention.get("sqlite_tuning_requested") or {}
     retention_phases = retention.get("prune_phase_timings") or {}
+    retention_secure_mode = str(
+        retention_tuning.get("secure_delete_mode") or ""
+    ).upper()
+    retention_secure_suffix = (
+        f" · secure {retention_secure_mode}" if retention_secure_mode else ""
+    )
     retention_fresh = bool(retention.get("fresh"))
     retention_state = str(retention.get("state") or "")
     net_eta_hours = retention.get("net_eta_hours")
@@ -3696,6 +3702,7 @@ def _storage_maintenance_panel(values: dict[str, Any]) -> str:
                 f"等研究锁 {_short_duration_label(retention_timings.get('control_lock_wait_seconds'))}"
                 f" · 批间休眠 {_short_duration_label(retention_timings.get('inter_batch_sleep_seconds'))}"
                 f" · cache {_fmt_int(retention_tuning.get('cache_mib'))} MiB"
+                f"{retention_secure_suffix}"
                 if retention_timings
                 else "新版 retention 完成一轮后显示"
             ),
@@ -8089,8 +8096,11 @@ def _retention_cycle_summary(
             if isinstance(timings, dict)
             else {},
             "sqlite_tuning_requested": {
-                key: _optional_int(sqlite_tuning.get(key)) or 0
-                for key in ("cache_mib", "mmap_mib")
+                "cache_mib": _optional_int(sqlite_tuning.get("cache_mib")) or 0,
+                "mmap_mib": _optional_int(sqlite_tuning.get("mmap_mib")) or 0,
+                "secure_delete_mode": str(
+                    sqlite_tuning.get("secure_delete_mode") or ""
+                ),
             }
             if isinstance(sqlite_tuning, dict)
             else {},

@@ -2329,6 +2329,9 @@ def _configure_retention_connection(
         conn.execute(f"PRAGMA cache_size = -{bounded_cache_mib * 1024}")
     if bounded_mmap_mib:
         conn.execute(f"PRAGMA mmap_size = {bounded_mmap_mib * 1024 * 1024}")
+    # Raw evidence is public market data; FAST avoids extra delete I/O while
+    # retaining zeroing when SQLite can do it without additional writes.
+    conn.execute("PRAGMA secure_delete = FAST")
 
     page_size = int(conn.execute("PRAGMA page_size").fetchone()[0])
     cache_setting = int(conn.execute("PRAGMA cache_size").fetchone()[0])
@@ -2339,11 +2342,13 @@ def _configure_retention_connection(
     )
     mmap_row = conn.execute("PRAGMA mmap_size").fetchone()
     mmap_bytes = int(mmap_row[0] or 0) if mmap_row is not None else 0
+    secure_delete = int(conn.execute("PRAGMA secure_delete").fetchone()[0])
     return {
         "cache_mib_requested": bounded_cache_mib,
         "cache_mib_effective": round(cache_bytes / (1024 * 1024), 3),
         "mmap_mib_requested": bounded_mmap_mib,
         "mmap_mib_effective": round(mmap_bytes / (1024 * 1024), 3),
+        "secure_delete_effective": secure_delete,
     }
 
 
@@ -2700,6 +2705,7 @@ def _run_retention_cycle_locked(
         "sqlite_tuning_requested": {
             "cache_mib": _bounded_retention_memory_mib(sqlite_cache_mib),
             "mmap_mib": _bounded_retention_memory_mib(sqlite_mmap_mib),
+            "secure_delete_mode": "fast",
         },
         "prune_phase_timings": {
             key: round(value, 3) for key, value in prune_phase_timings.items()
