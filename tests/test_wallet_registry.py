@@ -2,7 +2,11 @@ import json
 
 from pm_robot.config import RobotSettings
 from pm_robot.models import CandidateAddress, CandidateStage, ScoreBreakdown, WalletFeatures
-from pm_robot.ops import build_wallet_registry, build_winner_library
+from pm_robot.ops import (
+    build_wallet_registry,
+    build_winner_library,
+    refresh_active_candidate_registry,
+)
 from pm_robot.storage.db import connect, run_migrations
 from pm_robot.storage.repository import persist_score, persist_wallet_activity, upsert_candidate, upsert_wallet_feature
 
@@ -231,6 +235,104 @@ def test_winner_library_exports_only_publishable_eligible_wallets(tmp_path):
     assert summary["wallet_count"] == 1
     assert summary["stage_counts"] == {CandidateStage.LIVE_ELIGIBLE.value: 1}
     assert [row["address"] for row in rows] == [winner]
+
+
+def test_active_candidate_registry_refresh_materializes_only_stale_active_rows(tmp_path):
+    db_path = tmp_path / "robot.sqlite"
+    wallet = "0x" + "e" * 40
+    conn = connect(db_path)
+    try:
+        run_migrations(conn)
+        _seed_publishable_winner(conn, wallet)
+
+        first = refresh_active_candidate_registry(conn)
+        conn.commit()
+        row = conn.execute(
+            "SELECT * FROM wallet_registry WHERE address = ?",
+            (wallet,),
+        ).fetchone()
+        second = refresh_active_candidate_registry(conn)
+
+        assert first == {
+            "wallets_refreshed": 1,
+            "archived_wallets_skipped": 0,
+            "limit": 500,
+        }
+        assert second["wallets_refreshed"] == 0
+        assert row["candidate_stage"] == CandidateStage.LIVE_ELIGIBLE.value
+        assert row["registry_status"] == "ready_for_external_validation"
+        assert row["raw_retention_tier"] == "keep_full"
+        assert row["activity_count"] == 100
+
+        conn.execute(
+            """
+            INSERT INTO leader_scores(
+                address, leader_score, review_stage, review_reason,
+                components_json, penalties_json, policy_version, scored_at
+            ) VALUES (?, 95, ?, 'same_stage_rescore', '{}', '{}', 'test-v2', ?)
+            """,
+            (
+                wallet,
+                CandidateStage.LIVE_ELIGIBLE.value,
+                int(row["updated_at"]) + 1,
+            ),
+        )
+        conn.commit()
+
+        third = refresh_active_candidate_registry(conn)
+        rescored = conn.execute(
+            "SELECT leader_score, review_reason, policy_version FROM wallet_registry WHERE address = ?",
+            (wallet,),
+        ).fetchone()
+
+        assert third["wallets_refreshed"] == 1
+        assert dict(rescored) == {
+            "leader_score": 95.0,
+            "review_reason": "same_stage_rescore",
+            "policy_version": "test-v2",
+        }
+    finally:
+        conn.close()
+
+
+def test_active_candidate_registry_refresh_does_not_relabel_pruned_raw_history(tmp_path):
+    db_path = tmp_path / "robot.sqlite"
+    wallet = "0x" + "f" * 40
+    conn = connect(db_path)
+    try:
+        run_migrations(conn)
+        upsert_candidate(conn, CandidateAddress(address=wallet, sources="test_source"))
+        conn.execute(
+            "UPDATE candidate_wallets SET candidate_stage = ? WHERE address = ?",
+            (CandidateStage.PAPER_APPROVED.value, wallet),
+        )
+        conn.execute(
+            """
+            INSERT INTO wallet_registry(
+                address, candidate_stage, registry_status, raw_retention_tier,
+                raw_prune_version, raw_pruned_at, last_evaluated_at, updated_at
+            ) VALUES (?, 'needs_data', 'archived_raw_pruned', 'summary_only',
+                      'v2_zero_raw', 100, 100, 100)
+            """,
+            (wallet,),
+        )
+        conn.commit()
+
+        result = refresh_active_candidate_registry(conn)
+        row = conn.execute(
+            "SELECT registry_status, raw_retention_tier, raw_pruned_at FROM wallet_registry WHERE address = ?",
+            (wallet,),
+        ).fetchone()
+
+        assert result["wallets_refreshed"] == 0
+        assert result["archived_wallets_skipped"] == 1
+        assert dict(row) == {
+            "registry_status": "archived_raw_pruned",
+            "raw_retention_tier": "summary_only",
+            "raw_pruned_at": 100,
+        }
+    finally:
+        conn.close()
 
 
 def test_winner_library_rejects_live_stage_without_l3_evidence(tmp_path):

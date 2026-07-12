@@ -47,6 +47,11 @@ DAY_SECONDS = 86_400
 WAL_CHECKPOINT_MODES = ("none", "passive", "truncate")
 DEFAULT_FAILED_JOB_COOLDOWN_SECONDS = 21_600
 RETENTION_STARVATION_YIELD_THRESHOLD = 3
+ACTIVE_CANDIDATE_REGISTRY_STAGES = (
+    "paper_candidate",
+    "paper_approved",
+    "live_eligible",
+)
 WALLET_REGISTRY_TABLE_COLUMNS = [
     "address",
     "candidate_stage",
@@ -188,6 +193,100 @@ def build_winner_library(
         "csv_output_path": str(csv_output_path) if csv_output_path else "",
         "json_output_path": str(json_output_path) if json_output_path else "",
         "storage": storage_report(settings),
+    }
+
+
+def refresh_active_candidate_registry(
+    conn: sqlite3.Connection,
+    *,
+    limit: int = 500,
+) -> dict[str, int]:
+    """Refresh compact summaries for active candidates without changing their stage."""
+
+    row_limit = max(1, int(limit))
+    stage_placeholders = ", ".join("?" for _ in ACTIVE_CANDIDATE_REGISTRY_STAGES)
+    rows = conn.execute(
+        f"""
+        SELECT cw.address
+        FROM candidate_wallets cw
+        LEFT JOIN wallet_registry wr
+          ON wr.address = cw.address
+        LEFT JOIN wallet_features wf
+          ON wf.address = cw.address
+        LEFT JOIN leader_latest_scores latest
+          ON latest.address = cw.address
+        LEFT JOIN evidence_backfill_budget ebb
+          ON ebb.wallet = cw.address
+        LEFT JOIN copy_leader_performance clp
+          ON clp.leader_wallet = cw.address
+        LEFT JOIN paper_wallet_quality pwq
+          ON pwq.wallet = cw.address
+        LEFT JOIN wallet_activity_watermarks waw
+          ON waw.address = cw.address
+        LEFT JOIN leader_publish lp
+          ON lp.wallet = cw.address
+         AND lp.revoked_at IS NULL
+         AND lp.expires_at > strftime('%s','now')
+        WHERE cw.candidate_stage IN ({stage_placeholders})
+          AND (
+              wr.address IS NULL
+              OR (
+                  wr.registry_status NOT IN ('archive_pending', 'archived_raw_pruned')
+                  AND (
+                      wr.candidate_stage != cw.candidate_stage
+                      OR wr.raw_retention_tier != 'keep_full'
+                      OR COALESCE(latest.leader_score, 0) != wr.leader_score
+                      OR COALESCE(latest.review_stage, '') != wr.review_stage
+                      OR COALESCE(latest.review_reason, '') != wr.review_reason
+                      OR COALESCE(latest.policy_version, '') != wr.policy_version
+                      OR (
+                          wr.registry_status = 'published_or_exported'
+                          AND lp.wallet IS NULL
+                      )
+                      OR MAX(
+                          COALESCE(cw.updated_at, 0),
+                          COALESCE(wf.updated_at, 0),
+                          COALESCE(latest.scored_at, 0),
+                          COALESCE(ebb.updated_at, 0),
+                          COALESCE(clp.updated_at, 0),
+                          COALESCE(pwq.updated_at, 0),
+                          COALESCE(waw.updated_at, 0),
+                          COALESCE(lp.published_at, 0),
+                          COALESCE(lp.revoked_at, 0),
+                          COALESCE(
+                              (
+                                  SELECT MAX(latest_recorded_at)
+                                  FROM candidate_source_wallet_latest source_latest
+                                  WHERE source_latest.address = cw.address
+                              ),
+                              0
+                          )
+                      ) > wr.updated_at
+                  )
+              )
+          )
+        ORDER BY COALESCE(wr.updated_at, 0) ASC, cw.updated_at ASC, cw.address ASC
+        LIMIT ?
+        """,
+        (*ACTIVE_CANDIDATE_REGISTRY_STAGES, row_limit),
+    ).fetchall()
+    addresses = tuple(str(row["address"]) for row in rows)
+    refreshed_rows = _materialize_wallet_registry(conn, addresses=addresses) if addresses else []
+    archived_skipped = conn.execute(
+        f"""
+        SELECT COUNT(*) AS count
+        FROM candidate_wallets cw
+        JOIN wallet_registry wr
+          ON wr.address = cw.address
+        WHERE cw.candidate_stage IN ({stage_placeholders})
+          AND wr.registry_status IN ('archive_pending', 'archived_raw_pruned')
+        """,
+        ACTIVE_CANDIDATE_REGISTRY_STAGES,
+    ).fetchone()
+    return {
+        "wallets_refreshed": len(refreshed_rows),
+        "archived_wallets_skipped": int(archived_skipped["count"] or 0),
+        "limit": row_limit,
     }
 
 
@@ -2701,11 +2800,24 @@ def _materialize_wallet_registry(
         stages=stages,
         addresses=addresses,
     )
-    archived_rows = {
-        str(row["address"]): dict(row)
-        for row in conn.execute(
+    if addresses:
+        archived_placeholders = ", ".join("?" for _ in addresses)
+        archived_source_rows = conn.execute(
+            f"""
+            SELECT *
+            FROM wallet_registry
+            WHERE registry_status = 'archived_raw_pruned'
+              AND address IN ({archived_placeholders})
+            """,
+            tuple(address.lower() for address in addresses),
+        ).fetchall()
+    else:
+        archived_source_rows = conn.execute(
             "SELECT * FROM wallet_registry WHERE registry_status = 'archived_raw_pruned'"
         ).fetchall()
+    archived_rows = {
+        str(row["address"]): dict(row)
+        for row in archived_source_rows
     }
     rows = []
     for source_row in source_rows:

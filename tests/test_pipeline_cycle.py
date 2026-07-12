@@ -155,7 +155,8 @@ def test_pipeline_cycle_routes_repairs_through_canonical_planners(tmp_path):
         assert step_names.index("eligibility_repair_prepare") < step_names.index("wallet_pipeline_state_materialize")
         assert step_names.index("wallet_pipeline_state_materialize") < step_names.index("materialize_features")
         assert step_names.index("materialize_features") < step_names.index("incremental_score")
-        assert step_names.index("incremental_score") < step_names.index("evidence_promotion")
+        assert step_names.index("incremental_score") < step_names.index("active_candidate_registry_refresh")
+        assert step_names.index("active_candidate_registry_refresh") < step_names.index("evidence_promotion")
         assert step_names.index("evidence_promotion") < step_names.index("wallet_pipeline_plan")
         assert step_names.index("wallet_pipeline_plan") < step_names.index("copyability_plan")
         assert runs == []
@@ -253,7 +254,11 @@ def test_pipeline_cycle_scoring_only_skips_repairs_and_queue_planning(tmp_path, 
         assert report["ok"] is True
         assert report["mode"] == "scoring_only"
         assert calls == ["materialize_features", "incremental_score"]
-        assert executed == ["materialize_features", "incremental_score"]
+        assert executed == [
+            "materialize_features",
+            "incremental_score",
+            "active_candidate_registry_refresh",
+        ]
         assert skipped == {"post_score_planning": {"reason": "scoring_only"}}
         assert not {
             "eligibility_repair_prepare",
@@ -506,6 +511,7 @@ def test_pipeline_cycle_isolates_failed_phase_and_continues_committed_work(tmp_p
             "wallet_pipeline_state_materialize",
             "materialize_features",
             "incremental_score",
+            "active_candidate_registry_refresh",
             "evidence_promotion",
             "wallet_pipeline_plan",
             "copyability_plan",

@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from pm_robot.config import load_policy
+from pm_robot.ops import refresh_active_candidate_registry
 from pm_robot.orchestration.copyability_evidence import plan_copyability_evidence_jobs
 from pm_robot.orchestration.eligibility_repair import prepare_eligibility_repairs
 from pm_robot.orchestration.evidence_promotion import promote_wallet_evidence
@@ -199,10 +200,27 @@ def run_pipeline_cycle(
             continue_on_error=options.continue_on_error,
             step_reporter=step_reporter,
         )
+        _run_isolated_step(
+            conn,
+            steps,
+            "active_candidate_registry_refresh",
+            lambda: _refresh_active_candidate_registry(conn),
+            continue_on_error=options.continue_on_error,
+            step_reporter=step_reporter,
+        )
     else:
         _append_step(
             steps,
             _step("incremental_score", "skipped", {"reason": "run_scoring_disabled"}),
+            step_reporter=step_reporter,
+        )
+        _append_step(
+            steps,
+            _step(
+                "active_candidate_registry_refresh",
+                "skipped",
+                {"reason": "run_scoring_disabled"},
+            ),
             step_reporter=step_reporter,
         )
 
@@ -348,6 +366,11 @@ def _dry_run_steps(options: PipelineCycleOptions) -> list[dict[str, Any]]:
             "would_execute" if options.run_scoring else "skipped",
             {"limit": options.score_limit, "incremental": True},
         ),
+        _step(
+            "active_candidate_registry_refresh",
+            "would_execute" if options.run_scoring else "skipped",
+            {} if options.run_scoring else {"reason": "run_scoring_disabled"},
+        ),
     ]
     if options.scoring_only:
         scoring_topup_waterline = _scoring_topup_waterline(options)
@@ -440,6 +463,14 @@ def _scoring_topup_waterline(options: PipelineCycleOptions) -> int:
     if scoring_waterline and global_waterline:
         return min(scoring_waterline, global_waterline)
     return scoring_waterline
+
+
+def _refresh_active_candidate_registry(conn: sqlite3.Connection) -> dict[str, int]:
+    """Commit the active-candidate summary projection; candidate stages remain unchanged."""
+
+    result = refresh_active_candidate_registry(conn)
+    conn.commit()
+    return result
 
 
 def _step(
