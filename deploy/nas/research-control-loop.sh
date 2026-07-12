@@ -15,6 +15,7 @@ WALLET_LIGHT_LIMIT="${PM_ROBOT_PIPELINE_PLANNER_LIGHT_LIMIT:-30}"
 WALLET_MEDIUM_LIMIT="${PM_ROBOT_PIPELINE_PLANNER_MEDIUM_LIMIT:-20}"
 WALLET_DEEP_LIMIT="${PM_ROBOT_PIPELINE_PLANNER_DEEP_LIMIT:-5}"
 WALLET_MAX_ACTIVE_JOBS="${PM_ROBOT_PIPELINE_PLANNER_MAX_ACTIVE_JOBS:-240}"
+SCORING_TOPUP_MAX_ACTIVE_JOBS="${PM_ROBOT_RESEARCH_SCORING_TOPUP_MAX_ACTIVE_JOBS:-60}"
 COPYABILITY_LIMIT="${PM_ROBOT_COPYABILITY_PLANNER_LIMIT:-50}"
 COPYABILITY_MAX_ACTIVE_JOBS="${PM_ROBOT_COPYABILITY_PLANNER_MAX_ACTIVE_JOBS:-50}"
 COPYABILITY_MIN_ACTIVITY_EVENTS="${PM_ROBOT_COPYABILITY_MIN_ACTIVITY_EVENTS:-25}"
@@ -57,9 +58,11 @@ while true; do
   features_attempted=0
   scores_considered=0
   control_output=""
-  scoring_only_flag=""
+  set --
   if [ "$cycle_mode" = "scoring_only" ]; then
-    scoring_only_flag="--scoring-only"
+    set -- \
+      --scoring-only \
+      --scoring-wallet-topup-max-active-jobs "$SCORING_TOPUP_MAX_ACTIVE_JOBS"
   fi
   echo "$(date -Iseconds) research control: ordered cycle start (mode=${cycle_mode})"
   if control_output="$(python -m pm_robot.cli --env /app/.env pipeline-cycle \
@@ -92,7 +95,7 @@ while true; do
       --evidence-promotion-limit "$EVIDENCE_PROMOTION_LIMIT" \
       --score-limit "$SCORE_LIMIT" \
       --policy "$POLICY_PATH" \
-      $scoring_only_flag)"; then
+      "$@")"; then
     printf '%s\n' "$control_output"
     control_state=""
     if control_state="$(printf '%s' "$control_output" | python -c '
@@ -125,7 +128,7 @@ print(f"ok {features_attempted} {scores_considered}")
       scores_considered="${remaining_state#* }"
       if { [ "$FEATURE_LIMIT" -gt 0 ] && [ "$features_attempted" -ge "$FEATURE_LIMIT" ]; } || \
          { [ "$SCORE_LIMIT" -gt 0 ] && [ "$scores_considered" -ge "$SCORE_LIMIT" ]; }; then
-        # Catch up scoring without repeatedly running queue planners or eligibility repair.
+        # Catch up scoring with only the bounded wallet queue top-up enabled.
         sleep_interval="$ACTIVE_INTERVAL"
         if [ "$cycle_mode" = "scoring_only" ]; then
           catchup_cycles=$((catchup_cycles + 1))

@@ -422,6 +422,12 @@ def main() -> int:
     cycle_cmd.add_argument("--wallet-medium-limit", type=int, default=20)
     cycle_cmd.add_argument("--wallet-deep-limit", type=int, default=5)
     cycle_cmd.add_argument("--wallet-max-active-jobs", type=int, default=240)
+    cycle_cmd.add_argument(
+        "--scoring-wallet-topup-max-active-jobs",
+        type=int,
+        default=0,
+        help="Scoring-only wallet evidence queue waterline; 0 keeps queue planning disabled",
+    )
     cycle_cmd.add_argument("--copyability-limit", type=int, default=50)
     cycle_cmd.add_argument("--copyability-max-active-jobs", type=int, default=50)
     cycle_cmd.add_argument("--copyability-min-activity-events", type=int, default=25)
@@ -447,7 +453,7 @@ def main() -> int:
     cycle_cmd.add_argument(
         "--scoring-only",
         action="store_true",
-        help="Run only feature materialization and incremental scoring; skip repair and queue planning",
+        help="Run feature materialization and scoring, with only an explicitly bounded wallet queue top-up",
     )
     cycle_cmd.add_argument(
         "--continue-on-error",
@@ -1394,6 +1400,10 @@ def main() -> int:
                         wallet_medium_limit=args.wallet_medium_limit,
                         wallet_deep_limit=args.wallet_deep_limit,
                         wallet_max_active_jobs=args.wallet_max_active_jobs,
+                        scoring_wallet_topup_max_active_jobs=max(
+                            0,
+                            args.scoring_wallet_topup_max_active_jobs,
+                        ),
                         copyability_limit=args.copyability_limit,
                         copyability_max_active_jobs=args.copyability_max_active_jobs,
                         copyability_min_activity_events=args.copyability_min_activity_events,
@@ -1823,6 +1833,7 @@ def _pipeline_cycle_step_rows_written(step: dict) -> int:
         "eligibility_repair_prepare": "evidence_budgets_seeded",
         "wallet_pipeline_state_materialize": "wallets_materialized",
         "wallet_pipeline_plan": "jobs_enqueued",
+        "wallet_pipeline_topup": "jobs_enqueued",
         "copyability_plan": "jobs_enqueued",
         "materialize_features": "wallets_updated",
         "incremental_score": "scores_written",

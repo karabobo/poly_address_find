@@ -7,6 +7,7 @@ from pm_robot.orchestration.pipeline_cycle import PipelineCycleOptions, run_pipe
 from pm_robot.storage.db import connect, run_migrations
 from pm_robot.storage.repository import (
     materialize_wallet_processing_state,
+    enqueue_pipeline_job,
     persist_score,
     persist_wallet_activity,
     record_runtime_heartbeat,
@@ -261,6 +262,197 @@ def test_pipeline_cycle_scoring_only_skips_repairs_and_queue_planning(tmp_path, 
             "wallet_pipeline_plan",
             "copyability_plan",
         }.intersection(step["name"] for step in report["steps"])
+    finally:
+        conn.close()
+
+
+def test_pipeline_cycle_scoring_only_can_top_up_wallet_queue_without_full_planning(
+    tmp_path,
+    monkeypatch,
+):
+    conn = connect(tmp_path / "robot.sqlite")
+    calls: list[str] = []
+    planner_kwargs: dict = {}
+
+    def record(name: str, result: dict):
+        def operation(*args, **kwargs):
+            calls.append(name)
+            return result
+
+        return operation
+
+    def record_wallet_topup(*args, **kwargs):
+        calls.append("wallet_pipeline_topup")
+        planner_kwargs.update(kwargs)
+        return {
+            "targets_seen": 30,
+            "jobs_enqueued": 30,
+            "active_jobs": 0,
+            "max_active_jobs": 60,
+            "throttled": False,
+        }
+
+    def forbidden(name: str):
+        def operation(*args, **kwargs):
+            raise AssertionError(f"scoring-only top-up unexpectedly ran {name}")
+
+        return operation
+
+    try:
+        run_migrations(conn)
+        monkeypatch.setattr(
+            "pm_robot.orchestration.pipeline_cycle.materialize_wallet_features",
+            record("materialize_features", {"wallets_attempted": 3}),
+        )
+        monkeypatch.setattr(
+            "pm_robot.orchestration.pipeline_cycle.score_database",
+            record("incremental_score", {"score_candidates_considered": 2}),
+        )
+        monkeypatch.setattr(
+            "pm_robot.orchestration.pipeline_cycle.plan_wallet_pipeline_jobs",
+            record_wallet_topup,
+        )
+        for symbol in (
+            "prepare_eligibility_repairs",
+            "materialize_wallet_processing_state",
+            "promote_wallet_evidence",
+            "plan_copyability_evidence_jobs",
+        ):
+            monkeypatch.setattr(
+                f"pm_robot.orchestration.pipeline_cycle.{symbol}",
+                forbidden(symbol),
+            )
+
+        report = run_pipeline_cycle(
+            conn,
+            PipelineCycleOptions(
+                execute_plan=True,
+                scoring_only=True,
+                scoring_wallet_topup_max_active_jobs=60,
+                wallet_light_limit=30,
+                wallet_medium_limit=20,
+                wallet_deep_limit=5,
+                wallet_max_active_jobs=240,
+                feature_limit=80,
+                score_limit=300,
+                policy_path=Path("config/leader_scoring_policy.json"),
+                include_diagnostics=False,
+            ),
+        )
+
+        steps = {step["name"]: step for step in report["steps"]}
+        assert report["ok"] is True
+        assert calls == [
+            "materialize_features",
+            "incremental_score",
+            "wallet_pipeline_topup",
+        ]
+        assert planner_kwargs["light_limit"] == 30
+        assert planner_kwargs["medium_limit"] == 20
+        assert planner_kwargs["deep_limit"] == 5
+        assert planner_kwargs["max_active_jobs"] == 60
+        assert steps["wallet_pipeline_topup"]["status"] == "executed"
+        assert steps["wallet_pipeline_topup"]["data"]["jobs_enqueued"] == 30
+        assert "post_score_planning" not in steps
+        assert not {
+            "eligibility_repair_prepare",
+            "wallet_pipeline_state_materialize",
+            "evidence_promotion",
+            "copyability_plan",
+        }.intersection(steps)
+    finally:
+        conn.close()
+
+
+def test_pipeline_cycle_scoring_topup_respects_real_queue_waterline(tmp_path, monkeypatch):
+    from pm_robot.cli import _pipeline_cycle_step_rows_written
+
+    conn = connect(tmp_path / "robot.sqlite")
+    active_wallet = "0x" + "7" * 40
+    pending_wallet = "0x" + "8" * 40
+
+    def forbidden(name: str):
+        def operation(*args, **kwargs):
+            raise AssertionError(f"scoring-only top-up unexpectedly ran {name}")
+
+        return operation
+
+    try:
+        run_migrations(conn)
+        upsert_candidate(conn, CandidateAddress(address=pending_wallet, sources="test_source"))
+        conn.commit()
+        materialize_wallet_processing_state(conn)
+        assert enqueue_pipeline_job(
+            conn,
+            job_type="wallet_evidence_backfill",
+            wallet=active_wallet,
+            subject_key="light_pending",
+            tier="l0_discovered",
+            priority=1,
+            shard=0,
+            input_data={"stage": "light_pending"},
+            now=30_000,
+        )
+        conn.commit()
+
+        monkeypatch.setattr(
+            "pm_robot.orchestration.pipeline_cycle.materialize_wallet_features",
+            lambda *args, **kwargs: {"wallets_attempted": 0},
+        )
+        monkeypatch.setattr(
+            "pm_robot.orchestration.pipeline_cycle.score_database",
+            lambda *args, **kwargs: {"score_candidates_considered": 0},
+        )
+        for symbol in (
+            "prepare_eligibility_repairs",
+            "materialize_wallet_processing_state",
+            "promote_wallet_evidence",
+            "plan_copyability_evidence_jobs",
+        ):
+            monkeypatch.setattr(
+                f"pm_robot.orchestration.pipeline_cycle.{symbol}",
+                forbidden(symbol),
+            )
+
+        report = run_pipeline_cycle(
+            conn,
+            PipelineCycleOptions(
+                execute_plan=True,
+                scoring_only=True,
+                scoring_wallet_topup_max_active_jobs=60,
+                wallet_max_active_jobs=1,
+                wallet_shard_count=1,
+                feature_limit=0,
+                score_limit=0,
+                policy_path=Path("config/leader_scoring_policy.json"),
+                include_diagnostics=False,
+            ),
+        )
+
+        topup_step = next(step for step in report["steps"] if step["name"] == "wallet_pipeline_topup")
+        queued_wallets = [
+            row["wallet"]
+            for row in conn.execute(
+                """
+                SELECT wallet
+                FROM pipeline_jobs
+                WHERE job_type = 'wallet_evidence_backfill'
+                  AND status IN ('queued', 'running')
+                ORDER BY wallet
+                """
+            ).fetchall()
+        ]
+
+        assert topup_step["data"]["max_active_jobs"] == 1
+        assert topup_step["data"]["active_jobs"] == 1
+        assert topup_step["data"]["throttled"] is True
+        assert topup_step["data"]["reason"] == "active_queue_waterline"
+        assert topup_step["data"]["jobs_enqueued"] == 0
+        assert queued_wallets == [active_wallet]
+        assert _pipeline_cycle_step_rows_written(topup_step) == 0
+        assert _pipeline_cycle_step_rows_written(
+            {"name": "wallet_pipeline_topup", "data": {"jobs_enqueued": 7}}
+        ) == 7
     finally:
         conn.close()
 

@@ -39,6 +39,7 @@ class PipelineCycleOptions:
     wallet_medium_limit: int = 20
     wallet_deep_limit: int = 5
     wallet_max_active_jobs: int = 240
+    scoring_wallet_topup_max_active_jobs: int = 0
     copyability_limit: int = 50
     copyability_max_active_jobs: int = 50
     copyability_min_activity_events: int = 25
@@ -206,15 +207,37 @@ def run_pipeline_cycle(
         )
 
     if options.scoring_only:
-        _append_step(
-            steps,
-            _step(
-                "post_score_planning",
-                "skipped",
-                {"reason": "scoring_only"},
-            ),
-            step_reporter=step_reporter,
-        )
+        scoring_topup_waterline = _scoring_topup_waterline(options)
+        if scoring_topup_waterline > 0:
+            # Refill only existing evidence-state work; scoring catch-up does not rebuild state.
+            _run_isolated_step(
+                conn,
+                steps,
+                "wallet_pipeline_topup",
+                lambda: plan_wallet_pipeline_jobs(
+                    conn,
+                    policy_version=policy_version,
+                    light_limit=options.wallet_light_limit,
+                    medium_limit=options.wallet_medium_limit,
+                    deep_limit=options.wallet_deep_limit,
+                    shard_count=options.wallet_shard_count,
+                    max_active_jobs=scoring_topup_waterline,
+                    lock_retry_attempts=options.planner_lock_attempts,
+                    lock_retry_sleep_seconds=options.planner_lock_sleep_seconds,
+                ),
+                continue_on_error=options.continue_on_error,
+                step_reporter=step_reporter,
+            )
+        else:
+            _append_step(
+                steps,
+                _step(
+                    "post_score_planning",
+                    "skipped",
+                    {"reason": "scoring_only"},
+                ),
+                step_reporter=step_reporter,
+            )
     elif options.evidence_promotion_limit > 0:
         assert policy_path is not None
         _run_isolated_step(
@@ -327,8 +350,24 @@ def _dry_run_steps(options: PipelineCycleOptions) -> list[dict[str, Any]]:
         ),
     ]
     if options.scoring_only:
+        scoring_topup_waterline = _scoring_topup_waterline(options)
+        planning_step = (
+            _step(
+                "wallet_pipeline_topup",
+                "would_execute",
+                {
+                    "light_limit": options.wallet_light_limit,
+                    "medium_limit": options.wallet_medium_limit,
+                    "deep_limit": options.wallet_deep_limit,
+                    "shard_count": options.wallet_shard_count,
+                    "max_active_jobs": scoring_topup_waterline,
+                },
+            )
+            if scoring_topup_waterline > 0
+            else _step("post_score_planning", "skipped", {"reason": "scoring_only"})
+        )
         return scoring_steps + [
-            _step("post_score_planning", "skipped", {"reason": "scoring_only"}),
+            planning_step,
             _step("pipeline_smoothness_after", "would_observe", {"top": options.top}),
         ]
     return [
@@ -391,6 +430,16 @@ def _compact_smoothness(report: dict[str, Any]) -> dict[str, Any]:
         },
         "next_steps": report.get("next_steps", []),
     }
+
+
+def _scoring_topup_waterline(options: PipelineCycleOptions) -> int:
+    """Bound scoring-only queue admission without changing the global planner limit."""
+
+    scoring_waterline = max(0, int(options.scoring_wallet_topup_max_active_jobs))
+    global_waterline = max(0, int(options.wallet_max_active_jobs))
+    if scoring_waterline and global_waterline:
+        return min(scoring_waterline, global_waterline)
+    return scoring_waterline
 
 
 def _step(

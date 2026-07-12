@@ -298,6 +298,7 @@ def test_nas_research_control_runs_ordered_cycle_with_sharded_workers():
     assert "PM_ROBOT_RESEARCH_CONTROL_INTERVAL=300" in env
     assert "PM_ROBOT_RESEARCH_CONTROL_ACTIVE_INTERVAL=60" in env
     assert "PM_ROBOT_RESEARCH_CONTROL_CATCHUP_BURST_LIMIT=4" in env
+    assert "PM_ROBOT_RESEARCH_SCORING_TOPUP_MAX_ACTIVE_JOBS=60" in env
     assert "PM_ROBOT_PIPELINE_STATE_LIMIT=25" in env
     assert "PM_ROBOT_PIPELINE_STATE_COMMIT_EVERY=5" in env
     assert "PM_ROBOT_PIPELINE_PLANNER_MAX_ACTIVE_JOBS=240" in env
@@ -320,6 +321,7 @@ def test_nas_research_control_runs_ordered_cycle_with_sharded_workers():
     assert "PM_ROBOT_RESEARCH_CONTROL_LOCK_TIMEOUT_SECONDS:-120" in control
     assert "PM_ROBOT_RESEARCH_CONTROL_ACTIVE_INTERVAL:-60" in control
     assert "PM_ROBOT_RESEARCH_CONTROL_CATCHUP_BURST_LIMIT:-4" in control
+    assert "PM_ROBOT_RESEARCH_SCORING_TOPUP_MAX_ACTIVE_JOBS:-60" in control
     assert "PM_ROBOT_RESEARCH_PLANNER_LOCK_ATTEMPTS:-4" in control
     assert '--wallet-max-active-jobs "$WALLET_MAX_ACTIVE_JOBS"' in control
     assert '--copyability-max-active-jobs "$COPYABILITY_MAX_ACTIVE_JOBS"' in control
@@ -443,6 +445,9 @@ def test_nas_research_control_switches_saturated_followup_to_scoring_only(tmp_pa
     assert len(commands) == 2
     assert "--scoring-only" not in commands[0].split()
     assert "--scoring-only" in commands[1].split()
+    assert "--scoring-wallet-topup-max-active-jobs" not in commands[0].split()
+    topup_index = commands[1].split().index("--scoring-wallet-topup-max-active-jobs")
+    assert commands[1].split()[topup_index + 1] == "60"
     assert sleeps == ["60", "300"]
     assert "mode=full, next_mode=scoring_only" in result.stdout
     assert "mode=scoring_only, next_mode=full" in result.stdout
