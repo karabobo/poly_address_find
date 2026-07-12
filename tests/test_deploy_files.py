@@ -101,7 +101,7 @@ def test_nas_retention_prune_is_bounded_and_staggered():
     assert "PM_ROBOT_RETENTION_PRUNE_LIMIT=20" in env
     assert "PM_ROBOT_RETENTION_PRUNE_MAX_ACTIVITY_ROWS=5000" in env
     assert "PM_ROBOT_RETENTION_PRUNE_BATCH_DELAY=10" in env
-    assert "PM_ROBOT_RETENTION_CONTROL_LOCK_TIMEOUT=0" in env
+    assert "PM_ROBOT_RETENTION_CONTROL_LOCK_TIMEOUT=60" in env
     assert "PM_ROBOT_RETENTION_CATCHUP_PASSES=4" in env
     assert "PM_ROBOT_RETENTION_CATCHUP_DELAY=60" in env
     assert 'CLEANUP_BATCH_LIMIT="${PM_ROBOT_MAINTENANCE_CLEANUP_BATCH_LIMIT:-500}"' in loop
@@ -109,7 +109,7 @@ def test_nas_retention_prune_is_bounded_and_staggered():
     assert 'PRUNE_LIMIT="${PM_ROBOT_RETENTION_PRUNE_LIMIT:-20}"' in loop
     assert 'PRUNE_MAX_ACTIVITY_ROWS="${PM_ROBOT_RETENTION_PRUNE_MAX_ACTIVITY_ROWS:-5000}"' in loop
     assert 'PRUNE_BATCH_DELAY="${PM_ROBOT_RETENTION_PRUNE_BATCH_DELAY:-10}"' in loop
-    assert 'PRUNE_CONTROL_LOCK_TIMEOUT="${PM_ROBOT_RETENTION_CONTROL_LOCK_TIMEOUT:-0}"' in loop
+    assert 'PRUNE_CONTROL_LOCK_TIMEOUT="${PM_ROBOT_RETENTION_CONTROL_LOCK_TIMEOUT:-60}"' in loop
     assert 'PRUNE_CATCHUP_PASSES="${PM_ROBOT_RETENTION_CATCHUP_PASSES:-4}"' in loop
     assert 'PRUNE_CATCHUP_DELAY="${PM_ROBOT_RETENTION_CATCHUP_DELAY:-60}"' in loop
     assert '--cleanup-batch-limit "$CLEANUP_BATCH_LIMIT"' in loop
@@ -122,9 +122,103 @@ def test_nas_retention_prune_is_bounded_and_staggered():
     assert '--previous-report "$PRUNE_REPORT_PATH"' in loop
     assert '--report-path "$PRUNE_REPORT_PATH"' in loop
     assert 'mv "$PRUNE_REPORT_TMP" "$PRUNE_REPORT_PATH"' not in loop
-    assert "inflow_outpacing_cleanup|yielded_to_research" in loop
+    assert "inflow_outpacing_cleanup|yielded_to_research|retention_starved" in loop
     assert 'sleep "$PRUNE_CATCHUP_DELAY"' in loop
     assert "--skip-cleanup" not in loop
+
+
+def test_nas_retention_starvation_marks_maintenance_failed(tmp_path):
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    heartbeat_log = tmp_path / "heartbeats.log"
+    retention_report = tmp_path / "retention.json"
+    maintenance_report = tmp_path / "maintenance.json"
+    sleep_counter = tmp_path / "sleep.count"
+
+    fake_python = fake_bin / "python"
+    fake_python.write_text(
+        f"""#!{sys.executable}
+import json
+import os
+import pathlib
+import sys
+
+args = sys.argv[1:]
+if args and args[0] == "-c":
+    payload = json.loads(pathlib.Path(args[-1]).read_text(encoding="utf-8"))
+    print(payload.get("state", ""))
+elif "runtime-heartbeat" in args:
+    path = pathlib.Path(os.environ["HEARTBEAT_LOG"])
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(" ".join(args) + "\\n")
+elif "retention-cycle" in args:
+    report_path = pathlib.Path(args[args.index("--report-path") + 1])
+    payload = {{
+        "ok": True,
+        "state": "retention_starved",
+        "backlog_after": {{"total_wallets": 1, "total_activity_rows": 5}},
+        "storage": {{}},
+    }}
+    report_path.write_text(json.dumps(payload), encoding="utf-8")
+    print(json.dumps(payload))
+elif "maintenance" in args:
+    print(json.dumps({{"ok": True}}))
+else:
+    raise SystemExit("unexpected python invocation: " + " ".join(args))
+""",
+        encoding="utf-8",
+    )
+    fake_python.chmod(0o755)
+
+    fake_sleep = fake_bin / "sleep"
+    fake_sleep.write_text(
+        """#!/bin/sh
+count=0
+if [ -f "$SLEEP_COUNTER" ]; then
+  count="$(cat "$SLEEP_COUNTER")"
+fi
+count=$((count + 1))
+printf '%s' "$count" > "$SLEEP_COUNTER"
+if [ "$count" -le 3 ]; then
+  exit 0
+fi
+exit 99
+""",
+        encoding="utf-8",
+    )
+    fake_sleep.chmod(0o755)
+
+    fake_date = fake_bin / "date"
+    fake_date.write_text("#!/bin/sh\nprintf '%s\\n' '2026-07-12T00:00:00Z'\n", encoding="utf-8")
+    fake_date.chmod(0o755)
+
+    env = {
+        **os.environ,
+        "PATH": f"{fake_bin}:{os.environ.get('PATH', '')}",
+        "HEARTBEAT_LOG": str(heartbeat_log),
+        "SLEEP_COUNTER": str(sleep_counter),
+        "PM_ROBOT_MAINTENANCE_START_DELAY": "0",
+        "PM_ROBOT_MAINTENANCE_INTERVAL": "900",
+        "PM_ROBOT_MAINTENANCE_REPORT_PATH": str(maintenance_report),
+        "PM_ROBOT_RETENTION_PRUNE_REPORT_PATH": str(retention_report),
+        "PM_ROBOT_RETENTION_CATCHUP_PASSES": "4",
+        "PM_ROBOT_RETENTION_CATCHUP_DELAY": "1",
+    }
+    result = subprocess.run(
+        ["sh", "deploy/nas/maintenance-loop.sh"],
+        cwd=Path(__file__).resolve().parents[1],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert result.returncode == 99
+    assert result.stdout.count("retention retention_starved; retry") == 3
+    assert "maintenance loop: failed" in result.stderr
+    assert "runtime-heartbeat --name loop_maintenance --status failed" in heartbeat_log.read_text(
+        encoding="utf-8"
+    )
 
 
 def test_canonical_docs_describe_current_research_pipeline_only():

@@ -550,6 +550,74 @@ def test_retention_cycle_yields_before_batch_when_research_control_is_active(
     assert result["yielded_batch"] == 1
     assert result["batches_completed"] == 0
     assert result["deleted_activity_rows"] == 0
+    assert result["consecutive_zero_delete_yields"] == 1
+
+
+def test_retention_cycle_escalates_repeated_zero_delete_yields(
+    tmp_path,
+    monkeypatch,
+):
+    db_path = tmp_path / "robot.sqlite"
+    wallet = "0x" + "a" * 40
+    conn = connect(db_path)
+    try:
+        run_migrations(conn)
+        _seed_candidate(conn, wallet, materialized=True, roi=-0.2)
+        conn.execute(
+            "UPDATE candidate_wallets SET candidate_stage = 'blocked_hygiene' WHERE address = ?",
+            (wallet,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    class BusyGuard:
+        def __enter__(self):
+            raise TimeoutError("research control active")
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+    monkeypatch.setattr(
+        "pm_robot.ops.database_control_plane_guard",
+        lambda *args, **kwargs: BusyGuard(),
+    )
+    previous_report = tmp_path / "retention.json"
+    previous_report.write_text(
+        json.dumps(
+            {
+                "ok": True,
+                "dry_run": False,
+                "state": "yielded_to_research",
+                "consecutive_zero_delete_yields": 2,
+                "finished_at": int(time.time()) - 60,
+                "database_identity": _retention_database_identity(db_path),
+                "backlog_after": {
+                    "generated_at": int(time.time()) - 60,
+                    "terminal_wallets": 1,
+                    "terminal_activity_rows": 5,
+                    "needs_data_wallets": 0,
+                    "needs_data_activity_rows": 0,
+                    "total_wallets": 1,
+                    "total_activity_rows": 5,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = run_retention_cycle(
+        _settings(db_path),
+        batches=1,
+        batch_delay_seconds=0,
+        dry_run=False,
+        previous_report_path=previous_report,
+    )
+
+    assert result["state"] == "retention_starved"
+    assert result["consecutive_zero_delete_yields"] == 3
+    assert result["deleted_activity_rows"] == 0
+    assert result["backlog_after"]["total_activity_rows"] == 5
 
 
 def test_retention_cycle_releases_control_lock_between_batches(
@@ -767,6 +835,7 @@ def test_retention_cycle_cli_forwards_previous_report(tmp_path, monkeypatch, cap
     assert main() == 0
     assert captured["previous_report_path"] == previous_report
     assert captured["report_path"] == report_path
+    assert captured["control_lock_timeout_seconds"] == 60.0
     assert json.loads(capsys.readouterr().out)["ok"] is True
 
 

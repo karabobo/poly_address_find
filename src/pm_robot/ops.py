@@ -46,6 +46,7 @@ from pm_robot.storage.repository import api_request_summary, refresh_activity_wa
 DAY_SECONDS = 86_400
 WAL_CHECKPOINT_MODES = ("none", "passive", "truncate")
 DEFAULT_FAILED_JOB_COOLDOWN_SECONDS = 21_600
+RETENTION_STARVATION_YIELD_THRESHOLD = 3
 WALLET_REGISTRY_TABLE_COLUMNS = [
     "address",
     "candidate_stage",
@@ -2190,7 +2191,7 @@ def run_retention_cycle(
     keep_recent_activity: int = 0,
     batch_delay_seconds: float = 10.0,
     cycle_interval_seconds: int = 900,
-    control_lock_timeout_seconds: float = 0.0,
+    control_lock_timeout_seconds: float = 60.0,
     dry_run: bool = True,
     archive: bool = False,
     archive_dir: Path | None = None,
@@ -2244,7 +2245,7 @@ def _run_retention_cycle_locked(
     keep_recent_activity: int = 0,
     batch_delay_seconds: float = 10.0,
     cycle_interval_seconds: int = 900,
-    control_lock_timeout_seconds: float = 0.0,
+    control_lock_timeout_seconds: float = 60.0,
     dry_run: bool = True,
     archive: bool = False,
     archive_dir: Path | None = None,
@@ -2387,10 +2388,25 @@ def _run_retention_cycle_locked(
         if after_activity_rows > 0 and net_rate_per_hour > 0
         else None
     )
+    previous_zero_delete_yields = (
+        int(previous_cycle.get("consecutive_zero_delete_yields") or 0)
+        if previous_cycle_valid
+        else 0
+    )
+    consecutive_zero_delete_yields = (
+        previous_zero_delete_yields + 1
+        if yielded_to_research
+        and deleted_activity_rows <= 0
+        and after_activity_rows > 0
+        and not dry_run
+        else 0
+    )
     if dry_run:
         state = "dry_run"
     elif after_activity_rows <= 0:
         state = "caught_up"
+    elif consecutive_zero_delete_yields >= RETENTION_STARVATION_YIELD_THRESHOLD:
+        state = "retention_starved"
     elif yielded_to_research:
         state = "yielded_to_research"
     elif net_rate_per_hour > 0:
@@ -2419,6 +2435,7 @@ def _run_retention_cycle_locked(
         "batches_completed": len(batch_results),
         "yielded_to_research": yielded_to_research,
         "yielded_batch": yielded_batch,
+        "consecutive_zero_delete_yields": consecutive_zero_delete_yields,
         "wallet_count": sum(int(row["wallet_count"]) for row in batch_results),
         "selected_activity_rows": sum(
             int(row["selected_activity_rows"]) for row in batch_results
@@ -2476,6 +2493,10 @@ def _previous_retention_cycle(path: Path | None) -> dict[str, Any]:
             "database_id": str(database_identity["database_id"]),
             "mutation_generation": int(database_identity["mutation_generation"]),
         }
+        consecutive_zero_delete_yields = max(
+            0,
+            int(payload.get("consecutive_zero_delete_yields") or 0),
+        )
     except (TypeError, ValueError):
         return _empty_previous_retention_cycle()
     except KeyError:
@@ -2486,6 +2507,7 @@ def _previous_retention_cycle(path: Path | None) -> dict[str, Any]:
         "finished_at": max(0, finished_at),
         "backlog_after": normalized_backlog,
         "database_identity": normalized_identity,
+        "consecutive_zero_delete_yields": consecutive_zero_delete_yields,
     }
 
 
@@ -2496,6 +2518,7 @@ def _empty_previous_retention_cycle() -> dict[str, Any]:
         "finished_at": 0,
         "backlog_after": None,
         "database_identity": None,
+        "consecutive_zero_delete_yields": 0,
     }
 
 

@@ -3562,6 +3562,8 @@ def _storage_maintenance_panel(values: dict[str, Any]) -> str:
         retention_eta_label = "新增更快"
     elif retention_state == "yielded_to_research":
         retention_eta_label = "核心任务优先"
+    elif retention_state == "retention_starved":
+        retention_eta_label = "清理受阻"
     elif net_eta_hours is not None:
         retention_eta_label = _fmt_duration_hours(float(net_eta_hours)) or "已清完"
     else:
@@ -3650,7 +3652,11 @@ def _storage_maintenance_panel(values: dict[str, Any]) -> str:
             f"毛速度 {_fmt_int(retention.get('gross_rate_per_hour'))} 行/小时",
             "warn"
             if not bool(retention.get("ok"))
-            or retention_state in {"inflow_outpacing_cleanup", "no_progress"}
+            or retention_state in {
+                "inflow_outpacing_cleanup",
+                "no_progress",
+                "retention_starved",
+            }
             else "ok",
         ),
         (
@@ -3664,7 +3670,11 @@ def _storage_maintenance_panel(values: dict[str, Any]) -> str:
             "warn"
             if not retention_fresh
             or not bool(retention.get("ok"))
-            or retention_state in {"inflow_outpacing_cleanup", "no_progress"}
+            or retention_state in {
+                "inflow_outpacing_cleanup",
+                "no_progress",
+                "retention_starved",
+            }
             else "ok",
         ),
         ("WAL 提醒阈值", _fmt_bytes(int(values.get("wal_warn_bytes") or 0)), "超过后安排窗口", "ok"),
@@ -7836,6 +7846,7 @@ def _retention_cycle_summary(
         "net_eta_hours": None,
         "yielded_to_research": False,
         "yielded_batch": None,
+        "consecutive_zero_delete_yields": 0,
         "backlog_after": {},
         "storage": {},
         "error": "",
@@ -7877,6 +7888,9 @@ def _retention_cycle_summary(
             "net_eta_hours": _optional_float(payload.get("net_eta_hours")),
             "yielded_to_research": bool(payload.get("yielded_to_research")),
             "yielded_batch": _optional_int(payload.get("yielded_batch")),
+            "consecutive_zero_delete_yields": (
+                _optional_int(payload.get("consecutive_zero_delete_yields")) or 0
+            ),
             "backlog_after": {
                 key: _optional_int(backlog_after.get(key)) or 0
                 for key in (
@@ -8051,6 +8065,15 @@ def _storage_maintenance_summary(
         elif retention_state == "inflow_outpacing_cleanup":
             state = "retention_attention"
             next_action = "低价值证据转入清理队列的速度高于删除速度；继续在研究任务间隙追赶。"
+        elif retention_state == "retention_starved":
+            state = "retention_stalled"
+            consecutive_yields = int(
+                retention_cycle.get("consecutive_zero_delete_yields") or 0
+            )
+            next_action = (
+                f"低价值清理连续 {consecutive_yields} 次未获得写入窗口；"
+                "检查 maintenance-loop 与研究控制锁竞争。"
+            )
         elif retention_state == "yielded_to_research":
             next_action = "研究评分周期正在运行，低价值清理已主动让路并将在短延迟后重试。"
         elif retention_state == "no_progress" and int(

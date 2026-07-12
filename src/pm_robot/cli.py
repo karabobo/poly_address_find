@@ -817,8 +817,8 @@ def main() -> int:
     retention_cycle_cmd.add_argument(
         "--control-lock-timeout-seconds",
         type=float,
-        default=0.0,
-        help="Yield immediately when the high-priority research control cycle is active",
+        default=60.0,
+        help="Wait briefly for the high-priority research control cycle before yielding",
     )
     retention_cycle_cmd.add_argument(
         "--execute", action="store_true", help="Actually delete rows; default is dry-run"

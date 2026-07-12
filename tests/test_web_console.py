@@ -3485,6 +3485,51 @@ def test_storage_maintenance_shows_retention_yield_as_expected_priority(tmp_path
     assert "核心任务优先" in html
 
 
+def test_storage_maintenance_escalates_repeated_retention_starvation(tmp_path):
+    settings = RobotSettings(
+        db_path=tmp_path / "data" / "pm_robot.sqlite",
+        execution_mode="research",
+    )
+    conn = connect(settings.db_path)
+    try:
+        run_migrations(conn)
+        conn.commit()
+    finally:
+        conn.close()
+    report_path = tmp_path / "reports" / "retention_prune_status.json"
+    report_path.parent.mkdir(parents=True)
+    report_path.write_text(
+        json.dumps(
+            {
+                "ok": True,
+                "dry_run": False,
+                "state": "retention_starved",
+                "yielded_to_research": True,
+                "consecutive_zero_delete_yields": 3,
+                "backlog_after": {
+                    "total_wallets": 100,
+                    "total_activity_rows": 50_000,
+                },
+                "storage": {"total_data_bytes": 10_000},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    summary = _storage_maintenance_summary(
+        settings,
+        now=int(report_path.stat().st_mtime) + 10,
+        low_free_disk_bytes=1,
+        scheduled_backup_enabled=False,
+    )
+    html = _storage_maintenance_panel(summary)
+
+    assert summary["retention_cycle"]["consecutive_zero_delete_yields"] == 3
+    assert summary["state"] == "retention_stalled"
+    assert "连续 3 次" in summary["next_action"]
+    assert "清理受阻" in html
+
+
 def test_storage_maintenance_does_not_present_stale_retention_eta_as_current(tmp_path):
     settings = RobotSettings(
         db_path=tmp_path / "data" / "pm_robot.sqlite",

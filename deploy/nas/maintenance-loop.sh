@@ -20,7 +20,7 @@ PRUNE_ARCHIVE_ENABLED="${PM_ROBOT_RETENTION_ARCHIVE_ENABLED:-0}"
 PRUNE_REPORT_PATH="${PM_ROBOT_RETENTION_PRUNE_REPORT_PATH:-/app/reports/retention_prune_status.json}"
 PRUNE_CATCHUP_PASSES="${PM_ROBOT_RETENTION_CATCHUP_PASSES:-4}"
 PRUNE_CATCHUP_DELAY="${PM_ROBOT_RETENTION_CATCHUP_DELAY:-60}"
-PRUNE_CONTROL_LOCK_TIMEOUT="${PM_ROBOT_RETENTION_CONTROL_LOCK_TIMEOUT:-0}"
+PRUNE_CONTROL_LOCK_TIMEOUT="${PM_ROBOT_RETENTION_CONTROL_LOCK_TIMEOUT:-60}"
 
 runtime_heartbeat() {
   name="$1"
@@ -69,6 +69,7 @@ while true; do
       rm -f "$REPORT_TMP" || true
     fi
   fi
+  prune_state=""
   if [ "$maintenance_ok" -eq 1 ] && [ "$PRUNE_ENABLED" = "1" ]; then
     archive_args="--no-archive"
     if [ "$PRUNE_ARCHIVE_ENABLED" = "1" ]; then
@@ -103,7 +104,7 @@ while true; do
       fi
       prune_state="$(python -c 'import json, sys; print(json.load(open(sys.argv[1], encoding="utf-8")).get("state", ""))' "$PRUNE_REPORT_PATH" 2>/dev/null || true)"
       case "$prune_state" in
-        inflow_outpacing_cleanup|yielded_to_research)
+        inflow_outpacing_cleanup|yielded_to_research|retention_starved)
           if [ "$prune_pass" -lt "$PRUNE_CATCHUP_PASSES" ]; then
             echo "$(date -Iseconds) maintenance loop: retention ${prune_state}; retry in ${PRUNE_CATCHUP_DELAY}s"
             sleep "$PRUNE_CATCHUP_DELAY"
@@ -115,6 +116,10 @@ while true; do
       esac
       prune_pass=$((prune_pass + 1))
     done
+    if [ "$prune_state" = "retention_starved" ]; then
+      echo "$(date -Iseconds) maintenance loop: retention remained starved after ${PRUNE_CATCHUP_PASSES} passes" >&2
+      maintenance_ok=0
+    fi
   fi
   if [ "$maintenance_ok" -eq 1 ]; then
     echo "$(date -Iseconds) maintenance loop: ok"
