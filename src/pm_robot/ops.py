@@ -69,6 +69,7 @@ LOW_VALUE_REVIEW_REASONS = (
     "insufficient_copy_backtest_net_pnl_usdc:",
     "score_below_watchlist_after_evidence",
 )
+LOW_VALUE_TERMINAL_ACTIVITY_THRESHOLD = 25
 WALLET_REGISTRY_TABLE_COLUMNS = [
     "address",
     "candidate_stage",
@@ -3523,7 +3524,10 @@ def _wallet_registry_status(
         if "low_profit" in tags or "low_volume" in tags:
             return "archive_low_value", "summary_only"
         if _review_reason_matches(review_reason, ACTIONABLE_INCOMPLETE_REVIEW_REASONS):
-            if evidence_stage in TERMINAL_EVIDENCE_JOB_STAGES and activity_count < 25:
+            if (
+                evidence_stage in TERMINAL_EVIDENCE_JOB_STAGES
+                and activity_count < LOW_VALUE_TERMINAL_ACTIVITY_THRESHOLD
+            ):
                 return "archive_low_value", "summary_only"
             return "needs_more_scoring_data", "summary_and_recent"
         if (
@@ -4095,6 +4099,29 @@ def _needs_data_low_value_wallet_rows(
                       OR ls.review_reason LIKE 'insufficient_recent_30d_volume_usdc:%'
                       OR ls.review_reason LIKE 'insufficient_net_pnl_usdc:%'
                       OR ls.review_reason LIKE 'insufficient_copy_backtest_net_pnl_usdc:%'
+                      OR (
+                          COALESCE(wps.activity_count, 0) < {LOW_VALUE_TERMINAL_ACTIVITY_THRESHOLD}
+                          AND (
+                              COALESCE(ebb.stage, '') IN (
+                                  'light_done',
+                                  'medium_done',
+                                  'deep_done',
+                                  'paused_fast_market_specialist',
+                                  'raw_pruned'
+                              )
+                              OR COALESCE(wps.current_stage, '') IN (
+                                  'light_done',
+                                  'medium_done',
+                                  'deep_done'
+                              )
+                          )
+                          AND (
+                              ls.review_reason = 'no_wallet_metrics_attached'
+                              OR ls.review_reason = 'hygiene_evidence_incomplete'
+                              OR ls.review_reason LIKE 'missing_required_score_components:%'
+                              OR ls.review_reason LIKE 'missing_economic_materiality:%'
+                          )
+                      )
                   )
               )
           )

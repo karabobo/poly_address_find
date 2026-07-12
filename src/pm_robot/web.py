@@ -101,7 +101,7 @@ _ARCHIVE_CATALOG_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 
 _CANDIDATE_STAGE_LABELS = {
     CandidateStage.IMPORTED.value: "已导入",
-    CandidateStage.NEEDS_DATA.value: "待补证据",
+    CandidateStage.NEEDS_DATA.value: "未达评估条件",
     CandidateStage.NEEDS_REVIEW.value: "自动复核中",
     CandidateStage.PAPER_CANDIDATE.value: "Paper 候选",
     CandidateStage.PAPER_APPROVED.value: "Paper 已批准",
@@ -2982,7 +2982,7 @@ def _render_dashboard(settings: RobotSettings) -> str:
         _panel("L1/L2/L3 证据流水线", _evidence_pipeline_panel(data["evidence_pipeline"])),
         "</section>",
         '<section class="grid two">',
-        _panel("候选阶段", _simple_table(data["stage_counts"], ["name", "count"], ["阶段", "数量"], localized_keys={"name"})),
+        _panel("候选阶段（历史总库）", _simple_table(data["stage_counts"], ["name", "count"], ["阶段", "数量"], localized_keys={"name"})),
         _panel("评分阶段", _simple_table(data["score_stage_counts"], ["name", "count", "avg_score", "max_score"], ["阶段", "数量", "均分", "最高分"], localized_keys={"name"})),
         "</section>",
         '<section class="grid two">',
@@ -2992,7 +2992,7 @@ def _render_dashboard(settings: RobotSettings) -> str:
         _panel("评分规则", _dict_table(data["score_policy"])),
         _panel("Copyability 证据通道", _copyability_lane_panel(data["copyability_lane"])),
         _panel("Copyability 无信号高潜池", _copyability_no_signal_panel(data["copyability_no_signal"])),
-        _panel("Needs Data 原因", _needs_data_reason_table(data["needs_data_reasons"])),
+        _panel("未达评估条件原因", _needs_data_reason_table(data["needs_data_reasons"])),
         _panel("来源质量摘要", _source_quality_table(data["source_quality"])),
         _panel("高分阻塞分布", _simple_table(data["top_review_blockers"], ["blocker", "count", "max_score", "next_action", "example"], ["主阻塞", "数量", "最高分", "下一步", "例子"])),
         "</section>",
@@ -3288,7 +3288,14 @@ def _operator_focus_band(data: dict[str, Any]) -> str:
     readiness = data.get("production_readiness") or {}
     pipeline = data.get("evidence_pipeline") or {}
     storage = data.get("storage_maintenance") or {}
-    archive = storage.get("evidence_archive") or {}
+    retention = storage.get("retention_cycle") or {}
+    retention_backlog = retention.get("backlog_after") or {}
+    retention_wallets = int(retention_backlog.get("total_wallets") or 0)
+    retention_rows = int(retention_backlog.get("total_activity_rows") or 0)
+    retention_eta = (
+        _fmt_duration_hours(_optional_float(retention.get("forecast_eta_hours")) or 0.0)
+        or "待测算"
+    )
     running = int(pipeline.get("running") or 0)
     queued = int(pipeline.get("queued") or 0)
     evidence_state = "正在处理" if running else "等待 worker" if queued else "队列空闲"
@@ -3314,7 +3321,7 @@ def _operator_focus_band(data: dict[str, Any]) -> str:
         (
             "数据维护",
             _fmt_bytes(int(storage.get("db_bytes") or 0)),
-            f"Parquet 已归档 {_fmt_int(archive.get('wallet_count'))} 个钱包 · {storage.get('next_action') or ''}",
+            f"低价值待清理 {_fmt_int(retention_wallets)} 钱包 / {_fmt_int(retention_rows)} 行 · ETA {retention_eta}",
             "ok" if str(storage.get("state") or "ok") == "ok" else "warn",
         ),
     ]
@@ -3366,7 +3373,7 @@ def _wallet_filter_form(
 
     shortcuts = [
         ("", "全部"),
-        (CandidateStage.NEEDS_DATA.value, "待补证据"),
+        (CandidateStage.NEEDS_DATA.value, "未达评估条件"),
         (CandidateStage.NEEDS_REVIEW.value, "自动复核中"),
         (CandidateStage.PAPER_CANDIDATE.value, "Paper 候选"),
         (CandidateStage.BLOCKED_HYGIENE.value, "风险阻断"),
@@ -9229,7 +9236,8 @@ def _production_readiness_panel(values: dict[str, Any]) -> str:
         {"key": "真正需要人工", "count": values.get("operator_review_wallets")},
         {"key": "Hygiene 阻断", "count": values.get("blocked_hygiene")},
         {"key": "Copyability 阻断", "count": values.get("blocked_copyability")},
-        {"key": "待补证据", "count": values.get("needs_data")},
+        {"key": "当前证据任务", "count": values.get("evidence_pending")},
+        {"key": "历史 Needs Data 记录", "count": values.get("needs_data")},
         {"key": "当前首要原因", "count": values.get("top_blocker") or ""},
     ]
     action_rows = values.get("manual_review_actions") or []

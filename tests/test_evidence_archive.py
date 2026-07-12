@@ -107,6 +107,71 @@ def _seed_low_value_wallet(
         conn.close()
 
 
+def _seed_terminal_missing_materiality_wallet(
+    settings: RobotSettings,
+    wallet: str,
+    *,
+    activity_count: int,
+) -> None:
+    _seed_low_value_wallet(settings, wallet, terminal=False)
+    conn = connect(settings.db_path)
+    try:
+        conn.execute(
+            """
+            INSERT INTO evidence_backfill_budget(
+                wallet, source, priority, stage, target_depth, current_depth,
+                next_attempt_at, evidence_json, created_at, updated_at
+            ) VALUES (?, 'test', 10, 'light_done', 200, ?, 0, '{}', 2000, 2000)
+            """,
+            (wallet, activity_count),
+        )
+        conn.execute(
+            """
+            INSERT INTO wallet_processing_state(
+                wallet, discovery_tier, evidence_status, evidence_depth,
+                evidence_confidence, priority, current_stage, next_action,
+                activity_count, distinct_markets, non_fast_trade_count, updated_at
+            ) VALUES (?, 'l1_light', 'summary_ready', ?, 0.5, 50,
+                      'light_done', '', ?, 1, ?, 2000)
+            """,
+            (wallet, activity_count, activity_count, activity_count),
+        )
+        persist_score(
+            conn,
+            ScoreBreakdown(
+                address=wallet,
+                leader_score=0,
+                stage=CandidateStage.NEEDS_DATA,
+                reason="missing_economic_materiality:recent_30d_volume_usdc",
+                components={},
+                penalties={},
+            ),
+            policy_version="archive-test-terminal-thin",
+        )
+        scored_at = int(
+            conn.execute(
+                "SELECT scored_at FROM leader_latest_scores WHERE address = ?",
+                (wallet,),
+            ).fetchone()["scored_at"]
+        )
+        stale_at = scored_at - 1
+        conn.execute(
+            "UPDATE wallet_features SET updated_at = ? WHERE address = ?",
+            (stale_at, wallet),
+        )
+        conn.execute(
+            "UPDATE evidence_backfill_budget SET updated_at = ? WHERE wallet = ?",
+            (stale_at, wallet),
+        )
+        conn.execute(
+            "UPDATE wallet_processing_state SET updated_at = ? WHERE wallet = ?",
+            (stale_at, wallet),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def test_verified_parquet_archive_precedes_sqlite_prune(tmp_path):
     settings = _settings(tmp_path)
     wallet = "0x" + "1" * 40
@@ -227,6 +292,97 @@ def test_zero_score_deep_done_wallet_is_pruned_after_summary_materialization(tmp
 
     assert result["wallets"] == [wallet]
     assert result["deleted"]["wallet_activity"] == 5
+
+
+def test_terminal_thin_wallet_with_missing_materiality_is_pruned(tmp_path):
+    settings = _settings(tmp_path)
+    wallet = "0x" + "b" * 40
+    _seed_terminal_missing_materiality_wallet(settings, wallet, activity_count=5)
+
+    result = prune_low_value_evidence(
+        settings,
+        limit=5,
+        dry_run=False,
+        archive=False,
+    )
+
+    assert result["wallets"] == [wallet]
+    assert result["deleted"]["wallet_activity"] == 5
+    conn = connect(settings.db_path)
+    try:
+        registry = conn.execute(
+            "SELECT registry_status, raw_retention_tier FROM wallet_registry WHERE address = ?",
+            (wallet,),
+        ).fetchone()
+        assert tuple(registry) == ("archived_raw_pruned", "summary_only")
+    finally:
+        conn.close()
+
+
+def test_terminal_materiality_gap_with_enough_activity_is_not_pruned(tmp_path):
+    settings = _settings(tmp_path)
+    wallet = "0x" + "c" * 40
+    _seed_terminal_missing_materiality_wallet(settings, wallet, activity_count=25)
+
+    result = prune_low_value_evidence(
+        settings,
+        limit=5,
+        dry_run=False,
+        archive=False,
+    )
+
+    assert result["wallet_count"] == 0
+    conn = connect(settings.db_path)
+    try:
+        remaining = conn.execute(
+            "SELECT COUNT(*) FROM wallet_activity WHERE address = ?",
+            (wallet,),
+        ).fetchone()[0]
+        assert remaining == 5
+    finally:
+        conn.close()
+
+
+def test_missing_materiality_without_terminal_evidence_is_not_pruned(tmp_path):
+    settings = _settings(tmp_path)
+    wallet = "0x" + "d" * 40
+    _seed_low_value_wallet(settings, wallet, terminal=False)
+    conn = connect(settings.db_path)
+    try:
+        persist_score(
+            conn,
+            ScoreBreakdown(
+                address=wallet,
+                leader_score=0,
+                stage=CandidateStage.NEEDS_DATA,
+                reason="missing_economic_materiality:recent_30d_volume_usdc",
+                components={},
+                penalties={},
+            ),
+            policy_version="archive-test-nonterminal-thin",
+        )
+        scored_at = int(
+            conn.execute(
+                "SELECT scored_at FROM leader_latest_scores WHERE address = ?",
+                (wallet,),
+            ).fetchone()["scored_at"]
+        )
+        conn.execute(
+            "UPDATE wallet_features SET updated_at = ? WHERE address = ?",
+            (scored_at - 1, wallet),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    result = prune_low_value_evidence(
+        settings,
+        limit=5,
+        dry_run=False,
+        archive=False,
+    )
+
+    assert result["wallet_count"] == 0
 
 
 def test_deep_done_wallet_with_score_older_than_features_is_not_pruned(tmp_path):

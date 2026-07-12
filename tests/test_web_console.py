@@ -2707,7 +2707,7 @@ def test_dashboard_groups_needs_data_reasons_into_operator_actions(tmp_path):
     assert reasons["low_net_pnl"]["reason"] == "净收益不足"
     assert reasons["low_recent_volume"]["reason"] == "近期交易量不足"
     assert reasons["insufficient_directional_trades"]["reason"] == "有效交易样本不足"
-    assert "Needs Data 原因" in html
+    assert "未达评估条件原因" in html
     assert "补 copyability 证据并重评" in html
     assert "先物化 wallet_features，再分流补 copyability/hygiene" in html
     assert "证据已耗尽，保留摘要并停止昂贵补证据" in html
@@ -4108,12 +4108,50 @@ def test_dashboard_starts_with_operator_outcomes_and_pipeline(tmp_path):
     assert "系统运行" in html
     assert "研究漏斗" in html
     assert "当前处理重点" in html
+    assert "候选阶段（历史总库）" in html
+    assert "未达评估条件原因" in html
+    assert "当前证据任务" in html
+    assert "历史 Needs Data 记录" in html
     assert "正式钱包" in html
     assert "24h 完成任务" in html
     assert 'class="review-table"' in html
     assert html.index("今日运行概览") < html.index("高分待验证")
     assert html.index("当前结论") < html.index("研究漏斗")
     assert html.index("研究漏斗") < html.index("生产收敛详情")
+
+
+def test_operator_focus_separates_retention_backlog_from_evidence_queue():
+    html = web_module._operator_focus_band(
+        {
+            "production_readiness": {
+                "automatic_review_wallets": 0,
+                "watch_review_wallets": 0,
+                "operator_review_wallets": 0,
+                "copyability_pending": 0,
+            },
+            "evidence_pipeline": {
+                "running": 1,
+                "queued": 3,
+                "total_due_backlog": 3,
+                "total_eta_label": "2 分钟",
+            },
+            "storage_maintenance": {
+                "db_bytes": 20_000_000_000,
+                "state": "ok",
+                "retention_cycle": {
+                    "forecast_eta_hours": 12.3,
+                    "backlog_after": {
+                        "total_wallets": 1_937,
+                        "total_activity_rows": 3_738_920,
+                    },
+                },
+            },
+        }
+    )
+
+    assert "3 个待处理" in html
+    assert "低价值待清理 1,937 钱包 / 3,738,920 行" in html
+    assert "ETA 12.3 小时" in html
 
 
 def test_dashboard_and_startup_prewarm_use_lightweight_summary(tmp_path, monkeypatch):
