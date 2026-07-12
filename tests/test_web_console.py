@@ -737,6 +737,106 @@ def test_paper_handoff_ignores_stale_actionable_observer_rows(tmp_path):
     assert data["production_readiness"]["state"] == "paper_candidates_waiting_actionable_signals"
 
 
+def test_production_readiness_reports_independent_observer_market_progress(tmp_path):
+    settings = _settings(tmp_path)
+    conn = connect(settings.db_path)
+    wallet = "0xabc00000000000000000000000000000000000ab"
+    now = int(time.time())
+    try:
+        run_migrations(conn)
+        conn.execute(
+            """
+            INSERT INTO candidate_wallets(
+                address, sources, labels, notes, links, status,
+                candidate_stage, first_seen_at, updated_at
+            ) VALUES (?, 'observer-test', '', '', '', 'active', 'paper_approved', ?, ?)
+            """,
+            (wallet, now - 1200, now),
+        )
+        conn.execute(
+            """
+            INSERT INTO leader_scores(
+                address, leader_score, review_stage, review_reason,
+                components_json, penalties_json, policy_version, scored_at
+            ) VALUES (?, 81.0, 'paper_approved', 'observer_ready', '{}', '{}', 'test', ?)
+            """,
+            (wallet, now),
+        )
+        for index in range(10):
+            market_index = index % 2
+            conn.execute(
+                """
+                INSERT INTO paper_observer_trials(
+                    signal_id, wallet, candidate_stage, validation_cohort,
+                    market_slug, asset_id, outcome, side, detected_at,
+                    entry_evaluated_at, leader_price, entry_price, stake_usd,
+                    fee_usd, cost_usd, shares, slippage_bps, signal_age_sec,
+                    status, mark_price, mark_source, mark_value_usd, pnl_usd,
+                    roi, resolved_at, updated_at
+                ) VALUES (?, ?, 'paper_approved', 'validation', ?, ?, 'YES', 'BUY', ?,
+                          ?, 0.5, 0.5, 40, 0, 40, 80, 0, 10,
+                          'resolved', 0.55, 'gamma_settlement', 44, 4,
+                          0.1, ?, ?)
+                """,
+                (
+                    f"signal-{index}",
+                    wallet,
+                    f"market-{market_index}",
+                    f"asset-{market_index}",
+                    now - 100,
+                    now - 90,
+                    now - 10,
+                    now - 10,
+                ),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+    data = dashboard_data(settings)
+    readiness = data["production_readiness"]
+    html = _render_dashboard(settings)
+
+    assert readiness["state"] == "paper_observer_collecting_outcomes"
+    assert readiness["observer_trial_wallets"] == 1
+    assert readiness["observer_trial_total"] == 10
+    assert readiness["observer_trial_resolved"] == 10
+    assert readiness["observer_trial_resolved_markets"] == 2
+    assert readiness["observer_trial_best_resolved_markets"] == 2
+    assert readiness["observer_trial_market_target"] == 20
+    assert readiness["observer_trial_leading_wallet"] == wallet
+    assert readiness["observer_trial_leading_status"] == "collecting_outcomes"
+    assert "最佳进度 2/20 个独立已结算市场" in readiness["next_action"]
+    assert data["paper_handoff"]["wallets"][0]["observer_resolved_markets"] == 2
+    assert "结果验证钱包" in html
+    assert "最佳独立市场" in html
+    assert "按钱包和市场计样本，不按重复交易数" in html
+
+
+def test_dashboard_reuses_observer_summary_across_readiness_and_handoff(tmp_path, monkeypatch):
+    settings = _settings(tmp_path)
+    conn = connect(settings.db_path)
+    try:
+        run_migrations(conn)
+        conn.commit()
+    finally:
+        conn.close()
+
+    original = web_module.paper_observer_trial_summary
+    calls = 0
+
+    def counted_summary(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(web_module, "paper_observer_trial_summary", counted_summary)
+
+    dashboard_data(settings)
+
+    assert calls == 1
+
+
 def test_formal_publish_gate_requires_evidence_on_the_same_live_wallet(tmp_path):
     settings = RobotSettings(
         db_path=tmp_path / "pm_robot.sqlite",

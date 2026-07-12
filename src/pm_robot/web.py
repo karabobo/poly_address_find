@@ -925,14 +925,19 @@ def _dashboard_data(
     score_policy = _score_policy_freshness(conn, settings, paper_min_score=paper_min_score)
     score_policy["threshold_policy_loaded"] = paper_thresholds["policy_loaded"]
     score_policy["threshold_policy_error"] = paper_thresholds["policy_error"]
-    paper_handoff = _paper_handoff_summary(conn, settings)
+    dashboard_policy = load_policy(settings.policy_path)
+    paper_observer_trials = paper_observer_trial_summary(
+        conn,
+        policy=dashboard_policy,
+    )
+    paper_handoff = _paper_handoff_summary(
+        conn,
+        settings,
+        observer_summary=paper_observer_trials,
+    )
     paper_observer_preview = _paper_observer_preview_summary(conn, limit=8)
     paper_observer_evaluation = paper_observer_evaluation_data(settings)
     paper_observer_evaluation["history"] = _paper_signal_evaluation_history(conn)
-    paper_observer_trials = paper_observer_trial_summary(
-        conn,
-        policy=load_policy(settings.policy_path),
-    )
     paper_observer_trials["read_only"] = True
     paper_observer_trials["boundary"] = (
         "研究侧观察试验只固定及时可跟报价并计算 Gamma 标记/结算结果；"
@@ -945,6 +950,7 @@ def _dashboard_data(
         top_review_candidates=top_review_candidates,
         manual_review_actions=manual_review_actions,
         paper_min_score=paper_min_score,
+        observer_summary=paper_observer_trials,
     )
     return {
         "generated_at": int(time.time()),
@@ -5729,7 +5735,13 @@ def _review_blocker_next_action(key: str) -> str:
     return actions.get(key, "继续观察或人工复核")
 
 
-def _paper_handoff_summary(conn: sqlite3.Connection, settings: RobotSettings, *, limit: int = 10) -> dict[str, Any]:
+def _paper_handoff_summary(
+    conn: sqlite3.Connection,
+    settings: RobotSettings,
+    *,
+    limit: int = 10,
+    observer_summary: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     paper_min_score = _paper_candidate_min_score(settings)
     observer_current_cutoff = _paper_observer_current_cutoff()
     research_only = settings.execution_mode in {"research", "scoring", "research_scoring"}
@@ -5740,10 +5752,11 @@ def _paper_handoff_summary(conn: sqlite3.Connection, settings: RobotSettings, *,
         observer_current_cutoff=observer_current_cutoff,
         research_only=research_only,
     )
-    observer_summary = paper_observer_trial_summary(
-        conn,
-        policy=load_policy(settings.policy_path),
-    )
+    if observer_summary is None:
+        observer_summary = paper_observer_trial_summary(
+            conn,
+            policy=load_policy(settings.policy_path),
+        )
     observer_by_wallet = {
         str(item.get("wallet") or ""): item
         for item in observer_summary.get("wallet_summaries") or []
@@ -6540,6 +6553,7 @@ def _production_readiness_summary(
     top_review_candidates: list[dict[str, Any]],
     manual_review_actions: list[dict[str, Any]],
     paper_min_score: float,
+    observer_summary: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     stage_counts = {str(row.get("name") or ""): int(row.get("count") or 0) for row in stage_rows}
     manual = conn.execute(
@@ -6643,6 +6657,66 @@ def _production_readiness_summary(
         WHERE cw.candidate_stage IN ('paper_candidate', 'paper_approved', 'live_eligible')
         """
     ).fetchone()
+    if observer_summary is None:
+        observer_summary = paper_observer_trial_summary(
+            conn,
+            policy=load_policy(settings.policy_path),
+        )
+    paper_stage_addresses = {
+        str(row["address"] or "")
+        for row in conn.execute(
+            """
+            SELECT address
+            FROM candidate_wallets
+            WHERE candidate_stage IN ('paper_candidate', 'paper_approved', 'live_eligible')
+            """
+        )
+    }
+    paper_observer_rows = [
+        row
+        for row in observer_summary.get("wallet_summaries") or []
+        if str(row.get("wallet") or "") in paper_stage_addresses
+    ]
+    observer_validation_counts: dict[str, int] = {}
+    for row in paper_observer_rows:
+        status = str(row.get("validation_status") or "collecting_outcomes")
+        observer_validation_counts[status] = observer_validation_counts.get(status, 0) + 1
+    observer_trial_policy = dict(observer_summary.get("validation_policy") or {})
+    observer_trial_market_target = max(
+        1,
+        int(observer_trial_policy.get("min_resolved_markets") or 20),
+    )
+    leading_observer = max(
+        paper_observer_rows,
+        key=lambda row: (
+            int(row.get("resolved_markets") or 0),
+            float(row.get("settled_roi_pct") or 0),
+        ),
+        default={},
+    )
+    observer_trial_wallets = len(paper_observer_rows)
+    observer_trial_total = sum(int(row.get("total_trials") or 0) for row in paper_observer_rows)
+    observer_trial_resolved = sum(
+        int(row.get("resolved_trials") or 0) for row in paper_observer_rows
+    )
+    observer_trial_resolved_markets = sum(
+        int(row.get("resolved_markets") or 0) for row in paper_observer_rows
+    )
+    observer_trial_best_resolved_markets = int(
+        leading_observer.get("resolved_markets") or 0
+    )
+    observer_validated_promising = int(
+        observer_validation_counts.get("validated_promising", 0)
+    )
+    observer_validated_negative = int(
+        observer_validation_counts.get("validated_negative", 0)
+    )
+    observer_validated_mixed = int(
+        observer_validation_counts.get("validated_mixed", 0)
+    )
+    observer_validation_concentrated = int(
+        observer_validation_counts.get("validation_concentrated", 0)
+    )
     formal_publish_gate = _formal_publish_gate_summary(conn, settings=settings, stage_counts=stage_counts)
     # Operator-facing blocker should point at the active manual-review queue;
     # archived blockers remain visible in the stage counts.
@@ -6672,7 +6746,38 @@ def _production_readiness_summary(
         or (top_review_candidates[0].get("blocker_label") if top_review_candidates else "")
         or ""
     )
-    if paper_stage_wallets and observer_actionable_signals <= 0:
+    if paper_stage_wallets and observer_validated_negative:
+        state = "paper_observer_validated_negative"
+        next_action = (
+            f"{observer_validated_negative} 个 Paper 钱包已形成负向 observer 结论；"
+            "停止把它当作可升级对象，并复核是否移出 Paper 池。"
+        )
+    elif paper_stage_wallets and observer_validated_promising:
+        state = "paper_observer_validated_promising"
+        next_action = (
+            f"{observer_validated_promising} 个 Paper 钱包已通过独立市场结果验证；"
+            "保留研究结论，正式运行仍需独立执行与发布边界。"
+        )
+    elif paper_stage_wallets and observer_validation_concentrated:
+        state = "paper_observer_validation_concentrated"
+        next_action = (
+            f"{observer_validation_concentrated} 个 Paper 钱包结果样本过度集中；"
+            "继续补不同市场，不用重复交易数代替独立样本。"
+        )
+    elif paper_stage_wallets and observer_validated_mixed:
+        state = "paper_observer_validated_mixed"
+        next_action = (
+            f"{observer_validated_mixed} 个 Paper 钱包已完成结果验证但方向混合；"
+            "保持研究观察，不进入正式交接。"
+        )
+    elif paper_stage_wallets and observer_trial_wallets:
+        state = "paper_observer_collecting_outcomes"
+        next_action = (
+            f"已有 {observer_trial_wallets} 个 Paper 钱包进入结果验证；"
+            f"最佳进度 {observer_trial_best_resolved_markets}/{observer_trial_market_target} 个独立已结算市场，"
+            "继续收集，不按重复交易数提前放行。"
+        )
+    elif paper_stage_wallets and observer_actionable_signals <= 0:
         state = "paper_candidates_waiting_actionable_signals"
         next_action = "已有 paper 候选，但当前没有可及时跟信号；继续 observer 收集，不发布。"
     elif paper_stage_wallets:
@@ -6742,6 +6847,28 @@ def _production_readiness_summary(
         "observer_history_stale_signals": int(observer_history["stale_signals"] or 0) if observer_history else 0,
         "observer_history_quote_errors": int(observer_history["quote_errors"] or 0) if observer_history else 0,
         "observer_history_latest_evaluated_at": int(observer_history["latest_evaluated_at"] or 0) if observer_history else 0,
+        "observer_trial_wallets": observer_trial_wallets,
+        "observer_trial_total": observer_trial_total,
+        "observer_trial_resolved": observer_trial_resolved,
+        "observer_trial_resolved_markets": observer_trial_resolved_markets,
+        "observer_trial_best_resolved_markets": observer_trial_best_resolved_markets,
+        "observer_trial_market_target": observer_trial_market_target,
+        "observer_trial_leading_wallet": str(leading_observer.get("wallet") or ""),
+        "observer_trial_leading_roi_pct": float(
+            leading_observer.get("settled_roi_pct") or 0
+        ),
+        "observer_trial_leading_concentration_pct": float(
+            leading_observer.get("max_market_cost_share_pct") or 0
+        ),
+        "observer_trial_leading_status": str(
+            leading_observer.get("validation_status") or "no_trials"
+        ),
+        "observer_validation_policy": observer_trial_policy,
+        "observer_validation_counts": observer_validation_counts,
+        "observer_validated_promising_wallets": observer_validated_promising,
+        "observer_validated_negative_wallets": observer_validated_negative,
+        "observer_validated_mixed_wallets": observer_validated_mixed,
+        "observer_validation_concentrated_wallets": observer_validation_concentrated,
         "formal_publish_gate": formal_publish_gate,
         "top_blocker_key": top_blocker_key,
         "top_blocker": top_blocker,
@@ -9200,10 +9327,34 @@ def _production_readiness_panel(values: dict[str, Any]) -> str:
     if not values:
         return '<p class="empty">暂无收敛数据。</p>'
     has_paper = int(values.get("paper_stage_wallets") or 0) > 0
-    banner_state = "ok" if has_paper else "attention"
+    observer_outcome_risk = int(values.get("observer_validated_negative_wallets") or 0) + int(
+        values.get("observer_validation_concentrated_wallets") or 0
+    )
+    banner_state = "ok" if has_paper and not observer_outcome_risk else "attention"
     publish_gate = values.get("formal_publish_gate") or {}
     cards = [
         ("Paper 候选", _fmt_int(values.get("paper_stage_wallets")), "可进入外部验证", "ok" if has_paper else "warn"),
+        (
+            "结果验证钱包",
+            _fmt_int(values.get("observer_trial_wallets")),
+            f"{_fmt_int(values.get('observer_trial_resolved'))}/{_fmt_int(values.get('observer_trial_total'))} 试验已结算",
+            "ok" if int(values.get("observer_trial_wallets") or 0) else "warn",
+        ),
+        (
+            "最佳独立市场",
+            f"{_fmt_int(values.get('observer_trial_best_resolved_markets'))}/{_fmt_int(values.get('observer_trial_market_target'))}",
+            "按钱包和市场计样本，不按重复交易数",
+            "ok"
+            if int(values.get("observer_trial_best_resolved_markets") or 0)
+            >= int(values.get("observer_trial_market_target") or 1)
+            else "warn",
+        ),
+        (
+            "Observer 结论",
+            f"正向 {_fmt_int(values.get('observer_validated_promising_wallets'))} / 负向 {_fmt_int(values.get('observer_validated_negative_wallets'))}",
+            f"混合 {_fmt_int(values.get('observer_validated_mixed_wallets'))} · 集中 {_fmt_int(values.get('observer_validation_concentrated_wallets'))}",
+            "warn" if observer_outcome_risk else "ok",
+        ),
         (
             "正式钱包",
             _fmt_int(publish_gate.get("active_published_leaders")),
