@@ -652,6 +652,7 @@ def _summary_ready_without_score(conn: sqlite3.Connection, tables: set[str]) -> 
     if not {"candidate_wallets", "wallet_processing_state", "leader_scores"}.issubset(tables):
         return 0
     blocking_placeholders = ",".join("?" for _ in BLOCKING_CANDIDATE_STAGES)
+    registry_join, retention_filter = _active_raw_evidence_scope_sql(tables)
     return _scalar(
         conn,
         f"""
@@ -659,8 +660,10 @@ def _summary_ready_without_score(conn: sqlite3.Connection, tables: set[str]) -> 
         FROM wallet_processing_state wps
         JOIN candidate_wallets cw
           ON cw.address = wps.wallet
+        {registry_join}
         WHERE (wps.evidence_status = 'summary_ready' OR wps.next_action = 'score_wallet')
           AND cw.candidate_stage NOT IN ({blocking_placeholders})
+          {retention_filter}
           AND NOT EXISTS (
               SELECT 1 FROM leader_scores ls WHERE ls.address = wps.wallet
           )
@@ -673,6 +676,7 @@ def _summary_ready_score_stale(conn: sqlite3.Connection, tables: set[str], *, no
     if not {"candidate_wallets", "wallet_processing_state", "leader_scores"}.issubset(tables):
         return 0
     blocking_placeholders = ",".join("?" for _ in BLOCKING_CANDIDATE_STAGES)
+    registry_join, retention_filter = _active_raw_evidence_scope_sql(tables)
     return _scalar(
         conn,
         f"""
@@ -680,8 +684,10 @@ def _summary_ready_score_stale(conn: sqlite3.Connection, tables: set[str], *, no
         FROM wallet_processing_state wps
         JOIN candidate_wallets cw
           ON cw.address = wps.wallet
+        {registry_join}
         WHERE (wps.evidence_status = 'summary_ready' OR wps.next_action = 'score_wallet')
           AND cw.candidate_stage NOT IN ({blocking_placeholders})
+          {retention_filter}
           AND COALESCE(wps.updated_at, 0) < ?
           AND COALESCE((
               SELECT MAX(scored_at)
@@ -710,6 +716,7 @@ def _pending_without_active_job_count(
         if "evidence_backfill_budget" in tables
         else ""
     )
+    join_registry, retention_filter = _active_raw_evidence_scope_sql(tables)
     approval_join, promotion_filter = _evidence_promotion_audit_sql(
         tables,
         policy_version=policy_version,
@@ -732,9 +739,11 @@ def _pending_without_active_job_count(
         FROM wallet_processing_state wps
         {join_candidate}
         {join_budget}
+        {join_registry}
         {approval_join}
         WHERE wps.next_action IN ({placeholders})
           AND wps.evidence_status NOT IN ('paused', 'summary_ready')
+          {retention_filter}
           {promotion_filter}
           {candidate_filter}
           {priority_filter}
@@ -959,6 +968,7 @@ def _pending_without_active_job_samples(
         if "evidence_backfill_budget" in tables
         else ""
     )
+    join_registry, retention_filter = _active_raw_evidence_scope_sql(tables)
     approval_join, promotion_filter = _evidence_promotion_audit_sql(
         tables,
         policy_version=policy_version,
@@ -981,9 +991,11 @@ def _pending_without_active_job_samples(
         FROM wallet_processing_state wps
         {join_candidate}
         {join_budget}
+        {join_registry}
         {approval_join}
         WHERE wps.next_action IN ({placeholders})
           AND wps.evidence_status NOT IN ('paused', 'summary_ready')
+          {retention_filter}
           {promotion_filter}
           {candidate_filter}
           {priority_filter}
@@ -1090,6 +1102,7 @@ def _summary_ready_without_recent_score_samples(
     if not {"candidate_wallets", "wallet_processing_state", "leader_scores"}.issubset(tables):
         return []
     blocking_placeholders = ",".join("?" for _ in BLOCKING_CANDIDATE_STAGES)
+    registry_join, retention_filter = _active_raw_evidence_scope_sql(tables)
     rows = conn.execute(
         f"""
         SELECT
@@ -1102,8 +1115,10 @@ def _summary_ready_without_recent_score_samples(
         FROM wallet_processing_state wps
         JOIN candidate_wallets cw
           ON cw.address = wps.wallet
+        {registry_join}
         WHERE (wps.evidence_status = 'summary_ready' OR wps.next_action = 'score_wallet')
           AND cw.candidate_stage NOT IN ({blocking_placeholders})
+          {retention_filter}
           AND COALESCE(wps.updated_at, 0) < ?
           AND COALESCE((
               SELECT MAX(scored_at)
@@ -1116,6 +1131,17 @@ def _summary_ready_without_recent_score_samples(
         (*BLOCKING_CANDIDATE_STAGES, now - SCORE_STALE_GRACE_SECONDS, top),
     ).fetchall()
     return [dict(row) for row in rows]
+
+
+def _active_raw_evidence_scope_sql(tables: set[str]) -> tuple[str, str]:
+    """Exclude intentionally retired raw evidence from actionable audit backlogs."""
+
+    if "wallet_registry" not in tables:
+        return "", ""
+    return (
+        "LEFT JOIN wallet_registry wr ON wr.address = wps.wallet",
+        "AND COALESCE(wr.raw_retention_tier, '') != 'summary_only'",
+    )
 
 
 def _stale_running_job_samples(

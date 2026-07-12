@@ -488,6 +488,83 @@ def test_pipeline_audit_warns_only_after_score_stale_grace_window(tmp_path):
         conn.close()
 
 
+def test_pipeline_audit_excludes_summary_only_wallets_from_actionable_backlogs(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    pending_wallet = "0x" + "1" * 40
+    stale_wallet = "0x" + "2" * 40
+    unscored_wallet = "0x" + "3" * 40
+    try:
+        run_migrations(conn)
+        for wallet in (pending_wallet, stale_wallet, unscored_wallet):
+            upsert_candidate(conn, CandidateAddress(address=wallet, sources="test_source"))
+            conn.execute(
+                "UPDATE candidate_wallets SET candidate_stage = 'needs_data' WHERE address = ?",
+                (wallet,),
+            )
+            conn.execute(
+                """
+                INSERT INTO wallet_registry(
+                    address, candidate_stage, registry_status, raw_retention_tier,
+                    last_evaluated_at, updated_at
+                ) VALUES (?, 'needs_data', 'archived_raw_pruned', 'summary_only', 100, 100)
+                """,
+                (wallet,),
+            )
+        conn.execute(
+            """
+            INSERT INTO wallet_processing_state(
+                wallet, discovery_tier, evidence_status, current_stage,
+                next_action, priority, updated_at
+            ) VALUES (?, 'l1_light', 'needs_light', '', 'light_pending', 20, 200)
+            """,
+            (pending_wallet,),
+        )
+        for wallet in (stale_wallet, unscored_wallet):
+            conn.execute(
+                """
+                INSERT INTO wallet_processing_state(
+                    wallet, discovery_tier, evidence_status, current_stage,
+                    next_action, updated_at
+                ) VALUES (?, 'l3_deep', 'summary_ready', 'deep_done', 'score_wallet', 200)
+                """,
+                (wallet,),
+            )
+        conn.execute(
+            """
+            INSERT INTO leader_scores(
+                address, leader_score, review_stage, review_reason,
+                components_json, penalties_json, policy_version, scored_at
+            ) VALUES (?, 0, 'needs_data', 'archived', '{}', '{}', 'test', 50)
+            """,
+            (stale_wallet,),
+        )
+        conn.commit()
+
+        report = pipeline_audit_report(conn, now=1_000)
+
+        evidence = report["funnel"]["evidence"]
+        assert evidence["pending_without_active_job"] == 0
+        assert evidence["summary_ready_without_score"] == 0
+        assert evidence["summary_ready_score_stale"] == 0
+        assert report["samples"]["pending_without_active_job"] == []
+        assert report["samples"]["summary_ready_without_recent_score"] == []
+
+        conn.execute(
+            "UPDATE wallet_registry SET raw_retention_tier = 'summary_and_recent'"
+        )
+        conn.commit()
+
+        reactivated_report = pipeline_audit_report(conn, now=1_000)
+        reactivated_evidence = reactivated_report["funnel"]["evidence"]
+        assert reactivated_evidence["pending_without_active_job"] == 1
+        assert reactivated_evidence["summary_ready_without_score"] == 1
+        assert reactivated_evidence["summary_ready_score_stale"] == 2
+        assert len(reactivated_report["samples"]["pending_without_active_job"]) == 1
+        assert len(reactivated_report["samples"]["summary_ready_without_recent_score"]) == 2
+    finally:
+        conn.close()
+
+
 def test_pipeline_audit_flags_unvalidated_core_copy_credit(tmp_path):
     conn = connect(tmp_path / "robot.sqlite")
     wallet = "0x" + "b" * 40
