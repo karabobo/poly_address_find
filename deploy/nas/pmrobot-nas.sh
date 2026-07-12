@@ -762,6 +762,14 @@ print(json.dumps({
         "batches_completed": retention_cycle.get("batches_completed", 0),
         "error": retention_cycle.get("error", ""),
     },
+    "sqlite_compaction": {
+        "candidate": storage_maintenance.get("sqlite_compaction_candidate", False),
+        "ready": storage_maintenance.get("sqlite_compaction_ready", False),
+        "reusable_bytes": (storage_maintenance.get("sqlite_pages") or {}).get("reusable_bytes", 0),
+        "reusable_ratio": (storage_maintenance.get("sqlite_pages") or {}).get("reusable_ratio", 0),
+        "plan_command": storage_maintenance.get("compact_plan_command", ""),
+        "window_command": storage_maintenance.get("compact_window_command", ""),
+    },
     "db": db,
 }, ensure_ascii=False, sort_keys=True, indent=2))
 PY
@@ -872,6 +880,117 @@ row = conn.execute(
 ).fetchone()
 print(f"{int(row[0] or 0)} {int(row[1] or 0)} {int(row[2] or 0)}")
 PY
+}
+
+pipeline_active_job_counts() {
+  PM_ROBOT_HOST_DB_PATH="$DATA_DIR/pm_robot.sqlite" python3 - <<'PY'
+import os
+import sqlite3
+
+conn = sqlite3.connect(os.environ["PM_ROBOT_HOST_DB_PATH"])
+row = conn.execute(
+    """
+    SELECT
+        SUM(CASE WHEN job_type = 'wallet_evidence_backfill' THEN 1 ELSE 0 END),
+        SUM(CASE WHEN job_type = 'copyability_evidence' THEN 1 ELSE 0 END),
+        COUNT(*)
+    FROM pipeline_jobs
+    WHERE status IN ('queued', 'running')
+    """
+).fetchone()
+print(f"{int(row[0] or 0)} {int(row[1] or 0)} {int(row[2] or 0)}")
+PY
+}
+
+retention_compaction_guard() {
+  PM_ROBOT_RETENTION_REPORT="$REPORTS_DIR/retention_prune_status.json" python3 - <<'PY'
+import json
+import os
+import sys
+import time
+from pathlib import Path
+
+path = Path(os.environ["PM_ROBOT_RETENTION_REPORT"])
+try:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    age_seconds = max(0, int(time.time()) - int(path.stat().st_mtime))
+except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
+    print(f"Compaction guard: retention report unavailable: {type(exc).__name__}", file=sys.stderr)
+    raise SystemExit(1)
+
+backlog = payload.get("backlog_after") or {}
+rows = int(backlog.get("total_activity_rows") or 0)
+wallets = int(backlog.get("total_wallets") or 0)
+state = str(payload.get("state") or "")
+ok = bool(payload.get("ok")) and not bool(payload.get("dry_run"))
+fresh = age_seconds <= 3600
+if not ok or not fresh or state != "caught_up" or rows != 0 or wallets != 0:
+    print(
+        "Compaction guard: retention must be fresh and caught up "
+        f"(ok={ok} fresh={fresh} state={state or 'missing'} rows={rows} wallets={wallets}).",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+print("Compaction guard: retention backlog is empty and current.")
+PY
+}
+
+compact_evidence_plan() {
+  task_compose task \
+    --db /app/data/pm_robot.sqlite \
+    compact-evidence
+}
+
+COMPACT_WINDOW_ACTIVE=0
+COMPACT_RESTORE_WATCHDOG=0
+
+compact_window_cleanup() {
+  status=$?
+  restart_status=0
+  trap - EXIT INT TERM
+  if [[ "$COMPACT_WINDOW_ACTIVE" == "1" ]]; then
+    echo "SQLite compaction window: restarting research/scoring services."
+    compose up -d --no-deps --no-build --no-recreate $RESEARCH_SERVICES || restart_status=$?
+  fi
+  if [[ "$COMPACT_RESTORE_WATCHDOG" == "1" ]]; then
+    rm -f "$WATCHDOG_DISABLED_FILE"
+    echo "SQLite compaction window: runtime watchdog restored."
+  fi
+  if [[ "$status" -eq 0 && "$restart_status" -ne 0 ]]; then
+    status="$restart_status"
+  fi
+  exit "$status"
+}
+
+compact_evidence_window() {
+  retention_compaction_guard
+  read -r evidence_active copyability_active total_active < <(pipeline_active_job_counts)
+  if [[ "$total_active" != "0" ]]; then
+    echo "Compaction guard: ${total_active} active pipeline job(s) remain (${evidence_active} evidence, ${copyability_active} copyability)." >&2
+    return 1
+  fi
+  execution_running="$(execution_compose ps --services --filter status=running 2>/dev/null || true)"
+  if [[ -n "$execution_running" ]]; then
+    echo "Compaction guard: execution services are running; stop them before rebuilding SQLite." >&2
+    return 1
+  fi
+
+  if [[ ! -f "$WATCHDOG_DISABLED_FILE" ]]; then
+    watchdog_disable "offline SQLite evidence compaction" >/dev/null
+    COMPACT_RESTORE_WATCHDOG=1
+  fi
+  COMPACT_WINDOW_ACTIVE=1
+  trap compact_window_cleanup EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+
+  echo "SQLite compaction window: stopping research/scoring app services."
+  compose stop $APP_SERVICES
+  echo "SQLite compaction window: rebuilding, validating, and atomically replacing the database."
+  task_compose task \
+    --db /app/data/pm_robot.sqlite \
+    compact-evidence \
+    --execute
 }
 
 host_recover_once() {
@@ -1201,6 +1320,12 @@ PY
   recover-once)
     host_recover_once "${1:-2}" "${2:-50}" "${3:-}"
     ;;
+  compact-evidence-plan)
+    compact_evidence_plan
+    ;;
+  compact-evidence-window)
+    compact_evidence_window
+    ;;
   wal-truncate-window)
     wal_truncate_window "${1:-300}"
     ;;
@@ -1235,7 +1360,7 @@ PY
     compose run --rm --entrypoint /bin/sh task
     ;;
   *)
-    echo "Usage: $0 {up|web-up|web-restart|discovery-up|discovery-down|research-control-up|research-control-down|research-control-restart|pipeline-up|pipeline-down|copyability-up|copyability-down|score-up|score-down|observer-up|observer-down|maintenance-up|maintenance-down|backup-up|backup-down|backup-restart|backup-now|execution-up|execution-down|execution-restart|execution-status|execution-preflight|execution-logs [tail] [service]|down|restart|app-restart|runtime-ensure|watchdog-once|watchdog-status|watchdog-disable [reason]|watchdog-enable|discovery-restart|pipeline-restart|copyability-restart|copyability-ensure-workers|copyability-restart-when-idle [timeout_seconds] [poll_seconds]|score-restart|observer-restart|maintenance-restart|logs [tail] [service]|status|runtime-status|copyability-drain-once [limit<=5]|materialize-once [limit<=500]|score-once [limit<=500]|policy-rescore-once [score_limit<=500] [optional_feature_limit<=500]|recover-once [copyability_limit<=5] [score_limit<=500] [feature_limit<=500]|wal-truncate-window [checkpoint_timeout_seconds]|wal-truncate-when-idle [wait_timeout_seconds] [checkpoint_timeout_seconds] [poll_seconds]|migrate|health|app-status|maintenance|pipeline-jobs|pipeline-audit|copyability-jobs|shell}" >&2
+    echo "Usage: $0 {up|web-up|web-restart|discovery-up|discovery-down|research-control-up|research-control-down|research-control-restart|pipeline-up|pipeline-down|copyability-up|copyability-down|score-up|score-down|observer-up|observer-down|maintenance-up|maintenance-down|backup-up|backup-down|backup-restart|backup-now|execution-up|execution-down|execution-restart|execution-status|execution-preflight|execution-logs [tail] [service]|down|restart|app-restart|runtime-ensure|watchdog-once|watchdog-status|watchdog-disable [reason]|watchdog-enable|discovery-restart|pipeline-restart|copyability-restart|copyability-ensure-workers|copyability-restart-when-idle [timeout_seconds] [poll_seconds]|score-restart|observer-restart|maintenance-restart|logs [tail] [service]|status|runtime-status|copyability-drain-once [limit<=5]|materialize-once [limit<=500]|score-once [limit<=500]|policy-rescore-once [score_limit<=500] [optional_feature_limit<=500]|recover-once [copyability_limit<=5] [score_limit<=500] [feature_limit<=500]|compact-evidence-plan|compact-evidence-window|wal-truncate-window [checkpoint_timeout_seconds]|wal-truncate-when-idle [wait_timeout_seconds] [checkpoint_timeout_seconds] [poll_seconds]|migrate|health|app-status|maintenance|pipeline-jobs|pipeline-audit|copyability-jobs|shell}" >&2
     exit 2
     ;;
 esac

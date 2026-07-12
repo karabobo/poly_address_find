@@ -3646,6 +3646,84 @@ def test_storage_maintenance_explains_pruned_wallets_and_reusable_pages(tmp_path
     assert "删除后先复用" in html
 
 
+def test_storage_maintenance_waits_for_retention_before_marking_compaction_ready(tmp_path):
+    settings = RobotSettings(
+        db_path=tmp_path / "data" / "pm_robot.sqlite",
+        archive_dir=tmp_path / "data" / "parquet",
+        execution_mode="research",
+    )
+    conn = connect(settings.db_path)
+    try:
+        run_migrations(conn)
+        conn.execute("CREATE TABLE disposable_compaction_pages(payload BLOB)")
+        conn.executemany(
+            "INSERT INTO disposable_compaction_pages(payload) VALUES (zeroblob(4096))",
+            [() for _ in range(64)],
+        )
+        conn.commit()
+        conn.execute("DROP TABLE disposable_compaction_pages")
+        conn.commit()
+    finally:
+        conn.close()
+
+    report_path = tmp_path / "reports" / "retention_prune_status.json"
+    report_path.parent.mkdir(parents=True)
+    report_path.write_text(
+        json.dumps(
+            {
+                "ok": True,
+                "dry_run": False,
+                "state": "draining",
+                "backlog_after": {"total_activity_rows": 250, "total_wallets": 5},
+                "storage": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    waiting = _storage_maintenance_summary(
+        settings,
+        now=int(report_path.stat().st_mtime) + 60,
+        low_free_disk_bytes=1,
+        scheduled_backup_enabled=False,
+        sqlite_reclaimable_warn_bytes=1,
+        sqlite_reclaimable_warn_ratio=0.001,
+    )
+
+    assert waiting["state"] == "sqlite_compaction_waiting_retention"
+    assert waiting["sqlite_compaction_candidate"] is True
+    assert waiting["sqlite_compaction_ready"] is False
+    assert "250 行低价值证据" in waiting["next_action"]
+
+    report_path.write_text(
+        json.dumps(
+            {
+                "ok": True,
+                "dry_run": False,
+                "state": "caught_up",
+                "backlog_after": {"total_activity_rows": 0, "total_wallets": 0},
+                "storage": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    ready = _storage_maintenance_summary(
+        settings,
+        now=int(report_path.stat().st_mtime) + 60,
+        low_free_disk_bytes=1,
+        scheduled_backup_enabled=False,
+        sqlite_reclaimable_warn_bytes=1,
+        sqlite_reclaimable_warn_ratio=0.001,
+    )
+    html = _storage_maintenance_panel(ready)
+
+    assert ready["state"] == "sqlite_compaction_due"
+    assert ready["sqlite_compaction_ready"] is True
+    assert "./pmrobot-nas.sh compact-evidence-plan" in html
+    assert "./pmrobot-nas.sh compact-evidence-window" in html
+    assert "不创建备份副本" in html
+
+
 def test_directory_size_snapshot_falls_back_to_last_complete_scan(tmp_path, monkeypatch):
     archive_dir = tmp_path / "parquet"
     archive_dir.mkdir()

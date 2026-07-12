@@ -91,6 +91,8 @@ RETENTION_REPORT_MAX_AGE_SEC = 3_600
 WAL_PENDING_FRAME_WARN = 8_192
 LOW_FREE_DISK_BYTES = 100_000_000_000
 BACKUP_MAX_AGE_SECONDS = 26 * 3_600
+SQLITE_RECLAIMABLE_WARN_BYTES = 4_000_000_000
+SQLITE_RECLAIMABLE_WARN_RATIO = 0.25
 _DASHBOARD_CACHE_LOCK = threading.Lock()
 _DASHBOARD_CACHE: dict[tuple[str, bool, bool], tuple[float, dict[str, Any]]] = {}
 _DASHBOARD_REFRESHING: set[tuple[str, bool, bool]] = set()
@@ -3682,7 +3684,7 @@ def _storage_maintenance_panel(values: dict[str, Any]) -> str:
             "SQLite 可复用页",
             _fmt_bytes(int(sqlite_pages.get("reusable_bytes") or 0)),
             f"{_fmt_pct(sqlite_pages.get('reusable_ratio'))} of DB · 删除后先复用，队列清空后再压缩",
-            "ok",
+            "warn" if bool(values.get("sqlite_compaction_candidate")) else "ok",
         ),
         (
             "可用空间",
@@ -3832,6 +3834,11 @@ def _storage_maintenance_panel(values: dict[str, Any]) -> str:
     commands = [
         {"command": values.get("backup_now_command"), "when": "需要时手动创建一致性 SQLite 恢复点"},
         {"command": values.get("read_only_check"), "when": "先看报告，不改数据库"},
+        {"command": values.get("compact_plan_command"), "when": "只测算可删除行、空间和压缩前置条件"},
+        {
+            "command": values.get("compact_window_command"),
+            "when": "清理队列归零后：停服务、重建校验、原子替换并自动恢复",
+        },
         {"command": values.get("idle_window_command"), "when": "推荐：等待队列空闲后自动进入维护窗口"},
         {"command": values.get("safe_command"), "when": "普通维护窗口"},
         {"command": values.get("long_window_command"), "when": "WAL 很大或 NAS 较忙"},
@@ -8520,6 +8527,8 @@ def _storage_maintenance_summary(
     wal_critical_bytes: int = WAL_CRITICAL_BYTES,
     low_free_disk_bytes: int = LOW_FREE_DISK_BYTES,
     backup_max_age_seconds: int = BACKUP_MAX_AGE_SECONDS,
+    sqlite_reclaimable_warn_bytes: int = SQLITE_RECLAIMABLE_WARN_BYTES,
+    sqlite_reclaimable_warn_ratio: float = SQLITE_RECLAIMABLE_WARN_RATIO,
     scheduled_backup_enabled: bool | None = None,
     now: int | None = None,
 ) -> dict[str, Any]:
@@ -8634,6 +8643,22 @@ def _storage_maintenance_summary(
             archive_conn.close()
     except (OSError, sqlite3.Error, ValueError):
         archive_summary = evidence_archive_summary_unavailable()
+    reusable_bytes = int(sqlite_pages.get("reusable_bytes") or 0)
+    reusable_ratio = float(sqlite_pages.get("reusable_ratio") or 0)
+    compaction_candidate = bool(
+        reusable_bytes >= int(sqlite_reclaimable_warn_bytes)
+        and reusable_ratio >= float(sqlite_reclaimable_warn_ratio)
+    )
+    retention_backlog_rows = int(
+        (retention_cycle.get("backlog_after") or {}).get("total_activity_rows") or 0
+    )
+    compaction_ready = bool(
+        compaction_candidate
+        and retention_cycle.get("fresh")
+        and retention_cycle.get("ok")
+        and str(retention_cycle.get("state") or "") == "caught_up"
+        and retention_backlog_rows == 0
+    )
     parquet_storage = _directory_size_snapshot(settings.archive_dir)
     parquet_total_bytes = int(parquet_storage.get("bytes") or 0)
     if critical_wal:
@@ -8689,6 +8714,20 @@ def _storage_maintenance_summary(
             next_action = "低价值原始证据正在净减少，继续由 retention cycle 分批消化。"
         elif retention_state == "caught_up":
             next_action = "当前安全待清理队列已清空，继续保留钱包摘要并监控新增。"
+    if state == "ok" and compaction_candidate:
+        if compaction_ready:
+            state = "sqlite_compaction_due"
+            next_action = (
+                f"SQLite 有 {_fmt_bytes(reusable_bytes)} 空页可回收；"
+                "清理队列已空，可安排离线压缩窗口。"
+            )
+        else:
+            state = "sqlite_compaction_waiting_retention"
+            next_action = (
+                f"SQLite 已有 {_fmt_bytes(reusable_bytes)} 空页；"
+                f"先继续清理 {_fmt_int(retention_backlog_rows)} 行低价值证据，"
+                "清空后再做一次离线压缩。"
+            )
     return {
         "state": state,
         "next_action": next_action,
@@ -8721,13 +8760,22 @@ def _storage_maintenance_summary(
         "parquet_storage": parquet_storage,
         "retention_registry": retention_registry,
         "sqlite_pages": sqlite_pages,
+        "sqlite_compaction_candidate": compaction_candidate,
+        "sqlite_compaction_ready": compaction_ready,
+        "sqlite_reclaimable_warn_bytes": int(sqlite_reclaimable_warn_bytes),
+        "sqlite_reclaimable_warn_ratio": float(sqlite_reclaimable_warn_ratio),
         "retention_cycle": retention_cycle,
         "backup_now_command": "./pmrobot-nas.sh backup-now",
+        "compact_plan_command": "./pmrobot-nas.sh compact-evidence-plan",
+        "compact_window_command": "./pmrobot-nas.sh compact-evidence-window",
         "safe_command": "./pmrobot-nas.sh wal-truncate-window",
         "long_window_command": "./pmrobot-nas.sh wal-truncate-window 900",
         "idle_window_command": "./pmrobot-nas.sh wal-truncate-when-idle 7200 900 30",
         "read_only_check": "./pmrobot-nas.sh maintenance --dry-run",
-        "maintenance_boundary": "WAL truncate 会临时停止 research/scoring 服务；不要在 worker 高峰时执行。",
+        "maintenance_boundary": (
+            "WAL truncate 会临时停止 research/scoring 服务；"
+            "整库压缩也会停服，仅在清理队列归零后执行，不创建备份副本。"
+        ),
     }
 
 

@@ -2102,6 +2102,30 @@ def test_nas_research_stack_keeps_full_database_backups_manual_only():
     assert "runtime-heartbeat" in loop
 
 
+def test_nas_helper_has_guarded_no_backup_sqlite_compaction_window():
+    helper = Path("deploy/nas/pmrobot-nas.sh").read_text(encoding="utf-8")
+    window = helper.split("compact_evidence_window() {", 1)[1].split(
+        "\nhost_recover_once() {", 1
+    )[0]
+
+    assert "retention_compaction_guard" in helper
+    assert "state != \"caught_up\"" in helper
+    assert "pipeline_active_job_counts" in helper
+    assert "status IN ('queued', 'running')" in helper
+    assert "execution services are running" in window
+    assert "watchdog_disable \"offline SQLite evidence compaction\"" in window
+    assert "trap compact_window_cleanup EXIT" in window
+    assert "compose stop $APP_SERVICES" in window
+    assert "compact-evidence" in window
+    assert "--execute" in window
+    assert "backup" not in window.lower()
+    assert "compose up -d --no-deps --no-build --no-recreate $RESEARCH_SERVICES" in helper
+    assert "compact-evidence-plan" in helper
+    assert "compact-evidence-window" in helper
+    assert '"sqlite_compaction"' in helper
+    assert '"reusable_bytes"' in helper
+
+
 def test_nas_persistent_storage_can_live_outside_application_root():
     compose = Path("deploy/nas/docker-compose.yml").read_text(encoding="utf-8")
     execution = Path("deploy/nas/docker-compose.execution.yml").read_text(
