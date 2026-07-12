@@ -445,6 +445,11 @@ def main() -> int:
     cycle_cmd.add_argument("--policy", default=str(DEFAULT_POLICY_PATH))
     cycle_cmd.add_argument("--no-score", action="store_true", help="Skip local incremental scoring in execute mode")
     cycle_cmd.add_argument(
+        "--scoring-only",
+        action="store_true",
+        help="Run only feature materialization and incremental scoring; skip repair and queue planning",
+    )
+    cycle_cmd.add_argument(
         "--continue-on-error",
         action="store_true",
         help="Rollback a failed phase and continue later phases against the latest committed data",
@@ -1402,6 +1407,7 @@ def main() -> int:
                         evidence_promotion_limit=args.evidence_promotion_limit,
                         score_limit=args.score_limit,
                         run_scoring=not args.no_score,
+                        scoring_only=args.scoring_only,
                         policy_path=Path(args.policy),
                         continue_on_error=args.continue_on_error,
                         include_diagnostics=not args.no_diagnostics,

@@ -52,11 +52,15 @@ promising scored wallet
 The historical database column `wallet_processing_state.discovery_tier` is called `evidence_tier` in code.
 `pipeline_jobs.tier` is a job scope/dedupe field, not the wallet's real evidence tier.
 
-The NAS research/scoring stack has one control-plane owner: `research-control-loop.sh`. It executes the ordered
-`pipeline-cycle` handoff across eligibility preparation, stale wallet state, wallet/copyability queue admission,
-feature materialization, incremental scoring, and paper handoff export. Discovery and queue workers remain
-asynchronous. The control loop materializes only wallets with changed candidate metadata, evidence budgets, or
-activity watermarks.
+The NAS research/scoring stack has one control-plane owner: `research-control-loop.sh`. Its full cycle executes the
+ordered `pipeline-cycle` handoff across eligibility preparation, stale wallet state, wallet/copyability queue
+admission, feature materialization, incremental scoring, and paper handoff export. Discovery and queue workers
+remain asynchronous. The control loop materializes only wallets with changed candidate metadata, evidence budgets,
+or activity watermarks.
+When feature or scoring batches remain full, the same owner uses bounded `scoring_only` catch-up cycles. Those cycles
+refresh features and scores but deliberately skip eligibility repair, evidence promotion, and both queue planners.
+After a bounded catch-up burst, the next pass is always a full cycle; this keeps queue admission fresh without making
+retention compete with the complete research pipeline every minute.
 Each database phase commits independently. In NAS mode, a failed phase is rolled back and recorded, while later
 phases continue against the latest committed data. Paper handoff export runs after every cycle attempt, including
 partial cycles, so planner contention cannot make an otherwise valid handoff stale.
@@ -143,9 +147,9 @@ default `up`, `restart`, `runtime-ensure`, or watchdog commands.
   control lock so research remains the priority.
 - Planner backpressure limits queued/running wallet evidence and copyability jobs. Copyability planning keeps
   its per-pass batch limit separate from the active-queue waterline and only fills currently available slots.
-- Research control keeps feature and scoring transactions bounded. A cycle that fills either batch schedules
-  the next cycle on the shorter active interval; idle, failed, or malformed summaries retain the conservative
-  interval so backlog drains without turning the control plane into a tight loop.
+- Research control keeps feature and scoring transactions bounded. A full batch schedules a `scoring_only` pass on
+  the shorter active interval. Catch-up bursts are capped before forcing another full cycle; idle, failed, or
+  malformed summaries restore the conservative interval and full-cycle mode.
 - When queue capacity is tight, the planner allocates slots across light, medium, and deep evidence stages by
   configured weight, current active-job share, and a persistent smooth weighted round-robin cursor. Priority
   ordering remains intact within each stage, while fully drained planner cycles cannot reset stage fairness.

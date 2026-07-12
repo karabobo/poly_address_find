@@ -195,6 +195,76 @@ def test_pipeline_cycle_can_materialize_only_stale_wallet_state(tmp_path):
         conn.close()
 
 
+def test_pipeline_cycle_scoring_only_skips_repairs_and_queue_planning(tmp_path, monkeypatch):
+    conn = connect(tmp_path / "robot.sqlite")
+    calls: list[str] = []
+
+    def record(name: str, result: dict):
+        def operation(*args, **kwargs):
+            calls.append(name)
+            return result
+
+        return operation
+
+    def forbidden(name: str):
+        def operation(*args, **kwargs):
+            raise AssertionError(f"scoring-only unexpectedly ran {name}")
+
+        return operation
+
+    try:
+        run_migrations(conn)
+        monkeypatch.setattr(
+            "pm_robot.orchestration.pipeline_cycle.materialize_wallet_features",
+            record("materialize_features", {"wallets_attempted": 3}),
+        )
+        monkeypatch.setattr(
+            "pm_robot.orchestration.pipeline_cycle.score_database",
+            record("incremental_score", {"score_candidates_considered": 2}),
+        )
+        for symbol in (
+            "prepare_eligibility_repairs",
+            "materialize_wallet_processing_state",
+            "promote_wallet_evidence",
+            "plan_wallet_pipeline_jobs",
+            "plan_copyability_evidence_jobs",
+        ):
+            monkeypatch.setattr(
+                f"pm_robot.orchestration.pipeline_cycle.{symbol}",
+                forbidden(symbol),
+            )
+
+        report = run_pipeline_cycle(
+            conn,
+            PipelineCycleOptions(
+                execute_plan=True,
+                scoring_only=True,
+                feature_limit=80,
+                score_limit=300,
+                policy_path=Path("config/leader_scoring_policy.json"),
+                include_diagnostics=False,
+            ),
+        )
+
+        executed = [step["name"] for step in report["steps"] if step["status"] == "executed"]
+        skipped = {step["name"]: step["data"] for step in report["steps"] if step["status"] == "skipped"}
+
+        assert report["ok"] is True
+        assert report["mode"] == "scoring_only"
+        assert calls == ["materialize_features", "incremental_score"]
+        assert executed == ["materialize_features", "incremental_score"]
+        assert skipped == {"post_score_planning": {"reason": "scoring_only"}}
+        assert not {
+            "eligibility_repair_prepare",
+            "wallet_pipeline_state_materialize",
+            "evidence_promotion",
+            "wallet_pipeline_plan",
+            "copyability_plan",
+        }.intersection(step["name"] for step in report["steps"])
+    finally:
+        conn.close()
+
+
 def test_pipeline_cycle_isolates_failed_phase_and_continues_committed_work(tmp_path, monkeypatch):
     conn = connect(tmp_path / "robot.sqlite")
     wallet = "0x" + "5" * 40

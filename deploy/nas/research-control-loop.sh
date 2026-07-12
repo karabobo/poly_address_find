@@ -3,6 +3,7 @@ set -eu
 
 INTERVAL="${PM_ROBOT_RESEARCH_CONTROL_INTERVAL:-${PM_ROBOT_SCORE_LOOP_INTERVAL:-300}}"
 ACTIVE_INTERVAL="${PM_ROBOT_RESEARCH_CONTROL_ACTIVE_INTERVAL:-60}"
+CATCHUP_BURST_LIMIT="${PM_ROBOT_RESEARCH_CONTROL_CATCHUP_BURST_LIMIT:-4}"
 RUN_ONCE="${PM_ROBOT_RESEARCH_CONTROL_RUN_ONCE:-0}"
 LEGACY_MIN_SCORE="${PM_ROBOT_ELIGIBILITY_REPAIR_MIN_SCORE:-${PM_ROBOT_COPYABILITY_MIN_SCORE:-40}}"
 MIN_SCORE="${PM_ROBOT_RESEARCH_MIN_SCORE:-$LEGACY_MIN_SCORE}"
@@ -31,6 +32,11 @@ PLANNER_LOCK_ATTEMPTS="${PM_ROBOT_RESEARCH_PLANNER_LOCK_ATTEMPTS:-4}"
 PLANNER_LOCK_SLEEP_SECONDS="${PM_ROBOT_RESEARCH_PLANNER_LOCK_SLEEP_SECONDS:-1}"
 CONTROL_LOCK_TIMEOUT_SECONDS="${PM_ROBOT_RESEARCH_CONTROL_LOCK_TIMEOUT_SECONDS:-120}"
 
+if ! [ "$CATCHUP_BURST_LIMIT" -ge 1 ] 2>/dev/null; then
+  echo "PM_ROBOT_RESEARCH_CONTROL_CATCHUP_BURST_LIMIT must be a positive integer" >&2
+  exit 2
+fi
+
 runtime_heartbeat() {
   name="$1"
   status="${2:-ok}"
@@ -41,13 +47,21 @@ runtime_heartbeat() {
     --error "$error" >/dev/null 2>&1 || true
 }
 
+cycle_mode="full"
+catchup_cycles=0
+
 while true; do
   sleep_interval="$INTERVAL"
+  next_cycle_mode="full"
   cycle_status="failed"
   features_attempted=0
   scores_considered=0
   control_output=""
-  echo "$(date -Iseconds) research control: ordered cycle start"
+  scoring_only_flag=""
+  if [ "$cycle_mode" = "scoring_only" ]; then
+    scoring_only_flag="--scoring-only"
+  fi
+  echo "$(date -Iseconds) research control: ordered cycle start (mode=${cycle_mode})"
   if control_output="$(python -m pm_robot.cli --env /app/.env pipeline-cycle \
       --execute-plan \
       --continue-on-error \
@@ -77,7 +91,8 @@ while true; do
       --feature-commit-every "$FEATURE_COMMIT_EVERY" \
       --evidence-promotion-limit "$EVIDENCE_PROMOTION_LIMIT" \
       --score-limit "$SCORE_LIMIT" \
-      --policy "$POLICY_PATH")"; then
+      --policy "$POLICY_PATH" \
+      $scoring_only_flag)"; then
     printf '%s\n' "$control_output"
     control_state=""
     if control_state="$(printf '%s' "$control_output" | python -c '
@@ -110,10 +125,23 @@ print(f"ok {features_attempted} {scores_considered}")
       scores_considered="${remaining_state#* }"
       if { [ "$FEATURE_LIMIT" -gt 0 ] && [ "$features_attempted" -ge "$FEATURE_LIMIT" ]; } || \
          { [ "$SCORE_LIMIT" -gt 0 ] && [ "$scores_considered" -ge "$SCORE_LIMIT" ]; }; then
-        # A full batch signals backlog; keep bounded transactions but schedule the next cycle sooner.
+        # Catch up scoring without repeatedly running queue planners or eligibility repair.
         sleep_interval="$ACTIVE_INTERVAL"
+        if [ "$cycle_mode" = "scoring_only" ]; then
+          catchup_cycles=$((catchup_cycles + 1))
+        else
+          catchup_cycles=0
+        fi
+        if [ "$cycle_mode" = "scoring_only" ] && [ "$catchup_cycles" -ge "$CATCHUP_BURST_LIMIT" ]; then
+          next_cycle_mode="full"
+          catchup_cycles=0
+        else
+          next_cycle_mode="scoring_only"
+        fi
+      else
+        catchup_cycles=0
       fi
-      echo "$(date -Iseconds) research control: ordered cycle ok"
+      echo "$(date -Iseconds) research control: ordered cycle ok (mode=${cycle_mode})"
       runtime_heartbeat loop_research_control ok
     else
       cycle_status="invalid"
@@ -141,9 +169,10 @@ print(f"ok {features_attempted} {scores_considered}")
     echo "$(date -Iseconds) research control: export paper handoff failed" >&2
     runtime_heartbeat loop_score_paper_handoff failed "paper-handoff-export failed from research control"
   fi
-  echo "$(date -Iseconds) research control: next cycle in ${sleep_interval}s (status=${cycle_status}, features_attempted=${features_attempted}, scores_considered=${scores_considered})"
+  echo "$(date -Iseconds) research control: next cycle in ${sleep_interval}s (status=${cycle_status}, mode=${cycle_mode}, next_mode=${next_cycle_mode}, features_attempted=${features_attempted}, scores_considered=${scores_considered})"
   if [ "$RUN_ONCE" = "1" ]; then
     break
   fi
+  cycle_mode="$next_cycle_mode"
   sleep "$sleep_interval"
 done

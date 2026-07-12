@@ -297,6 +297,7 @@ def test_nas_research_control_runs_ordered_cycle_with_sharded_workers():
     assert "PM_ROBOT_PIPELINE_PRIORITY_AGING_SECONDS=1800" in env
     assert "PM_ROBOT_RESEARCH_CONTROL_INTERVAL=300" in env
     assert "PM_ROBOT_RESEARCH_CONTROL_ACTIVE_INTERVAL=60" in env
+    assert "PM_ROBOT_RESEARCH_CONTROL_CATCHUP_BURST_LIMIT=4" in env
     assert "PM_ROBOT_PIPELINE_STATE_LIMIT=25" in env
     assert "PM_ROBOT_PIPELINE_STATE_COMMIT_EVERY=5" in env
     assert "PM_ROBOT_PIPELINE_PLANNER_MAX_ACTIVE_JOBS=240" in env
@@ -318,6 +319,7 @@ def test_nas_research_control_runs_ordered_cycle_with_sharded_workers():
     assert "PM_ROBOT_RESEARCH_BUSY_TIMEOUT_SECONDS:-15" in control
     assert "PM_ROBOT_RESEARCH_CONTROL_LOCK_TIMEOUT_SECONDS:-120" in control
     assert "PM_ROBOT_RESEARCH_CONTROL_ACTIVE_INTERVAL:-60" in control
+    assert "PM_ROBOT_RESEARCH_CONTROL_CATCHUP_BURST_LIMIT:-4" in control
     assert "PM_ROBOT_RESEARCH_PLANNER_LOCK_ATTEMPTS:-4" in control
     assert '--wallet-max-active-jobs "$WALLET_MAX_ACTIVE_JOBS"' in control
     assert '--copyability-max-active-jobs "$COPYABILITY_MAX_ACTIVE_JOBS"' in control
@@ -336,6 +338,7 @@ def test_nas_research_control_runs_ordered_cycle_with_sharded_workers():
     assert 'sleep_interval="$ACTIVE_INTERVAL"' in control
     assert 'sleep_interval="$INTERVAL"' in control
     assert "sleep \"$sleep_interval\"" in control
+    assert "--scoring-only" in control
     assert "sleep \"$sleep_interval\"" in worker
 
 
@@ -427,6 +430,182 @@ def test_nas_research_control_uses_idle_interval_after_failed_cycle(tmp_path):
     assert "next cycle in 300s (status=failed" in result.stdout
 
 
+def test_nas_research_control_switches_saturated_followup_to_scoring_only(tmp_path):
+    saturated = _research_control_summary(features_attempted=80, scores_considered=300)
+    idle = _research_control_summary(features_attempted=4, scores_considered=12)
+
+    result, commands, sleeps = _run_nas_research_control_sequence(
+        tmp_path,
+        [(saturated, 0), (idle, 0)],
+    )
+
+    assert result.returncode == 73, result.stderr
+    assert len(commands) == 2
+    assert "--scoring-only" not in commands[0].split()
+    assert "--scoring-only" in commands[1].split()
+    assert sleeps == ["60", "300"]
+    assert "mode=full, next_mode=scoring_only" in result.stdout
+    assert "mode=scoring_only, next_mode=full" in result.stdout
+
+
+def test_nas_research_control_forces_full_cycle_after_bounded_scoring_burst(tmp_path):
+    saturated = _research_control_summary(features_attempted=80, scores_considered=300)
+    idle = _research_control_summary(features_attempted=1, scores_considered=2)
+
+    result, commands, sleeps = _run_nas_research_control_sequence(
+        tmp_path,
+        [(saturated, 0), (saturated, 0), (saturated, 0), (idle, 0)],
+        burst_limit=2,
+    )
+
+    assert result.returncode == 73, result.stderr
+    assert ["--scoring-only" in command.split() for command in commands] == [
+        False,
+        True,
+        True,
+        False,
+    ]
+    assert sleeps == ["60", "60", "60", "300"]
+    assert result.stdout.count("mode=scoring_only, next_mode=full") == 1
+
+
+@pytest.mark.parametrize(
+    ("catchup_case", "catchup_exit", "expected_status"),
+    [
+        ("idle", 0, "ok"),
+        ("failed", 1, "failed"),
+        ("invalid", 0, "invalid"),
+    ],
+)
+def test_nas_research_control_recovers_idle_failed_or_invalid_catchup_to_full_cycle(
+    tmp_path,
+    catchup_case,
+    catchup_exit,
+    expected_status,
+):
+    saturated = _research_control_summary(features_attempted=80, scores_considered=300)
+    idle = _research_control_summary(features_attempted=0, scores_considered=0)
+    catchup_output = {
+        "idle": _research_control_summary(features_attempted=3, scores_considered=5),
+        "failed": '{"ok": false}',
+        "invalid": "not-json",
+    }[catchup_case]
+
+    result, commands, sleeps = _run_nas_research_control_sequence(
+        tmp_path,
+        [(saturated, 0), (catchup_output, catchup_exit), (idle, 0)],
+    )
+
+    assert result.returncode == 73, result.stderr
+    assert ["--scoring-only" in command.split() for command in commands] == [False, True, False]
+    assert sleeps == ["60", "300", "300"]
+    assert (
+        f"next cycle in 300s (status={expected_status}, mode=scoring_only, next_mode=full"
+        in result.stdout
+    )
+
+
+def _research_control_summary(*, features_attempted, scores_considered):
+    return json.dumps(
+        {
+            "ok": True,
+            "steps": [
+                {
+                    "name": "materialize_features",
+                    "data": {"wallets_attempted": features_attempted},
+                },
+                {
+                    "name": "incremental_score",
+                    "data": {"score_candidates_considered": scores_considered},
+                },
+            ],
+        }
+    )
+
+
+def _run_nas_research_control_sequence(tmp_path, cycles, *, burst_limit=4):
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    sequence_dir = tmp_path / "sequence"
+    sequence_dir.mkdir()
+    for index, (output, exit_code) in enumerate(cycles, start=1):
+        (sequence_dir / f"{index}.stdout").write_text(output + "\n", encoding="utf-8")
+        (sequence_dir / f"{index}.exit").write_text(str(exit_code), encoding="utf-8")
+
+    counter_path = tmp_path / "control-counter"
+    args_log = tmp_path / "control-args.log"
+    sleep_log = tmp_path / "sleep.log"
+    python_wrapper = fake_bin / "python"
+    python_wrapper.write_text(
+        "#!/bin/sh\n"
+        "if [ \"$1\" = \"-m\" ]; then\n"
+        "  case \" $* \" in\n"
+        "    *\" pipeline-cycle --execute-plan \"*)\n"
+        "      cycle=0\n"
+        "      if [ -f \"$FAKE_CONTROL_COUNTER\" ]; then cycle=$(cat \"$FAKE_CONTROL_COUNTER\"); fi\n"
+        "      cycle=$((cycle + 1))\n"
+        "      printf '%s\\n' \"$cycle\" > \"$FAKE_CONTROL_COUNTER\"\n"
+        "      printf '%s\\n' \"$*\" >> \"$FAKE_CONTROL_ARGS_LOG\"\n"
+        "      cat \"$FAKE_CONTROL_SEQUENCE_DIR/$cycle.stdout\"\n"
+        "      exit $(cat \"$FAKE_CONTROL_SEQUENCE_DIR/$cycle.exit\")\n"
+        "      ;;\n"
+        "    *\" paper-handoff-export \"*)\n"
+        "      printf '%s\\n' '{\"ok\": true}'\n"
+        "      exit 0\n"
+        "      ;;\n"
+        "    *\" runtime-heartbeat \"*)\n"
+        "      exit 0\n"
+        "      ;;\n"
+        "  esac\n"
+        "fi\n"
+        f'exec "{sys.executable}" "$@"\n',
+        encoding="utf-8",
+    )
+    python_wrapper.chmod(0o755)
+    date_wrapper = fake_bin / "date"
+    date_wrapper.write_text(
+        "#!/bin/sh\nprintf '%s\\n' '2026-07-12T09:00:00+08:00'\n",
+        encoding="utf-8",
+    )
+    date_wrapper.chmod(0o755)
+    sleep_wrapper = fake_bin / "sleep"
+    sleep_wrapper.write_text(
+        "#!/bin/sh\n"
+        "printf '%s\\n' \"$1\" >> \"$FAKE_SLEEP_LOG\"\n"
+        "cycle=$(cat \"$FAKE_CONTROL_COUNTER\")\n"
+        "if [ \"$cycle\" -ge \"$FAKE_CONTROL_MAX_CYCLES\" ]; then exit 73; fi\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    sleep_wrapper.chmod(0o755)
+    env = {
+        **os.environ,
+        "PATH": f"{fake_bin}:{os.environ.get('PATH', '')}",
+        "FAKE_CONTROL_SEQUENCE_DIR": str(sequence_dir),
+        "FAKE_CONTROL_COUNTER": str(counter_path),
+        "FAKE_CONTROL_ARGS_LOG": str(args_log),
+        "FAKE_CONTROL_MAX_CYCLES": str(len(cycles)),
+        "FAKE_SLEEP_LOG": str(sleep_log),
+        "PM_ROBOT_RESEARCH_CONTROL_ACTIVE_INTERVAL": "60",
+        "PM_ROBOT_RESEARCH_CONTROL_INTERVAL": "300",
+        "PM_ROBOT_RESEARCH_CONTROL_CATCHUP_BURST_LIMIT": str(burst_limit),
+        "PM_ROBOT_SCORE_FEATURE_LIMIT": "80",
+        "PM_ROBOT_SCORE_LIMIT": "300",
+    }
+    result = subprocess.run(
+        ["sh", "deploy/nas/research-control-loop.sh"],
+        cwd=Path(__file__).resolve().parents[1],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    commands = args_log.read_text(encoding="utf-8").splitlines()
+    sleeps = sleep_log.read_text(encoding="utf-8").splitlines()
+    return result, commands, sleeps
+
+
 def _run_nas_research_control_once(tmp_path, control_output, *, exit_code=0):
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
@@ -435,7 +614,7 @@ def _run_nas_research_control_once(tmp_path, control_output, *, exit_code=0):
         "#!/bin/sh\n"
         "if [ \"$1\" = \"-m\" ]; then\n"
         "  case \" $* \" in\n"
-        "    *\" pipeline-cycle \"*)\n"
+        "    *\" pipeline-cycle --execute-plan \"*)\n"
         "      printf '%s\\n' \"$FAKE_CONTROL_OUTPUT\"\n"
         "      exit \"${FAKE_CONTROL_EXIT:-0}\"\n"
         "      ;;\n"

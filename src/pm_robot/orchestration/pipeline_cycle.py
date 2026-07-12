@@ -52,6 +52,7 @@ class PipelineCycleOptions:
     evidence_promotion_limit: int = 100
     score_limit: int = 0
     run_scoring: bool = True
+    scoring_only: bool = False
     policy_path: Path | None = None
     continue_on_error: bool = False
     include_diagnostics: bool = True
@@ -90,24 +91,26 @@ def run_pipeline_cycle(
     )
 
     if dry_run:
-        eligibility_preview = prepare_eligibility_repairs(
-            conn,
-            limit=options.repair_limit,
-            min_score=options.min_score,
-            min_copyability_activity_events=options.copyability_min_activity_events,
-            dry_run=True,
-        )
-        steps.append(
-            _step(
-                "eligibility_repair_preview",
-                "preview",
-                eligibility_preview.__dict__,
+        if not options.scoring_only:
+            eligibility_preview = prepare_eligibility_repairs(
+                conn,
+                limit=options.repair_limit,
+                min_score=options.min_score,
+                min_copyability_activity_events=options.copyability_min_activity_events,
+                dry_run=True,
             )
-        )
+            steps.append(
+                _step(
+                    "eligibility_repair_preview",
+                    "preview",
+                    eligibility_preview.__dict__,
+                )
+            )
         return {
             "ok": True,
             "dry_run": True,
             "executed": False,
+            "mode": "scoring_only" if options.scoring_only else "full",
             "safety": _safety_contract(),
             "before": before,
             "steps": steps + _dry_run_steps(options),
@@ -115,53 +118,54 @@ def run_pipeline_cycle(
             "recommended_command": "pipeline-cycle --execute-plan",
         }
 
-    _run_isolated_step(
-        conn,
-        steps,
-        "eligibility_repair_prepare",
-        lambda: prepare_eligibility_repairs(
-            conn,
-            limit=options.repair_limit,
-            min_score=options.min_score,
-            min_copyability_activity_events=options.copyability_min_activity_events,
-            dry_run=False,
-        ),
-        continue_on_error=options.continue_on_error,
-        step_reporter=step_reporter,
-    )
-
-    # Repair budgets must become processing state before the canonical planner runs.
-    _run_isolated_step(
-        conn,
-        steps,
-        "wallet_pipeline_state_materialize",
-        lambda: materialize_wallet_processing_state(
-            conn,
-            limit=options.state_limit,
-            commit_every=options.state_commit_every,
-            stale_only=options.state_stale_only,
-        ),
-        continue_on_error=options.continue_on_error,
-        step_reporter=step_reporter,
-    )
-
-    if options.include_diagnostics:
+    if not options.scoring_only:
         _run_isolated_step(
             conn,
             steps,
-            "pipeline_smoothness_after_state",
-            lambda: _compact_smoothness(
-                pipeline_smoothness_report(
-                    conn,
-                    top=options.top,
-                    min_score=options.min_score,
-                    min_copyability_activity_events=options.copyability_min_activity_events,
-                )
+            "eligibility_repair_prepare",
+            lambda: prepare_eligibility_repairs(
+                conn,
+                limit=options.repair_limit,
+                min_score=options.min_score,
+                min_copyability_activity_events=options.copyability_min_activity_events,
+                dry_run=False,
             ),
-            status="observed",
             continue_on_error=options.continue_on_error,
             step_reporter=step_reporter,
         )
+
+        # Repair budgets must become processing state before the canonical planner runs.
+        _run_isolated_step(
+            conn,
+            steps,
+            "wallet_pipeline_state_materialize",
+            lambda: materialize_wallet_processing_state(
+                conn,
+                limit=options.state_limit,
+                commit_every=options.state_commit_every,
+                stale_only=options.state_stale_only,
+            ),
+            continue_on_error=options.continue_on_error,
+            step_reporter=step_reporter,
+        )
+
+        if options.include_diagnostics:
+            _run_isolated_step(
+                conn,
+                steps,
+                "pipeline_smoothness_after_state",
+                lambda: _compact_smoothness(
+                    pipeline_smoothness_report(
+                        conn,
+                        top=options.top,
+                        min_score=options.min_score,
+                        min_copyability_activity_events=options.copyability_min_activity_events,
+                    )
+                ),
+                status="observed",
+                continue_on_error=options.continue_on_error,
+                step_reporter=step_reporter,
+            )
 
     _run_isolated_step(
         conn,
@@ -201,7 +205,17 @@ def run_pipeline_cycle(
             step_reporter=step_reporter,
         )
 
-    if options.evidence_promotion_limit > 0:
+    if options.scoring_only:
+        _append_step(
+            steps,
+            _step(
+                "post_score_planning",
+                "skipped",
+                {"reason": "scoring_only"},
+            ),
+            step_reporter=step_reporter,
+        )
+    elif options.evidence_promotion_limit > 0:
         assert policy_path is not None
         _run_isolated_step(
             conn,
@@ -222,43 +236,44 @@ def run_pipeline_cycle(
             step_reporter=step_reporter,
         )
 
-    _run_isolated_step(
-        conn,
-        steps,
-        "wallet_pipeline_plan",
-        lambda: plan_wallet_pipeline_jobs(
+    if not options.scoring_only:
+        _run_isolated_step(
             conn,
-            policy_version=policy_version,
-            light_limit=options.wallet_light_limit,
-            medium_limit=options.wallet_medium_limit,
-            deep_limit=options.wallet_deep_limit,
-            shard_count=options.wallet_shard_count,
-            max_active_jobs=options.wallet_max_active_jobs,
-            lock_retry_attempts=options.planner_lock_attempts,
-            lock_retry_sleep_seconds=options.planner_lock_sleep_seconds,
-        ),
-        continue_on_error=options.continue_on_error,
-        step_reporter=step_reporter,
-    )
+            steps,
+            "wallet_pipeline_plan",
+            lambda: plan_wallet_pipeline_jobs(
+                conn,
+                policy_version=policy_version,
+                light_limit=options.wallet_light_limit,
+                medium_limit=options.wallet_medium_limit,
+                deep_limit=options.wallet_deep_limit,
+                shard_count=options.wallet_shard_count,
+                max_active_jobs=options.wallet_max_active_jobs,
+                lock_retry_attempts=options.planner_lock_attempts,
+                lock_retry_sleep_seconds=options.planner_lock_sleep_seconds,
+            ),
+            continue_on_error=options.continue_on_error,
+            step_reporter=step_reporter,
+        )
 
-    _run_isolated_step(
-        conn,
-        steps,
-        "copyability_plan",
-        lambda: plan_copyability_evidence_jobs(
+        _run_isolated_step(
             conn,
-            limit=options.copyability_limit,
-            max_active_jobs=options.copyability_max_active_jobs,
-            min_score=options.min_score,
-            min_activity_events=options.copyability_min_activity_events,
-            shard_count=options.copyability_shard_count,
-            rescan_seconds=options.copyability_rescan_seconds,
-            lock_retry_attempts=options.planner_lock_attempts,
-            lock_retry_sleep_seconds=options.planner_lock_sleep_seconds,
-        ),
-        continue_on_error=options.continue_on_error,
-        step_reporter=step_reporter,
-    )
+            steps,
+            "copyability_plan",
+            lambda: plan_copyability_evidence_jobs(
+                conn,
+                limit=options.copyability_limit,
+                max_active_jobs=options.copyability_max_active_jobs,
+                min_score=options.min_score,
+                min_activity_events=options.copyability_min_activity_events,
+                shard_count=options.copyability_shard_count,
+                rescan_seconds=options.copyability_rescan_seconds,
+                lock_retry_attempts=options.planner_lock_attempts,
+                lock_retry_sleep_seconds=options.planner_lock_sleep_seconds,
+            ),
+            continue_on_error=options.continue_on_error,
+            step_reporter=step_reporter,
+        )
 
     after = {}
     if options.include_diagnostics:
@@ -286,6 +301,7 @@ def run_pipeline_cycle(
         "failed_steps": failed_steps,
         "dry_run": False,
         "executed": True,
+        "mode": "scoring_only" if options.scoring_only else "full",
         "safety": _safety_contract(),
         "before": before,
         "steps": steps,
@@ -294,16 +310,7 @@ def run_pipeline_cycle(
 
 
 def _dry_run_steps(options: PipelineCycleOptions) -> list[dict[str, Any]]:
-    return [
-        _step(
-            "wallet_pipeline_state_materialize",
-            "would_execute",
-            {
-                "limit": options.state_limit,
-                "stale_only": options.state_stale_only,
-                "commit_every": options.state_commit_every,
-            },
-        ),
+    scoring_steps = [
         _step(
             "materialize_features",
             "would_execute",
@@ -318,6 +325,23 @@ def _dry_run_steps(options: PipelineCycleOptions) -> list[dict[str, Any]]:
             "would_execute" if options.run_scoring else "skipped",
             {"limit": options.score_limit, "incremental": True},
         ),
+    ]
+    if options.scoring_only:
+        return scoring_steps + [
+            _step("post_score_planning", "skipped", {"reason": "scoring_only"}),
+            _step("pipeline_smoothness_after", "would_observe", {"top": options.top}),
+        ]
+    return [
+        _step(
+            "wallet_pipeline_state_materialize",
+            "would_execute",
+            {
+                "limit": options.state_limit,
+                "stale_only": options.state_stale_only,
+                "commit_every": options.state_commit_every,
+            },
+        ),
+        *scoring_steps,
         _step(
             "evidence_promotion",
             "would_execute" if options.evidence_promotion_limit > 0 else "skipped",
