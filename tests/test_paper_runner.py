@@ -37,6 +37,11 @@ class RateLimitedBookClient:
         )
 
 
+class MissingBookClient:
+    def book(self, token_id: str) -> dict:
+        return {"bids": [], "asks": []}
+
+
 def _candidate_address(suffix: str) -> str:
     return "0x" + suffix * 40
 
@@ -485,6 +490,150 @@ def test_paper_observer_evaluate_can_persist_quoteability_evidence(tmp_path):
         conn.close()
 
 
+def test_paper_observer_persist_consumes_accepted_signal_once(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    try:
+        run_migrations(conn)
+        address = _candidate_address("a")
+        upsert_candidate(conn, CandidateAddress(address=address, sources="test"))
+        _seed_paper_eligibility(conn, address, stage=CandidateStage.PAPER_APPROVED, score=83.11)
+
+        first = evaluate_paper_observer(
+            conn,
+            limit=1,
+            persist=True,
+            client=BOOK_CLIENT,
+        )
+        second = evaluate_paper_observer(
+            conn,
+            limit=1,
+            persist=True,
+            client=BOOK_CLIENT,
+        )
+
+        assert first.signals_seen == 1
+        assert first.evaluations_persisted == 1
+        assert first.trials_opened == 1
+        assert second.signals_seen == 0
+        assert second.evaluations_persisted == 0
+        assert second.trials_opened == 0
+        assert conn.execute("SELECT COUNT(*) FROM paper_signal_evaluations").fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM paper_observer_trials").fetchone()[0] == 1
+    finally:
+        conn.close()
+
+
+def test_paper_observer_retries_rejected_quote_after_cooldown(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    try:
+        run_migrations(conn)
+        address = _candidate_address("b")
+        upsert_candidate(conn, CandidateAddress(address=address, sources="test"))
+        _seed_paper_eligibility(conn, address, stage=CandidateStage.PAPER_APPROVED, score=83.11)
+        now = int(time.time())
+
+        first = evaluate_paper_observer(
+            conn,
+            limit=1,
+            max_signal_age_sec=300,
+            retry_cooldown_sec=60,
+            now=now,
+            persist=True,
+            client=MissingBookClient(),
+        )
+        cooling_down = evaluate_paper_observer(
+            conn,
+            limit=1,
+            max_signal_age_sec=300,
+            retry_cooldown_sec=60,
+            now=now + 30,
+            persist=True,
+            client=MissingBookClient(),
+        )
+        retried = evaluate_paper_observer(
+            conn,
+            limit=1,
+            max_signal_age_sec=300,
+            retry_cooldown_sec=60,
+            now=now + 61,
+            persist=True,
+            client=MissingBookClient(),
+        )
+
+        assert first.signals_seen == 1
+        assert first.accepted_signals == 0
+        assert first.evaluations_persisted == 1
+        assert cooling_down.signals_seen == 0
+        assert retried.signals_seen == 1
+        assert retried.accepted_signals == 0
+        evidence = conn.execute(
+            "SELECT accepted, evaluated_at FROM paper_signal_evaluations WHERE wallet = ?",
+            (address,),
+        ).fetchone()
+        assert evidence["accepted"] == 0
+        assert evidence["evaluated_at"] == now + 61
+        assert conn.execute("SELECT COUNT(*) FROM paper_observer_trials").fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+def test_paper_observer_prioritizes_unseen_market_before_newer_repeat(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    try:
+        run_migrations(conn)
+        address = _candidate_address("c")
+        upsert_candidate(conn, CandidateAddress(address=address, sources="test"))
+        _seed_paper_eligibility(conn, address, stage=CandidateStage.PAPER_APPROVED, score=83.11)
+        conn.execute("DELETE FROM wallet_activity WHERE address = ?", (address,))
+        now = int(time.time())
+        history = [
+            _activity(
+                asset=f"asset-history-{index}",
+                timestamp=now - 90_000 - index,
+                idx=20_000 + index,
+            )
+            for index in range(99)
+        ]
+        seen = _activity(asset="asset-seen-first", timestamp=now - 120, idx=30_001)
+        seen["conditionId"] = "condition-seen"
+        seen["slug"] = "market-seen"
+        persist_wallet_activity(conn, address, [*history, seen], ingested_at=now)
+
+        first = evaluate_paper_observer(
+            conn,
+            limit=1,
+            max_signal_age_sec=300,
+            now=now,
+            persist=True,
+            client=BOOK_CLIENT,
+        )
+        assert first.evaluations[0]["market_slug"] == "market-seen"
+
+        repeat = _activity(asset="asset-seen-repeat", timestamp=now + 10, idx=30_002)
+        repeat["conditionId"] = "condition-seen"
+        repeat["slug"] = "market-seen"
+        unseen = _activity(asset="asset-unseen", timestamp=now + 5, idx=30_003)
+        unseen["conditionId"] = "condition-unseen"
+        unseen["slug"] = "market-unseen"
+        persist_wallet_activity(conn, address, [repeat, unseen], ingested_at=now + 15)
+
+        second = evaluate_paper_observer(
+            conn,
+            limit=1,
+            max_signal_age_sec=300,
+            now=now + 15,
+            persist=True,
+            client=BOOK_CLIENT,
+        )
+
+        assert second.signals_seen == 1
+        assert second.evaluations[0]["market_slug"] == "market-unseen"
+        assert conn.execute("SELECT COUNT(*) FROM paper_signal_evaluations").fetchone()[0] == 2
+        assert conn.execute("SELECT COUNT(*) FROM paper_observer_trials").fetchone()[0] == 2
+    finally:
+        conn.close()
+
+
 def test_paper_observer_evaluate_marks_old_quoteable_signals_not_actionable(tmp_path):
     conn = connect(tmp_path / "robot.sqlite")
     try:
@@ -630,6 +779,8 @@ def test_paper_observer_evaluate_cli_can_persist_without_writing_orders(tmp_path
     assert payload["evaluations_persisted"] == 1
     assert payload["trials_opened"] == 1
     assert payload["actionable_signals"] == 1
+    assert payload["retry_cooldown_sec"] == 60
+    assert payload["selection_mode"] == "incremental_unseen_market_first"
     assert order_count == 0
     assert evidence_count == 1
     assert trial_count == 1

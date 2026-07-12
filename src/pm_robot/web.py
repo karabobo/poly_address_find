@@ -9727,6 +9727,12 @@ def _paper_observer_evaluation_panel(values: dict[str, Any]) -> str:
         ("报价成功", f"{_fmt_int(values.get('quotes_succeeded'))}/{_fmt_int(attempted)}", "CLOB book", "ok" if int(values.get("quotes_succeeded") or 0) else "warn"),
         ("可模拟成交", _fmt_int(accepted), "accepted by paper broker", "ok" if accepted else "warn"),
         ("可及时跟", _fmt_int(actionable), f"<= {_fmt_int(values.get('max_actionable_signal_age_sec'))} 秒", "ok" if actionable else "warn"),
+        (
+            "报价调度",
+            "增量优先新市场" if values.get("selection_mode") == "incremental_unseen_market_first" else "最新快照",
+            f"失败冷却 {_fmt_int(values.get('retry_cooldown_sec'))} 秒",
+            "ok",
+        ),
         ("过时信号", _fmt_int(values.get("stale_signal_rejections")), "quoteable but too old", "warn" if int(values.get("stale_signal_rejections") or 0) else "ok"),
         ("拒绝", _fmt_int(values.get("rejected_signals")), "quote/risk/depth", "warn" if int(values.get("rejected_signals") or 0) else "ok"),
         ("平均滑点", _fmt_num(values.get("average_slippage_bps")), "bps, accepted only", "ok" if accepted else "warn"),

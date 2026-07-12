@@ -1977,6 +1977,7 @@ def test_nas_paper_observer_loop_runs_fast_readonly_quote_evaluation():
     assert "PM_ROBOT_PAPER_OBSERVER_ACTIVITY_MAX_EVENTS=50" in env
     assert "PM_ROBOT_PAPER_OBSERVER_ACTIVITY_SLEEP=0.1" in env
     assert "PM_ROBOT_PAPER_OBSERVER_EVALUATION_MAX_SIGNAL_AGE_SEC=300" in env
+    assert "PM_ROBOT_PAPER_OBSERVER_RETRY_COOLDOWN_SEC=60" in env
     assert "ingest-activity" in loop
     assert "--paper-stage-only" in loop
     assert "paper-observer-preview" in loop
@@ -1986,6 +1987,7 @@ def test_nas_paper_observer_loop_runs_fast_readonly_quote_evaluation():
     assert "PAPER_OBSERVER_EVALUATION_MAX_SIGNAL_AGE_SEC" in loop
     assert '--max-signal-age-sec "$PAPER_OBSERVER_EVALUATION_MAX_SIGNAL_AGE_SEC"' in loop
     assert "--max-actionable-signal-age-sec" in loop
+    assert '--retry-cooldown-sec "$PAPER_OBSERVER_RETRY_COOLDOWN_SEC"' in loop
     assert "--persist" in loop
     assert "paper_orders" not in loop
     assert "publish-leaders" not in loop

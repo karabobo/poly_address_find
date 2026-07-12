@@ -623,6 +623,8 @@ def paper_observer_evaluation_file_report(root):
         "age_seconds": max(0, age_seconds),
         "max_signal_age_sec": int(payload.get("max_signal_age_sec") or 0),
         "max_actionable_signal_age_sec": int(payload.get("max_actionable_signal_age_sec") or 0),
+        "retry_cooldown_sec": int(payload.get("retry_cooldown_sec") or 0),
+        "selection_mode": str(payload.get("selection_mode") or ""),
         "max_stake_usd": float(payload.get("max_stake_usd") or 0),
         "signals_seen": int(payload.get("signals_seen") or 0),
         "quotes_attempted": int(payload.get("quotes_attempted") or 0),

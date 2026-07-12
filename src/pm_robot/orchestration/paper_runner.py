@@ -23,6 +23,8 @@ PAPER_STAGES = PAPER_ELIGIBLE_CANDIDATE_STAGES
 PAPER_BLOCKERS = ("non_positive_settled_roi", "non_positive_total_roi")
 PAPER_OBSERVER_PREVIEW_SCHEMA_VERSION = "paper_observer_preview_v1"
 PAPER_OBSERVER_EVALUATION_SCHEMA_VERSION = "paper_observer_evaluation_v1"
+PAPER_OBSERVER_RETRY_COOLDOWN_SEC = 60
+PAPER_OBSERVER_SELECTION_MODE = "incremental_unseen_market_first"
 PAPER_OBSERVER_DIAGNOSTIC_WINDOWS = (
     (21_600, "6h"),
     (86_400, "24h"),
@@ -67,6 +69,8 @@ class PaperObserverEvaluation:
     generated_at: int
     max_signal_age_sec: int
     max_actionable_signal_age_sec: int
+    retry_cooldown_sec: int
+    selection_mode: str
     max_stake_usd: float
     signals_seen: int
     quotes_attempted: int
@@ -136,6 +140,7 @@ def evaluate_paper_observer(
     max_stake_usd: float = 40.0,
     max_signal_age_sec: int = 21_600,
     max_actionable_signal_age_sec: int = 300,
+    retry_cooldown_sec: int = PAPER_OBSERVER_RETRY_COOLDOWN_SEC,
     now: int | None = None,
     persist: bool = False,
     client: PublicPolymarketClient | None = None,
@@ -146,6 +151,7 @@ def evaluate_paper_observer(
     safe_limit = min(max(int(limit), 1), 250)
     safe_max_signal_age_sec = max(int(max_signal_age_sec), 0)
     safe_max_actionable_signal_age_sec = max(int(max_actionable_signal_age_sec), 0)
+    safe_retry_cooldown_sec = max(int(retry_cooldown_sec), 0)
     safe_max_stake_usd = max(float(max_stake_usd), 1.0)
     min_timestamp = generated_at - safe_max_signal_age_sec if safe_max_signal_age_sec > 0 else 0
     rows = _candidate_activity_rows(
@@ -154,6 +160,11 @@ def evaluate_paper_observer(
         min_timestamp=min_timestamp,
         include_watchlist_min_score=None,
         include_review_min_score=None,
+        observer_retry_after=(
+            generated_at - safe_retry_cooldown_sec
+            if persist
+            else None
+        ),
     )
     broker = PaperBroker(ledger_path=None, conn=None, max_stake_usd=safe_max_stake_usd)
     client = client or PublicPolymarketClient(conn=conn)
@@ -184,6 +195,8 @@ def evaluate_paper_observer(
         generated_at=generated_at,
         max_signal_age_sec=safe_max_signal_age_sec,
         max_actionable_signal_age_sec=safe_max_actionable_signal_age_sec,
+        retry_cooldown_sec=safe_retry_cooldown_sec,
+        selection_mode=(PAPER_OBSERVER_SELECTION_MODE if persist else "snapshot_latest_first"),
         max_stake_usd=round(safe_max_stake_usd, 2),
         signals_seen=len(evaluations),
         quotes_attempted=len(evaluations),
@@ -524,12 +537,45 @@ def _candidate_activity_rows(
     min_timestamp: int,
     include_watchlist_min_score: float | None,
     include_review_min_score: float | None,
+    observer_retry_after: int | None = None,
 ) -> list[sqlite3.Row]:
     placeholders = ",".join("?" for _ in PAPER_STAGES)
     params: list[object] = [*PAPER_STAGES]
     _ = include_watchlist_min_score, include_review_min_score
     stage_filter = f"cw.candidate_stage IN ({placeholders})"
-    params.extend([*PAPER_BLOCKERS, PAPER_MIN_PRICE, PAPER_MAX_PRICE, min_timestamp, limit])
+    params.extend([*PAPER_BLOCKERS, PAPER_MIN_PRICE, PAPER_MAX_PRICE, min_timestamp])
+    observer_filter = ""
+    observer_order = "wa.timestamp DESC, wa.activity_id DESC"
+    if observer_retry_after is not None:
+        # Persisted observer cycles consume accepted signals once and retry failures after a cooldown.
+        observer_filter = """
+          AND NOT EXISTS (
+              SELECT 1
+              FROM paper_signal_evaluations pse
+              WHERE pse.signal_id = 'activity-' || wa.activity_id
+                AND (
+                    pse.accepted = 1
+                    OR pse.evaluated_at >= ?
+                )
+          )
+        """
+        observer_order = """
+            CASE WHEN EXISTS (
+                SELECT 1
+                FROM paper_observer_trials pot
+                WHERE pot.wallet = wa.address
+                  AND pot.market_slug = wa.market_slug
+            ) THEN 1 ELSE 0 END ASC,
+            CASE WHEN EXISTS (
+                SELECT 1
+                FROM paper_signal_evaluations prior_pse
+                WHERE prior_pse.signal_id = 'activity-' || wa.activity_id
+            ) THEN 1 ELSE 0 END ASC,
+            wa.timestamp DESC,
+            wa.activity_id DESC
+        """
+        params.append(max(0, int(observer_retry_after)))
+    params.append(limit)
     rows = conn.execute(
         f"""
         SELECT
@@ -598,7 +644,8 @@ def _candidate_activity_rows(
                     OR po.created_at >= strftime('%s','now') - 300
                 )
           )
-        ORDER BY wa.timestamp DESC, wa.activity_id DESC
+          {observer_filter}
+        ORDER BY {observer_order}
         LIMIT ?
         """,
         params,

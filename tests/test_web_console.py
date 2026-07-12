@@ -1181,6 +1181,8 @@ def test_dashboard_shows_readonly_paper_observer_preview(tmp_path):
                 "generated_at": now,
                 "max_signal_age_sec": 21_600,
                 "max_actionable_signal_age_sec": 300,
+                "retry_cooldown_sec": 60,
+                "selection_mode": "incremental_unseen_market_first",
                 "max_stake_usd": 40,
                 "signals_seen": 1,
                 "quotes_attempted": 1,
@@ -1250,6 +1252,8 @@ def test_dashboard_shows_readonly_paper_observer_preview(tmp_path):
     assert data["paper_observer_evaluation"]["state"] == "current"
     assert data["paper_observer_evaluation"]["accepted_signals"] == 1
     assert data["paper_observer_evaluation"]["actionable_signals"] == 1
+    assert data["paper_observer_evaluation"]["retry_cooldown_sec"] == 60
+    assert data["paper_observer_evaluation"]["selection_mode"] == "incremental_unseen_market_first"
     assert data["paper_observer_evaluation"]["history"]["total_evaluations"] == 1
     assert data["paper_observer_evaluation"]["history"]["actionable"] == 1
     assert data["paper_observer_evaluation"]["history"]["wallets_summary"][0]["wallet"] == wallet
@@ -1263,6 +1267,7 @@ def test_dashboard_shows_readonly_paper_observer_preview(tmp_path):
     assert data["paper_handoff"]["wallets"][0]["observer_quality_evaluations"] == 1
     assert data["paper_handoff"]["wallets"][0]["observer_quality_actionable_rate_pct"] == 100.0
     assert data["paper_handoff"]["wallets"][0]["observer_quality_avg_signal_age_sec"] == 60.0
+    assert "增量优先新市场" in html
     assert preview["signals_seen"] == 1
     assert preview["signals"][0]["market_slug"] == "fresh-market"
     assert evaluation["accepted_signals"] == 1

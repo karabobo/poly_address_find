@@ -50,7 +50,12 @@ from pm_robot.orchestration.eligibility_repair import prepare_eligibility_repair
 from pm_robot.orchestration.feature_materializer import materialize_wallet_features
 from pm_robot.orchestration.gamma_ingestor import ingest_gamma_markets
 from pm_robot.orchestration.leaderboard_discovery import discover_leaderboard_candidates
-from pm_robot.orchestration.paper_runner import evaluate_paper_observer, preview_paper_observer, run_paper
+from pm_robot.orchestration.paper_runner import (
+    PAPER_OBSERVER_RETRY_COOLDOWN_SEC,
+    evaluate_paper_observer,
+    preview_paper_observer,
+    run_paper,
+)
 from pm_robot.orchestration.paper_observer_outcomes import settle_paper_observer_trials
 from pm_robot.orchestration.pipeline_cycle import PipelineCycleOptions, run_pipeline_cycle
 from pm_robot.orchestration.pipeline_audit import pipeline_audit_report
@@ -628,6 +633,12 @@ def main() -> int:
         type=int,
         default=300,
         help="Signals older than this remain historical quote checks but are not actionable",
+    )
+    paper_observer_eval_cmd.add_argument(
+        "--retry-cooldown-sec",
+        type=int,
+        default=PAPER_OBSERVER_RETRY_COOLDOWN_SEC,
+        help="Retry rejected observer quotes only after this cooldown; accepted signals are not re-quoted",
     )
     paper_observer_eval_cmd.add_argument(
         "--persist",
@@ -1650,6 +1661,7 @@ def main() -> int:
                 max_stake_usd=args.max_stake_usd,
                 max_signal_age_sec=args.max_signal_age_sec,
                 max_actionable_signal_age_sec=args.max_actionable_signal_age_sec,
+                retry_cooldown_sec=args.retry_cooldown_sec,
                 persist=args.persist,
             )
         finally:
