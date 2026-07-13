@@ -123,6 +123,58 @@ def _seed_paper_eligibility(
     conn.commit()
 
 
+def _seed_exploratory_copyability_observer(
+    conn,
+    address: str,
+    *,
+    score: float = 60.0,
+    hygiene_status: str = "clean",
+    evidence_ready: bool = True,
+) -> None:
+    upsert_candidate(conn, CandidateAddress(address=address, sources="test"))
+    conn.execute(
+        "UPDATE candidate_wallets SET candidate_stage = 'blocked_copyability' WHERE address = ?",
+        (address,),
+    )
+    upsert_wallet_feature(
+        conn,
+        WalletFeatures(
+            address=address,
+            hygiene_status=hygiene_status,
+            copy_event_count=0,
+        ),
+    )
+    conn.execute(
+        """
+        INSERT INTO leader_scores(
+            address, leader_score, review_stage, review_reason,
+            components_json, penalties_json, policy_version, scored_at
+        ) VALUES (?, ?, 'blocked_copyability', 'copyability_scan_no_signal',
+                  '{}', '{}', 'test', ?)
+        """,
+        (address, score, int(time.time())),
+    )
+    conn.execute(
+        """
+        INSERT INTO wallet_processing_state(
+            wallet, discovery_tier, evidence_status, evidence_depth,
+            evidence_confidence, priority, current_stage, next_action,
+            next_action_at, activity_count, distinct_markets,
+            non_fast_trade_count, updated_at
+        ) VALUES (?, ?, 'summary_ready', 1000, 1.0, 10, 'deep_done',
+                  'score_wallet', 0, 1000, 30, 200, ?)
+        """,
+        (address, "l3_deep" if evidence_ready else "l1_light", int(time.time())),
+    )
+    persist_wallet_activity(
+        conn,
+        address,
+        [_activity(timestamp=int(time.time()), idx=20_000)],
+        ingested_at=int(time.time()),
+    )
+    conn.commit()
+
+
 def test_paper_runner_ignores_unapproved_candidate(tmp_path):
     conn = connect(tmp_path / "robot.sqlite")
     try:
@@ -286,7 +338,11 @@ def test_paper_observer_preview_lists_signals_without_writing_orders(tmp_path):
         assert preview.schema_version == "paper_observer_preview_v1"
         assert preview.signals_seen == 1
         assert preview.paper_stage_wallets == 1
+        assert preview.exploratory_copyability_wallets == 0
+        assert preview.observer_wallets == 1
         assert preview.recent_buy_events >= 1
+        assert preview.paper_stage_recent_buy_events >= 1
+        assert preview.exploratory_copyability_recent_buy_events == 0
         assert preview.latest_buy_ts is not None
         assert preview.latest_buy_ingested_at is not None
         assert preview.latest_buy_age_sec is not None
@@ -294,6 +350,8 @@ def test_paper_observer_preview_lists_signals_without_writing_orders(tmp_path):
         assert preview.no_signal_reason == ""
         windows = {row["window_label"]: row for row in preview.window_diagnostics}
         assert windows["6h"]["recent_buy_events"] >= 1
+        assert windows["6h"]["paper_stage_recent_buy_events"] >= 1
+        assert windows["6h"]["exploratory_copyability_recent_buy_events"] == 0
         assert windows["6h"]["eligible_signals"] == 1
         assert windows["6h"]["max_ingest_lag_sec"] is not None
         assert windows["6h"]["no_signal_reason"] == ""
@@ -304,6 +362,140 @@ def test_paper_observer_preview_lists_signals_without_writing_orders(tmp_path):
         assert "ingest_lag_sec" in preview.signals[0]
         assert preview.signals[0]["observer_action"] == "external_paper_quote_and_evaluate"
         assert count == 0
+    finally:
+        conn.close()
+
+
+def test_copyability_observer_is_isolated_from_formal_paper_execution(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    try:
+        run_migrations(conn)
+        address = _candidate_address("c")
+        _seed_exploratory_copyability_observer(conn, address)
+
+        formal_preview = preview_paper_observer(conn, limit=10)
+        exploratory_preview = preview_paper_observer(
+            conn,
+            limit=10,
+            exploratory_copyability_min_score=55,
+        )
+        evaluation = evaluate_paper_observer(
+            conn,
+            limit=10,
+            exploratory_copyability_min_score=55,
+            persist=True,
+            client=BOOK_CLIENT,
+        )
+        paper_run = run_paper(conn, ledger_path=None, limit=10, client=BOOK_CLIENT)
+
+        assert formal_preview.signals_seen == 0
+        assert formal_preview.observer_wallets == 0
+        assert exploratory_preview.signals_seen == 1
+        assert exploratory_preview.paper_stage_wallets == 0
+        assert exploratory_preview.exploratory_copyability_wallets == 1
+        assert exploratory_preview.observer_wallets == 1
+        assert exploratory_preview.recent_buy_events == 1
+        assert exploratory_preview.paper_stage_recent_buy_events == 0
+        assert exploratory_preview.exploratory_copyability_recent_buy_events == 1
+        exploratory_windows = {
+            row["window_label"]: row for row in exploratory_preview.window_diagnostics
+        }
+        assert exploratory_windows["6h"]["recent_buy_events"] == 1
+        assert exploratory_windows["6h"]["paper_stage_recent_buy_events"] == 0
+        assert (
+            exploratory_windows["6h"]["exploratory_copyability_recent_buy_events"]
+            == 1
+        )
+        assert exploratory_windows["6h"]["eligible_signals"] == 1
+        assert exploratory_preview.signals[0]["validation_cohort"] == "exploratory_copyability"
+        assert exploratory_preview.signals[0]["source"] == "copyability_observer_activity"
+        assert evaluation.validation_signals == 0
+        assert evaluation.exploratory_copyability_signals == 1
+        assert paper_run.signals_seen == 0
+        assert conn.execute("SELECT COUNT(*) FROM paper_orders").fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT validation_cohort FROM paper_signal_evaluations"
+        ).fetchone()[0] == "exploratory_copyability"
+        assert conn.execute(
+            "SELECT validation_cohort FROM paper_observer_trials"
+        ).fetchone()[0] == "exploratory_copyability"
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize(
+    ("score", "hygiene_status", "evidence_ready"),
+    [
+        (54.9, "clean", True),
+        (60.0, "unknown", True),
+        (60.0, "clean", False),
+    ],
+)
+def test_copyability_observer_fails_closed_on_research_gates(
+    tmp_path,
+    score,
+    hygiene_status,
+    evidence_ready,
+):
+    conn = connect(tmp_path / "robot.sqlite")
+    try:
+        run_migrations(conn)
+        address = _candidate_address("4")
+        _seed_exploratory_copyability_observer(
+            conn,
+            address,
+            score=score,
+            hygiene_status=hygiene_status,
+            evidence_ready=evidence_ready,
+        )
+
+        preview = preview_paper_observer(
+            conn,
+            limit=10,
+            exploratory_copyability_min_score=55,
+        )
+
+        assert preview.signals_seen == 0
+        assert preview.exploratory_copyability_wallets == 0
+        assert preview.observer_wallets == 0
+        assert preview.no_signal_reason == "no_observer_wallets"
+    finally:
+        conn.close()
+
+
+def test_copyability_observer_diagnostics_use_exploratory_activity_scope(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    try:
+        run_migrations(conn)
+        address = _candidate_address("5")
+        _seed_exploratory_copyability_observer(conn, address)
+        conn.execute(
+            "UPDATE wallet_activity SET price = 0.01 WHERE address = ?",
+            (address,),
+        )
+        conn.commit()
+
+        preview = preview_paper_observer(
+            conn,
+            limit=10,
+            exploratory_copyability_min_score=55,
+        )
+
+        assert preview.signals_seen == 0
+        assert preview.paper_stage_wallets == 0
+        assert preview.exploratory_copyability_wallets == 1
+        assert preview.observer_wallets == 1
+        assert preview.recent_buy_events == 1
+        assert preview.paper_stage_recent_buy_events == 0
+        assert preview.exploratory_copyability_recent_buy_events == 1
+        assert preview.no_signal_reason == "recent_buys_failed_eligibility_or_deduped"
+        windows = {row["window_label"]: row for row in preview.window_diagnostics}
+        assert windows["6h"]["recent_buy_events"] == 1
+        assert windows["6h"]["exploratory_copyability_recent_buy_events"] == 1
+        assert windows["6h"]["eligible_signals"] == 0
+        assert windows["6h"]["no_signal_reason"] == (
+            "recent_buys_failed_eligibility_or_deduped"
+        )
     finally:
         conn.close()
 
@@ -354,7 +546,10 @@ def test_paper_observer_preview_explains_stale_buy_window(tmp_path):
 
         assert preview.signals_seen == 0
         assert preview.paper_stage_wallets == 1
+        assert preview.observer_wallets == 1
         assert preview.recent_buy_events == 0
+        assert preview.paper_stage_recent_buy_events == 0
+        assert preview.exploratory_copyability_recent_buy_events == 0
         assert preview.latest_buy_ts is not None
         assert preview.latest_buy_ingested_at is not None
         assert preview.latest_buy_age_sec is not None

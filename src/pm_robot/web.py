@@ -55,6 +55,7 @@ from pm_robot.orchestration.wallet_pipeline import (
 )
 from pm_robot.models import CandidateStage
 from pm_robot.pipeline_terms import (
+    DEFAULT_EXPLORATORY_COPYABILITY_MIN_SCORE,
     PAPER_ELIGIBLE_CANDIDATE_STAGES,
     EvidenceJobStage,
     EvidenceStatus,
@@ -100,6 +101,18 @@ _DIRECTORY_SIZE_CACHE_LOCK = threading.Lock()
 _DIRECTORY_SIZE_CACHE: dict[str, tuple[float, int]] = {}
 _ARCHIVE_CATALOG_CACHE_LOCK = threading.Lock()
 _ARCHIVE_CATALOG_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
+
+
+def _paper_observer_exploratory_min_score() -> float:
+    raw = os.environ.get(
+        "PM_ROBOT_PAPER_OBSERVER_EXPLORATORY_MIN_SCORE",
+        str(DEFAULT_EXPLORATORY_COPYABILITY_MIN_SCORE),
+    )
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        return DEFAULT_EXPLORATORY_COPYABILITY_MIN_SCORE
+
 
 _CANDIDATE_STAGE_LABELS = {
     CandidateStage.IMPORTED.value: "已导入",
@@ -480,6 +493,7 @@ def paper_observer_preview_data(
     *,
     limit: int = 50,
     max_signal_age_sec: int = 21_600,
+    exploratory_copyability_min_score: float | None = None,
 ) -> dict[str, Any]:
     conn = connect_readonly(settings.db_path)
     try:
@@ -487,6 +501,11 @@ def paper_observer_preview_data(
             conn,
             limit=limit,
             max_signal_age_sec=max_signal_age_sec,
+            exploratory_copyability_min_score=(
+                _paper_observer_exploratory_min_score()
+                if exploratory_copyability_min_score is None
+                else exploratory_copyability_min_score
+            ),
         )
     finally:
         conn.close()
@@ -686,6 +705,11 @@ def _handler_factory(config: WebConsoleConfig) -> type[BaseHTTPRequestHandler]:
                         config.settings,
                         limit=_int_param(params, "limit", 50),
                         max_signal_age_sec=_int_param(params, "max_signal_age_sec", 21_600),
+                        exploratory_copyability_min_score=_float_param(
+                            params,
+                            "exploratory_copyability_min_score",
+                            _paper_observer_exploratory_min_score(),
+                        ),
                     )
                 )
                 return
@@ -935,7 +959,11 @@ def _dashboard_data(
         settings,
         observer_summary=paper_observer_trials,
     )
-    paper_observer_preview = _paper_observer_preview_summary(conn, limit=8)
+    paper_observer_preview = _paper_observer_preview_summary(
+        conn,
+        limit=8,
+        exploratory_copyability_min_score=_paper_observer_exploratory_min_score(),
+    )
     paper_observer_evaluation = paper_observer_evaluation_data(settings)
     paper_observer_evaluation["history"] = _paper_signal_evaluation_history(conn)
     paper_observer_trials["read_only"] = True
@@ -6401,6 +6429,28 @@ def _paper_observer_evaluation_file(settings: RobotSettings) -> dict[str, Any]:
 def _paper_signal_evaluation_history(conn: sqlite3.Connection) -> dict[str, Any]:
     if not _table_exists(conn, "paper_signal_evaluations"):
         return {"available": False}
+    validation = _paper_signal_evaluation_history_for_cohort(conn, "validation")
+    exploratory = _paper_signal_evaluation_history_for_cohort(
+        conn,
+        "exploratory_copyability",
+    )
+    return {
+        "available": True,
+        **validation,
+        "exploratory_copyability": {
+            "available": True,
+            **exploratory,
+            "counts_toward_formal_validation": False,
+        },
+    }
+
+
+def _paper_signal_evaluation_history_for_cohort(
+    conn: sqlite3.Connection,
+    cohort: str,
+) -> dict[str, Any]:
+    """Aggregate one observer cohort so research rows cannot inflate formal metrics."""
+
     row = conn.execute(
         """
         SELECT
@@ -6414,13 +6464,14 @@ def _paper_signal_evaluation_history(conn: sqlite3.Connection) -> dict[str, Any]
             AVG(quote_latency_ms) AS avg_latency_ms,
             MAX(evaluated_at) AS latest_evaluated_at
         FROM paper_signal_evaluations
-        """
+        WHERE validation_cohort = ?
+        """,
+        (cohort,),
     ).fetchone()
     total = int(row["total_evaluations"] or 0) if row else 0
     accepted = int(row["accepted"] or 0) if row else 0
     actionable = int(row["actionable"] or 0) if row else 0
     return {
-        "available": True,
         "total_evaluations": total,
         "wallets": int(row["wallets"] or 0) if row else 0,
         "accepted": accepted,
@@ -6437,26 +6488,31 @@ def _paper_signal_evaluation_history(conn: sqlite3.Connection) -> dict[str, Any]
             """
             SELECT decision_reason AS reason, COUNT(*) AS count
             FROM paper_signal_evaluations
+            WHERE validation_cohort = ?
             GROUP BY decision_reason
             ORDER BY count DESC, reason ASC
             LIMIT 8
             """,
+            (cohort,),
         ),
         "actionability_reason_counts": _rows(
             conn,
             """
             SELECT actionability_reason AS reason, COUNT(*) AS count
             FROM paper_signal_evaluations
+            WHERE validation_cohort = ?
             GROUP BY actionability_reason
             ORDER BY count DESC, reason ASC
             LIMIT 8
             """,
+            (cohort,),
         ),
         "wallets_summary": _rows(
             conn,
             """
             SELECT
                 wallet,
+                validation_cohort,
                 COUNT(*) AS signals,
                 SUM(CASE WHEN accepted = 1 THEN 1 ELSE 0 END) AS accepted,
                 SUM(CASE WHEN actionable = 1 THEN 1 ELSE 0 END) AS actionable,
@@ -6467,10 +6523,12 @@ def _paper_signal_evaluation_history(conn: sqlite3.Connection) -> dict[str, Any]
                 SUM(CASE WHEN actionability_reason = 'signal_too_old' THEN 1 ELSE 0 END) AS stale_signals,
                 MAX(evaluated_at) AS latest_evaluated_at
             FROM paper_signal_evaluations
-            GROUP BY wallet
+            WHERE validation_cohort = ?
+            GROUP BY wallet, validation_cohort
             ORDER BY accepted_rate_pct DESC, signals DESC, latest_evaluated_at DESC
             LIMIT 10
             """,
+            (cohort,),
         ),
     }
 
@@ -6491,15 +6549,24 @@ def _paper_observer_preview_summary(
     *,
     limit: int = 50,
     max_signal_age_sec: int = 21_600,
+    exploratory_copyability_min_score: float = DEFAULT_EXPLORATORY_COPYABILITY_MIN_SCORE,
 ) -> dict[str, Any]:
-    preview = preview_paper_observer(conn, limit=limit, max_signal_age_sec=max_signal_age_sec)
+    preview = preview_paper_observer(
+        conn,
+        limit=limit,
+        max_signal_age_sec=max_signal_age_sec,
+        exploratory_copyability_min_score=exploratory_copyability_min_score,
+    )
     payload = dict(preview.__dict__)
     for row in payload.get("window_diagnostics") or []:
         row["avg_ingest_lag"] = _duration_label(row.get("avg_ingest_lag_sec"))
         row["max_ingest_lag"] = _duration_label(row.get("max_ingest_lag_sec"))
     payload["read_only"] = True
     payload["write_scope"] = "no_writes"
-    payload["boundary"] = "只读 paper observer 预览：列出合格近期信号，不查盘口、不写 paper_orders。"
+    payload["boundary"] = (
+        "只读 Observer 预览：同时观察正式 Paper 与隔离的 copyability 探索钱包；"
+        "探索数据不计入正式验证，不查盘口、不写 paper_orders。"
+    )
     payload["suggested_window"] = _paper_observer_suggested_window(payload)
     payload["next_action"] = (
         "有信号时交给外部 paper observer 做报价、滑点和结算质量记录。"
@@ -6534,6 +6601,8 @@ def _paper_observer_no_signal_action(values: dict[str, Any]) -> str:
             f"默认窗口暂无信号；最短可复盘窗口是 {suggested.get('window_label')}，"
             "仅用于历史 paper 观察复盘，不代表实时跟单。"
         )
+    if reason == "no_observer_wallets":
+        return "当前没有正式 Paper 或合格的 copyability 探索钱包，等待研究管道产生新候选。"
     if reason == "no_paper_stage_wallets":
         return "当前没有 paper-stage 钱包，先等待研究侧批准候选。"
     if reason == "no_buy_activity":
@@ -9660,12 +9729,16 @@ def _paper_observer_preview_panel(values: dict[str, Any]) -> str:
     max_age_hours = round(float(values.get("max_signal_age_sec") or 0) / 3600, 2)
     latest_buy_age = _duration_label(values.get("latest_buy_age_sec"))
     max_ingest_lag = values.get("recent_buy_max_ingest_lag_sec")
+    formal_buys = int(values.get("paper_stage_recent_buy_events") or 0)
+    exploratory_buys = int(values.get("exploratory_copyability_recent_buy_events") or 0)
     suggested = values.get("suggested_window") or {}
     cards = [
         ("可观察信号", _fmt_int(signal_count), "eligible recent BUY", "ok" if signal_count else "warn"),
-        ("交接钱包", _fmt_int(values.get("paper_stage_wallets")), "paper-stage wallets", "ok" if int(values.get("paper_stage_wallets") or 0) else "warn"),
-        ("窗口内 BUY", _fmt_int(values.get("recent_buy_events")), "before eligibility/dedupe", "ok" if int(values.get("recent_buy_events") or 0) else "warn"),
-        ("最近 BUY", latest_buy_age, "latest paper-stage BUY", "ok" if signal_count else "warn"),
+        ("正式钱包", _fmt_int(values.get("paper_stage_wallets")), "计入正式 Paper 验证", "ok" if int(values.get("paper_stage_wallets") or 0) else "warn"),
+        ("探索钱包", _fmt_int(values.get("exploratory_copyability_wallets")), "blocked_copyability，仅研究", "ok" if int(values.get("exploratory_copyability_wallets") or 0) else "warn"),
+        ("观察总数", _fmt_int(values.get("observer_wallets")), "正式 + 探索", "ok" if int(values.get("observer_wallets") or 0) else "warn"),
+        ("窗口内 BUY", _fmt_int(values.get("recent_buy_events")), f"正式 {formal_buys} · 探索 {exploratory_buys}", "ok" if int(values.get("recent_buy_events") or 0) else "warn"),
+        ("最近 BUY", latest_buy_age, "latest observer-scope BUY", "ok" if signal_count else "warn"),
         (
             "入库延迟",
             _duration_label(max_ingest_lag) if max_ingest_lag is not None else "无",
@@ -9706,8 +9779,8 @@ def _paper_observer_preview_panel(values: dict[str, Any]) -> str:
         + '<h3 class="subhead">观察窗口对比</h3>'
         + _simple_table(
             values.get("window_diagnostics") or [],
-            ["window_label", "recent_buy_events", "eligible_signals", "avg_ingest_lag", "max_ingest_lag", "no_signal_reason"],
-            ["窗口", "BUY 数", "合格信号", "均入库延迟", "最大入库延迟", "无信号原因"],
+            ["window_label", "recent_buy_events", "paper_stage_recent_buy_events", "exploratory_copyability_recent_buy_events", "eligible_signals", "avg_ingest_lag", "max_ingest_lag", "no_signal_reason"],
+            ["窗口", "BUY 总数", "正式 BUY", "探索 BUY", "合格信号", "均入库延迟", "最大入库延迟", "无信号原因"],
         )
         + _paper_observer_signals_table(values.get("signals") or [])
     )
@@ -9721,6 +9794,7 @@ def _paper_observer_evaluation_panel(values: dict[str, Any]) -> str:
     actionable = int(values.get("actionable_signals") or 0)
     attempted = int(values.get("quotes_attempted") or 0)
     history = values.get("history") or {}
+    exploratory_history = history.get("exploratory_copyability") or {}
     cards = [
         ("状态", state, "paper_observer_evaluation.json", "ok" if state == "current" else "warn"),
         ("信号", _fmt_int(values.get("signals_seen")), "eligible signals", "ok" if attempted else "warn"),
@@ -9738,6 +9812,12 @@ def _paper_observer_evaluation_panel(values: dict[str, Any]) -> str:
         ("平均滑点", _fmt_num(values.get("average_slippage_bps")), "bps, accepted only", "ok" if accepted else "warn"),
         ("平均延迟", _fmt_num(values.get("average_latency_ms")), "ms", "ok"),
         ("历史可跟率", f"{_fmt_num(history.get('actionable_rate_pct'))}%", f"{_fmt_int(history.get('actionable'))}/{_fmt_int(history.get('total_evaluations'))}", "ok" if int(history.get("actionable") or 0) else "warn"),
+        (
+            "探索观察",
+            _fmt_int(exploratory_history.get("total_evaluations")),
+            "blocked_copyability，不计入正式验证",
+            "ok" if int(exploratory_history.get("total_evaluations") or 0) else "warn",
+        ),
         ("写入范围", values.get("write_scope") or "unknown", "evaluation only", "ok" if values.get("read_only") else "warn"),
     ]
     return (
@@ -9756,6 +9836,13 @@ def _paper_observer_evaluation_panel(values: dict[str, Any]) -> str:
             ["wallet", "signals", "accepted", "actionable", "actionable_rate_pct", "avg_slippage_bps", "quote_errors", "stale_signals", "latest_evaluated_at"],
             ["钱包", "评估", "盘口通过", "及时可跟", "可跟率 %", "均滑点", "报价错误", "过时", "最近评估"],
         )
+        + '<h3 class="subhead">探索性 Copyability 报价证据</h3>'
+        + '<p class="muted">仅用于验证缺信号钱包是否真实可跟，不改变候选阶段，也不计入正式 Paper 指标。</p>'
+        + _simple_table(
+            exploratory_history.get("wallets_summary") or [],
+            ["wallet", "signals", "accepted", "actionable", "actionable_rate_pct", "avg_slippage_bps", "quote_errors", "stale_signals", "latest_evaluated_at"],
+            ["钱包", "评估", "盘口通过", "及时可跟", "可跟率 %", "均滑点", "报价错误", "过时", "最近评估"],
+        )
         + '<h3 class="subhead">可行动判断</h3>'
         + _simple_table(history.get("actionability_reason_counts") or [], ["reason", "count"], ["原因", "数量"])
         + '<h3 class="subhead">报价拒绝原因</h3>'
@@ -9769,7 +9856,9 @@ def _paper_observer_trials_panel(values: dict[str, Any]) -> str:
     if not values or not values.get("available"):
         return '<p class="empty">观察结果表尚未初始化。</p>'
     total = int(values.get("total_trials") or 0)
-    if total <= 0:
+    exploratory = values.get("exploratory_copyability") or {}
+    exploratory_total = int(exploratory.get("total_trials") or 0)
+    if total <= 0 and exploratory_total <= 0:
         return (
             f'<div class="health-banner attention"><strong>{_e(values.get("boundary"))}</strong>'
             '<span>等待 paper observer 捕捉首个可及时跟信号。</span></div>'
@@ -9796,6 +9885,12 @@ def _paper_observer_trials_panel(values: dict[str, Any]) -> str:
     ]
     cards = [
         ("研究试验", _fmt_int(total), f"{_fmt_int(values.get('wallets'))} 个钱包", "ok"),
+        (
+            "探索试验",
+            _fmt_int(exploratory_total),
+            "不计入正式 Paper 验证",
+            "ok" if exploratory_total else "warn",
+        ),
         ("待结算", _fmt_int(values.get("open_trials")), "Gamma 持续标记", "warn" if int(values.get("open_trials") or 0) else "ok"),
         ("独立市场样本", _fmt_int(market_samples), "同市场重复买入只算一个样本", "ok" if market_samples else "warn"),
         ("已结算市场", _fmt_int(resolved_markets), f"试验 {resolved}/{total}", "ok" if resolved_markets else "warn"),
@@ -9835,6 +9930,13 @@ def _paper_observer_trials_panel(values: dict[str, Any]) -> str:
             ],
             ["钱包", "验证状态", "初步方向", "试验", "市场样本", "已结算市场", "结算盈亏", "结算 ROI %", "市场胜率 %", "最大市场占比 %", "判定依据", "最近更新"],
         )
+        + '<h3 class="subhead">探索性 Copyability 结果</h3>'
+        + '<p class="muted">这些结果只帮助判断 blocked_copyability 钱包是否值得重新评分，不参与正式 Paper 或发布门槛。</p>'
+        + _simple_table(
+            exploratory.get("wallet_summaries") or [],
+            ["wallet", "total_trials", "market_samples", "resolved_markets", "settled_pnl_usd", "settled_roi_pct", "win_rate_pct", "max_market_cost_share_pct", "latest_updated_at"],
+            ["钱包", "试验", "市场样本", "已结算市场", "结算盈亏", "结算 ROI %", "市场胜率 %", "最大市场占比 %", "最近更新"],
+        )
     )
 
 
@@ -9869,7 +9971,7 @@ def _paper_observer_evaluation_table(rows: list[dict[str, Any]]) -> str:
         body.append(
             "<tr>"
             f'<td><a class="mono strong-link" href="/wallet/{_e(wallet)}">{_short(wallet)}</a>'
-            f'<small>{_e(row.get("signal_id") or "")}</small></td>'
+            f'<small>{_e(row.get("signal_id") or "")} · {_e(row.get("validation_cohort") or "")}</small></td>'
             f'<td><div class="numline">{_e(row.get("market_slug") or "")}</div>'
             f'<small>{_e(row.get("outcome") or "")} · {_e(row.get("side") or "")}</small></td>'
             f'<td class="num">{_fmt_num(row.get("leader_price"))}</td>'

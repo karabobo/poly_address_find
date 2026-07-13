@@ -109,6 +109,60 @@ def test_needs_data_retention_archives_explicit_economic_rejection():
     assert status == ("archive_low_value", "summary_only")
 
 
+def test_blocked_copyability_observer_keeps_only_recent_raw_evidence():
+    status = _wallet_registry_status(
+        {
+            "candidate_stage": CandidateStage.BLOCKED_COPYABILITY.value,
+            "existing_registry_status": "archived_raw_pruned",
+            "publish_status": "",
+            "processing_evidence_tier": "l3_deep",
+            "processing_evidence_status": "summary_ready",
+            "processing_current_stage": "deep_done",
+            "processing_activity_count": 1000,
+            "processing_distinct_markets": 30,
+            "processing_non_fast_trade_count": 200,
+            "source_event_count": 1,
+        },
+        feature={"hygiene_status": "clean", "extra": {}},
+        score={
+            "leader_score": 60,
+            "review_reason": "copyability_scan_no_signal",
+        },
+        evidence={"stage": "deep_done", "activity_count": 0},
+        paper={"production_ready": False, "blockers": []},
+        tags=[],
+    )
+
+    assert status == ("copyability_observer_watch", "summary_and_recent")
+
+
+def test_low_score_blocked_copyability_wallet_remains_summary_only():
+    status = _wallet_registry_status(
+        {
+            "candidate_stage": CandidateStage.BLOCKED_COPYABILITY.value,
+            "existing_registry_status": "",
+            "publish_status": "",
+            "processing_evidence_tier": "l3_deep",
+            "processing_evidence_status": "summary_ready",
+            "processing_current_stage": "deep_done",
+            "processing_activity_count": 1000,
+            "processing_distinct_markets": 30,
+            "processing_non_fast_trade_count": 200,
+            "source_event_count": 1,
+        },
+        feature={"hygiene_status": "clean", "extra": {}},
+        score={
+            "leader_score": 54.9,
+            "review_reason": "copyability_scan_no_signal",
+        },
+        evidence={"stage": "deep_done", "activity_count": 0},
+        paper={"production_ready": False, "blockers": []},
+        tags=[],
+    )
+
+    assert status == ("blocked_copyability", "summary_only")
+
+
 def _seed_publishable_winner(conn, wallet: str) -> None:
     upsert_candidate(conn, CandidateAddress(address=wallet, sources="test_source", labels="seed"))
     upsert_wallet_feature(
@@ -462,6 +516,73 @@ def test_active_candidate_registry_refresh_does_not_relabel_pruned_raw_history(t
             "registry_status": "archived_raw_pruned",
             "raw_retention_tier": "summary_only",
             "raw_pruned_at": 100,
+        }
+    finally:
+        conn.close()
+
+
+def test_active_candidate_registry_reactivates_copyability_observer(tmp_path):
+    db_path = tmp_path / "robot.sqlite"
+    wallet = "0x" + "9" * 40
+    conn = connect(db_path)
+    try:
+        run_migrations(conn)
+        upsert_candidate(conn, CandidateAddress(address=wallet, sources="test_source"))
+        conn.execute(
+            "UPDATE candidate_wallets SET candidate_stage = 'blocked_copyability' WHERE address = ?",
+            (wallet,),
+        )
+        upsert_wallet_feature(
+            conn,
+            WalletFeatures(address=wallet, hygiene_status="clean"),
+        )
+        persist_score(
+            conn,
+            ScoreBreakdown(
+                address=wallet,
+                leader_score=60,
+                stage=CandidateStage.BLOCKED_COPYABILITY,
+                reason="copyability_scan_no_signal",
+                components={},
+                penalties={},
+            ),
+            policy_version="test",
+        )
+        conn.execute(
+            """
+            INSERT INTO wallet_processing_state(
+                wallet, discovery_tier, evidence_status, evidence_depth,
+                evidence_confidence, priority, current_stage, next_action,
+                next_action_at, activity_count, distinct_markets,
+                non_fast_trade_count, updated_at
+            ) VALUES (?, 'l3_deep', 'summary_ready', 1000, 1.0, 10,
+                      'deep_done', 'score_wallet', 0, 1000, 30, 200, 1)
+            """,
+            (wallet,),
+        )
+        conn.execute(
+            """
+            INSERT INTO wallet_registry(
+                address, candidate_stage, registry_status, raw_retention_tier,
+                raw_prune_version, raw_pruned_at, last_evaluated_at, updated_at
+            ) VALUES (?, 'blocked_copyability', 'archived_raw_pruned', 'summary_only',
+                      'v2_zero_raw', 100, 100, 100)
+            """,
+            (wallet,),
+        )
+        conn.commit()
+
+        result = refresh_active_candidate_registry(conn)
+        row = conn.execute(
+            "SELECT registry_status, raw_retention_tier, raw_pruned_at FROM wallet_registry WHERE address = ?",
+            (wallet,),
+        ).fetchone()
+
+        assert result["wallets_refreshed"] == 1
+        assert dict(row) == {
+            "registry_status": "copyability_observer_watch",
+            "raw_retention_tier": "summary_and_recent",
+            "raw_pruned_at": None,
         }
     finally:
         conn.close()

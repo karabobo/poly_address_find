@@ -15,6 +15,7 @@ from pm_robot.storage.repository import (
     finish_ingest_run,
     list_activity_backfill_targets,
     list_ingest_targets,
+    list_observer_activity_targets,
     list_paper_activity_targets,
     persist_wallet_activity,
     rebuild_wallet_episodes,
@@ -41,6 +42,7 @@ def ingest_activity(
     max_events_per_wallet: int = 200,
     target_events_per_wallet: int = 0,
     paper_stage_only: bool = False,
+    exploratory_copyability_min_score: float | None = None,
     sleep_seconds: float = 0.25,
     client: PublicPolymarketClient | None = None,
 ) -> ActivityIngestSummary:
@@ -48,8 +50,16 @@ def ingest_activity(
     run_type = "paper_activity" if paper_stage_only else "activity"
     run_id = start_ingest_run(conn, run_type)
     if paper_stage_only:
-        wallets = list_paper_activity_targets(conn, limit=wallet_limit)
-        activity_source = "paper_wallet_activity"
+        if exploratory_copyability_min_score is None:
+            wallets = list_paper_activity_targets(conn, limit=wallet_limit)
+            activity_source = "paper_wallet_activity"
+        else:
+            wallets = list_observer_activity_targets(
+                conn,
+                limit=wallet_limit,
+                exploratory_copyability_min_score=exploratory_copyability_min_score,
+            )
+            activity_source = "observer_wallet_activity"
     else:
         wallets = (
             list_activity_backfill_targets(

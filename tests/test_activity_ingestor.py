@@ -4,7 +4,12 @@ from pm_robot.clients.http import HttpClientError
 from pm_robot.models import CandidateAddress, CandidateStage
 from pm_robot.orchestration.activity_ingestor import _fetch_wallet_activity, ingest_activity
 from pm_robot.storage.db import connect, run_migrations
-from pm_robot.storage.repository import activity_event_key, upsert_candidate
+from pm_robot.storage.repository import (
+    activity_event_key,
+    list_observer_activity_targets,
+    persist_wallet_activity,
+    upsert_candidate,
+)
 
 
 class FakeActivityClient:
@@ -119,6 +124,122 @@ def test_ingest_activity_can_refresh_only_paper_stage_wallets(tmp_path):
             ).fetchone()[0]
             == 0
         )
+    finally:
+        conn.close()
+
+
+def test_ingest_activity_can_refresh_isolated_copyability_observer_wallets(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    try:
+        run_migrations(conn)
+        wallet = "0x" + "c" * 40
+        upsert_candidate(conn, CandidateAddress(address=wallet, sources="test"))
+        conn.execute(
+            "UPDATE candidate_wallets SET candidate_stage = 'blocked_copyability' WHERE address = ?",
+            (wallet,),
+        )
+        conn.execute(
+            """
+            INSERT INTO leader_scores(
+                address, leader_score, review_stage, review_reason,
+                components_json, penalties_json, policy_version, scored_at
+            ) VALUES (?, 60, 'blocked_copyability', 'copyability_scan_no_signal',
+                      '{}', '{}', 'test', 1)
+            """,
+            (wallet,),
+        )
+        conn.execute(
+            "INSERT INTO wallet_features(address, hygiene_status, updated_at) VALUES (?, 'clean', 1)",
+            (wallet,),
+        )
+        conn.execute(
+            """
+            INSERT INTO wallet_processing_state(
+                wallet, discovery_tier, evidence_status, evidence_depth,
+                evidence_confidence, priority, current_stage, next_action,
+                next_action_at, activity_count, distinct_markets,
+                non_fast_trade_count, updated_at
+            ) VALUES (?, 'l3_deep', 'summary_ready', 1000, 1.0, 10,
+                      'deep_done', 'score_wallet', 0, 1000, 30, 200, 1)
+            """,
+            (wallet,),
+        )
+        conn.commit()
+        client = FakeActivityClient({0: [_event(1_300, "0xobserver")]})
+
+        summary = ingest_activity(
+            conn,
+            wallet_limit=10,
+            page_limit=10,
+            max_events_per_wallet=10,
+            paper_stage_only=True,
+            exploratory_copyability_min_score=55,
+            sleep_seconds=0,
+            client=client,
+        )
+
+        assert summary.wallets_attempted == 1
+        assert summary.events_written == 1
+        assert client.calls == [(wallet, 10, 0)]
+        raw = conn.execute(
+            "SELECT raw_json FROM wallet_activity WHERE address = ?",
+            (wallet,),
+        ).fetchone()[0]
+        assert json.loads(raw)["source"] == "observer_wallet_activity"
+    finally:
+        conn.close()
+
+
+def test_copyability_observer_target_uses_total_trade_history_fallback(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    try:
+        run_migrations(conn)
+        wallet = "0x" + "d" * 40
+        upsert_candidate(conn, CandidateAddress(address=wallet, sources="test"))
+        conn.execute(
+            "UPDATE candidate_wallets SET candidate_stage = 'blocked_copyability' WHERE address = ?",
+            (wallet,),
+        )
+        conn.execute(
+            """
+            INSERT INTO leader_scores(
+                address, leader_score, review_stage, review_reason,
+                components_json, penalties_json, policy_version, scored_at
+            ) VALUES (?, 60, 'blocked_copyability', 'copyability_scan_no_signal',
+                      '{}', '{}', 'test', 1)
+            """,
+            (wallet,),
+        )
+        conn.execute(
+            "INSERT INTO wallet_features(address, hygiene_status, updated_at) VALUES (?, 'clean', 1)",
+            (wallet,),
+        )
+        conn.execute(
+            """
+            INSERT INTO wallet_processing_state(
+                wallet, discovery_tier, evidence_status, evidence_depth,
+                evidence_confidence, priority, current_stage, next_action,
+                next_action_at, activity_count, distinct_markets,
+                non_fast_trade_count, updated_at
+            ) VALUES (?, 'l3_deep', 'summary_ready', 1000, 1.0, 10,
+                      'deep_done', 'score_wallet', 0, 1000, 30, 0, 1)
+            """,
+            (wallet,),
+        )
+        persist_wallet_activity(
+            conn,
+            wallet,
+            [_event(1_000 + idx, f"0xhistory{idx}") for idx in range(100)],
+            ingested_at=2_000,
+        )
+
+        targets = list_observer_activity_targets(
+            conn,
+            limit=10,
+            exploratory_copyability_min_score=55,
+        )
+
+        assert targets == [wallet]
     finally:
         conn.close()
 

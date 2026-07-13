@@ -15,6 +15,8 @@ from typing import Any
 
 from pm_robot.orchestration.evidence_readiness import paper_evidence_ready
 from pm_robot.pipeline_terms import (
+    COPYABILITY_OBSERVER_REVIEW_REASON,
+    DEFAULT_EXPLORATORY_COPYABILITY_MIN_SCORE,
     PAPER_ELIGIBLE_CANDIDATE_STAGES,
     PROVISIONAL_CANDIDATE_STAGES,
     PUBLISHABLE_CANDIDATE_STAGE,
@@ -34,6 +36,8 @@ MIN_PUBLISH_COPY_EVENTS = 5
 MIN_PUBLISH_EDGE_RETENTION_PCT = 60.0
 MIN_PUBLISH_WALK_FORWARD_CONSISTENCY_PCT = 55.0
 ELIGIBLE_HYGIENE_STATUSES = ("clean", "screened")
+EXPLORATORY_COPYABILITY_STAGE = "blocked_copyability"
+MIN_EXPLORATORY_COPYABILITY_HISTORY_EVENTS = 100
 
 
 @dataclass(frozen=True)
@@ -79,6 +83,61 @@ def paper_eligibility_status(
         reasons.append("insufficient_trade_events")
     if _float(row.get("copy_event_count")) < MIN_PAPER_COPY_EVENTS:
         reasons.append("missing_copyability_evidence")
+    hygiene_status = _text(row.get("hygiene_status")).lower()
+    if hygiene_status not in ELIGIBLE_HYGIENE_STATUSES:
+        reasons.append(f"hygiene_status:{hygiene_status or 'missing'}")
+    paper_blockers = set(_json_list(row.get("paper_blockers_json")))
+    for blocker in FATAL_PAPER_BLOCKERS:
+        if blocker in paper_blockers:
+            reasons.append(f"paper_blocker:{blocker}")
+    return _deduped_result(reasons)
+
+
+def exploratory_copyability_eligibility_status(
+    conn: sqlite3.Connection,
+    wallet: str,
+    *,
+    min_score: float = DEFAULT_EXPLORATORY_COPYABILITY_MIN_SCORE,
+    facts: dict[str, Any] | sqlite3.Row | None = None,
+) -> EligibilityResult:
+    """Return whether a blocked wallet may enter the research-only observer cohort.
+
+    This gate never changes candidate_stage and never grants paper or publish
+    eligibility. It only admits mature, hygienic wallets that are blocked solely
+    because no copyability signal has been observed yet.
+    """
+
+    row = _wallet_eligibility_facts(conn, wallet, facts=facts)
+    return exploratory_copyability_facts_status(row, min_score=min_score)
+
+
+def exploratory_copyability_facts_status(
+    facts: dict[str, Any] | sqlite3.Row,
+    *,
+    min_score: float = DEFAULT_EXPLORATORY_COPYABILITY_MIN_SCORE,
+) -> EligibilityResult:
+    """Evaluate the research observer gate from already materialized wallet facts."""
+
+    row = dict(facts)
+    reasons: list[str] = []
+    stage = _text(row.get("candidate_stage")).lower()
+    if stage != EXPLORATORY_COPYABILITY_STAGE:
+        reasons.append(f"stage_not_copyability_observer:{stage or 'missing'}")
+    review_reason = _text(row.get("review_reason"))
+    if review_reason != COPYABILITY_OBSERVER_REVIEW_REASON:
+        reasons.append(f"review_reason_not_observer_eligible:{review_reason or 'missing'}")
+    if _float(row.get("leader_score")) < max(0.0, float(min_score)):
+        reasons.append("below_exploratory_copyability_score")
+    if not paper_evidence_ready(row):
+        reasons.append("paper_evidence_tier_incomplete")
+    if _int(row.get("source_count") or row.get("source_event_count")) < MIN_PAPER_SOURCE_COUNT:
+        reasons.append("insufficient_source_count")
+    history_events = max(
+        _int(row.get("trade_events")),
+        _int(row.get("non_fast_trade_count")),
+    )
+    if history_events < MIN_EXPLORATORY_COPYABILITY_HISTORY_EVENTS:
+        reasons.append("insufficient_trade_history")
     hygiene_status = _text(row.get("hygiene_status")).lower()
     if hygiene_status not in ELIGIBLE_HYGIENE_STATUSES:
         reasons.append(f"hygiene_status:{hygiene_status or 'missing'}")

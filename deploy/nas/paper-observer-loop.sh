@@ -7,6 +7,7 @@ PAPER_ACTIVITY_PAGE_LIMIT="${PM_ROBOT_PAPER_OBSERVER_ACTIVITY_PAGE_LIMIT:-${PM_R
 PAPER_ACTIVITY_MAX_EVENTS="${PM_ROBOT_PAPER_OBSERVER_ACTIVITY_MAX_EVENTS:-${PM_ROBOT_PAPER_ACTIVITY_MAX_EVENTS:-50}}"
 PAPER_ACTIVITY_SLEEP="${PM_ROBOT_PAPER_OBSERVER_ACTIVITY_SLEEP:-${PM_ROBOT_PAPER_ACTIVITY_SLEEP:-0.1}}"
 PAPER_OBSERVER_PREVIEW_LIMIT="${PM_ROBOT_PAPER_OBSERVER_PREVIEW_LIMIT:-50}"
+PAPER_OBSERVER_EXPLORATORY_MIN_SCORE="${PM_ROBOT_PAPER_OBSERVER_EXPLORATORY_MIN_SCORE:-55}"
 PAPER_OBSERVER_MAX_SIGNAL_AGE_SEC="${PM_ROBOT_PAPER_OBSERVER_MAX_SIGNAL_AGE_SEC:-21600}"
 PAPER_OBSERVER_MAX_ACTIONABLE_SIGNAL_AGE_SEC="${PM_ROBOT_PAPER_OBSERVER_MAX_ACTIONABLE_SIGNAL_AGE_SEC:-300}"
 PAPER_OBSERVER_EVALUATION_MAX_SIGNAL_AGE_SEC="${PM_ROBOT_PAPER_OBSERVER_EVALUATION_MAX_SIGNAL_AGE_SEC:-$PAPER_OBSERVER_MAX_ACTIONABLE_SIGNAL_AGE_SEC}"
@@ -35,6 +36,7 @@ while true; do
   echo "$(date -Iseconds) paper observer loop: refresh paper-stage activity start"
   if python -m pm_robot.cli --env /app/.env ingest-activity \
       --paper-stage-only \
+      --exploratory-copyability-min-score "$PAPER_OBSERVER_EXPLORATORY_MIN_SCORE" \
       --wallet-limit "$PAPER_ACTIVITY_WALLET_LIMIT" \
       --page-limit "$PAPER_ACTIVITY_PAGE_LIMIT" \
       --max-events-per-wallet "$PAPER_ACTIVITY_MAX_EVENTS" \
@@ -50,6 +52,7 @@ while true; do
   if python -m pm_robot.cli --env /app/.env paper-observer-preview \
       --out /app/reports/paper_observer_preview.json \
       --limit "$PAPER_OBSERVER_PREVIEW_LIMIT" \
+      --exploratory-copyability-min-score "$PAPER_OBSERVER_EXPLORATORY_MIN_SCORE" \
       --max-signal-age-sec "$PAPER_OBSERVER_MAX_SIGNAL_AGE_SEC"; then
     echo "$(date -Iseconds) paper observer loop: export preview ok"
     runtime_heartbeat loop_paper_observer_preview ok
@@ -66,6 +69,7 @@ while true; do
       --max-signal-age-sec "$PAPER_OBSERVER_EVALUATION_MAX_SIGNAL_AGE_SEC" \
       --max-actionable-signal-age-sec "$PAPER_OBSERVER_MAX_ACTIONABLE_SIGNAL_AGE_SEC" \
       --retry-cooldown-sec "$PAPER_OBSERVER_RETRY_COOLDOWN_SEC" \
+      --exploratory-copyability-min-score "$PAPER_OBSERVER_EXPLORATORY_MIN_SCORE" \
       --persist; then
     echo "$(date -Iseconds) paper observer loop: evaluate quotes ok"
     runtime_heartbeat loop_paper_observer_evaluation ok

@@ -1863,7 +1863,7 @@ def test_nas_discovery_loop_runs_high_quality_sources_without_queue_planning():
     assert "container_name: pm-robot-rtds-discovery" in compose
     assert "rtds-discovery-loop.sh" in compose
     assert "PM_ROBOT_RTDS_MIN_TRADE_USDC=500" in env
-    assert "PM_ROBOT_RTDS_WATCH_MIN_SCORE=65" in env
+    assert "PM_ROBOT_RTDS_WATCH_MIN_SCORE=55" in env
     assert "PM_ROBOT_RTDS_MAX_IDLE_SECONDS=300" in env
     assert "discover-rtds" in rtds_loop
     assert "--min-trade-usdc" in rtds_loop
@@ -1972,6 +1972,7 @@ def test_nas_paper_observer_loop_runs_fast_readonly_quote_evaluation():
     assert "observer-restart" in helper
     assert "PM_ROBOT_PAPER_OBSERVER_LOOP_INTERVAL=60" in env
     assert "PM_ROBOT_PAPER_OBSERVER_PREVIEW_LIMIT=50" in env
+    assert "PM_ROBOT_PAPER_OBSERVER_EXPLORATORY_MIN_SCORE=55" in env
     assert "PM_ROBOT_PAPER_OBSERVER_ACTIVITY_WALLET_LIMIT=10" in env
     assert "PM_ROBOT_PAPER_OBSERVER_ACTIVITY_PAGE_LIMIT=50" in env
     assert "PM_ROBOT_PAPER_OBSERVER_ACTIVITY_MAX_EVENTS=50" in env
@@ -1980,6 +1981,7 @@ def test_nas_paper_observer_loop_runs_fast_readonly_quote_evaluation():
     assert "PM_ROBOT_PAPER_OBSERVER_RETRY_COOLDOWN_SEC=60" in env
     assert "ingest-activity" in loop
     assert "--paper-stage-only" in loop
+    assert loop.count("--exploratory-copyability-min-score") == 3
     assert "paper-observer-preview" in loop
     assert "/app/reports/paper_observer_preview.json" in loop
     assert "paper-observer-evaluate" in loop

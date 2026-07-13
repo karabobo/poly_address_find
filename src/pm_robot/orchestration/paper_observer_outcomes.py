@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from pm_robot.execution.market_marks import gamma_market_mark
+from pm_robot.pipeline_terms import EXPLORATORY_COPYABILITY_COHORT
 
 
 @dataclass(frozen=True)
@@ -195,7 +196,40 @@ def paper_observer_trial_summary(
             "validation_policy": thresholds.as_dict(),
             "validation_counts": {},
             "wallet_summaries": [],
+            "exploratory_copyability": {
+                "available": False,
+                "total_trials": 0,
+                "wallets": 0,
+                "wallet_summaries": [],
+            },
         }
+    validation = _cohort_trial_summary(conn, thresholds=thresholds, cohort="validation")
+    exploratory = _cohort_trial_summary(
+        conn,
+        thresholds=thresholds,
+        cohort=EXPLORATORY_COPYABILITY_COHORT,
+    )
+    return {
+        "available": True,
+        **validation,
+        "validation_policy": thresholds.as_dict(),
+        "exploratory_copyability": {
+            "available": True,
+            **exploratory,
+            "validation_policy": thresholds.as_dict(),
+            "counts_toward_formal_validation": False,
+        },
+    }
+
+
+def _cohort_trial_summary(
+    conn: sqlite3.Connection,
+    *,
+    thresholds: ObserverValidationThresholds,
+    cohort: str,
+) -> dict[str, Any]:
+    """Summarize one observer cohort so exploratory rows cannot affect formal gates."""
+
     rows = conn.execute(
         """
         SELECT
@@ -212,9 +246,11 @@ def paper_observer_trial_summary(
             SUM(CASE WHEN status = 'resolved' THEN pnl_usd ELSE 0 END) AS settled_pnl_usd,
             MAX(updated_at) AS latest_updated_at
         FROM paper_observer_trials
+        WHERE validation_cohort = ?
         GROUP BY wallet, market_slug
         ORDER BY wallet ASC, market_slug ASC
-        """
+        """,
+        (cohort,),
     ).fetchall()
     market_rows = [dict(row) for row in rows]
     summary = _summarize_market_samples(market_rows)
@@ -224,7 +260,11 @@ def paper_observer_trial_summary(
     wallet_summaries = []
     validation_counts: dict[str, int] = {}
     for wallet, wallet_rows in by_wallet.items():
-        wallet_summary = {"wallet": wallet, **_summarize_market_samples(wallet_rows)}
+        wallet_summary = {
+            "wallet": wallet,
+            "validation_cohort": cohort,
+            **_summarize_market_samples(wallet_rows),
+        }
         wallet_summary.update(_observer_validation(wallet_summary, thresholds))
         status = str(wallet_summary["validation_status"])
         validation_counts[status] = validation_counts.get(status, 0) + 1
@@ -237,10 +277,8 @@ def paper_observer_trial_summary(
         )
     )
     return {
-        "available": True,
         **summary,
         "wallets": len(by_wallet),
-        "validation_policy": thresholds.as_dict(),
         "validation_counts": validation_counts,
         "wallet_summaries": wallet_summaries,
     }

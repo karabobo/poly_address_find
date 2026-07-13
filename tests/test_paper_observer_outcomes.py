@@ -27,12 +27,14 @@ def _evaluation(
     signal_id="activity-1",
     market_slug="market-1",
     stake_usd=40.0,
+    validation_cohort="validation",
+    wallet=WALLET,
 ):
     return {
         "signal_id": signal_id,
-        "wallet": WALLET,
+        "wallet": wallet,
         "candidate_stage": "paper_approved",
-        "validation_cohort": "validation",
+        "validation_cohort": validation_cohort,
         "market_slug": market_slug,
         "asset_id": "token-yes",
         "outcome": "Yes",
@@ -213,6 +215,36 @@ def test_observer_summary_counts_repeated_trades_as_two_market_samples(tmp_path)
         assert wallet["market_samples"] == 2
         assert wallet["win_rate_pct"] == 50.0
         assert wallet["trial_win_rate_pct"] == 75.0
+    finally:
+        conn.close()
+
+
+def test_observer_summary_keeps_exploratory_trials_out_of_formal_metrics(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    exploratory_wallet = "0x" + "b" * 40
+    try:
+        run_migrations(conn)
+        evaluations = [
+            _evaluation(signal_id="formal-1", market_slug="formal-market"),
+            _evaluation(
+                signal_id="exploratory-1",
+                market_slug="exploratory-market",
+                validation_cohort="exploratory_copyability",
+                wallet=exploratory_wallet,
+            ),
+        ]
+        assert persist_paper_observer_trials(conn, evaluations, evaluated_at=1_000) == 2
+
+        summary = paper_observer_trial_summary(conn)
+        exploratory = summary["exploratory_copyability"]
+
+        assert summary["total_trials"] == 1
+        assert summary["wallets"] == 1
+        assert summary["wallet_summaries"][0]["wallet"] == WALLET
+        assert exploratory["total_trials"] == 1
+        assert exploratory["wallets"] == 1
+        assert exploratory["wallet_summaries"][0]["wallet"] == exploratory_wallet
+        assert exploratory["counts_toward_formal_validation"] is False
     finally:
         conn.close()
 

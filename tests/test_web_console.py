@@ -1236,13 +1236,19 @@ def test_dashboard_shows_readonly_paper_observer_preview(tmp_path):
     assert data["paper_observer_preview"]["signals"][0]["wallet"] == wallet
     assert data["paper_observer_preview"]["signals"][0]["ingest_lag_sec"] == 60
     assert data["paper_observer_preview"]["paper_stage_wallets"] == 1
+    assert data["paper_observer_preview"]["exploratory_copyability_wallets"] == 0
+    assert data["paper_observer_preview"]["observer_wallets"] == 1
     assert data["paper_observer_preview"]["recent_buy_events"] == 1
+    assert data["paper_observer_preview"]["paper_stage_recent_buy_events"] == 1
+    assert data["paper_observer_preview"]["exploratory_copyability_recent_buy_events"] == 0
     assert data["paper_observer_preview"]["latest_buy_ts"] == now - 60
     assert data["paper_observer_preview"]["latest_buy_ingested_at"] == now
     assert data["paper_observer_preview"]["recent_buy_max_ingest_lag_sec"] == 60
     assert data["paper_observer_preview"]["no_signal_reason"] == ""
     windows = {row["window_label"]: row for row in data["paper_observer_preview"]["window_diagnostics"]}
     assert windows["6h"]["eligible_signals"] == 1
+    assert windows["6h"]["paper_stage_recent_buy_events"] == 1
+    assert windows["6h"]["exploratory_copyability_recent_buy_events"] == 0
     assert windows["6h"]["max_ingest_lag_sec"] == 60
     assert windows["6h"]["max_ingest_lag"] == "1 分钟"
     assert windows["6h"]["no_signal_reason"] == ""
@@ -1283,8 +1289,11 @@ def test_dashboard_shows_readonly_paper_observer_preview(tmp_path):
     assert "quality 1 eval" in html
     assert "入库延迟" in html
     assert "ingest lag" in html
+    assert "探索钱包" in html
+    assert "探索 BUY" in html
     assert "JSON 观察预览" in html
-    assert "只读 paper observer 预览" in html
+    assert "只读 Observer 预览" in html
+    assert "探索数据不计入正式验证" in html
     assert "窗口内 BUY" in html
     assert "最近 BUY" in html
     assert "观察窗口对比" in html

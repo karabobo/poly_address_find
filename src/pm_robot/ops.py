@@ -14,8 +14,17 @@ from pathlib import Path
 from typing import Any, BinaryIO, Callable
 
 from pm_robot.config import RobotSettings
-from pm_robot.pipeline_terms import PENDING_EVIDENCE_JOB_STAGES, TERMINAL_EVIDENCE_JOB_STAGES
-from pm_robot.risk.eligibility import winner_library_eligibility_status
+from pm_robot.orchestration.evidence_readiness import paper_evidence_ready_sql
+from pm_robot.pipeline_terms import (
+    COPYABILITY_OBSERVER_REVIEW_REASON,
+    DEFAULT_EXPLORATORY_COPYABILITY_MIN_SCORE,
+    PENDING_EVIDENCE_JOB_STAGES,
+    TERMINAL_EVIDENCE_JOB_STAGES,
+)
+from pm_robot.risk.eligibility import (
+    exploratory_copyability_facts_status,
+    winner_library_eligibility_status,
+)
 from pm_robot.storage.api_rate_limit import (
     api_rate_limit_summary,
     api_rate_limit_summary_from_path,
@@ -55,6 +64,10 @@ ACTIVE_CANDIDATE_REGISTRY_STAGES = (
     "paper_approved",
     "live_eligible",
 )
+ARCHIVED_REGISTRY_REACTIVATION_STATUSES = (
+    "copyability_observer_watch",
+    "needs_evidence_backfill",
+)
 ACTIONABLE_INCOMPLETE_REVIEW_REASONS = (
     "no_wallet_metrics_attached",
     "hygiene_evidence_incomplete",
@@ -75,6 +88,8 @@ WALLET_REGISTRY_TABLE_COLUMNS = [
     "candidate_stage",
     "registry_status",
     "raw_retention_tier",
+    "raw_prune_version",
+    "raw_pruned_at",
     "leader_score",
     "review_stage",
     "review_reason",
@@ -223,6 +238,11 @@ def refresh_active_candidate_registry(
 
     row_limit = max(1, int(limit))
     stage_placeholders = ", ".join("?" for _ in ACTIVE_CANDIDATE_REGISTRY_STAGES)
+    reactivation_addresses = _archived_registry_reactivation_addresses(
+        conn,
+        limit=row_limit,
+    )
+    remaining_limit = max(0, row_limit - len(reactivation_addresses))
     rows = conn.execute(
         f"""
         SELECT cw.address
@@ -292,10 +312,13 @@ def refresh_active_candidate_registry(
         (
             *ACTIVE_CANDIDATE_REGISTRY_STAGES,
             *ACTIVE_CANDIDATE_REGISTRY_STAGES,
-            row_limit,
+            remaining_limit,
         ),
     ).fetchall()
-    addresses = tuple(str(row["address"]) for row in rows)
+    addresses = (
+        *reactivation_addresses,
+        *(str(row["address"]) for row in rows),
+    )
     refreshed_rows = _materialize_wallet_registry(conn, addresses=addresses) if addresses else []
     archived_skipped = conn.execute(
         f"""
@@ -316,6 +339,52 @@ def refresh_active_candidate_registry(
         "archived_wallets_skipped": int(archived_skipped["count"] or 0),
         "limit": row_limit,
     }
+
+
+def _archived_registry_reactivation_addresses(
+    conn: sqlite3.Connection,
+    *,
+    limit: int,
+) -> tuple[str, ...]:
+    """Return archived wallets that regained an explicitly supported active path."""
+
+    pending_placeholders = ", ".join("?" for _ in PENDING_EVIDENCE_JOB_STAGES)
+    rows = conn.execute(
+        f"""
+        SELECT cw.address
+        FROM candidate_wallets cw
+        JOIN wallet_registry wr
+          ON wr.address = cw.address
+        LEFT JOIN leader_latest_scores latest
+          ON latest.address = cw.address
+        LEFT JOIN wallet_features wf
+          ON wf.address = cw.address
+        LEFT JOIN wallet_processing_state wps
+          ON wps.wallet = cw.address
+        LEFT JOIN evidence_backfill_budget ebb
+          ON ebb.wallet = cw.address
+        WHERE wr.registry_status = 'archived_raw_pruned'
+          AND (
+                COALESCE(ebb.stage, '') IN ({pending_placeholders})
+                OR (
+                       cw.candidate_stage = 'blocked_copyability'
+                   AND COALESCE(latest.review_reason, '') = ?
+                   AND COALESCE(latest.leader_score, 0) >= ?
+                   AND LOWER(COALESCE(wf.hygiene_status, '')) IN ('clean', 'screened')
+                   AND {paper_evidence_ready_sql('wps')}
+                )
+          )
+        ORDER BY wr.updated_at ASC, cw.address ASC
+        LIMIT ?
+        """,
+        (
+            *PENDING_EVIDENCE_JOB_STAGES,
+            COPYABILITY_OBSERVER_REVIEW_REASON,
+            DEFAULT_EXPLORATORY_COPYABILITY_MIN_SCORE,
+            max(1, int(limit)),
+        ),
+    ).fetchall()
+    return tuple(str(row["address"]) for row in rows)
 
 
 def health_check(settings: RobotSettings) -> dict[str, Any]:
@@ -3112,7 +3181,14 @@ def _materialize_wallet_registry(
     for source_row in source_rows:
         row = dict(source_row)
         archived = archived_rows.get(str(row["address"]))
-        rows.append(archived if archived is not None else _wallet_registry_row(row, now=now))
+        refreshed = _wallet_registry_row(row, now=now)
+        if (
+            archived is not None
+            and refreshed["registry_status"] not in ARCHIVED_REGISTRY_REACTIVATION_STATUSES
+        ):
+            rows.append(archived)
+        else:
+            rows.append(refreshed)
     _upsert_wallet_registry_rows(conn, rows)
     return rows
 
@@ -3217,6 +3293,12 @@ def _wallet_registry_source_rows(
             COALESCE(ebb.error_count, 0) AS evidence_error_count,
             COALESCE(ebb.evidence_json, '{{}}') AS evidence_backfill_json,
             ebb.updated_at AS evidence_updated_at,
+            COALESCE(wps.discovery_tier, '') AS processing_evidence_tier,
+            COALESCE(wps.evidence_status, '') AS processing_evidence_status,
+            COALESCE(wps.current_stage, '') AS processing_current_stage,
+            COALESCE(wps.activity_count, 0) AS processing_activity_count,
+            COALESCE(wps.distinct_markets, 0) AS processing_distinct_markets,
+            COALESCE(wps.non_fast_trade_count, 0) AS processing_non_fast_trade_count,
             COALESCE(clp.backtest_trade_count, 0) AS copy_backtest_trade_count,
             COALESCE(clp.copied_market_count, 0) AS copy_backtest_market_count,
             clp.total_stake_usdc AS copy_backtest_stake_usdc,
@@ -3251,6 +3333,12 @@ def _wallet_registry_source_rows(
                 FROM wallet_activity wa
                 WHERE wa.address = cw.address
             ) AS activity_count,
+            (
+                SELECT COUNT(*)
+                FROM wallet_activity wa
+                WHERE wa.address = cw.address
+                  AND wa.type = 'TRADE'
+            ) AS trade_event_count,
             (
                 SELECT MIN(wa.timestamp)
                 FROM wallet_activity wa
@@ -3294,6 +3382,8 @@ def _wallet_registry_source_rows(
           )
         LEFT JOIN evidence_backfill_budget ebb
           ON ebb.wallet = cw.address
+        LEFT JOIN wallet_processing_state wps
+          ON wps.wallet = cw.address
         LEFT JOIN copy_leader_performance clp
           ON clp.leader_wallet = cw.address
         LEFT JOIN paper_wallet_quality pwq
@@ -3439,6 +3529,8 @@ def _wallet_registry_row(row: dict[str, Any], *, now: int) -> dict[str, Any]:
         "candidate_stage": row.get("candidate_stage") or "",
         "registry_status": registry_status,
         "raw_retention_tier": retention_tier,
+        "raw_prune_version": "",
+        "raw_pruned_at": None,
         "leader_score": float(row.get("leader_score") or 0),
         "review_stage": row.get("review_stage") or "",
         "review_reason": row.get("review_reason") or "",
@@ -3488,9 +3580,28 @@ def _wallet_registry_status(
 ) -> tuple[str, str]:
     existing_status = str(row.get("existing_registry_status") or "")
     evidence_stage = str(evidence.get("stage") or "")
+    observer_eligible = exploratory_copyability_facts_status(
+        {
+            "candidate_stage": row.get("candidate_stage"),
+            "review_reason": score.get("review_reason"),
+            "leader_score": score.get("leader_score"),
+            "hygiene_status": feature.get("hygiene_status"),
+            "paper_blockers_json": paper.get("blockers"),
+            "discovery_tier": row.get("processing_evidence_tier"),
+            "evidence_status": row.get("processing_evidence_status"),
+            "current_stage": row.get("processing_current_stage"),
+            "activity_count": row.get("processing_activity_count"),
+            "distinct_markets": row.get("processing_distinct_markets"),
+            "non_fast_trade_count": row.get("processing_non_fast_trade_count"),
+            "trade_events": row.get("trade_event_count"),
+            "source_count": row.get("source_event_count"),
+        },
+        min_score=DEFAULT_EXPLORATORY_COPYABILITY_MIN_SCORE,
+    ).eligible
     if (
         existing_status in {"archive_pending", "archived_raw_pruned"}
         and evidence_stage not in PENDING_EVIDENCE_JOB_STAGES
+        and not observer_eligible
     ):
         return existing_status, "summary_only"
     stage = str(row.get("candidate_stage") or "")
@@ -3510,6 +3621,8 @@ def _wallet_registry_status(
     if stage == "blocked_hygiene":
         return "blocked_hygiene", "summary_only"
     if stage == "blocked_copyability":
+        if observer_eligible:
+            return "copyability_observer_watch", "summary_and_recent"
         return "blocked_copyability", "summary_only"
     if stage == "rejected":
         return "rejected", "summary_only"
@@ -3983,6 +4096,8 @@ def _terminal_low_value_wallet_rows(
           ON wr.address = cw.address
         WHERE cw.candidate_stage IN ('rejected', 'blocked_hygiene', 'blocked_copyability')
           AND wr.raw_pruned_at IS NULL
+          AND COALESCE(wr.registry_status, '') != 'copyability_observer_watch'
+          AND COALESCE(wr.raw_retention_tier, 'summary_only') = 'summary_only'
           {archive_pending_sql}
           {address_sql}
           AND NOT EXISTS (

@@ -12,10 +12,19 @@ from pm_robot.clients.http import HttpClientError
 from pm_robot.clients.polymarket_public import PublicPolymarketClient
 from pm_robot.execution.paper_broker import PAPER_MAX_PRICE, PAPER_MIN_PRICE, PaperBroker
 from pm_robot.execution.paper_quote import simulate_buy_quote
-from pm_robot.models import TradeSignal
+from pm_robot.models import CandidateStage, TradeSignal
+from pm_robot.orchestration.evidence_readiness import paper_evidence_ready_sql
 from pm_robot.orchestration.retry_policy import is_upstream_scheduling_error
-from pm_robot.pipeline_terms import PAPER_ELIGIBLE_CANDIDATE_STAGES, PROVISIONAL_CANDIDATE_STAGES
-from pm_robot.risk.eligibility import paper_eligibility_status
+from pm_robot.pipeline_terms import (
+    COPYABILITY_OBSERVER_ACTIVITY_SOURCE,
+    COPYABILITY_OBSERVER_REVIEW_REASON,
+    EXPLORATORY_COPYABILITY_COHORT,
+    PAPER_ELIGIBLE_CANDIDATE_STAGES,
+)
+from pm_robot.risk.eligibility import (
+    exploratory_copyability_eligibility_status,
+    paper_eligibility_status,
+)
 from pm_robot.storage.repository import persist_paper_observer_trials, persist_paper_signal_evaluations
 
 
@@ -25,6 +34,7 @@ PAPER_OBSERVER_PREVIEW_SCHEMA_VERSION = "paper_observer_preview_v1"
 PAPER_OBSERVER_EVALUATION_SCHEMA_VERSION = "paper_observer_evaluation_v1"
 PAPER_OBSERVER_RETRY_COOLDOWN_SEC = 60
 PAPER_OBSERVER_SELECTION_MODE = "incremental_unseen_market_first"
+EXPLORATORY_COPYABILITY_STAGE = CandidateStage.BLOCKED_COPYABILITY.value
 PAPER_OBSERVER_DIAGNOSTIC_WINDOWS = (
     (21_600, "6h"),
     (86_400, "24h"),
@@ -46,9 +56,14 @@ class PaperObserverPreview:
     schema_version: str
     generated_at: int
     max_signal_age_sec: int
+    exploratory_copyability_min_score: float | None
     min_timestamp: int
     paper_stage_wallets: int
+    exploratory_copyability_wallets: int
+    observer_wallets: int
     recent_buy_events: int
+    paper_stage_recent_buy_events: int
+    exploratory_copyability_recent_buy_events: int
     latest_activity_ts: int | None
     latest_buy_ts: int | None
     latest_activity_ingested_at: int | None
@@ -72,7 +87,10 @@ class PaperObserverEvaluation:
     retry_cooldown_sec: int
     selection_mode: str
     max_stake_usd: float
+    exploratory_copyability_min_score: float | None
     signals_seen: int
+    validation_signals: int
+    exploratory_copyability_signals: int
     quotes_attempted: int
     quotes_succeeded: int
     accepted_signals: int
@@ -93,6 +111,7 @@ def preview_paper_observer(
     *,
     limit: int = 50,
     max_signal_age_sec: int = 21_600,
+    exploratory_copyability_min_score: float | None = None,
     now: int | None = None,
 ) -> PaperObserverPreview:
     """Return eligible recent paper signals without quotes, orders, or writes."""
@@ -107,17 +126,38 @@ def preview_paper_observer(
         min_timestamp=min_timestamp,
         include_watchlist_min_score=None,
         include_review_min_score=None,
+        exploratory_copyability_min_score=exploratory_copyability_min_score,
     )
     signals = [_observation_from_row(row) for row in rows]
-    context = _observer_activity_context(conn, min_timestamp=min_timestamp, generated_at=generated_at)
+    context = _observer_activity_context(
+        conn,
+        min_timestamp=min_timestamp,
+        generated_at=generated_at,
+        exploratory_copyability_min_score=exploratory_copyability_min_score,
+    )
     no_signal_reason = "" if signals else _observer_no_signal_reason(context, min_timestamp=min_timestamp)
     return PaperObserverPreview(
         schema_version=PAPER_OBSERVER_PREVIEW_SCHEMA_VERSION,
         generated_at=generated_at,
         max_signal_age_sec=safe_max_signal_age_sec,
+        exploratory_copyability_min_score=(
+            max(0.0, float(exploratory_copyability_min_score))
+            if exploratory_copyability_min_score is not None
+            else None
+        ),
         min_timestamp=min_timestamp,
         paper_stage_wallets=int(context.get("paper_stage_wallets") or 0),
+        exploratory_copyability_wallets=int(
+            context.get("exploratory_copyability_wallets") or 0
+        ),
+        observer_wallets=int(context.get("observer_wallets") or 0),
         recent_buy_events=int(context.get("recent_buy_events") or 0),
+        paper_stage_recent_buy_events=int(
+            context.get("paper_stage_recent_buy_events") or 0
+        ),
+        exploratory_copyability_recent_buy_events=int(
+            context.get("exploratory_copyability_recent_buy_events") or 0
+        ),
         latest_activity_ts=context.get("latest_activity_ts"),
         latest_buy_ts=context.get("latest_buy_ts"),
         latest_activity_ingested_at=context.get("latest_activity_ingested_at"),
@@ -127,7 +167,12 @@ def preview_paper_observer(
         recent_buy_avg_ingest_lag_sec=context.get("recent_buy_avg_ingest_lag_sec"),
         recent_buy_max_ingest_lag_sec=context.get("recent_buy_max_ingest_lag_sec"),
         no_signal_reason=no_signal_reason,
-        window_diagnostics=_observer_window_diagnostics(conn, generated_at=generated_at, limit=safe_limit),
+        window_diagnostics=_observer_window_diagnostics(
+            conn,
+            generated_at=generated_at,
+            limit=safe_limit,
+            exploratory_copyability_min_score=exploratory_copyability_min_score,
+        ),
         signals_seen=len(signals),
         signals=signals,
     )
@@ -141,6 +186,7 @@ def evaluate_paper_observer(
     max_signal_age_sec: int = 21_600,
     max_actionable_signal_age_sec: int = 300,
     retry_cooldown_sec: int = PAPER_OBSERVER_RETRY_COOLDOWN_SEC,
+    exploratory_copyability_min_score: float | None = None,
     now: int | None = None,
     persist: bool = False,
     client: PublicPolymarketClient | None = None,
@@ -160,6 +206,7 @@ def evaluate_paper_observer(
         min_timestamp=min_timestamp,
         include_watchlist_min_score=None,
         include_review_min_score=None,
+        exploratory_copyability_min_score=exploratory_copyability_min_score,
         observer_retry_after=(
             generated_at - safe_retry_cooldown_sec
             if persist
@@ -188,6 +235,14 @@ def evaluate_paper_observer(
     actionable = [row for row in evaluations if row.get("actionable")]
     stale = [row for row in evaluations if row.get("actionability_reason") == "signal_too_old"]
     quote_errors = [row for row in evaluations if row.get("quote_error")]
+    validation = [
+        row for row in evaluations if row.get("validation_cohort") == "validation"
+    ]
+    exploratory = [
+        row
+        for row in evaluations
+        if row.get("validation_cohort") == EXPLORATORY_COPYABILITY_COHORT
+    ]
     latencies = [float(row["quote_latency_ms"]) for row in evaluations if row.get("quote_latency_ms") is not None]
     slippages = [float(row["slippage_bps"]) for row in accepted if row.get("slippage_bps") is not None]
     return PaperObserverEvaluation(
@@ -198,7 +253,14 @@ def evaluate_paper_observer(
         retry_cooldown_sec=safe_retry_cooldown_sec,
         selection_mode=(PAPER_OBSERVER_SELECTION_MODE if persist else "snapshot_latest_first"),
         max_stake_usd=round(safe_max_stake_usd, 2),
+        exploratory_copyability_min_score=(
+            max(0.0, float(exploratory_copyability_min_score))
+            if exploratory_copyability_min_score is not None
+            else None
+        ),
         signals_seen=len(evaluations),
+        validation_signals=len(validation),
+        exploratory_copyability_signals=len(exploratory),
         quotes_attempted=len(evaluations),
         quotes_succeeded=len(evaluations) - len(quote_errors),
         accepted_signals=len(accepted),
@@ -391,12 +453,43 @@ def _observer_activity_context(
     *,
     min_timestamp: int,
     generated_at: int,
-) -> dict[str, int | None]:
+    exploratory_copyability_min_score: float | None = None,
+) -> dict[str, object]:
+    """Summarize activity for the exact formal and research observer scopes."""
+
     placeholders = ",".join("?" for _ in PAPER_STAGES)
+    params: list[object] = [*PAPER_STAGES]
+    exploratory_scope_sql = "SELECT NULL AS address WHERE 0"
+    if exploratory_copyability_min_score is not None:
+        exploratory_scope_sql = _exploratory_copyability_scope_sql()
+        params.extend(
+            _exploratory_copyability_scope_params(
+                exploratory_copyability_min_score
+            )
+        )
+    params.extend([min_timestamp] * 5)
     row = conn.execute(
         f"""
+        WITH observer_wallets AS (
+            SELECT cw.address, 'validation' AS validation_cohort
+            FROM candidate_wallets cw
+            WHERE cw.candidate_stage IN ({placeholders})
+
+            UNION ALL
+
+            SELECT exploratory.address, '{EXPLORATORY_COPYABILITY_COHORT}' AS validation_cohort
+            FROM ({exploratory_scope_sql}) exploratory
+        )
         SELECT
-            COUNT(DISTINCT cw.address) AS paper_stage_wallets,
+            COUNT(DISTINCT CASE
+                WHEN ow.validation_cohort = 'validation' THEN ow.address
+                ELSE NULL
+            END) AS paper_stage_wallets,
+            COUNT(DISTINCT CASE
+                WHEN ow.validation_cohort = '{EXPLORATORY_COPYABILITY_COHORT}' THEN ow.address
+                ELSE NULL
+            END) AS exploratory_copyability_wallets,
+            COUNT(DISTINCT ow.address) AS observer_wallets,
             MAX(wa.timestamp) AS latest_activity_ts,
             MAX(wa.ingested_at) AS latest_activity_ingested_at,
             MAX(CASE
@@ -417,6 +510,22 @@ def _observer_activity_context(
                 ELSE 0
             END) AS recent_buy_events
             ,
+            SUM(CASE
+                WHEN ow.validation_cohort = 'validation'
+                  AND wa.type = 'TRADE'
+                  AND UPPER(COALESCE(wa.side, '')) = 'BUY'
+                  AND wa.timestamp >= ?
+                THEN 1
+                ELSE 0
+            END) AS paper_stage_recent_buy_events,
+            SUM(CASE
+                WHEN ow.validation_cohort = '{EXPLORATORY_COPYABILITY_COHORT}'
+                  AND wa.type = 'TRADE'
+                  AND UPPER(COALESCE(wa.side, '')) = 'BUY'
+                  AND wa.timestamp >= ?
+                THEN 1
+                ELSE 0
+            END) AS exploratory_copyability_recent_buy_events,
             AVG(CASE
                 WHEN wa.type = 'TRADE'
                   AND UPPER(COALESCE(wa.side, '')) = 'BUY'
@@ -431,12 +540,11 @@ def _observer_activity_context(
                 THEN MAX(0, wa.ingested_at - wa.timestamp)
                 ELSE NULL
             END) AS recent_buy_max_ingest_lag_sec
-        FROM candidate_wallets cw
+        FROM observer_wallets ow
         LEFT JOIN wallet_activity wa
-          ON wa.address = cw.address
-        WHERE cw.candidate_stage IN ({placeholders})
+          ON wa.address = ow.address
         """,
-        (min_timestamp, min_timestamp, min_timestamp, *PAPER_STAGES),
+        params,
     ).fetchone()
     latest_activity_ts = _optional_int(row["latest_activity_ts"] if row else None)
     latest_buy_ts = _optional_int(row["latest_buy_ts"] if row else None)
@@ -444,7 +552,18 @@ def _observer_activity_context(
     latest_buy_ingested_at = _optional_int(row["latest_buy_ingested_at"] if row else None)
     return {
         "paper_stage_wallets": int(row["paper_stage_wallets"] or 0) if row else 0,
+        "exploratory_copyability_wallets": (
+            int(row["exploratory_copyability_wallets"] or 0) if row else 0
+        ),
+        "observer_wallets": int(row["observer_wallets"] or 0) if row else 0,
         "recent_buy_events": int(row["recent_buy_events"] or 0) if row else 0,
+        "paper_stage_recent_buy_events": (
+            int(row["paper_stage_recent_buy_events"] or 0) if row else 0
+        ),
+        "exploratory_copyability_recent_buy_events": (
+            int(row["exploratory_copyability_recent_buy_events"] or 0) if row else 0
+        ),
+        "exploratory_scope_enabled": exploratory_copyability_min_score is not None,
         "latest_activity_ts": latest_activity_ts,
         "latest_buy_ts": latest_buy_ts,
         "latest_activity_ingested_at": latest_activity_ingested_at,
@@ -456,8 +575,69 @@ def _observer_activity_context(
     }
 
 
-def _observer_no_signal_reason(context: dict[str, int | None], *, min_timestamp: int) -> str:
-    if int(context.get("paper_stage_wallets") or 0) <= 0:
+def _exploratory_copyability_scope_sql() -> str:
+    """Return the shared research-only wallet scope used by observer metrics."""
+
+    return f"""
+        SELECT cw.address
+        FROM candidate_wallets cw
+        LEFT JOIN leader_scores ls
+          ON ls.score_id = (
+              SELECT score_id
+              FROM leader_scores
+              WHERE address = cw.address
+              ORDER BY scored_at DESC, score_id DESC
+              LIMIT 1
+          )
+        LEFT JOIN wallet_features wf
+          ON wf.address = cw.address
+        LEFT JOIN wallet_processing_state wps
+          ON wps.wallet = cw.address
+        LEFT JOIN paper_wallet_quality pwq
+          ON pwq.wallet = cw.address
+        WHERE cw.candidate_stage = ?
+          AND COALESCE(ls.review_reason, '') = ?
+          AND COALESCE(ls.leader_score, 0) >= ?
+          AND LOWER(COALESCE(wf.hygiene_status, '')) IN ('clean', 'screened')
+          AND {paper_evidence_ready_sql('wps')}
+          AND (
+                COALESCE(wps.non_fast_trade_count, 0) >= 100
+                OR (
+                    SELECT COUNT(*)
+                    FROM wallet_activity trade_events
+                    WHERE trade_events.address = cw.address
+                      AND trade_events.type = 'TRADE'
+                ) >= 100
+          )
+          AND EXISTS (
+              SELECT 1
+              FROM candidate_source_events cse
+              WHERE cse.address = cw.address
+          )
+          AND NOT EXISTS (
+              SELECT 1
+              FROM json_each(CASE
+                  WHEN json_valid(COALESCE(pwq.blockers_json, '[]')) THEN pwq.blockers_json
+                  ELSE '[]'
+              END) blocker
+              WHERE blocker.value IN ({','.join('?' for _ in PAPER_BLOCKERS)})
+          )
+    """
+
+
+def _exploratory_copyability_scope_params(min_score: float) -> tuple[object, ...]:
+    return (
+        EXPLORATORY_COPYABILITY_STAGE,
+        COPYABILITY_OBSERVER_REVIEW_REASON,
+        max(0.0, float(min_score)),
+        *PAPER_BLOCKERS,
+    )
+
+
+def _observer_no_signal_reason(context: dict[str, object], *, min_timestamp: int) -> str:
+    if int(context.get("observer_wallets") or 0) <= 0:
+        if context.get("exploratory_scope_enabled"):
+            return "no_observer_wallets"
         return "no_paper_stage_wallets"
     latest_buy_ts = context.get("latest_buy_ts")
     if latest_buy_ts is None:
@@ -474,6 +654,7 @@ def _observer_window_diagnostics(
     *,
     generated_at: int,
     limit: int,
+    exploratory_copyability_min_score: float | None = None,
 ) -> list[dict[str, object]]:
     diagnostics: list[dict[str, object]] = []
     for seconds, label in PAPER_OBSERVER_DIAGNOSTIC_WINDOWS:
@@ -484,13 +665,25 @@ def _observer_window_diagnostics(
             min_timestamp=min_timestamp,
             include_watchlist_min_score=None,
             include_review_min_score=None,
+            exploratory_copyability_min_score=exploratory_copyability_min_score,
         )
-        context = _observer_activity_context(conn, min_timestamp=min_timestamp, generated_at=generated_at)
+        context = _observer_activity_context(
+            conn,
+            min_timestamp=min_timestamp,
+            generated_at=generated_at,
+            exploratory_copyability_min_score=exploratory_copyability_min_score,
+        )
         diagnostics.append(
             {
                 "window_label": label,
                 "max_signal_age_sec": seconds,
                 "recent_buy_events": int(context.get("recent_buy_events") or 0),
+                "paper_stage_recent_buy_events": int(
+                    context.get("paper_stage_recent_buy_events") or 0
+                ),
+                "exploratory_copyability_recent_buy_events": int(
+                    context.get("exploratory_copyability_recent_buy_events") or 0
+                ),
                 "eligible_signals": len(rows),
                 "avg_ingest_lag_sec": context.get("recent_buy_avg_ingest_lag_sec"),
                 "max_ingest_lag_sec": context.get("recent_buy_max_ingest_lag_sec"),
@@ -537,15 +730,39 @@ def _candidate_activity_rows(
     min_timestamp: int,
     include_watchlist_min_score: float | None,
     include_review_min_score: float | None,
+    exploratory_copyability_min_score: float | None = None,
     observer_retry_after: int | None = None,
 ) -> list[sqlite3.Row]:
     placeholders = ",".join("?" for _ in PAPER_STAGES)
     params: list[object] = [*PAPER_STAGES]
     _ = include_watchlist_min_score, include_review_min_score
     stage_filter = f"cw.candidate_stage IN ({placeholders})"
+    if exploratory_copyability_min_score is not None:
+        stage_filter = f"""(
+            {stage_filter}
+            OR (
+                   cw.candidate_stage = ?
+               AND COALESCE(ls.review_reason, '') = ?
+               AND COALESCE(ls.leader_score, 0) >= ?
+               AND LOWER(COALESCE(wf.hygiene_status, '')) IN ('clean', 'screened')
+               AND {paper_evidence_ready_sql('wps')}
+            )
+        )"""
+        params.extend(
+            [
+                EXPLORATORY_COPYABILITY_STAGE,
+                COPYABILITY_OBSERVER_REVIEW_REASON,
+                max(0.0, float(exploratory_copyability_min_score)),
+            ]
+        )
     params.extend([*PAPER_BLOCKERS, PAPER_MIN_PRICE, PAPER_MAX_PRICE, min_timestamp])
     observer_filter = ""
-    observer_order = "wa.timestamp DESC, wa.activity_id DESC"
+    paper_stage_order_values = ",".join(f"'{stage}'" for stage in PAPER_STAGES)
+    observer_order = f"""
+        CASE WHEN cw.candidate_stage IN ({paper_stage_order_values}) THEN 0 ELSE 1 END ASC,
+        wa.timestamp DESC,
+        wa.activity_id DESC
+    """
     if observer_retry_after is not None:
         # Persisted observer cycles consume accepted signals once and retry failures after a cooldown.
         observer_filter = """
@@ -560,6 +777,7 @@ def _candidate_activity_rows(
           )
         """
         observer_order = """
+            CASE WHEN cw.candidate_stage IN ({paper_stage_order_values}) THEN 0 ELSE 1 END ASC,
             CASE WHEN EXISTS (
                 SELECT 1
                 FROM paper_observer_trials pot
@@ -573,7 +791,7 @@ def _candidate_activity_rows(
             ) THEN 1 ELSE 0 END ASC,
             wa.timestamp DESC,
             wa.activity_id DESC
-        """
+        """.format(paper_stage_order_values=paper_stage_order_values)
         params.append(max(0, int(observer_retry_after)))
     params.append(limit)
     rows = conn.execute(
@@ -594,6 +812,12 @@ def _candidate_activity_rows(
             COALESCE(wf.copy_event_count, 0) AS copy_event_count,
             COALESCE(wf.hygiene_status, '') AS hygiene_status,
             COALESCE(pwq.blockers_json, '[]') AS paper_blockers_json,
+            wps.discovery_tier,
+            wps.evidence_status,
+            wps.current_stage,
+            COALESCE(wps.activity_count, 0) AS activity_count,
+            COALESCE(wps.distinct_markets, 0) AS distinct_markets,
+            COALESCE(wps.non_fast_trade_count, 0) AS non_fast_trade_count,
             (
                 SELECT COUNT(*)
                 FROM wallet_activity trade_events
@@ -620,6 +844,8 @@ def _candidate_activity_rows(
           ON pwq.wallet = wa.address
         LEFT JOIN wallet_features wf
           ON wf.address = wa.address
+        LEFT JOIN wallet_processing_state wps
+          ON wps.wallet = wa.address
         WHERE {stage_filter}
           AND NOT EXISTS (
               SELECT 1
@@ -650,11 +876,22 @@ def _candidate_activity_rows(
         """,
         params,
     ).fetchall()
-    return [
-        row
-        for row in rows
-        if paper_eligibility_status(conn, row["address"], facts=row).eligible
-    ]
+    eligible_rows: list[sqlite3.Row] = []
+    for row in rows:
+        if row["candidate_stage"] in PAPER_STAGES:
+            if paper_eligibility_status(conn, row["address"], facts=row).eligible:
+                eligible_rows.append(row)
+            continue
+        if exploratory_copyability_min_score is not None and (
+            exploratory_copyability_eligibility_status(
+                conn,
+                row["address"],
+                min_score=exploratory_copyability_min_score,
+                facts=row,
+            ).eligible
+        ):
+            eligible_rows.append(row)
+    return eligible_rows
 
 
 def _signal_from_row(row: sqlite3.Row) -> TradeSignal:
@@ -670,16 +907,14 @@ def _signal_from_row(row: sqlite3.Row) -> TradeSignal:
         source=_signal_source(row),
         confidence=1.0,
         validation_cohort=(
-            "exploratory"
-            if row["candidate_stage"] in PROVISIONAL_CANDIDATE_STAGES
+            EXPLORATORY_COPYABILITY_COHORT
+            if row["candidate_stage"] == EXPLORATORY_COPYABILITY_STAGE
             else "validation"
         ),
     )
 
 
 def _signal_source(row: sqlite3.Row) -> str:
-    if row["candidate_stage"] in PROVISIONAL_CANDIDATE_STAGES:
-        if row["review_reason"] == "watchlist_score":
-            return "paper_watchlist_activity"
-        return "paper_review_activity"
+    if row["candidate_stage"] == EXPLORATORY_COPYABILITY_STAGE:
+        return COPYABILITY_OBSERVER_ACTIVITY_SOURCE
     return "paper_wallet_activity"

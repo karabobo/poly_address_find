@@ -18,10 +18,12 @@ from pm_robot.orchestration.review_disposition import (
 )
 from pm_robot.pipeline_terms import (
     COPYABILITY_DEEP_SCAN_UNVALIDATED_REASON,
+    COPYABILITY_OBSERVER_REVIEW_REASON,
     PAPER_ELIGIBLE_CANDIDATE_STAGES,
     PROVISIONAL_CANDIDATE_STAGES,
     PipelineJobType,
 )
+from pm_robot.risk.eligibility import exploratory_copyability_eligibility_status
 from pm_robot.storage.repository import persist_wallet_activity, record_runtime_heartbeat
 
 
@@ -31,7 +33,7 @@ DEFAULT_RTDS_MAX_IDLE_SECONDS = 300.0
 RTDS_SQLITE_LOCK_RETRY_DELAYS = (0.25, 0.5, 1.0, 2.0)
 RTDS_WALLET_KEYS = ("proxyWallet", "proxy_wallet", "user", "address", "wallet", "trader")
 RTDS_WATCH_ACTIVITY_SOURCE = "polymarket_rtds_watch_activity"
-DEFAULT_RTDS_WATCH_MIN_SCORE = 65.0
+DEFAULT_RTDS_WATCH_MIN_SCORE = 55.0
 
 
 class TextWebSocket(Protocol):
@@ -800,7 +802,7 @@ def _persist_watch_scope_activity(
 
 
 def _rtds_watch_wallets(conn: sqlite3.Connection, *, min_score: float) -> set[str]:
-    """Select high-score wallets plus deep-scan near misses for realtime evidence."""
+    """Select near-paper and copyability-observer wallets for realtime evidence."""
 
     placeholders = ",".join("?" for _ in PROVISIONAL_CANDIDATE_STAGES)
     rows = conn.execute(
@@ -822,9 +824,14 @@ def _rtds_watch_wallets(conn: sqlite3.Connection, *, min_score: float) -> set[st
             latest_score.leader_score,
             latest_score.review_reason,
             COALESCE(wps.activity_count, 0) AS activity_count,
+            COALESCE(wps.discovery_tier, '') AS discovery_tier,
             COALESCE(wps.discovery_tier, '') AS evidence_tier,
             COALESCE(wps.evidence_status, '') AS evidence_status,
+            COALESCE(wps.current_stage, '') AS current_stage,
             COALESCE(wps.next_action, '') AS next_action,
+            COALESCE(wps.distinct_markets, 0) AS distinct_markets,
+            COALESCE(wps.non_fast_trade_count, 0) AS non_fast_trade_count,
+            COALESCE(wps.non_fast_trade_count, 0) AS trade_events,
             COALESCE(latest_copy_job.status, '') AS copyability_status,
             COALESCE(
                 json_extract(latest_copy_job.output_json, '$.graph_scan_mode'),
@@ -844,7 +851,14 @@ def _rtds_watch_wallets(conn: sqlite3.Connection, *, min_score: float) -> set[st
             COALESCE(cls.qualified_follower_count, 0) AS qualified_follower_count,
             COALESCE(clp.backtest_trade_count, 0) AS backtest_trade_count,
             COALESCE(wf.edge_retention_pct, 0) AS edge_retention_pct,
-            COALESCE(wf.walk_forward_consistency_pct, 0) AS walk_forward_consistency_pct
+            COALESCE(wf.walk_forward_consistency_pct, 0) AS walk_forward_consistency_pct,
+            COALESCE(wf.hygiene_status, '') AS hygiene_status,
+            COALESCE(pwq.blockers_json, '[]') AS paper_blockers_json,
+            (
+                SELECT COUNT(*)
+                FROM candidate_source_events cse
+                WHERE cse.address = cw.address
+            ) AS source_count
         FROM candidate_wallets cw
         JOIN leader_latest_scores latest_score
           ON latest_score.address = cw.address
@@ -858,10 +872,16 @@ def _rtds_watch_wallets(conn: sqlite3.Connection, *, min_score: float) -> set[st
           ON clp.leader_wallet = cw.address
         LEFT JOIN latest_copy_job
           ON latest_copy_job.wallet = cw.address
+        LEFT JOIN paper_wallet_quality pwq
+          ON pwq.wallet = cw.address
         WHERE (
                cw.candidate_stage IN ({placeholders})
             OR (
                    cw.candidate_stage = 'needs_data'
+               AND latest_score.review_reason = ?
+            )
+            OR (
+                   cw.candidate_stage = 'blocked_copyability'
                AND latest_score.review_reason = ?
             )
         )
@@ -870,11 +890,21 @@ def _rtds_watch_wallets(conn: sqlite3.Connection, *, min_score: float) -> set[st
             PipelineJobType.COPYABILITY_EVIDENCE.value,
             *PROVISIONAL_CANDIDATE_STAGES,
             COPYABILITY_DEEP_SCAN_UNVALIDATED_REASON,
+            COPYABILITY_OBSERVER_REVIEW_REASON,
         ),
     ).fetchall()
     eligible: set[str] = set()
     for row in rows:
         facts = dict(row)
+        if str(row["candidate_stage"] or "") == "blocked_copyability":
+            if exploratory_copyability_eligibility_status(
+                conn,
+                str(row["address"]),
+                min_score=min_score,
+                facts=facts,
+            ).eligible:
+                eligible.add(str(row["address"]).lower())
+            continue
         if float(row["leader_score"] or 0) >= float(min_score):
             eligible.add(str(row["address"]).lower())
             continue

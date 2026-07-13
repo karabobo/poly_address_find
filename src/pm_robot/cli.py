@@ -196,8 +196,8 @@ def main() -> int:
     discover_rtds.add_argument(
         "--watch-min-score",
         type=float,
-        default=65.0,
-        help="Persist RTDS activity for needs_manual_review wallets at or above this score without paper approval",
+        default=55.0,
+        help="Persist RTDS activity for near-paper research wallets without granting paper approval",
     )
     discover_rtds.add_argument("--batch-size", type=int, default=25)
     discover_rtds.add_argument("--flush-interval", type=float, default=10.0)
@@ -235,6 +235,12 @@ def main() -> int:
         "--paper-stage-only",
         action="store_true",
         help="Refresh only paper-stage research wallets for observation exports",
+    )
+    ingest_activity_cmd.add_argument(
+        "--exploratory-copyability-min-score",
+        type=float,
+        default=None,
+        help="Also refresh mature blocked_copyability wallets for research-only observation",
     )
     ingest_activity_cmd.add_argument("--sleep", type=float, default=0.25)
 
@@ -613,6 +619,12 @@ def main() -> int:
         default=21_600,
         help="Only include recent approved wallet activity; use 0 to disable the age gate",
     )
+    paper_observer_cmd.add_argument(
+        "--exploratory-copyability-min-score",
+        type=float,
+        default=None,
+        help="Include the isolated research-only copyability observer cohort",
+    )
     paper_observer_cmd.add_argument("--out", default="", help="Optional JSON export path")
 
     paper_observer_eval_cmd = sub.add_parser(
@@ -639,6 +651,12 @@ def main() -> int:
         type=int,
         default=PAPER_OBSERVER_RETRY_COOLDOWN_SEC,
         help="Retry rejected observer quotes only after this cooldown; accepted signals are not re-quoted",
+    )
+    paper_observer_eval_cmd.add_argument(
+        "--exploratory-copyability-min-score",
+        type=float,
+        default=None,
+        help="Include the isolated research-only copyability observer cohort",
     )
     paper_observer_eval_cmd.add_argument(
         "--persist",
@@ -1093,6 +1111,7 @@ def main() -> int:
                 max_events_per_wallet=args.max_events_per_wallet,
                 target_events_per_wallet=args.target_events_per_wallet,
                 paper_stage_only=args.paper_stage_only,
+                exploratory_copyability_min_score=args.exploratory_copyability_min_score,
                 sleep_seconds=args.sleep,
             )
         finally:
@@ -1640,6 +1659,7 @@ def main() -> int:
                 conn,
                 limit=args.limit,
                 max_signal_age_sec=args.max_signal_age_sec,
+                exploratory_copyability_min_score=args.exploratory_copyability_min_score,
             )
         finally:
             conn.close()
@@ -1662,6 +1682,7 @@ def main() -> int:
                 max_signal_age_sec=args.max_signal_age_sec,
                 max_actionable_signal_age_sec=args.max_actionable_signal_age_sec,
                 retry_cooldown_sec=args.retry_cooldown_sec,
+                exploratory_copyability_min_score=args.exploratory_copyability_min_score,
                 persist=args.persist,
             )
         finally:

@@ -1,5 +1,6 @@
 import sqlite3
 
+from pm_robot.models import CandidateAddress
 from pm_robot.orchestration import rtds_discovery as rtds_module
 from pm_robot.orchestration.activity_discovery import ActivityDiscoverySummary
 from pm_robot.orchestration.rtds_discovery import (
@@ -8,7 +9,7 @@ from pm_robot.orchestration.rtds_discovery import (
 )
 from pm_robot.pipeline_terms import COPYABILITY_DEEP_SCAN_UNVALIDATED_REASON
 from pm_robot.storage.db import connect, run_migrations
-from pm_robot.storage.repository import get_wallet_features
+from pm_robot.storage.repository import get_wallet_features, upsert_candidate
 
 
 class FakeWebSocket:
@@ -650,6 +651,56 @@ def test_rtds_watch_includes_rescannable_needs_data_near_miss(tmp_path):
         conn.commit()
 
         assert rtds_module._rtds_watch_wallets(conn, min_score=65) == {wallet}
+    finally:
+        conn.close()
+
+
+def test_rtds_watch_includes_only_mature_copyability_observer_wallets(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    wallet = "0x" + "c" * 40
+    try:
+        run_migrations(conn)
+        upsert_candidate(conn, CandidateAddress(address=wallet, sources="test"))
+        conn.execute(
+            "UPDATE candidate_wallets SET candidate_stage = 'blocked_copyability' WHERE address = ?",
+            (wallet,),
+        )
+        conn.execute(
+            """
+            INSERT INTO leader_scores(
+                address, leader_score, review_stage, review_reason,
+                components_json, penalties_json, policy_version, scored_at
+            ) VALUES (?, 60, 'blocked_copyability', 'copyability_scan_no_signal',
+                      '{}', '{}', 'test', 1)
+            """,
+            (wallet,),
+        )
+        conn.execute(
+            "INSERT INTO wallet_features(address, hygiene_status, updated_at) VALUES (?, 'clean', 1)",
+            (wallet,),
+        )
+        conn.execute(
+            """
+            INSERT INTO wallet_processing_state(
+                wallet, discovery_tier, evidence_status, evidence_depth,
+                evidence_confidence, priority, current_stage, next_action,
+                next_action_at, activity_count, non_fast_trade_count,
+                distinct_markets, updated_at
+            ) VALUES (?, 'l3_deep', 'summary_ready', 1000, 1.0, 10,
+                      'deep_done', 'score_wallet', 0, 1000, 200, 30, 1)
+            """,
+            (wallet,),
+        )
+        conn.commit()
+
+        assert rtds_module._rtds_watch_wallets(conn, min_score=55) == {wallet}
+        assert rtds_module._rtds_watch_wallets(conn, min_score=61) == set()
+        conn.execute(
+            "UPDATE wallet_features SET hygiene_status = 'unknown' WHERE address = ?",
+            (wallet,),
+        )
+        conn.commit()
+        assert rtds_module._rtds_watch_wallets(conn, min_score=55) == set()
     finally:
         conn.close()
 

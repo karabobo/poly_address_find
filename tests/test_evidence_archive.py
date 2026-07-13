@@ -190,7 +190,7 @@ def test_verified_parquet_archive_precedes_sqlite_prune(tmp_path):
     assert result["deleted"]["wallet_activity"] == 5
     manifest_path = settings.archive_dir / result["archive"]["manifest_path"]
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    assert manifest["source_schema_version"] == 55
+    assert manifest["source_schema_version"] == 56
     assert manifest["prune_version"] == "v3_parquet_archive"
     assert manifest["compression"] == "zstd"
     activity_file = next(item for item in manifest["files"] if item["table_name"] == "wallet_activity")
@@ -238,6 +238,85 @@ def test_verified_parquet_archive_precedes_sqlite_prune(tmp_path):
         assert conn.execute("SELECT COUNT(*) FROM evidence_archive_runs").fetchone()[0] == 1
     finally:
         conn.close()
+
+
+def test_copyability_observer_watch_is_not_pruned(tmp_path):
+    settings = _settings(tmp_path)
+    wallet = "0x" + "9" * 40
+    _seed_low_value_wallet(settings, wallet, terminal=False)
+    conn = connect(settings.db_path)
+    try:
+        persist_score(
+            conn,
+            ScoreBreakdown(
+                address=wallet,
+                leader_score=60,
+                stage=CandidateStage.BLOCKED_COPYABILITY,
+                reason="copyability_scan_no_signal",
+                components={},
+                penalties={},
+            ),
+            policy_version="archive-test-copyability-observer",
+        )
+        conn.execute(
+            """
+            INSERT INTO wallet_processing_state(
+                wallet, discovery_tier, evidence_status, evidence_depth,
+                evidence_confidence, priority, current_stage, next_action,
+                next_action_at, activity_count, distinct_markets,
+                non_fast_trade_count, updated_at
+            ) VALUES (?, 'l3_deep', 'summary_ready', 1000, 1.0, 10,
+                      'deep_done', 'score_wallet', 0, 1000, 30, 200, 2000)
+            """,
+            (wallet,),
+        )
+        conn.execute(
+            """
+            INSERT INTO wallet_registry(
+                address, candidate_stage, registry_status, raw_retention_tier,
+                last_evaluated_at, updated_at
+            ) VALUES (?, 'blocked_copyability', 'copyability_observer_watch',
+                      'summary_and_recent', 2000, 2000)
+            """,
+            (wallet,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    result = prune_low_value_evidence(
+        settings,
+        limit=5,
+        dry_run=False,
+        archive=False,
+    )
+
+    assert result["wallet_count"] == 0
+    assert result["deleted"]["wallet_activity"] == 0
+    conn = connect(settings.db_path)
+    try:
+        remaining = conn.execute(
+            "SELECT COUNT(*) FROM wallet_activity WHERE address = ?",
+            (wallet,),
+        ).fetchone()[0]
+        registry = dict(
+            conn.execute(
+                """
+                SELECT registry_status, raw_retention_tier, raw_pruned_at
+                FROM wallet_registry
+                WHERE address = ?
+                """,
+                (wallet,),
+            ).fetchone()
+        )
+    finally:
+        conn.close()
+    assert remaining == 5
+    assert registry == {
+        "registry_status": "copyability_observer_watch",
+        "raw_retention_tier": "summary_and_recent",
+        "raw_pruned_at": None,
+    }
 
 
 def test_zero_score_deep_done_wallet_is_pruned_after_summary_materialization(tmp_path):

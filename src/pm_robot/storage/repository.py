@@ -19,6 +19,8 @@ from pm_robot.models import (
 )
 from pm_robot.orchestration.evidence_readiness import paper_evidence_ready_sql
 from pm_robot.pipeline_terms import (
+    COPYABILITY_OBSERVER_REVIEW_REASON,
+    DEFAULT_EXPLORATORY_COPYABILITY_MIN_SCORE,
     EvidenceJobStage,
     EvidenceStatus,
     EvidenceTier,
@@ -26,6 +28,7 @@ from pm_robot.pipeline_terms import (
     evidence_promotion_approval_snapshot,
     evidence_promotion_is_approved,
 )
+from pm_robot.risk.eligibility import exploratory_copyability_eligibility_status
 from pm_robot.storage.db import retry_sqlite_locked
 
 
@@ -299,25 +302,119 @@ def list_ingest_targets(conn: sqlite3.Connection, *, limit: int = 50) -> list[st
 def list_paper_activity_targets(conn: sqlite3.Connection, *, limit: int = 50) -> list[str]:
     """Return paper-stage wallets for active observation refresh only."""
 
+    return list_observer_activity_targets(conn, limit=limit)
+
+
+def list_observer_activity_targets(
+    conn: sqlite3.Connection,
+    *,
+    limit: int = 50,
+    exploratory_copyability_min_score: float | None = None,
+) -> list[str]:
+    """Return formal Paper wallets plus an optional research-only observer cohort."""
+
     placeholders = ",".join("?" for _ in PAPER_ELIGIBLE_CANDIDATE_STAGES)
+    safe_limit = max(1, int(limit))
+    include_exploratory = exploratory_copyability_min_score is not None
+    exploratory_filter = ""
+    params: list[Any] = [*PAPER_ELIGIBLE_CANDIDATE_STAGES]
+    if include_exploratory:
+        exploratory_filter = """
+            OR (
+                   cw.candidate_stage = 'blocked_copyability'
+               AND COALESCE(ls.review_reason, '') = ?
+               AND COALESCE(ls.leader_score, 0) >= ?
+               AND LOWER(COALESCE(wf.hygiene_status, '')) IN ('clean', 'screened')
+               AND {paper_ready_sql}
+            )
+        """.format(paper_ready_sql=paper_evidence_ready_sql("wps"))
+        params.extend(
+            [
+                COPYABILITY_OBSERVER_REVIEW_REASON,
+                max(
+                    0.0,
+                    float(
+                        exploratory_copyability_min_score
+                        if exploratory_copyability_min_score is not None
+                        else DEFAULT_EXPLORATORY_COPYABILITY_MIN_SCORE
+                    ),
+                ),
+            ]
+        )
+    params.append(safe_limit)
     rows = conn.execute(
         f"""
-        SELECT address FROM candidate_wallets
-        WHERE candidate_stage IN ({placeholders})
+        SELECT
+            cw.address,
+            cw.candidate_stage,
+            COALESCE(ls.leader_score, 0) AS leader_score,
+            COALESCE(ls.review_reason, '') AS review_reason,
+            COALESCE(wf.hygiene_status, '') AS hygiene_status,
+            COALESCE(wf.copy_event_count, 0) AS copy_event_count,
+            COALESCE(pwq.blockers_json, '[]') AS paper_blockers_json,
+            wps.discovery_tier,
+            wps.evidence_status,
+            wps.current_stage,
+            COALESCE(wps.activity_count, 0) AS activity_count,
+            COALESCE(wps.distinct_markets, 0) AS distinct_markets,
+            COALESCE(wps.non_fast_trade_count, 0) AS non_fast_trade_count,
+            (
+                SELECT COUNT(*)
+                FROM wallet_activity trade_events
+                WHERE trade_events.address = cw.address
+                  AND trade_events.type = 'TRADE'
+            ) AS trade_events,
+            (
+                SELECT COUNT(*)
+                FROM candidate_source_events cse
+                WHERE cse.address = cw.address
+            ) AS source_count
+        FROM candidate_wallets cw
+        LEFT JOIN leader_scores ls
+          ON ls.score_id = (
+              SELECT score_id
+              FROM leader_scores
+              WHERE address = cw.address
+              ORDER BY scored_at DESC, score_id DESC
+              LIMIT 1
+          )
+        LEFT JOIN wallet_features wf
+          ON wf.address = cw.address
+        LEFT JOIN wallet_processing_state wps
+          ON wps.wallet = cw.address
+        LEFT JOIN paper_wallet_quality pwq
+          ON pwq.wallet = cw.address
+        WHERE (
+            cw.candidate_stage IN ({placeholders})
+            {exploratory_filter}
+        )
         ORDER BY
-            CASE candidate_stage
+            CASE cw.candidate_stage
                 WHEN 'live_eligible' THEN 0
                 WHEN 'paper_approved' THEN 1
                 WHEN 'paper_candidate' THEN 2
                 ELSE 3
             END ASC,
-            COALESCE(last_ingested_at, 0) ASC,
-            updated_at DESC
+            COALESCE(cw.last_ingested_at, 0) ASC,
+            COALESCE(ls.leader_score, 0) DESC,
+            cw.updated_at DESC
         LIMIT ?
         """,
-        (*PAPER_ELIGIBLE_CANDIDATE_STAGES, limit),
+        params,
     ).fetchall()
-    return [row["address"] for row in rows]
+    targets: list[str] = []
+    for row in rows:
+        if row["candidate_stage"] in PAPER_ELIGIBLE_CANDIDATE_STAGES:
+            targets.append(str(row["address"]))
+            continue
+        if include_exploratory and exploratory_copyability_eligibility_status(
+            conn,
+            str(row["address"]),
+            min_score=float(exploratory_copyability_min_score or 0),
+            facts=row,
+        ).eligible:
+            targets.append(str(row["address"]))
+    return targets
 
 
 def list_activity_backfill_targets(

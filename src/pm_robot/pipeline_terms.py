@@ -71,6 +71,10 @@ CANDIDATE_STAGES = tuple(stage.value for stage in CandidateStage)
 EVIDENCE_PROMOTION_APPROVAL_PREFIX = "promotion_approved"
 EVIDENCE_PROMOTION_DEFERRED_PREFIX = "promotion_deferred"
 COPYABILITY_DEEP_SCAN_UNVALIDATED_REASON = "copyability_deep_scan_unvalidated"
+COPYABILITY_OBSERVER_REVIEW_REASON = "copyability_scan_no_signal"
+EXPLORATORY_COPYABILITY_COHORT = "exploratory_copyability"
+COPYABILITY_OBSERVER_ACTIVITY_SOURCE = "copyability_observer_activity"
+DEFAULT_EXPLORATORY_COPYABILITY_MIN_SCORE = 55.0
 
 
 def evidence_promotion_approval_reason(
