@@ -14,7 +14,10 @@ from pm_robot.orchestration.copyability_evidence import (
     plan_copyability_evidence_jobs,
     run_copyability_evidence_worker,
 )
-from pm_robot.pipeline_terms import COPYABILITY_DEEP_SCAN_UNVALIDATED_REASON
+from pm_robot.pipeline_terms import (
+    COPYABILITY_DEEP_SCAN_UNVALIDATED_REASON,
+    COPYABILITY_OBSERVER_REVIEW_REASON,
+)
 from pm_robot.research.copy_backtest import TargetedCopyBacktestSummary
 from pm_robot.research.copy_graph import TargetedCopyGraphSummary
 from pm_robot.storage.db import connect, run_migrations
@@ -243,6 +246,96 @@ def test_copyability_rescore_cannot_bypass_paper_evidence_gate(tmp_path):
             (wallet,),
         ).fetchone()["next_action"]
         assert next_action == ""
+    finally:
+        conn.close()
+
+
+def test_copyability_rescore_reopens_no_signal_observer_when_signal_is_validated(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    wallet = "0x" + "f" * 40
+    policy = load_policy(Path("config/leader_scoring_policy.json"))
+    try:
+        run_migrations(conn)
+        upsert_candidate(conn, CandidateAddress(address=wallet, sources="test"))
+        conn.execute(
+            "UPDATE candidate_wallets SET candidate_stage = 'blocked_copyability' WHERE address = ?",
+            (wallet,),
+        )
+        conn.execute(
+            """
+            INSERT INTO leader_scores(
+                address, leader_score, review_stage, review_reason,
+                components_json, penalties_json, policy_version, scored_at
+            ) VALUES (?, 60, 'blocked_copyability', ?, '{}', '{}', 'test', 100)
+            """,
+            (wallet, COPYABILITY_OBSERVER_REVIEW_REASON),
+        )
+        upsert_wallet_feature(
+            conn,
+            WalletFeatures(
+                address=wallet,
+                cumulative_win_rate=0.72,
+                recent_30d_volume_usdc=750_000,
+                net_pnl_usdc=250_000,
+                total_volume_usdc=5_000_000,
+                event_win_rate=0.88,
+                trade_win_rate=0.58,
+                avg_dca_entries=25,
+                sell_pct=2,
+                bot_score=45,
+                leader_in_degree=8,
+                copy_event_count=40,
+                copy_market_count=12,
+                containment_pct_median=0.95,
+                copy_stream_roi=0.025,
+                edge_retention_pct=70,
+                walk_forward_consistency_pct=60,
+                survival_score=70,
+                single_market_pnl_share=0.2,
+                net_to_gross_exposure=0.7,
+                hygiene_status="clean",
+                primary_category="politics",
+                extra={"copy_backtest_trade_count": 40},
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO wallet_processing_state(
+                wallet, discovery_tier, evidence_status, evidence_depth,
+                evidence_confidence, priority, current_stage, next_action,
+                next_action_at, activity_count, non_fast_trade_count,
+                distinct_markets, updated_at
+            ) VALUES (?, 'l3_deep', 'summary_ready', 1000, 1.0, 10,
+                      'deep_done', 'score_wallet', 0, 1000, 900, 20, 100)
+            """,
+            (wallet,),
+        )
+
+        assert copyability_evidence._score_wallet_after_copyability(
+            conn,
+            wallet=wallet,
+            policy=policy,
+            policy_version=str(policy["version"]),
+            graph_scan_mode="deep",
+            pair_stats_written=8,
+            qualified_pairs=2,
+        )
+        latest = conn.execute(
+            """
+            SELECT cw.candidate_stage, ls.review_stage, ls.review_reason
+            FROM candidate_wallets cw
+            JOIN leader_latest_scores ls ON ls.address = cw.address
+            WHERE cw.address = ?
+            """,
+            (wallet,),
+        ).fetchone()
+
+        assert latest["candidate_stage"] in {
+            CandidateStage.PAPER_CANDIDATE.value,
+            CandidateStage.PAPER_APPROVED.value,
+        }
+        assert latest["candidate_stage"] == latest["review_stage"]
+        assert latest["review_reason"] != COPYABILITY_OBSERVER_REVIEW_REASON
     finally:
         conn.close()
 
@@ -871,6 +964,186 @@ def test_copyability_planner_rescans_needs_data_near_miss_after_new_activity(tmp
         assert summary.jobs_enqueued == 1
         assert job["status"] == "queued"
         assert json.loads(job["input_json"])["planner_reason"] == "new_activity_after_deep_scan"
+    finally:
+        conn.close()
+
+
+def test_copyability_planner_rescans_no_signal_observer_after_new_activity(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    observer = "0x" + "7" * 40
+    quiet_observer = "0x" + "8" * 40
+    true_block = "0x" + "9" * 40
+    fatal_paper_block = "0x" + "a" * 40
+    try:
+        run_migrations(conn)
+        for wallet, reason in (
+            (observer, COPYABILITY_OBSERVER_REVIEW_REASON),
+            (quiet_observer, COPYABILITY_OBSERVER_REVIEW_REASON),
+            (true_block, "hedge_or_arbitrage_exposure_too_low"),
+            (fatal_paper_block, COPYABILITY_OBSERVER_REVIEW_REASON),
+        ):
+            upsert_candidate(conn, CandidateAddress(address=wallet, sources="test"))
+            conn.execute(
+                "UPDATE candidate_wallets SET candidate_stage = 'blocked_copyability' WHERE address = ?",
+                (wallet,),
+            )
+            conn.execute(
+                """
+                INSERT INTO leader_scores(
+                    address, leader_score, review_stage, review_reason,
+                    components_json, penalties_json, policy_version, scored_at
+                ) VALUES (?, 60, 'blocked_copyability', ?, '{}', '{}', 'test', 10000)
+                """,
+                (wallet, reason),
+            )
+            conn.execute(
+                """
+                INSERT INTO wallet_processing_state(
+                    wallet, discovery_tier, evidence_status, evidence_depth,
+                    evidence_confidence, priority, current_stage, next_action,
+                    next_action_at, activity_count, non_fast_trade_count,
+                    distinct_markets, updated_at
+                ) VALUES (?, 'l3_deep', 'summary_ready', 500, 1.0, 10,
+                    'deep_done', '', 0, 500, 300, 10, 10000)
+                """,
+                (wallet,),
+            )
+            conn.execute(
+                "INSERT INTO wallet_features(address, hygiene_status, extra_json, updated_at) "
+                "VALUES (?, 'clean', '{}', 10000)",
+                (wallet,),
+            )
+            conn.execute(
+                """
+                INSERT INTO pipeline_jobs(
+                    job_type, wallet, subject_key, tier, priority, shard, status,
+                    lease_owner, lease_until, attempts, max_attempts, next_attempt_at,
+                    input_json, output_json, last_error, created_at, updated_at, completed_at
+                ) VALUES (?, ?, 'copyability', 'copyability', 10, 0, 'done',
+                    NULL, 0, 1, 3, 0, ?, ?, '', 100, 100, 100)
+                """,
+                (
+                    JOB_TYPE,
+                    wallet,
+                    json.dumps({"graph_scan_mode": "deep", "activity_newest_timestamp": 1000}),
+                    json.dumps({"graph_scan_mode": "deep", "activity_newest_timestamp": 1000}),
+                ),
+            )
+
+        conn.execute(
+            """
+            INSERT INTO paper_wallet_quality(
+                wallet, orders, open_positions, settled_positions,
+                gamma_marked_positions, fallback_marked_positions, mark_coverage,
+                settled_cost_usd, settled_pnl_usd, settled_roi,
+                total_pnl_usd, total_roi, production_ready, blockers_json, updated_at
+            ) VALUES (?, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                      '["non_positive_total_roi"]', 100)
+            """,
+            (fatal_paper_block,),
+        )
+        conn.executemany(
+            """
+            INSERT INTO wallet_activity_watermarks(
+                address, newest_timestamp, newest_activity_key, updated_at
+            ) VALUES (?, ?, ?, 200)
+            """,
+            [
+                (observer, 1001, "new-observer-event"),
+                (quiet_observer, 1000, "same-observer-event"),
+                (true_block, 1001, "new-blocked-event"),
+                (fatal_paper_block, 1001, "new-paper-blocked-event"),
+            ],
+        )
+        conn.commit()
+
+        summary = plan_copyability_evidence_jobs(
+            conn,
+            limit=10,
+            min_score=40,
+            min_activity_events=25,
+            shard_count=1,
+            rescan_seconds=100,
+            now=10_000,
+        )
+        rows = {
+            row["wallet"]: dict(row)
+            for row in conn.execute(
+                "SELECT wallet, status, input_json FROM pipeline_jobs WHERE job_type = ?",
+                (JOB_TYPE,),
+            )
+        }
+
+        assert summary.targets_seen == 1
+        assert summary.jobs_enqueued == 1
+        assert rows[observer]["status"] == "queued"
+        assert json.loads(rows[observer]["input_json"])["planner_reason"] == (
+            "new_activity_after_deep_scan"
+        )
+        assert rows[quiet_observer]["status"] == "done"
+        assert rows[true_block]["status"] == "done"
+        assert rows[fatal_paper_block]["status"] == "done"
+
+        conn.execute(
+            """
+            UPDATE pipeline_jobs
+            SET status = 'done',
+                input_json = ?,
+                output_json = ?,
+                completed_at = 9950,
+                updated_at = 9950
+            WHERE job_type = ? AND wallet = ?
+            """,
+            (
+                json.dumps({"graph_scan_mode": "deep", "activity_newest_timestamp": 1001}),
+                json.dumps({"graph_scan_mode": "deep", "activity_newest_timestamp": 1001}),
+                JOB_TYPE,
+                observer,
+            ),
+        )
+        conn.commit()
+
+        unchanged = plan_copyability_evidence_jobs(
+            conn,
+            limit=10,
+            min_score=40,
+            min_activity_events=25,
+            shard_count=1,
+            rescan_seconds=100,
+            now=10_000,
+        )
+        assert unchanged.jobs_enqueued == 0
+
+        conn.execute(
+            """
+            UPDATE wallet_activity_watermarks
+            SET newest_timestamp = 1002, newest_activity_key = 'next-event', updated_at = 10000
+            WHERE address = ?
+            """,
+            (observer,),
+        )
+        conn.commit()
+        cooling_down = plan_copyability_evidence_jobs(
+            conn,
+            limit=10,
+            min_score=40,
+            min_activity_events=25,
+            shard_count=1,
+            rescan_seconds=100,
+            now=10_000,
+        )
+        assert cooling_down.jobs_enqueued == 0
+
+        ready_again = plan_copyability_evidence_jobs(
+            conn,
+            limit=10,
+            min_score=40,
+            min_activity_events=25,
+            shard_count=1,
+            rescan_seconds=100,
+            now=10_051,
+        )
+        assert ready_again.jobs_enqueued == 1
     finally:
         conn.close()
 
@@ -1725,7 +1998,16 @@ def test_copyability_worker_blocks_completed_deep_scan_with_no_signal(tmp_path, 
         upsert_candidate(conn, CandidateAddress(address=wallet, sources="test"))
         conn.execute(
             "UPDATE candidate_wallets SET candidate_stage = ? WHERE address = ?",
-            (CandidateStage.NEEDS_REVIEW.value, wallet),
+            (CandidateStage.BLOCKED_COPYABILITY.value, wallet),
+        )
+        conn.execute(
+            """
+            INSERT INTO leader_scores(
+                address, leader_score, review_stage, review_reason,
+                components_json, penalties_json, policy_version, scored_at
+            ) VALUES (?, 60, 'blocked_copyability', ?, '{}', '{}', 'test', 100)
+            """,
+            (wallet, COPYABILITY_OBSERVER_REVIEW_REASON),
         )
         upsert_wallet_feature(
             conn,

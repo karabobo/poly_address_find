@@ -664,6 +664,59 @@ def test_persist_score_preserves_copyability_block(tmp_path):
         conn.close()
 
 
+def test_persist_score_only_reopens_no_signal_copyability_observer(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    observer = CandidateAddress(address="0x" + "a" * 40, sources="test")
+    true_block = CandidateAddress(address="0x" + "b" * 40, sources="test")
+    try:
+        run_migrations(conn)
+        for candidate, reason in (
+            (observer, "copyability_scan_no_signal"),
+            (true_block, "hedge_or_arbitrage_exposure_too_low"),
+        ):
+            upsert_candidate(conn, candidate)
+            persist_score(
+                conn,
+                ScoreBreakdown(
+                    address=candidate.address,
+                    leader_score=60,
+                    stage=CandidateStage.BLOCKED_COPYABILITY,
+                    reason=reason,
+                    components={},
+                    penalties={},
+                ),
+                policy_version="test",
+            )
+
+        for candidate in (observer, true_block):
+            persist_score(
+                conn,
+                ScoreBreakdown(
+                    address=candidate.address,
+                    leader_score=65,
+                    stage=CandidateStage.NEEDS_REVIEW,
+                    reason="watchlist_score",
+                    components={},
+                    penalties={},
+                ),
+                policy_version="test",
+                allow_copyability_observer_transition=True,
+            )
+
+        stages = {
+            row["address"]: row["candidate_stage"]
+            for row in conn.execute(
+                "SELECT address, candidate_stage FROM candidate_wallets WHERE address IN (?, ?)",
+                (observer.address, true_block.address),
+            )
+        }
+
+        assert stages[observer.address] == CandidateStage.NEEDS_REVIEW.value
+        assert stages[true_block.address] == CandidateStage.BLOCKED_COPYABILITY.value
+    finally:
+        conn.close()
+
+
 def test_persist_wallet_activity_hashes_keys_and_skips_legacy_duplicates(tmp_path):
     conn = connect(tmp_path / "robot.sqlite")
     try:

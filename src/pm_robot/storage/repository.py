@@ -2962,14 +2962,32 @@ def persist_score(
     score: ScoreBreakdown,
     *,
     policy_version: str = "",
+    allow_copyability_observer_transition: bool = False,
 ) -> None:
     now = int(time.time())
     current = conn.execute(
-        "SELECT candidate_stage FROM candidate_wallets WHERE address = ?",
+        """
+        SELECT
+            cw.candidate_stage,
+            COALESCE((
+                SELECT ls.review_reason
+                FROM leader_scores ls
+                WHERE ls.address = cw.address
+                ORDER BY ls.scored_at DESC, ls.score_id DESC
+                LIMIT 1
+            ), '') AS latest_review_reason
+        FROM candidate_wallets cw
+        WHERE cw.address = ?
+        """,
         (score.address,),
     ).fetchone()
     from_stage = current["candidate_stage"] if current else None
-    next_stage = _score_target_stage(from_stage, score.stage.value)
+    next_stage = _score_target_stage(
+        from_stage,
+        score.stage.value,
+        current_review_reason=current["latest_review_reason"] if current else "",
+        allow_copyability_observer_transition=allow_copyability_observer_transition,
+    )
     conn.execute(
         """
         INSERT INTO leader_scores(
@@ -3041,10 +3059,22 @@ BLOCKING_SCORE_STAGES = {"rejected", "blocked_hygiene", "blocked_copyability"}
 PAPER_READY_SCORE_STAGES = {"paper_candidate", "paper_approved", "live_eligible"}
 
 
-def _score_target_stage(current_stage: str | None, scored_stage: str) -> str:
+def _score_target_stage(
+    current_stage: str | None,
+    scored_stage: str,
+    *,
+    current_review_reason: str = "",
+    allow_copyability_observer_transition: bool = False,
+) -> str:
     if current_stage == "rejected":
         return current_stage
     if current_stage in {"blocked_hygiene", "blocked_copyability"} and scored_stage not in BLOCKING_SCORE_STAGES:
+        if (
+            current_stage == "blocked_copyability"
+            and allow_copyability_observer_transition
+            and current_review_reason == COPYABILITY_OBSERVER_REVIEW_REASON
+        ):
+            return scored_stage
         return current_stage
     if current_stage == "live_eligible" and scored_stage in PAPER_READY_SCORE_STAGES:
         return current_stage

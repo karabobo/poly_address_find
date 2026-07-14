@@ -12,10 +12,12 @@ from typing import Any
 
 from pm_robot.config import load_policy
 from pm_robot.models import CandidateAddress, CandidateStage
+from pm_robot.orchestration.evidence_readiness import paper_evidence_ready_sql
 from pm_robot.orchestration.feature_materializer import materialize_wallet_feature
 from pm_robot.orchestration.review_pipeline import apply_score_lifecycle_guards
 from pm_robot.pipeline_terms import (
     COPYABILITY_DEEP_SCAN_UNVALIDATED_REASON,
+    COPYABILITY_OBSERVER_REVIEW_REASON,
     PipelineJobType,
 )
 from pm_robot.research.copy_backtest import backtest_copy_stream_for_leaders
@@ -24,6 +26,7 @@ from pm_robot.research.copy_graph import (
     prune_unqualified_copy_links_for_leaders,
 )
 from pm_robot.research.scoring import score_candidate
+from pm_robot.risk.eligibility import exploratory_copyability_eligibility_status
 from pm_robot.storage.db import retry_sqlite_locked
 from pm_robot.storage.repository import (
     PipelineJobLeaseLost,
@@ -582,7 +585,13 @@ def _score_wallet_after_copyability(
         and score.reason == "score_below_watchlist_after_evidence"
     ):
         score = replace(score, reason=COPYABILITY_DEEP_SCAN_UNVALIDATED_REASON)
-    persist_score(conn, score, policy_version=policy_version)
+    # A no-signal observer block is reversible only from a completed copyability rescan.
+    persist_score(
+        conn,
+        score,
+        policy_version=policy_version,
+        allow_copyability_observer_transition=True,
+    )
     consume_fresh_score_actions(
         conn,
         policy_version=policy_version,
@@ -752,6 +761,9 @@ def _select_copyability_targets(
     now: int,
     addresses: tuple[str, ...] = (),
 ) -> list[sqlite3.Row]:
+    safe_limit = max(0, int(limit))
+    if safe_limit == 0:
+        return []
     stale_before = now - max(0, int(rescan_seconds))
     normalized_addresses = tuple(dict.fromkeys(address.lower() for address in addresses if address))
     latest_address_filter = ""
@@ -760,7 +772,9 @@ def _select_copyability_targets(
         placeholders = ", ".join("?" for _address in normalized_addresses)
         latest_address_filter = f"WHERE address IN ({placeholders})"
         candidate_address_filter = f"AND cw.address IN ({placeholders})"
-    return conn.execute(
+    # The SQL prefilter keeps the candidate set small. The shared observer gate
+    # remains authoritative for blocked no-signal wallets so planner rules cannot drift.
+    rows = conn.execute(
         f"""
         WITH latest AS (
             SELECT *
@@ -828,7 +842,17 @@ def _select_copyability_targets(
              AND pj.wallet = cw.address
              AND pj.tier = ?
              AND pj.subject_key = ?
-            WHERE cw.candidate_stage NOT IN ('rejected', 'blocked_hygiene', 'blocked_copyability')
+            WHERE (
+                    cw.candidate_stage NOT IN ('rejected', 'blocked_hygiene', 'blocked_copyability')
+                 OR (
+                        cw.candidate_stage = 'blocked_copyability'
+                    AND latest.review_stage = 'blocked_copyability'
+                    AND latest.review_reason = '{COPYABILITY_OBSERVER_REVIEW_REASON}'
+                    AND latest.leader_score >= {LIGHT_NO_SIGNAL_DEEP_RESCAN_MIN_SCORE}
+                    AND LOWER(COALESCE(wf.hygiene_status, '')) IN ('clean', 'screened')
+                    AND {paper_evidence_ready_sql("wps")}
+                 )
+            )
               AND COALESCE(wr.raw_retention_tier, '') != 'summary_only'
               {candidate_address_filter}
               AND (
@@ -851,6 +875,11 @@ def _select_copyability_targets(
                  OR (
                         latest.review_stage = 'needs_data'
                         AND latest.review_reason = '{COPYABILITY_DEEP_SCAN_UNVALIDATED_REASON}'
+                    )
+                 OR (
+                        cw.candidate_stage = 'blocked_copyability'
+                    AND latest.review_stage = 'blocked_copyability'
+                    AND latest.review_reason = '{COPYABILITY_OBSERVER_REVIEW_REASON}'
                     )
               )
         ),
@@ -906,6 +935,13 @@ def _select_copyability_targets(
                         AND COALESCE(feature_copy_candidate_event_count, 0) = 0
                         AND COALESCE(feature_copy_candidate_market_count, 0) = 0
                         AND COALESCE(feature_copy_validated_pair_count, 0) = 0
+                    )
+                 OR (
+                        candidate_stage = 'blocked_copyability'
+                    AND review_stage = 'blocked_copyability'
+                    AND review_reason = '{COPYABILITY_OBSERVER_REVIEW_REASON}'
+                    AND existing_job_status = 'done'
+                    AND existing_scan_mode IN ('', 'default', 'deep')
                     )
                  OR (
                         review_stage = 'needs_data'
@@ -1052,9 +1088,23 @@ def _select_copyability_targets(
             now,
             stale_before,
             LIGHT_NO_SIGNAL_DEEP_RESCAN_MIN_SCORE,
-            int(limit),
+            safe_limit * 2,
         ),
     ).fetchall()
+    targets: list[sqlite3.Row] = []
+    for row in rows:
+        if str(row["candidate_stage"] or "") == CandidateStage.BLOCKED_COPYABILITY.value:
+            if not exploratory_copyability_eligibility_status(
+                conn,
+                str(row["address"]),
+                min_score=LIGHT_NO_SIGNAL_DEEP_RESCAN_MIN_SCORE,
+                facts=row,
+            ).eligible:
+                continue
+        targets.append(row)
+        if len(targets) >= safe_limit:
+            break
+    return targets
 
 
 def _revalidate_copyability_targets(
