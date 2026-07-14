@@ -4519,6 +4519,7 @@ def test_dashboard_localizes_internal_status_badges(tmp_path):
     assert ">L3 深度证据<" in _localized_cell("l3_deep")
     assert ">证据摘要就绪<" in _localized_cell("summary_ready")
     assert ">Paper 候选<" in _badge("paper_candidate")
+    assert ">研究通过，待 Paper 验证<" in _badge("paper_approved")
     assert _format_cell("active") == "active"
 
 

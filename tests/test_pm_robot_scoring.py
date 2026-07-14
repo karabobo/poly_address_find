@@ -289,6 +289,47 @@ def test_high_score_without_validated_copyability_stays_in_review():
     assert score.reason == "copyability_evidence_unvalidated"
 
 
+def test_stale_copyability_diagnostics_do_not_validate_an_empty_current_sample():
+    candidate = CandidateAddress(address="0x" + "b" * 40)
+    features = WalletFeatures(
+        address=candidate.address,
+        cumulative_win_rate=0.95,
+        recent_30d_volume_usdc=100_000_000,
+        net_pnl_usdc=20_000_000,
+        total_volume_usdc=50_000_000,
+        event_win_rate=0.95,
+        trade_win_rate=0.9,
+        avg_dca_entries=45,
+        sell_pct=1,
+        bot_score=20,
+        median_gap_sec=30,
+        maker_fraction=0.1,
+        leader_in_degree=0,
+        copy_event_count=0,
+        copy_market_count=0,
+        containment_pct_median=0,
+        copy_stream_roi=0,
+        survival_score=100,
+        single_market_pnl_share=0.2,
+        net_to_gross_exposure=0.8,
+        hygiene_status="clean",
+        primary_category="politics",
+        extra={
+            "copy_backtest_trade_count": 58,
+            "copy_graph_qualified_follower_count": 1,
+            "copy_stream_roi_source": "no_copy_backtest_default_zero",
+        },
+    )
+
+    score = score_candidate(candidate, features, POLICY)
+
+    assert score.components["copy_leader_graph"] == 0
+    assert score.components["copy_stream_roi"] == 0
+    assert score.components["execution_copyability"] == 0
+    assert score.stage == CandidateStage.NEEDS_REVIEW
+    assert score.reason == "copyability_evidence_unvalidated"
+
+
 def test_low_absolute_profit_wallet_cannot_be_promoted_by_copy_sample():
     candidate = CandidateAddress(address="0x" + "6" * 40)
     features = WalletFeatures(

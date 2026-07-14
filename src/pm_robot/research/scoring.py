@@ -148,6 +148,15 @@ def _has_validated_copyability(features: WalletFeatures, policy: dict[str, Any])
     except (TypeError, ValueError):
         validated_pairs = 0
     source = str(features.extra.get("copy_stream_roi_source") or "")
+    has_current_copy_sample = (
+        float(features.leader_in_degree or 0.0) > 0
+        and float(features.copy_event_count or 0.0) > 0
+        and float(features.copy_market_count or 0.0) > 0
+    )
+    # Extra JSON keeps diagnostics across refreshes. Never let stale diagnostics
+    # validate copyability after the canonical copy sample has been cleared.
+    if not has_current_copy_sample:
+        return False
     if backtest_trades >= min_backtest_trades:
         return True
     if validated_pairs > 0:

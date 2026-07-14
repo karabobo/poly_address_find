@@ -1,7 +1,8 @@
+import json
 from pathlib import Path
 
 from pm_robot.config import load_policy
-from pm_robot.models import CandidateAddress
+from pm_robot.models import CandidateAddress, WalletFeatures
 from pm_robot.research.copy_backtest import backtest_copy_stream, backtest_copy_stream_for_leaders
 from pm_robot.research.copy_graph import (
     mine_copy_graph,
@@ -14,6 +15,7 @@ from pm_robot.storage.repository import (
     persist_wallet_activity,
     rebuild_wallet_episodes,
     upsert_candidate,
+    upsert_wallet_feature,
 )
 
 
@@ -37,6 +39,58 @@ def _mark_deep_evidence_ready(conn, wallet: str) -> None:
         """,
         (wallet, activity_count),
     )
+
+
+def test_targeted_copy_refresh_removes_stale_diagnostics_when_no_signal(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    leader = "0x" + "9" * 40
+    policy = load_policy(Path("config/leader_scoring_policy.json"))
+    try:
+        run_migrations(conn)
+        upsert_candidate(conn, CandidateAddress(address=leader, sources="test"))
+        upsert_wallet_feature(
+            conn,
+            WalletFeatures(
+                address=leader,
+                leader_in_degree=1,
+                copy_event_count=10,
+                copy_market_count=3,
+                containment_pct_median=0.9,
+                copy_stream_roi=0.1,
+                edge_retention_pct=80,
+                walk_forward_consistency_pct=70,
+                survival_score=90,
+                extra={
+                    "keep_me": "research",
+                    "copy_graph_last_copy_event_at": 100,
+                    "copy_graph_median_lag_seconds": 5,
+                    "copy_graph_qualified_follower_count": 1,
+                    "copy_backtest_trade_count": 10,
+                    "copy_backtest_net_pnl_usdc": 25,
+                    "copy_backtest_win_rate": 0.8,
+                    "copy_backtest_median_lag_seconds": 5,
+                    "copy_backtest_edge_retention_pct": 80,
+                    "copy_backtest_walk_forward_consistency_pct": 70,
+                    "copy_backtest_max_drawdown_pct": 0.1,
+                },
+            ),
+        )
+        conn.commit()
+
+        graph = mine_copy_graph_for_leaders(conn, policy, [leader], now=1_000)
+        backtest = backtest_copy_stream_for_leaders(conn, policy, [leader], now=1_000)
+        row = conn.execute("SELECT * FROM wallet_features WHERE address = ?", (leader,)).fetchone()
+        extra = json.loads(row["extra_json"])
+
+        assert graph.qualified_pairs == 0
+        assert backtest.leader_performance_written == 0
+        assert row["leader_in_degree"] is None
+        assert row["copy_event_count"] is None
+        assert row["copy_stream_roi"] is None
+        assert row["edge_retention_pct"] is None
+        assert extra == {"keep_me": "research"}
+    finally:
+        conn.close()
 
 
 def test_mine_copy_graph_promotes_qualified_leader(tmp_path):

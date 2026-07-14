@@ -821,6 +821,15 @@ def _clear_leader_features(conn: sqlite3.Connection, leaders: list[str] | None =
                 copy_event_count = NULL,
                 copy_market_count = NULL,
                 containment_pct_median = NULL,
+                extra_json = json_remove(
+                    CASE
+                        WHEN json_valid(COALESCE(extra_json, '{{}}')) THEN extra_json
+                        ELSE '{{}}'
+                    END,
+                    '$.copy_graph_last_copy_event_at',
+                    '$.copy_graph_median_lag_seconds',
+                    '$.copy_graph_qualified_follower_count'
+                ),
                 updated_at = ?
             WHERE address IN ({_placeholders(leaders)})
             """,
@@ -834,11 +843,27 @@ def _clear_leader_features(conn: sqlite3.Connection, leaders: list[str] | None =
             copy_event_count = NULL,
             copy_market_count = NULL,
             containment_pct_median = NULL,
+            extra_json = json_remove(
+                CASE
+                    WHEN json_valid(COALESCE(extra_json, '{}')) THEN extra_json
+                    ELSE '{}'
+                END,
+                '$.copy_graph_last_copy_event_at',
+                '$.copy_graph_median_lag_seconds',
+                '$.copy_graph_qualified_follower_count'
+            ),
             updated_at = ?
         WHERE leader_in_degree IS NOT NULL
            OR copy_event_count IS NOT NULL
            OR copy_market_count IS NOT NULL
            OR containment_pct_median IS NOT NULL
+           OR json_type(
+                CASE
+                    WHEN json_valid(COALESCE(extra_json, '{}')) THEN extra_json
+                    ELSE '{}'
+                END,
+                '$.copy_graph_qualified_follower_count'
+              ) IS NOT NULL
         """,
         (ts,),
     )

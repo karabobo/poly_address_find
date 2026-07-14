@@ -119,7 +119,7 @@ _CANDIDATE_STAGE_LABELS = {
     CandidateStage.NEEDS_DATA.value: "未达评估条件",
     CandidateStage.NEEDS_REVIEW.value: "自动复核中",
     CandidateStage.PAPER_CANDIDATE.value: "Paper 候选",
-    CandidateStage.PAPER_APPROVED.value: "Paper 已批准",
+    CandidateStage.PAPER_APPROVED.value: "研究通过，待 Paper 验证",
     CandidateStage.LIVE_ELIGIBLE.value: "可交接生产",
     CandidateStage.REJECTED.value: "已拒绝",
     CandidateStage.BLOCKED_HYGIENE.value: "Hygiene 阻断",

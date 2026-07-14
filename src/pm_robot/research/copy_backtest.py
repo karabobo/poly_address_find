@@ -449,6 +449,19 @@ def _clear_copy_stream_features(conn: sqlite3.Connection, leaders: list[str] | N
                 edge_retention_pct = NULL,
                 walk_forward_consistency_pct = NULL,
                 survival_score = NULL,
+                extra_json = json_remove(
+                    CASE
+                        WHEN json_valid(COALESCE(extra_json, '{{}}')) THEN extra_json
+                        ELSE '{{}}'
+                    END,
+                    '$.copy_backtest_trade_count',
+                    '$.copy_backtest_net_pnl_usdc',
+                    '$.copy_backtest_win_rate',
+                    '$.copy_backtest_median_lag_seconds',
+                    '$.copy_backtest_edge_retention_pct',
+                    '$.copy_backtest_walk_forward_consistency_pct',
+                    '$.copy_backtest_max_drawdown_pct'
+                ),
                 updated_at = ?
             WHERE address IN ({_placeholders(leaders)})
             """,
@@ -462,10 +475,30 @@ def _clear_copy_stream_features(conn: sqlite3.Connection, leaders: list[str] | N
             edge_retention_pct = NULL,
             walk_forward_consistency_pct = NULL,
             survival_score = NULL,
+            extra_json = json_remove(
+                CASE
+                    WHEN json_valid(COALESCE(extra_json, '{}')) THEN extra_json
+                    ELSE '{}'
+                END,
+                '$.copy_backtest_trade_count',
+                '$.copy_backtest_net_pnl_usdc',
+                '$.copy_backtest_win_rate',
+                '$.copy_backtest_median_lag_seconds',
+                '$.copy_backtest_edge_retention_pct',
+                '$.copy_backtest_walk_forward_consistency_pct',
+                '$.copy_backtest_max_drawdown_pct'
+            ),
             updated_at = ?
         WHERE copy_stream_roi IS NOT NULL
            OR edge_retention_pct IS NOT NULL
            OR walk_forward_consistency_pct IS NOT NULL
+           OR json_type(
+                CASE
+                    WHEN json_valid(COALESCE(extra_json, '{}')) THEN extra_json
+                    ELSE '{}'
+                END,
+                '$.copy_backtest_trade_count'
+              ) IS NOT NULL
         """,
         (ts,),
     )

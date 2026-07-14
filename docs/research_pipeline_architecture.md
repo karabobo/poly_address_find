@@ -115,7 +115,8 @@ claims full L3 coverage, and does not grant live execution or publication permis
 - `needs_data`: evidence or scoring inputs are incomplete.
 - `needs_manual_review`: conservative holding stage; automated evidence work may continue.
 - `paper_candidate`: research gates passed for paper-stage observation.
-- `paper_approved`: paper evidence passed the configured policy.
+- `paper_approved`: research score and historical copyability validation passed; the wallet is admitted to
+  paper observation, but paper performance has not passed yet.
 - `live_eligible`: publishable research label for a separate execution system.
 - `blocked_hygiene`, `blocked_copyability`, `rejected`: explicit blocking outcomes.
 
