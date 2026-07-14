@@ -4275,7 +4275,7 @@ def _select_prune_wallet_rows(
     max_activity_rows: int,
     allow_first_over_budget: bool = True,
 ) -> tuple[list[str], int, bool]:
-    """Apply an exact row budget without starving one oversized oldest wallet."""
+    """Fill the row budget without starving one oversized oldest wallet."""
 
     wallets: list[str] = []
     selected_activity_rows = 0
@@ -4285,6 +4285,7 @@ def _select_prune_wallet_rows(
         conn,
         [str(row["address"]) for row in rows[:bounded_limit]],
     )
+    budget_exhausted = False
     for row in rows:
         if len(wallets) >= bounded_limit:
             break
@@ -4295,10 +4296,11 @@ def _select_prune_wallet_rows(
             and selected_activity_rows + estimate > activity_budget
         )
         if exceeds_budget and (wallets or not allow_first_over_budget):
-            return wallets, selected_activity_rows, True
+            budget_exhausted = True
+            continue
         wallets.append(address)
         selected_activity_rows += estimate
-    return wallets, selected_activity_rows, False
+    return wallets, selected_activity_rows, budget_exhausted
 
 
 def _wallet_activity_count(conn: sqlite3.Connection, wallets: list[str]) -> int:

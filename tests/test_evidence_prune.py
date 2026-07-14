@@ -1186,6 +1186,76 @@ def test_prune_selection_is_bounded_by_activity_rows(tmp_path):
     assert result["activity_budget_exceeded"] is False
 
 
+def test_prune_selection_fills_budget_after_skipping_large_wallet(tmp_path):
+    db_path = tmp_path / "robot.sqlite"
+    wallets = ["0x" + digit * 40 for digit in ("4", "5", "6")]
+    conn = connect(db_path)
+    try:
+        run_migrations(conn)
+        for wallet in wallets:
+            _seed_candidate(conn, wallet, materialized=True)
+            conn.execute(
+                "UPDATE candidate_wallets SET candidate_stage = 'blocked_hygiene' WHERE address = ?",
+                (wallet,),
+            )
+        conn.execute(
+            """
+            DELETE FROM wallet_activity
+            WHERE address = ?
+              AND activity_id NOT IN (
+                  SELECT activity_id
+                  FROM wallet_activity
+                  WHERE address = ?
+                  ORDER BY activity_id
+                  LIMIT 4
+              )
+            """,
+            (wallets[0], wallets[0]),
+        )
+        conn.execute(
+            """
+            DELETE FROM wallet_activity
+            WHERE address = ?
+              AND activity_id NOT IN (
+                  SELECT activity_id
+                  FROM wallet_activity
+                  WHERE address = ?
+                  ORDER BY activity_id
+                  LIMIT 4
+              )
+            """,
+            (wallets[1], wallets[1]),
+        )
+        conn.execute(
+            """
+            DELETE FROM wallet_activity
+            WHERE address = ?
+              AND activity_id NOT IN (
+                  SELECT activity_id
+                  FROM wallet_activity
+                  WHERE address = ?
+                  ORDER BY activity_id
+                  LIMIT 1
+              )
+            """,
+            (wallets[2], wallets[2]),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    result = prune_low_value_evidence(
+        _settings(db_path),
+        limit=10,
+        max_activity_rows=5,
+        dry_run=True,
+    )
+
+    assert result["wallets"] == [wallets[0], wallets[2]]
+    assert result["selected_activity_rows"] == 5
+    assert result["activity_budget_exceeded"] is False
+
+
 def test_prune_activity_budget_does_not_starve_one_oversized_wallet(tmp_path):
     db_path = tmp_path / "robot.sqlite"
     wallet = "0x" + "8" * 40
