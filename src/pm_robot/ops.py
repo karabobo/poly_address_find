@@ -1191,7 +1191,7 @@ def compact_low_value_evidence(
     if not source_path.exists():
         raise FileNotFoundError(source_path)
     with database_access_guard(_retention_cycle_lock_key(source_path), exclusive=True):
-        with database_access_guard(source_path, exclusive=True):
+        with database_access_guard(source_path, exclusive=not dry_run):
             return _compact_low_value_evidence_locked(
                 settings,
                 dry_run=dry_run,
@@ -1205,7 +1205,7 @@ def _compact_low_value_evidence_locked(
     dry_run: bool,
     progress: Callable[[str], None] | None,
 ) -> dict[str, Any]:
-    """Run compact rebuild while the process owns exclusive database access."""
+    """Plan or rebuild while the caller owns the required database access guard."""
 
     source_path = settings.db_path.resolve()
     partial_path = source_path.with_name(f".{source_path.name}.compact.partial")

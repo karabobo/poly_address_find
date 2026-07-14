@@ -2116,6 +2116,10 @@ def test_nas_helper_has_guarded_no_backup_sqlite_compaction_window():
     assert "state != \"caught_up\"" in helper
     assert "pipeline_active_job_counts" in helper
     assert "status IN ('queued', 'running')" in helper
+    assert (
+        "execution_compose ps --services --filter status=running $EXECUTION_SERVICES"
+        in window.replace("\\\n", " ")
+    )
     assert "execution services are running" in window
     assert "watchdog_disable \"offline SQLite evidence compaction\"" in window
     assert "trap compact_window_cleanup EXIT" in window

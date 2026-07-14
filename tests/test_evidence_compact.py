@@ -1,3 +1,4 @@
+import contextlib
 import sqlite3
 
 import pytest
@@ -44,6 +45,36 @@ def _activity(idx: int) -> dict:
         "usdcSize": 5,
         "transactionHash": f"0x{idx:064x}",
     }
+
+
+def test_compact_evidence_dry_run_uses_shared_database_guard(tmp_path, monkeypatch):
+    db_path = tmp_path / "robot.sqlite"
+    conn = connect(db_path)
+    try:
+        run_migrations(conn)
+    finally:
+        conn.close()
+
+    access_modes = []
+    real_guard = ops.database_access_guard
+
+    @contextlib.contextmanager
+    def tracking_guard(db_path, *, exclusive, timeout_seconds=120.0):
+        access_modes.append(bool(exclusive))
+        with real_guard(
+            db_path,
+            exclusive=exclusive,
+            timeout_seconds=timeout_seconds,
+        ):
+            yield
+
+    monkeypatch.setattr(ops, "database_access_guard", tracking_guard)
+
+    result = compact_low_value_evidence(_settings(db_path), dry_run=True)
+
+    assert result["ok"] is True
+    assert result["dry_run"] is True
+    assert access_modes == [True, False]
 
 
 def _seed_wallet(conn, wallet: str, *, stage: CandidateStage) -> None:

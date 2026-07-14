@@ -971,7 +971,10 @@ compact_evidence_window() {
     echo "Compaction guard: ${total_active} active pipeline job(s) remain (${evidence_active} evidence, ${copyability_active} copyability)." >&2
     return 1
   fi
-  execution_running="$(execution_compose ps --services --filter status=running 2>/dev/null || true)"
+  execution_running="$(
+    execution_compose ps --services --filter status=running $EXECUTION_SERVICES \
+      2>/dev/null || true
+  )"
   if [[ -n "$execution_running" ]]; then
     echo "Compaction guard: execution services are running; stop them before rebuilding SQLite." >&2
     return 1
