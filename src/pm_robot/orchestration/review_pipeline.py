@@ -11,9 +11,11 @@ from typing import Any
 from pm_robot.config import load_policy, threshold
 from pm_robot.io import load_candidate_addresses, load_wallet_features, write_rows
 from pm_robot.models import CandidateAddress, CandidateStage, ScoreBreakdown
+from pm_robot.orchestration.copyability_truth import reconcile_copyability_truth
 from pm_robot.orchestration.evidence_readiness import paper_evidence_ready, paper_evidence_ready_sql
 from pm_robot.pipeline_terms import (
     PENDING_EVIDENCE_JOB_STAGES,
+    PENDING_EVIDENCE_STATUSES,
     TERMINAL_EVIDENCE_JOB_STAGES,
     EvidenceStatus,
 )
@@ -93,7 +95,17 @@ def score_database(
 ) -> dict[str, int]:
     policy = load_policy(policy_path)
     policy_version = str(policy.get("version", ""))
-    candidates = _list_score_candidates(conn, incremental=incremental, limit=limit, policy_version=policy_version)
+    truth_reconcile = _write_with_retry(
+        conn,
+        lambda: reconcile_copyability_truth(conn),
+        begin_immediate=True,
+    )
+    candidates = _list_score_candidates(
+        conn,
+        incremental=incremental,
+        limit=limit,
+        policy_version=policy_version,
+    )
     features_by_address = get_wallet_features(conn)
     scores = []
     for candidate in candidates:
@@ -145,6 +157,8 @@ def score_database(
     counts = _candidate_stage_counts(conn)
     counts["score_candidates_considered"] = len(candidates)
     counts["scores_written"] = written_scores
+    if truth_reconcile.orphan_leaders:
+        counts["copyability_truth_reconciled"] = truth_reconcile.orphan_leaders
     if skipped_incomplete_overwrites:
         counts["incomplete_rescore_skipped"] = skipped_incomplete_overwrites
     if skipped_unchanged_scores:
@@ -181,13 +195,6 @@ def apply_paper_evidence_guard(conn: sqlite3.Connection, score: ScoreBreakdown) 
     )
 
 
-PENDING_EVIDENCE_STATUSES = {
-    EvidenceStatus.PENDING.value,
-    EvidenceStatus.NEEDS_LIGHT.value,
-    EvidenceStatus.NEEDS_MEDIUM.value,
-    EvidenceStatus.NEEDS_DEEP.value,
-    EvidenceStatus.QUEUED.value,
-}
 BORDERLINE_LIFECYCLE_REPAIR_PENDING_STATUSES = tuple(sorted(PENDING_EVIDENCE_STATUSES))
 
 
@@ -393,10 +400,18 @@ def repair_paper_stage_evidence_incomplete(
     return repaired
 
 
-def _write_with_retry(conn: sqlite3.Connection, operation):
+def _write_with_retry(
+    conn: sqlite3.Connection,
+    operation,
+    *,
+    begin_immediate: bool = False,
+):
     """Run a short scoring write section and commit it independently."""
 
     def _operation():
+        if begin_immediate:
+            conn.commit()
+            conn.execute("BEGIN IMMEDIATE")
         result = operation()
         conn.commit()
         return result
@@ -432,11 +447,24 @@ def _list_score_candidates(
           ON wr.address = cw.address
         LEFT JOIN leader_latest_scores latest
           ON latest.address = cw.address
-        WHERE cw.candidate_stage NOT IN ('rejected', 'blocked_hygiene', 'blocked_copyability')
+        WHERE (
+              cw.candidate_stage NOT IN ('rejected', 'blocked_hygiene', 'blocked_copyability')
+              OR (
+                  cw.candidate_stage IN ('rejected', 'blocked_hygiene', 'blocked_copyability')
+                  AND COALESCE(wps.next_action, '') = 'score_wallet'
+              )
+          )
           AND COALESCE(wr.raw_retention_tier, '') != 'summary_only'
           AND (
               latest.address IS NULL
               OR latest.policy_version != ?
+              OR (
+                  COALESCE(wps.next_action, '') = 'score_wallet'
+                  AND COALESCE(
+                      json_extract(wf.extra_json, '$.copy_stream_roi_source'),
+                      ''
+                  ) = 'copyability_truth_no_qualified_pair'
+              )
               OR COALESCE(wf.updated_at, 0) > latest.scored_at
               OR COALESCE(wps.updated_at, 0) > latest.scored_at
               OR COALESCE(cw.updated_at, 0) > latest.scored_at

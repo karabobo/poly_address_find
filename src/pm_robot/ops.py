@@ -512,6 +512,12 @@ def _production_readiness(conn: sqlite3.Connection, tables: set[str]) -> dict[st
             SELECT COUNT(*) FROM copy_leader_performance
             WHERE edge_retention_pct >= 60
               AND walk_forward_consistency_pct >= 55
+              AND EXISTS (
+                  SELECT 1
+                  FROM copy_pair_stats pair
+                  WHERE pair.leader_wallet = copy_leader_performance.leader_wallet
+                    AND pair.qualifies = 1
+              )
             """,
         ),
         "formal_paper_wallets": _scalar(

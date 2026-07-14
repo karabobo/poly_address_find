@@ -88,6 +88,16 @@ def test_pipeline_smoothness_reports_eligibility_blockers_and_backlog(tmp_path):
         _score(conn, paper_ready, score=60, stage=CandidateStage.PAPER_CANDIDATE, reason="paper_candidate")
         persist_wallet_activity(conn, paper_ready, _trade_events(paper_ready, 100), ingested_at=20_000)
         _insert_l3_evidence(conn, paper_ready)
+        conn.execute(
+            """
+            INSERT INTO copy_pair_stats(
+                leader_wallet, follower_wallet, copy_event_count, copy_market_count,
+                follower_trade_count, containment_pct, leader_precedes_pct,
+                median_lag_seconds, first_copy_ts, last_copy_ts, qualifies, updated_at
+            ) VALUES (?, ?, 2, 2, 120, 0.2, 1.0, 2, 1000, 2000, 1, 20000)
+            """,
+            (paper_ready, copy_blocked),
+        )
         conn.commit()
 
         prepare_eligibility_repairs(conn, limit=10, now=50_000)

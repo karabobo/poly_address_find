@@ -68,7 +68,7 @@ def mine_copy_graph(conn: sqlite3.Connection, policy: dict[str, Any]) -> CopyGra
         )
 
     conn.execute("DELETE FROM copy_leader_stats")
-    _clear_leader_features(conn)
+    clear_copy_graph_features(conn)
     leader_stats = _build_leader_stats(conn, now)
     if leader_stats:
         conn.executemany(
@@ -175,7 +175,7 @@ def mine_copy_graph_for_leaders(
 
     leader_stats = _build_leader_stats_for_leaders(conn, leader_wallets, ts)
     _delete_for_leaders(conn, "copy_leader_stats", "leader_wallet", leader_wallets)
-    _clear_leader_features(conn, leader_wallets)
+    clear_copy_graph_features(conn, leader_wallets)
     if leader_stats:
         conn.executemany(
             """
@@ -811,8 +811,15 @@ def _merge_leader_features(conn: sqlite3.Connection, leaders: list[str] | None =
         upsert_wallet_feature(conn, merged)
 
 
-def _clear_leader_features(conn: sqlite3.Connection, leaders: list[str] | None = None) -> None:
-    ts = int(time.time())
+def clear_copy_graph_features(
+    conn: sqlite3.Connection,
+    leaders: list[str] | None = None,
+    *,
+    now: int | None = None,
+) -> None:
+    """Clear graph-owned feature fields without touching candidate diagnostics."""
+
+    ts = now or int(time.time())
     if leaders:
         conn.execute(
             f"""

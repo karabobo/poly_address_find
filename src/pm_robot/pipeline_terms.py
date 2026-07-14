@@ -58,6 +58,13 @@ PENDING_EVIDENCE_JOB_STAGES = (
     EvidenceJobStage.MEDIUM_PENDING.value,
     EvidenceJobStage.DEEP_PENDING.value,
 )
+PENDING_EVIDENCE_STATUSES = (
+    EvidenceStatus.PENDING.value,
+    EvidenceStatus.NEEDS_LIGHT.value,
+    EvidenceStatus.NEEDS_MEDIUM.value,
+    EvidenceStatus.NEEDS_DEEP.value,
+    EvidenceStatus.QUEUED.value,
+)
 TERMINAL_EVIDENCE_JOB_STAGES = (
     EvidenceJobStage.LIGHT_DONE.value,
     EvidenceJobStage.MEDIUM_DONE.value,

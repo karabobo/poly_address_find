@@ -153,7 +153,8 @@ def test_pipeline_cycle_routes_repairs_through_canonical_planners(tmp_path):
         assert steps["eligibility_repair_prepare"]["data"]["wallet_repairs_prepared"] == 1
         assert steps["eligibility_repair_prepare"]["data"]["copyability_repairs_ready"] == 1
         assert step_names.index("eligibility_repair_prepare") < step_names.index("wallet_pipeline_state_materialize")
-        assert step_names.index("wallet_pipeline_state_materialize") < step_names.index("materialize_features")
+        assert step_names.index("wallet_pipeline_state_materialize") < step_names.index("copyability_truth_reconcile")
+        assert step_names.index("copyability_truth_reconcile") < step_names.index("materialize_features")
         assert step_names.index("materialize_features") < step_names.index("incremental_score")
         assert step_names.index("incremental_score") < step_names.index("active_candidate_registry_refresh")
         assert step_names.index("active_candidate_registry_refresh") < step_names.index("evidence_promotion")
@@ -255,6 +256,7 @@ def test_pipeline_cycle_scoring_only_skips_repairs_and_queue_planning(tmp_path, 
         assert report["mode"] == "scoring_only"
         assert calls == ["materialize_features", "incremental_score"]
         assert executed == [
+            "copyability_truth_reconcile",
             "materialize_features",
             "incremental_score",
             "active_candidate_registry_refresh",
@@ -509,6 +511,7 @@ def test_pipeline_cycle_isolates_failed_phase_and_continues_committed_work(tmp_p
         assert [step["name"] for step in reported_steps] == [
             "eligibility_repair_prepare",
             "wallet_pipeline_state_materialize",
+            "copyability_truth_reconcile",
             "materialize_features",
             "incremental_score",
             "active_candidate_registry_refresh",

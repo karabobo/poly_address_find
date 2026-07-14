@@ -12,6 +12,7 @@ from typing import Any
 
 from pm_robot.config import load_policy
 from pm_robot.models import CandidateAddress, CandidateStage
+from pm_robot.orchestration.copyability_truth import reconcile_copyability_truth
 from pm_robot.orchestration.evidence_readiness import paper_evidence_ready_sql
 from pm_robot.orchestration.feature_materializer import materialize_wallet_feature
 from pm_robot.orchestration.review_pipeline import apply_score_lifecycle_guards
@@ -74,6 +75,7 @@ class CopyabilityPlanSummary:
     available_slots: int = 0
     throttled: bool = False
     reason: str = ""
+    truth_reconciled_leaders: int = 0
 
 
 @dataclass(frozen=True)
@@ -169,6 +171,7 @@ def _plan_copyability_evidence_jobs_once(
     """Reserve copyability queue capacity and enqueue work under one write lock."""
 
     ts = now
+    truth_reconcile = reconcile_copyability_truth(conn, now=ts)
     active_jobs = _active_copyability_job_count(conn)
     batch_limit = max(0, int(limit))
     waterline_slots = (
@@ -189,6 +192,7 @@ def _plan_copyability_evidence_jobs_once(
             available_slots=0,
             throttled=True,
             reason="active_queue_waterline",
+            truth_reconciled_leaders=truth_reconcile.orphan_leaders,
         )
     targets = _revalidate_copyability_targets(
         conn,
@@ -242,6 +246,7 @@ def _plan_copyability_evidence_jobs_once(
         max_active_jobs=max(0, int(max_active_jobs)),
         available_slots=available_slots,
         throttled=False,
+        truth_reconciled_leaders=truth_reconcile.orphan_leaders,
     )
 
 

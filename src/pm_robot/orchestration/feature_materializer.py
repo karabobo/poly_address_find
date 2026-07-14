@@ -616,7 +616,17 @@ def _episode_stats(conn: sqlite3.Connection, wallet: str) -> dict[str, Any]:
 
 def _copy_stats(conn: sqlite3.Connection, wallet: str) -> dict[str, Any]:
     perf = conn.execute(
-        "SELECT * FROM copy_leader_performance WHERE leader_wallet = ?",
+        """
+        SELECT performance.*
+        FROM copy_leader_performance performance
+        WHERE performance.leader_wallet = ?
+          AND EXISTS (
+              SELECT 1
+              FROM copy_pair_stats pair
+              WHERE pair.leader_wallet = performance.leader_wallet
+                AND pair.qualifies = 1
+          )
+        """,
         (wallet,),
     ).fetchone()
     if perf:

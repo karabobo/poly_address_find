@@ -42,7 +42,7 @@ def backtest_copy_stream(conn: sqlite3.Connection, policy: dict[str, Any]) -> Co
 
     conn.execute("DELETE FROM copy_backtest_trades")
     conn.execute("DELETE FROM copy_leader_performance")
-    _clear_copy_stream_features(conn)
+    clear_copy_backtest_features(conn)
     trades = _build_backtest_trades(conn, stake_usdc=stake_usdc, friction_bps=friction_bps, now=now)
     if trades:
         conn.executemany(
@@ -175,7 +175,7 @@ def backtest_copy_stream_for_leaders(
         f"DELETE FROM copy_leader_performance WHERE leader_wallet IN ({placeholders})",
         tuple(rebuild_leaders),
     )
-    _clear_copy_stream_features(conn, rebuild_leaders)
+    clear_copy_backtest_features(conn, rebuild_leaders)
     if performance:
         conn.executemany(
             """
@@ -439,8 +439,15 @@ def _merge_copy_stream_features(conn: sqlite3.Connection, leaders: list[str] | N
         upsert_wallet_feature(conn, merged)
 
 
-def _clear_copy_stream_features(conn: sqlite3.Connection, leaders: list[str] | None = None) -> None:
-    ts = int(time.time())
+def clear_copy_backtest_features(
+    conn: sqlite3.Connection,
+    leaders: list[str] | None = None,
+    *,
+    now: int | None = None,
+) -> None:
+    """Clear backtest-owned feature fields for leaders whose validation changed."""
+
+    ts = now or int(time.time())
     if leaders:
         conn.execute(
             f"""

@@ -17,6 +17,7 @@ from typing import Any, Callable
 from pm_robot.config import load_policy
 from pm_robot.ops import refresh_active_candidate_registry
 from pm_robot.orchestration.copyability_evidence import plan_copyability_evidence_jobs
+from pm_robot.orchestration.copyability_truth import reconcile_copyability_truth
 from pm_robot.orchestration.eligibility_repair import prepare_eligibility_repairs
 from pm_robot.orchestration.evidence_promotion import promote_wallet_evidence
 from pm_robot.orchestration.feature_materializer import materialize_wallet_features
@@ -168,6 +169,15 @@ def run_pipeline_cycle(
                 continue_on_error=options.continue_on_error,
                 step_reporter=step_reporter,
             )
+
+    _run_isolated_step(
+        conn,
+        steps,
+        "copyability_truth_reconcile",
+        lambda: reconcile_copyability_truth(conn),
+        continue_on_error=options.continue_on_error,
+        step_reporter=step_reporter,
+    )
 
     _run_isolated_step(
         conn,
@@ -352,6 +362,11 @@ def run_pipeline_cycle(
 
 def _dry_run_steps(options: PipelineCycleOptions) -> list[dict[str, Any]]:
     scoring_steps = [
+        _step(
+            "copyability_truth_reconcile",
+            "would_execute",
+            {},
+        ),
         _step(
             "materialize_features",
             "would_execute",

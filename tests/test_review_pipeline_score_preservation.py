@@ -15,7 +15,7 @@ from pm_robot.storage.repository import (
     persist_score,
     sync_wallet_processing_state,
     upsert_candidate,
-    upsert_wallet_feature,
+    upsert_wallet_feature as _upsert_wallet_feature,
 )
 
 
@@ -52,6 +52,40 @@ def _strong_features(address: str) -> WalletFeatures:
         hygiene_status="clean",
         primary_category="politics",
         extra={"paper_roi_after_slippage": 0.08},
+    )
+
+
+def upsert_wallet_feature(conn: sqlite3.Connection, feature: WalletFeatures) -> None:
+    """Seed the qualified pair implied by positive copy scoring fields."""
+
+    _upsert_wallet_feature(conn, feature)
+    if not (
+        float(feature.leader_in_degree or 0) > 0
+        and float(feature.copy_event_count or 0) > 0
+        and float(feature.copy_market_count or 0) > 0
+    ):
+        return
+    conn.execute(
+        """
+        INSERT INTO copy_pair_stats(
+            leader_wallet, follower_wallet, copy_event_count, copy_market_count,
+            follower_trade_count, containment_pct, leader_precedes_pct,
+            median_lag_seconds, first_copy_ts, last_copy_ts, qualifies, updated_at
+        ) VALUES (?, ?, ?, ?, ?, 0.4, 1.0, 2, 100, 200, 1, 300)
+        ON CONFLICT(leader_wallet, follower_wallet) DO UPDATE SET
+            copy_event_count = excluded.copy_event_count,
+            copy_market_count = excluded.copy_market_count,
+            follower_trade_count = excluded.follower_trade_count,
+            qualifies = 1,
+            updated_at = excluded.updated_at
+        """,
+        (
+            feature.address,
+            feature.address,
+            int(feature.copy_event_count or 0),
+            int(feature.copy_market_count or 0),
+            int(feature.copy_event_count or 0),
+        ),
     )
 
 
@@ -986,6 +1020,97 @@ def test_score_database_preserves_non_restorable_stage_on_incomplete_rescore(tmp
         assert latest is not None
         assert latest["review_stage"] != CandidateStage.NEEDS_DATA.value
         assert stage == CandidateStage.BLOCKED_HYGIENE.value
+    finally:
+        conn.close()
+
+
+def test_incremental_score_processes_explicit_action_for_blocked_wallet(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    address = "0x" + "b" * 40
+    try:
+        run_migrations(conn)
+        upsert_candidate(conn, CandidateAddress(address=address, sources="test"))
+        upsert_wallet_feature(conn, _strong_features(address))
+        _insert_l3_state(conn, address)
+        conn.execute(
+            "UPDATE candidate_wallets SET candidate_stage = 'blocked_copyability' WHERE address = ?",
+            (address,),
+        )
+        conn.commit()
+
+        counts = score_database(conn, policy_path=POLICY_PATH, incremental=True, limit=10)
+        latest = _latest_score(conn, address)
+        stage = conn.execute(
+            "SELECT candidate_stage FROM candidate_wallets WHERE address = ?",
+            (address,),
+        ).fetchone()["candidate_stage"]
+
+        assert counts["score_candidates_considered"] == 1
+        assert counts["scores_written"] == 1
+        assert latest is not None
+        assert stage == CandidateStage.BLOCKED_COPYABILITY.value
+    finally:
+        conn.close()
+
+
+def test_score_database_removes_orphan_copy_credit_before_scoring(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    address = "0x" + "c" * 40
+    follower = "0x" + "d" * 40
+    try:
+        run_migrations(conn)
+        upsert_candidate(conn, CandidateAddress(address=address, sources="test"))
+        upsert_candidate(conn, CandidateAddress(address=follower, sources="test"))
+        _upsert_wallet_feature(conn, _strong_features(address))
+        _insert_l3_state(conn, address)
+        conn.execute(
+            "UPDATE wallet_processing_state SET next_action = '' WHERE wallet = ?",
+            (address,),
+        )
+        conn.execute(
+            """
+            INSERT INTO copy_pair_stats(
+                leader_wallet, follower_wallet, copy_event_count, copy_market_count,
+                follower_trade_count, containment_pct, leader_precedes_pct,
+                median_lag_seconds, first_copy_ts, last_copy_ts, qualifies, updated_at
+            ) VALUES (?, ?, 12, 8, 40, 0.1, 1.0, 2, 100, 200, 0, 300)
+            """,
+            (address, follower),
+        )
+        persist_score(
+            conn,
+            ScoreBreakdown(
+                address=address,
+                leader_score=85.0,
+                stage=CandidateStage.PAPER_APPROVED,
+                reason="stale_copy_credit",
+                components={"execution_copyability": 10.0},
+                penalties={},
+            ),
+            policy_version=_policy_version(),
+        )
+        conn.commit()
+
+        counts = score_database(conn, policy_path=POLICY_PATH, incremental=True, limit=10)
+        latest = _latest_score(conn, address)
+        feature = conn.execute(
+            "SELECT * FROM wallet_features WHERE address = ?",
+            (address,),
+        ).fetchone()
+        components = json.loads(latest["components_json"])
+
+        assert counts["copyability_truth_reconciled"] == 1
+        assert counts["score_candidates_considered"] == 1
+        assert latest["review_stage"] not in {
+            CandidateStage.PAPER_CANDIDATE.value,
+            CandidateStage.PAPER_APPROVED.value,
+            CandidateStage.LIVE_ELIGIBLE.value,
+        }
+        assert components["execution_copyability"] == 0
+        assert components["copy_stream_roi"] == 0
+        assert feature["leader_in_degree"] == 0
+        assert feature["copy_event_count"] == 0
+        assert feature["copy_market_count"] == 0
     finally:
         conn.close()
 

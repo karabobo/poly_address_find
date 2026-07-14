@@ -147,6 +147,40 @@ def test_materialize_wallet_features_keeps_unvalidated_copy_signal_out_of_scorin
         conn.close()
 
 
+def test_materialize_wallet_features_ignores_orphan_copy_performance(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    wallet = "0x" + "8" * 40
+    try:
+        run_migrations(conn)
+        _seed_wallet(conn, wallet, qualifies=0)
+        conn.execute(
+            """
+            INSERT INTO copy_leader_performance(
+                leader_wallet, backtest_trade_count, copied_market_count,
+                total_stake_usdc, gross_pnl_usdc, net_pnl_usdc,
+                gross_roi, net_roi, win_rate, median_lag_seconds,
+                last_backtest_trade_at, updated_at, edge_retention_pct,
+                walk_forward_consistency_pct, max_drawdown_pct
+            ) VALUES (?, 20, 10, 200, 50, 40, 0.25, 0.2, 0.75, 2,
+                      2000, 20000, 80, 70, 0.1)
+            """,
+            (wallet,),
+        )
+        conn.commit()
+
+        materialize_wallet_features(conn, limit=1, min_activity_events=25, now=30_000)
+        feature = get_wallet_features(conn)[wallet]
+
+        assert feature.leader_in_degree == 0.0
+        assert feature.copy_event_count == 0.0
+        assert feature.copy_stream_roi == 0.0
+        assert feature.extra["copy_stream_roi_source"] == (
+            "copy_candidate_pair_stats_unvalidated_default_zero"
+        )
+    finally:
+        conn.close()
+
+
 def test_materialize_wallet_features_prioritizes_score_ready_pipeline_state(tmp_path):
     conn = connect(tmp_path / "robot.sqlite")
     score_ready = "0x" + "3" * 40
