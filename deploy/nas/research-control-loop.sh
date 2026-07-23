@@ -1,266 +1,132 @@
 #!/usr/bin/env sh
 set -eu
 
-INTERVAL="${PM_ROBOT_RESEARCH_CONTROL_INTERVAL:-${PM_ROBOT_SCORE_LOOP_INTERVAL:-300}}"
-ACTIVE_INTERVAL="${PM_ROBOT_RESEARCH_CONTROL_ACTIVE_INTERVAL:-60}"
-CATCHUP_BURST_LIMIT="${PM_ROBOT_RESEARCH_CONTROL_CATCHUP_BURST_LIMIT:-4}"
+# This loop owns only local control-plane decisions. Network history reads are
+# executed by sharded wallet-history workers.
+INTERVAL="${PM_ROBOT_RESEARCH_CONTROL_INTERVAL:-180}"
+ACTIVE_INTERVAL="${PM_ROBOT_RESEARCH_CONTROL_ACTIVE_INTERVAL:-30}"
 RUN_ONCE="${PM_ROBOT_RESEARCH_CONTROL_RUN_ONCE:-0}"
-LEGACY_MIN_SCORE="${PM_ROBOT_ELIGIBILITY_REPAIR_MIN_SCORE:-${PM_ROBOT_COPYABILITY_MIN_SCORE:-40}}"
-MIN_SCORE="${PM_ROBOT_RESEARCH_MIN_SCORE:-$LEGACY_MIN_SCORE}"
-STATE_LIMIT="${PM_ROBOT_PIPELINE_STATE_LIMIT:-25}"
-STATE_COMMIT_EVERY="${PM_ROBOT_PIPELINE_STATE_COMMIT_EVERY:-5}"
-REPAIR_LIMIT="${PM_ROBOT_ELIGIBILITY_REPAIR_LIMIT:-100}"
-SHARD_COUNT="${PM_ROBOT_PIPELINE_SHARD_COUNT:-3}"
-WALLET_LIGHT_LIMIT="${PM_ROBOT_PIPELINE_PLANNER_LIGHT_LIMIT:-30}"
-WALLET_MEDIUM_LIMIT="${PM_ROBOT_PIPELINE_PLANNER_MEDIUM_LIMIT:-20}"
-WALLET_DEEP_LIMIT="${PM_ROBOT_PIPELINE_PLANNER_DEEP_LIMIT:-5}"
-WALLET_MAX_ACTIVE_JOBS="${PM_ROBOT_PIPELINE_PLANNER_MAX_ACTIVE_JOBS:-240}"
-SCORING_TOPUP_MAX_ACTIVE_JOBS="${PM_ROBOT_RESEARCH_SCORING_TOPUP_MAX_ACTIVE_JOBS:-60}"
-COPYABILITY_LIMIT="${PM_ROBOT_COPYABILITY_PLANNER_LIMIT:-50}"
-COPYABILITY_MAX_ACTIVE_JOBS="${PM_ROBOT_COPYABILITY_PLANNER_MAX_ACTIVE_JOBS:-50}"
-COPYABILITY_MIN_ACTIVITY_EVENTS="${PM_ROBOT_COPYABILITY_MIN_ACTIVITY_EVENTS:-25}"
-COPYABILITY_SHARD_COUNT="${PM_ROBOT_COPYABILITY_SHARD_COUNT:-1}"
-COPYABILITY_RESCAN_SECONDS="${PM_ROBOT_COPYABILITY_RESCAN_SECONDS:-21600}"
-FEATURE_LIMIT="${PM_ROBOT_SCORE_FEATURE_LIMIT:-80}"
-FEATURE_MIN_ACTIVITY_EVENTS="${PM_ROBOT_SCORE_MIN_ACTIVITY_EVENTS:-25}"
-FEATURE_COMMIT_EVERY="${PM_ROBOT_SCORE_FEATURE_COMMIT_EVERY:-10}"
-EVIDENCE_PROMOTION_LIMIT="${PM_ROBOT_EVIDENCE_PROMOTION_LIMIT:-80}"
-SCORE_LIMIT="${PM_ROBOT_SCORE_LIMIT:-300}"
-POLICY_PATH="${PM_ROBOT_POLICY_PATH:-/app/config/leader_scoring_policy.json}"
-PAPER_HANDOFF_LIMIT="${PM_ROBOT_PAPER_HANDOFF_LIMIT:-250}"
-BUSY_TIMEOUT_SECONDS="${PM_ROBOT_RESEARCH_BUSY_TIMEOUT_SECONDS:-15}"
-PLANNER_LOCK_ATTEMPTS="${PM_ROBOT_RESEARCH_PLANNER_LOCK_ATTEMPTS:-4}"
-PLANNER_LOCK_SLEEP_SECONDS="${PM_ROBOT_RESEARCH_PLANNER_LOCK_SLEEP_SECONDS:-1}"
-CONTROL_LOCK_TIMEOUT_SECONDS="${PM_ROBOT_RESEARCH_CONTROL_LOCK_TIMEOUT_SECONDS:-120}"
-
-if ! [ "$CATCHUP_BURST_LIMIT" -ge 1 ] 2>/dev/null; then
-  echo "PM_ROBOT_RESEARCH_CONTROL_CATCHUP_BURST_LIMIT must be a positive integer" >&2
-  exit 2
-fi
+SHARD_COUNT="${PM_ROBOT_WALLET_HISTORY_SHARD_COUNT:-3}"
+HISTORY_LIMIT="${PM_ROBOT_WALLET_HISTORY_PLANNER_LIMIT:-12}"
+HISTORY_MAX_ACTIVE_JOBS="${PM_ROBOT_WALLET_HISTORY_MAX_ACTIVE_JOBS:-36}"
+LIGHT_REFRESH_SECONDS="${PM_ROBOT_WALLET_HISTORY_LIGHT_REFRESH_SECONDS:-2592000}"
+DEEP_REFRESH_SECONDS="${PM_ROBOT_WALLET_HISTORY_DEEP_REFRESH_SECONDS:-604800}"
+MIN_COHORT_SIZE="${PM_ROBOT_WALLET_LEVEL_MIN_COHORT_SIZE:-20}"
+TIMEOUT_MIN_COHORT_SIZE="${PM_ROBOT_WALLET_LEVEL_TIMEOUT_MIN_COHORT_SIZE:-5}"
+MAX_WAIT_SECONDS="${PM_ROBOT_WALLET_LEVEL_MAX_WAIT_SECONDS:-3600}"
+L3_FRACTION="${PM_ROBOT_WALLET_LEVEL_L3_FRACTION:-0.25}"
+L4_FRACTION="${PM_ROBOT_WALLET_LEVEL_L4_FRACTION:-0.20}"
+L5_FRACTION="${PM_ROBOT_WALLET_LEVEL_L5_FRACTION:-0.10}"
+L3_MAX_PROMOTIONS="${PM_ROBOT_WALLET_LEVEL_L3_MAX_PROMOTIONS:-12}"
+L4_MAX_PROMOTIONS="${PM_ROBOT_WALLET_LEVEL_L4_MAX_PROMOTIONS:-6}"
+L5_MAX_PROMOTIONS="${PM_ROBOT_WALLET_LEVEL_L5_MAX_PROMOTIONS:-2}"
+L6_LIMIT="${PM_ROBOT_WALLET_L6_PLANNER_LIMIT:-5}"
+L6_MAX_ACTIVE_JOBS="${PM_ROBOT_WALLET_L6_MAX_ACTIVE_JOBS:-10}"
+L6_SHARD_COUNT="${PM_ROBOT_WALLET_L6_SHARD_COUNT:-1}"
+L6_REFRESH_SECONDS="${PM_ROBOT_WALLET_L6_REFRESH_SECONDS:-1209600}"
 
 runtime_heartbeat() {
-  name="$1"
-  status="${2:-ok}"
-  error="${3:-}"
+  status="$1"
+  error="${2:-}"
   python -m pm_robot.cli --env /app/.env runtime-heartbeat \
-    --name "$name" \
+    --name loop_wallet_history_planner \
+    --status "$status" \
+    --error "$error" >/dev/null 2>&1 || true
+  python -m pm_robot.cli --env /app/.env runtime-heartbeat \
+    --name loop_wallet_level_control \
     --status "$status" \
     --error "$error" >/dev/null 2>&1 || true
 }
 
-cycle_mode="full"
-catchup_cycles=0
-promotion_catchup_cycles=0
-
-while true; do
-  sleep_interval="$INTERVAL"
-  next_cycle_mode="full"
-  cycle_status="failed"
-  features_attempted=0
-  scores_considered=0
-  wallet_jobs_enqueued=0
-  promotion_targets_seen=0
-  control_output=""
-  control_exit=0
-  set --
-  if [ "$cycle_mode" = "scoring_only" ]; then
-    set -- \
-      --scoring-only \
-      --scoring-wallet-topup-max-active-jobs "$SCORING_TOPUP_MAX_ACTIVE_JOBS"
-  fi
-  echo "$(date -Iseconds) research control: ordered cycle start (mode=${cycle_mode})"
-  if control_output="$(python -m pm_robot.cli --env /app/.env pipeline-cycle \
-      --execute-plan \
-      --continue-on-error \
-      --heartbeat-prefix loop_research_control_step \
-      --no-diagnostics \
-      --busy-timeout-seconds "$BUSY_TIMEOUT_SECONDS" \
-      --control-lock-timeout-seconds "$CONTROL_LOCK_TIMEOUT_SECONDS" \
-      --planner-lock-attempts "$PLANNER_LOCK_ATTEMPTS" \
-      --planner-lock-sleep-seconds "$PLANNER_LOCK_SLEEP_SECONDS" \
-      --min-score "$MIN_SCORE" \
-      --state-limit "$STATE_LIMIT" \
-      --state-stale-only \
-      --state-commit-every "$STATE_COMMIT_EVERY" \
-      --repair-limit "$REPAIR_LIMIT" \
-      --shard-count "$SHARD_COUNT" \
-      --wallet-light-limit "$WALLET_LIGHT_LIMIT" \
-      --wallet-medium-limit "$WALLET_MEDIUM_LIMIT" \
-      --wallet-deep-limit "$WALLET_DEEP_LIMIT" \
-      --wallet-max-active-jobs "$WALLET_MAX_ACTIVE_JOBS" \
-      --copyability-limit "$COPYABILITY_LIMIT" \
-      --copyability-max-active-jobs "$COPYABILITY_MAX_ACTIVE_JOBS" \
-      --copyability-min-activity-events "$COPYABILITY_MIN_ACTIVITY_EVENTS" \
-      --copyability-shard-count "$COPYABILITY_SHARD_COUNT" \
-      --copyability-rescan-seconds "$COPYABILITY_RESCAN_SECONDS" \
-      --feature-limit "$FEATURE_LIMIT" \
-      --feature-min-activity-events "$FEATURE_MIN_ACTIVITY_EVENTS" \
-      --feature-commit-every "$FEATURE_COMMIT_EVERY" \
-      --evidence-promotion-limit "$EVIDENCE_PROMOTION_LIMIT" \
-      --score-limit "$SCORE_LIMIT" \
-      --policy "$POLICY_PATH" \
-      "$@")"; then
-    control_exit=0
-  else
-    control_exit=$?
-  fi
-  if [ -n "$control_output" ]; then
-    printf '%s\n' "$control_output"
-  fi
-  control_state=""
-  if control_state="$(printf '%s' "$control_output" | python -c '
+json_counter_sum() {
+  python -c '
 import json
 import sys
 
-payload = json.load(sys.stdin)
-cycle_mode = sys.argv[1]
-command_exit = int(sys.argv[2])
-report_ok = payload.get("ok") is True
-report_partial = payload.get("partial") is True
-if not report_ok and not report_partial:
-    raise ValueError("pipeline cycle did not report ok or partial")
-if report_ok and command_exit != 0:
-    raise ValueError("successful report returned a nonzero exit")
-steps = {
-    str(step.get("name") or ""): step
-    for step in payload.get("steps") or []
-    if isinstance(step, dict)
+selection = json.loads(sys.argv[1])
+history = json.loads(sys.argv[2])
+l6 = json.loads(sys.argv[3])
+if selection.get("status") != "ok" or history.get("status") != "ok" or l6.get("status") != "ok":
+    raise ValueError("unsupported control summary status")
+keys = ("promoted_l3", "promoted_l4", "promoted_l5")
+values = [selection.get(key) for key in keys]
+values.append(history.get("jobs_enqueued"))
+values.append(l6.get("jobs_enqueued"))
+if any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in values):
+    raise ValueError("control counters must be nonnegative integers")
+print(sum(values))
+' "$1" "$2" "$3"
 }
 
-def step_counter(step_name, key):
-    step = steps.get(step_name)
-    data = step.get("data") if isinstance(step, dict) else None
-    if isinstance(data, dict) and key in data:
-        value = data[key]
-        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-            raise ValueError(f"{step_name}.{key} must be a nonnegative integer")
-        return value
-    if report_partial and isinstance(step, dict) and step.get("status") == "failed":
-        return 0
-    raise ValueError(f"{step_name} summary is missing")
+while true; do
+  sleep_interval="$INTERVAL"
+  cycle_status="failed"
+  work_count=0
+  selection_output=""
+  history_output=""
+  l6_output=""
 
+  echo "$(date -Iseconds) wallet level control: start"
+  selection_ok=0
+  if selection_output="$(python -m pm_robot.cli --env /app/.env wallet-level-select \
+      --min-cohort-size "$MIN_COHORT_SIZE" \
+      --timeout-min-cohort-size "$TIMEOUT_MIN_COHORT_SIZE" \
+      --max-wait-seconds "$MAX_WAIT_SECONDS" \
+      --l3-fraction "$L3_FRACTION" \
+      --l4-fraction "$L4_FRACTION" \
+      --l5-fraction "$L5_FRACTION" \
+      --l3-max-promotions "$L3_MAX_PROMOTIONS" \
+      --l4-max-promotions "$L4_MAX_PROMOTIONS" \
+      --l5-max-promotions "$L5_MAX_PROMOTIONS")"; then
+    selection_ok=1
+    printf '%s\n' "$selection_output"
+  else
+    echo "$(date -Iseconds) wallet level selection failed" >&2
+  fi
 
-def step_counter_or_skipped(step_name, key):
-    step = steps.get(step_name)
-    if isinstance(step, dict) and step.get("status") == "skipped":
-        return 0
-    return step_counter(step_name, key)
+  history_ok=0
+  if history_output="$(python -m pm_robot.cli --env /app/.env wallet-history-plan \
+      --limit "$HISTORY_LIMIT" \
+      --max-active-jobs "$HISTORY_MAX_ACTIVE_JOBS" \
+      --light-refresh-seconds "$LIGHT_REFRESH_SECONDS" \
+      --deep-refresh-seconds "$DEEP_REFRESH_SECONDS" \
+      --shard-count "$SHARD_COUNT")"; then
+    history_ok=1
+    printf '%s\n' "$history_output"
+  else
+    echo "$(date -Iseconds) wallet history planning failed" >&2
+  fi
 
+  l6_ok=0
+  if l6_output="$(python -m pm_robot.cli --env /app/.env wallet-l6-plan \
+      --limit "$L6_LIMIT" \
+      --max-active-jobs "$L6_MAX_ACTIVE_JOBS" \
+      --shard-count "$L6_SHARD_COUNT" \
+      --refresh-seconds "$L6_REFRESH_SECONDS")"; then
+    l6_ok=1
+    printf '%s\n' "$l6_output"
+  else
+    echo "$(date -Iseconds) L6 validation planning failed" >&2
+  fi
 
-features_attempted = step_counter("materialize_features", "wallets_attempted")
-scores_considered = step_counter("incremental_score", "score_candidates_considered")
-wallet_jobs_enqueued = 0
-promotion_targets_seen = 0
-if cycle_mode == "full":
-    wallet_plan_data = (steps.get("wallet_pipeline_plan") or {}).get("data")
-    if not isinstance(wallet_plan_data, dict) or "jobs_enqueued" not in wallet_plan_data:
-        raise ValueError("wallet pipeline plan summary is missing")
-    raw_jobs_enqueued = wallet_plan_data["jobs_enqueued"]
-    if isinstance(raw_jobs_enqueued, bool) or not isinstance(raw_jobs_enqueued, int):
-        raise ValueError("wallet pipeline jobs_enqueued must be an integer")
-    wallet_jobs_enqueued = raw_jobs_enqueued
-    promotion_targets_seen = step_counter_or_skipped(
-        "evidence_promotion",
-        "targets_seen",
-    )
-if wallet_jobs_enqueued < 0 or promotion_targets_seen < 0:
-    raise ValueError("pipeline cycle counters must be non-negative")
-report_status = "ok" if report_ok else "partial"
-print(
-    f"{report_status} {features_attempted} {scores_considered} "
-    f"{wallet_jobs_enqueued} {promotion_targets_seen}"
-)
-' "$cycle_mode" "$control_exit" 2>/dev/null)"; then
-    cycle_status="${control_state%% *}"
-    remaining_state="${control_state#* }"
-    features_attempted="${remaining_state%% *}"
-    remaining_state="${remaining_state#* }"
-    scores_considered="${remaining_state%% *}"
-    remaining_state="${remaining_state#* }"
-    wallet_jobs_enqueued="${remaining_state%% *}"
-    promotion_targets_seen="${remaining_state#* }"
-    score_catchup_needed=0
-    wallet_topup_needed=0
-    promotion_catchup_needed=0
-    if { [ "$FEATURE_LIMIT" -gt 0 ] && [ "$features_attempted" -ge "$FEATURE_LIMIT" ]; } || \
-       { [ "$SCORE_LIMIT" -gt 0 ] && [ "$scores_considered" -ge "$SCORE_LIMIT" ]; }; then
-      score_catchup_needed=1
-    fi
-    if [ "$cycle_mode" = "full" ] && [ "$wallet_jobs_enqueued" -gt 0 ]; then
-      wallet_topup_needed=1
-    fi
-    if [ "$cycle_mode" = "full" ] && \
-       [ "$EVIDENCE_PROMOTION_LIMIT" -gt 0 ] && \
-       [ "$promotion_targets_seen" -ge "$EVIDENCE_PROMOTION_LIMIT" ]; then
-      promotion_catchup_needed=1
-    fi
-    if [ "$promotion_catchup_needed" = "1" ]; then
-      # Promotion runs before queue planning, so a bounded full-cycle burst advances
-      # local deferrals while preserving the planner waterline and maintenance window.
-      catchup_cycles=0
-      promotion_catchup_cycles=$((promotion_catchup_cycles + 1))
-      next_cycle_mode="full"
-      if [ "$promotion_catchup_cycles" -ge "$CATCHUP_BURST_LIMIT" ]; then
-        sleep_interval="$INTERVAL"
-        promotion_catchup_cycles=0
-      else
+  if [ "$selection_ok" -eq 1 ] && [ "$history_ok" -eq 1 ] && [ "$l6_ok" -eq 1 ]; then
+    if work_count="$(json_counter_sum "$selection_output" "$history_output" "$l6_output" 2>/dev/null)"; then
+      cycle_status="ok"
+      if [ "$work_count" -gt 0 ]; then
         sleep_interval="$ACTIVE_INTERVAL"
       fi
-    elif [ "$score_catchup_needed" = "1" ] || [ "$wallet_topup_needed" = "1" ]; then
-      # One lightweight follow-up keeps wallet workers fed without removing the maintenance window.
-      promotion_catchup_cycles=0
-      sleep_interval="$ACTIVE_INTERVAL"
-      if [ "$cycle_mode" = "scoring_only" ]; then
-        catchup_cycles=$((catchup_cycles + 1))
-      else
-        catchup_cycles=0
-      fi
-      if [ "$cycle_mode" = "scoring_only" ] && [ "$catchup_cycles" -ge "$CATCHUP_BURST_LIMIT" ]; then
-        next_cycle_mode="full"
-        catchup_cycles=0
-      else
-        next_cycle_mode="scoring_only"
-      fi
-    else
-      catchup_cycles=0
-      promotion_catchup_cycles=0
-    fi
-    if [ "$cycle_status" = "ok" ]; then
-      echo "$(date -Iseconds) research control: ordered cycle ok (mode=${cycle_mode})"
-      runtime_heartbeat loop_research_control ok
-    else
-      echo "$(date -Iseconds) research control: ordered cycle partial (mode=${cycle_mode}); later phases used committed data" >&2
-      runtime_heartbeat loop_research_control partial "one or more isolated pipeline-cycle phases failed"
-    fi
-  else
-    summary_preview="$(printf '%.160s' "$control_output" | tr '\n\r' '  ')"
-    if [ "$control_exit" -ne 0 ]; then
-      cycle_status="failed"
-      echo "$(date -Iseconds) research control: ordered cycle partial; later phases used committed data; output=${summary_preview}" >&2
-      runtime_heartbeat loop_research_control partial "pipeline-cycle failed without a valid partial summary"
+      runtime_heartbeat ok
     else
       cycle_status="invalid"
-      echo "$(date -Iseconds) research control: invalid JSON summary; using idle interval; output=${summary_preview}" >&2
-      runtime_heartbeat loop_research_control partial "pipeline-cycle returned an invalid summary"
+      runtime_heartbeat partial "wallet level control returned invalid summaries"
     fi
+  else
+    runtime_heartbeat partial "wallet level selection, history planning, or L6 planning failed"
   fi
 
-  # Handoff freshness must not depend on every planning phase succeeding.
-  echo "$(date -Iseconds) research control: export paper handoff start"
-  if python -m pm_robot.cli --env /app/.env paper-handoff-export \
-      --out /app/reports/paper_handoff.json \
-      --csv-out /app/reports/paper_handoff.csv \
-      --limit "$PAPER_HANDOFF_LIMIT"; then
-    echo "$(date -Iseconds) research control: export paper handoff ok"
-    runtime_heartbeat loop_score_paper_handoff ok
-  else
-    echo "$(date -Iseconds) research control: export paper handoff failed" >&2
-    runtime_heartbeat loop_score_paper_handoff failed "paper-handoff-export failed from research control"
-  fi
-  echo "$(date -Iseconds) research control: next cycle in ${sleep_interval}s (status=${cycle_status}, mode=${cycle_mode}, next_mode=${next_cycle_mode}, features_attempted=${features_attempted}, scores_considered=${scores_considered}, wallet_jobs_enqueued=${wallet_jobs_enqueued}, promotion_targets_seen=${promotion_targets_seen})"
+  echo "$(date -Iseconds) wallet level control: next cycle in ${sleep_interval}s (status=${cycle_status}, work=${work_count})"
   if [ "$RUN_ONCE" = "1" ]; then
     break
   fi
-  cycle_mode="$next_cycle_mode"
   sleep "$sleep_interval"
 done

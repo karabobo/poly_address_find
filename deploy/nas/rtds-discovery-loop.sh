@@ -2,10 +2,8 @@
 set -eu
 
 ENDPOINT="${PM_ROBOT_RTDS_ENDPOINT:-wss://ws-live-data.polymarket.com}"
-MIN_TRADE_USDC="${PM_ROBOT_RTDS_MIN_TRADE_USDC:-500}"
-PAPER_MIN_TRADE_USDC="${PM_ROBOT_RTDS_PAPER_MIN_TRADE_USDC:-0}"
-WATCH_MIN_SCORE="${PM_ROBOT_RTDS_WATCH_MIN_SCORE:-55}"
-BATCH_SIZE="${PM_ROBOT_RTDS_BATCH_SIZE:-20}"
+MIN_TRADE_USDC="${PM_ROBOT_RTDS_MIN_TRADE_USDC:-1}"
+BATCH_SIZE="${PM_ROBOT_RTDS_BATCH_SIZE:-100}"
 FLUSH_INTERVAL="${PM_ROBOT_RTDS_FLUSH_INTERVAL:-10}"
 PING_INTERVAL="${PM_ROBOT_RTDS_PING_INTERVAL:-5}"
 RECEIVE_TIMEOUT="${PM_ROBOT_RTDS_RECEIVE_TIMEOUT:-1}"
@@ -29,8 +27,6 @@ while true; do
   if python -m pm_robot.cli --env /app/.env discover-rtds \
       --endpoint "$ENDPOINT" \
       --min-trade-usdc "$MIN_TRADE_USDC" \
-      --paper-min-trade-usdc "$PAPER_MIN_TRADE_USDC" \
-      --watch-min-score "$WATCH_MIN_SCORE" \
       --batch-size "$BATCH_SIZE" \
       --flush-interval "$FLUSH_INTERVAL" \
       --ping-interval "$PING_INTERVAL" \

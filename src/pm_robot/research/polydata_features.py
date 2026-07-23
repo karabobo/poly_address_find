@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from pm_robot.models import CandidateAddress, WalletFeatures
+from pm_robot.storage.wallet_levels import normalize_wallet
 
 
 def load_polydata_traders(path: Path) -> list[dict[str, Any]]:
@@ -19,8 +20,9 @@ def load_polydata_traders(path: Path) -> list[dict[str, Any]]:
 
 
 def polydata_candidate(row: dict[str, Any], *, source_name: str) -> CandidateAddress | None:
-    wallet = str(row.get("wallet") or "").strip().lower()
-    if not wallet:
+    try:
+        wallet = normalize_wallet(str(row.get("wallet") or ""))
+    except ValueError:
         return None
     labels = []
     if row.get("smart_level"):
@@ -43,8 +45,9 @@ def polydata_candidate(row: dict[str, Any], *, source_name: str) -> CandidateAdd
 
 
 def polydata_features(row: dict[str, Any]) -> WalletFeatures | None:
-    wallet = str(row.get("wallet") or "").strip().lower()
-    if not wallet:
+    try:
+        wallet = normalize_wallet(str(row.get("wallet") or ""))
+    except ValueError:
         return None
 
     overview = _dict(row.get("overview"))
@@ -92,17 +95,8 @@ def polydata_features(row: dict[str, Any]) -> WalletFeatures | None:
         bot_score=_first_float(row, "bot_score", default=_as_float(bot.get("score"))),
         trades_per_day=_as_float(bot.get("trades_per_day")),
         median_gap_sec=_as_float(bot.get("med_gap")),
-        maker_fraction=None,
-        leader_in_degree=None,
-        copy_event_count=None,
-        copy_market_count=None,
-        containment_pct_median=None,
-        copy_stream_roi=None,
-        edge_retention_pct=None,
-        walk_forward_consistency_pct=None,
         survival_score=_first_float(row, "smart_score", default=None),
         single_market_pnl_share=_single_market_share(pnl),
-        net_to_gross_exposure=None,
         hygiene_status="clean",
         primary_category=primary_category,
         last_active_days_ago=None,

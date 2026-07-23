@@ -2,7 +2,19 @@ from pm_robot.clients.http import HttpClientError
 from pm_robot.orchestration.activity_discovery import discover_activity_candidates
 from pm_robot.storage.db import connect, run_migrations
 from pm_robot.storage.repository import get_wallet_features, upsert_candidate, upsert_wallet_feature
+from pm_robot.storage.wallet_levels import get_wallet_level
 from pm_robot.models import CandidateAddress, WalletFeatures
+from pm_robot.wallet_levels import WalletLevel
+
+
+def _table_exists(conn, name: str) -> bool:
+    return (
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (name,),
+        ).fetchone()
+        is not None
+    )
 
 
 class FakeGlobalActivityClient:
@@ -49,7 +61,7 @@ def _activity(wallet: str, tx: str, usdc: float, market: str = "market-1") -> di
     }
 
 
-def test_discover_activity_candidates_keeps_one_off_trade_in_observation_pool(tmp_path):
+def test_discover_activity_candidates_keeps_small_trade_at_l0(tmp_path):
     conn = connect(tmp_path / "robot.sqlite")
     wallet = "0x" + "1" * 40
     try:
@@ -67,28 +79,22 @@ def test_discover_activity_candidates_keeps_one_off_trade_in_observation_pool(tm
             conn,
             pages=1,
             page_limit=100,
-            min_trades=2,
-            min_usdc_volume=20,
             client=client,
         )
         row = conn.execute("SELECT * FROM candidate_wallets WHERE address = ?", (wallet,)).fetchone()
         observed = conn.execute("SELECT * FROM observed_wallets WHERE wallet = ?", (wallet,)).fetchone()
-        budget = conn.execute(
-            "SELECT * FROM evidence_backfill_budget WHERE wallet = ?",
-            (wallet,),
-        ).fetchone()
 
         assert summary.status == "ok"
         assert summary.wallets_seen == 2
-        assert summary.candidates_inserted_or_updated == 0
+        assert summary.candidates_inserted_or_updated == 1
         assert summary.observed_wallets == 2
-        assert summary.promoted_wallets == 0
-        assert row is None
+        assert summary.promoted_wallets == 1
+        assert row is not None
         assert observed["recent_trade_count"] == 1
         assert observed["recent_max_trade_usdc"] == 120
-        assert observed["promotion_reason"] == ""
-        assert budget is None
-        assert wallet not in get_wallet_features(conn)
+        assert observed["promotion_reason"] == "observed_sample_volume_at_least_100_usdc"
+        assert not _table_exists(conn, "evidence_backfill_budget")
+        assert wallet in get_wallet_features(conn)
     finally:
         conn.close()
 
@@ -112,7 +118,7 @@ def test_discover_activity_candidates_promotes_exceptionally_large_single_trade(
 
         assert summary.promoted_wallets == 1
         assert candidate["sources"] == "polymarket_trades_global"
-        assert observed["promotion_reason"] == "single_trade_usdc>=5000"
+        assert observed["promotion_reason"] == "observed_sample_volume_at_least_100_usdc"
     finally:
         conn.close()
 
@@ -162,30 +168,29 @@ def test_discover_activity_candidates_only_marks_promoted_after_candidate_insert
         assert promoted_candidate is not None
         assert promoted["promoted_at"] is not None
         assert observed_only_candidate is None
-        assert observed_only["promotion_reason"] == "recent_10_trade_usdc_total>=300"
+        assert observed_only["promotion_reason"] == ""
         assert observed_only["promoted_at"] is None
     finally:
         conn.close()
 
 
-def test_discover_activity_candidates_keeps_small_wallet_in_observation_pool(tmp_path):
+def test_discover_activity_candidates_keeps_subthreshold_sample_in_observation_pool(tmp_path):
     conn = connect(tmp_path / "robot.sqlite")
     wallet = "0x" + "2" * 40
     try:
         run_migrations(conn)
         client = FakeGlobalActivityClient({0: [_activity(wallet, "0x1", 15), _activity(wallet, "0x2", 20)]})
 
-        summary = discover_activity_candidates(conn, pages=1, min_trades=2, min_usdc_volume=20, client=client)
+        summary = discover_activity_candidates(conn, pages=1, client=client)
         candidate = conn.execute("SELECT * FROM candidate_wallets WHERE address = ?", (wallet,)).fetchone()
         observed = conn.execute("SELECT * FROM observed_wallets WHERE wallet = ?", (wallet,)).fetchone()
-        budget = conn.execute("SELECT * FROM evidence_backfill_budget WHERE wallet = ?", (wallet,)).fetchone()
 
         assert summary.status == "ok"
         assert summary.observed_wallets == 1
         assert summary.promoted_wallets == 0
         assert summary.candidates_inserted_or_updated == 0
         assert candidate is None
-        assert budget is None
+        assert not _table_exists(conn, "evidence_backfill_budget")
         assert observed["recent_trade_count"] == 2
         assert observed["recent_usdc_total"] == 35
         assert observed["promotion_reason"] == ""
@@ -228,7 +233,7 @@ def test_discover_activity_candidates_promotes_cumulative_recent_observed_volume
             }
         )
 
-        summary = discover_activity_candidates(conn, pages=1, min_trades=2, min_usdc_volume=20, client=client)
+        summary = discover_activity_candidates(conn, pages=1, client=client)
         candidate = conn.execute("SELECT * FROM candidate_wallets WHERE address = ?", (wallet,)).fetchone()
         observed = conn.execute("SELECT * FROM observed_wallets WHERE wallet = ?", (wallet,)).fetchone()
 
@@ -237,7 +242,7 @@ def test_discover_activity_candidates_promotes_cumulative_recent_observed_volume
         assert observed["recent_trade_count"] == 10
         assert observed["recent_usdc_total"] == 300
         assert observed["recent_max_trade_usdc"] == 30
-        assert observed["promotion_reason"] == "recent_10_trade_usdc_total>=300"
+        assert observed["promotion_reason"] == "observed_sample_volume_at_least_100_usdc"
     finally:
         conn.close()
 
@@ -251,7 +256,7 @@ def test_discover_activity_candidates_merges_existing_candidate_source(tmp_path)
         conn.commit()
         client = FakeGlobalActivityClient({0: [_activity(wallet, "0x1", 15), _activity(wallet, "0x2", 20)]})
 
-        discover_activity_candidates(conn, pages=1, min_trades=2, min_usdc_volume=20, client=client)
+        discover_activity_candidates(conn, pages=1, client=client)
         row = conn.execute("SELECT sources, labels FROM candidate_wallets WHERE address = ?", (wallet,)).fetchone()
         observed = conn.execute("SELECT promotion_reason FROM observed_wallets WHERE wallet = ?", (wallet,)).fetchone()
 
@@ -304,22 +309,13 @@ def test_existing_candidate_refresh_does_not_consume_new_promotion_limit(tmp_pat
         conn.close()
 
 
-def test_activity_discovery_observes_but_does_not_revive_summary_only_wallet(tmp_path):
+def test_activity_discovery_ignores_legacy_summary_only_state_and_reenters_new_funnel(tmp_path):
     conn = connect(tmp_path / "robot.sqlite")
     wallet = "0x" + "7" * 40
     try:
         run_migrations(conn)
         upsert_candidate(conn, CandidateAddress(address=wallet, sources="archived_source"))
         upsert_wallet_feature(conn, WalletFeatures(address=wallet, net_pnl_usdc=42))
-        conn.execute(
-            """
-            INSERT INTO wallet_registry(
-                address, candidate_stage, registry_status, raw_retention_tier,
-                last_evaluated_at, updated_at
-            ) VALUES (?, 'needs_data', 'archived_raw_pruned', 'summary_only', ?, ?)
-            """,
-            (wallet, 10_000, 10_000),
-        )
         conn.commit()
 
         summary = discover_activity_candidates(
@@ -337,17 +333,16 @@ def test_activity_discovery_observes_but_does_not_revive_summary_only_wallet(tmp
             (wallet,),
         ).fetchone()
         feature = get_wallet_features(conn)[wallet]
+        assert not _table_exists(conn, "wallet_registry")
         assert summary.observed_wallets == 1
         assert summary.promoted_wallets == 0
-        assert summary.candidates_inserted_or_updated == 0
-        assert candidate["sources"] == "archived_source"
+        assert summary.candidates_inserted_or_updated == 1
+        assert candidate["sources"] == "archived_source | polymarket_trades_global"
         assert observed["recent_max_trade_usdc"] == 500
-        assert observed["promoted_at"] is None
+        assert observed["promoted_at"] is not None
+        assert get_wallet_level(conn, wallet).level is WalletLevel.L1
         assert feature.net_pnl_usdc == 42
-        assert conn.execute(
-            "SELECT COUNT(*) FROM evidence_backfill_budget WHERE wallet = ?",
-            (wallet,),
-        ).fetchone()[0] == 0
+        assert not _table_exists(conn, "evidence_backfill_budget")
     finally:
         conn.close()
 

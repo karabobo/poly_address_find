@@ -1,0 +1,15 @@
+[Unit]
+Description=pm-robot VPS localhost HTTP CONNECT proxy for NAS outbound traffic
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/pm-robot/deploy/vps/vps-http-connect-proxy.py --host 127.0.0.1 --port 18081
+Restart=always
+RestartSec=5
+User=root
+WorkingDirectory=/opt/pm-robot
+
+[Install]
+WantedBy=multi-user.target

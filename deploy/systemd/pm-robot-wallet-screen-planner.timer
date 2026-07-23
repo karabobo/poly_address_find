@@ -1,0 +1,11 @@
+[Unit]
+Description=Plan bounded pm-robot wallet screen jobs
+
+[Timer]
+OnBootSec=3min
+OnUnitInactiveSec=3min
+AccuracySec=20s
+Persistent=true
+
+[Install]
+WantedBy=timers.target

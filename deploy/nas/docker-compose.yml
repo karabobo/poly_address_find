@@ -5,7 +5,7 @@ services:
       dockerfile: deploy/nas/Dockerfile.tunnel
     image: pm-robot:ssh-tunnel
     container_name: pm-robot-proxy-tunnel
-    restart: unless-stopped
+    restart: always
     network_mode: host
     env_file:
       - ./.env
@@ -18,7 +18,24 @@ services:
       PM_ROBOT_PROXY_TUNNEL_LOG_PATH: /logs/vps-http-proxy-tunnel.log
     volumes:
       - ./ssh:/ssh:ro
-      - ${PM_ROBOT_STORAGE_ROOT:-.}/logs:/logs
+      - ${PM_ROBOT_STORAGE_ROOT:-/volume1/poly_data/pmbot}/logs:/logs
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          python -c 'import os, socket, sys;
+          host, port = os.environ.get("PM_ROBOT_PROXY_HEALTHCHECK_TARGET", "ws-live-data.polymarket.com:443").rsplit(":", 1);
+          bind_host = os.environ.get("PM_ROBOT_PROXY_LOCAL_HOST", "0.0.0.0");
+          probe_host = "127.0.0.1" if bind_host in ("0.0.0.0", "::") else bind_host;
+          s = socket.create_connection((probe_host, int(os.environ.get("PM_ROBOT_PROXY_LOCAL_PORT", "18082"))), 5);
+          s.sendall(f"CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n\r\n".encode("ascii"));
+          data = s.recv(128);
+          s.close();
+          sys.exit(0 if b" 200 " in data.split(b"\r\n", 1)[0] else 1)'
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
 
   web:
     build:
@@ -26,7 +43,7 @@ services:
       dockerfile: deploy/nas/Dockerfile
     image: pm-robot:nas
     container_name: pm-robot-web
-    restart: unless-stopped
+    restart: always
     env_file:
       - ./.env
     working_dir: /app
@@ -47,10 +64,10 @@ services:
       - ./app/src:/app/src:ro
       - ./app/deploy:/app/deploy:ro
       - ./app/scripts:/app/scripts:ro
-      - ${PM_ROBOT_STORAGE_ROOT:-.}/data:/app/data
-      - ${PM_ROBOT_STORAGE_ROOT:-.}/logs:/app/logs
-      - ${PM_ROBOT_STORAGE_ROOT:-.}/backups:/app/backups
-      - ${PM_ROBOT_STORAGE_ROOT:-.}/reports:/app/reports
+      - ${PM_ROBOT_STORAGE_ROOT:-/volume1/poly_data/pmbot}/data:/app/data
+      - ${PM_ROBOT_STORAGE_ROOT:-/volume1/poly_data/pmbot}/logs:/app/logs
+      - ${PM_ROBOT_STORAGE_ROOT:-/volume1/poly_data/pmbot}/backups:/app/backups
+      - ${PM_ROBOT_STORAGE_ROOT:-/volume1/poly_data/pmbot}/reports:/app/reports
       - ./config:/app/config:ro
 
   research-control:
@@ -59,7 +76,7 @@ services:
       dockerfile: deploy/nas/Dockerfile
     image: pm-robot:nas
     container_name: pm-robot-research-control
-    restart: unless-stopped
+    restart: always
     env_file:
       - ./.env
     working_dir: /app
@@ -70,10 +87,10 @@ services:
       - ./app/src:/app/src:ro
       - ./app/deploy:/app/deploy:ro
       - ./app/scripts:/app/scripts:ro
-      - ${PM_ROBOT_STORAGE_ROOT:-.}/data:/app/data
-      - ${PM_ROBOT_STORAGE_ROOT:-.}/logs:/app/logs
-      - ${PM_ROBOT_STORAGE_ROOT:-.}/backups:/app/backups
-      - ${PM_ROBOT_STORAGE_ROOT:-.}/reports:/app/reports
+      - ${PM_ROBOT_STORAGE_ROOT:-/volume1/poly_data/pmbot}/data:/app/data
+      - ${PM_ROBOT_STORAGE_ROOT:-/volume1/poly_data/pmbot}/logs:/app/logs
+      - ${PM_ROBOT_STORAGE_ROOT:-/volume1/poly_data/pmbot}/backups:/app/backups
+      - ${PM_ROBOT_STORAGE_ROOT:-/volume1/poly_data/pmbot}/reports:/app/reports
       - ./config:/app/config:ro
 
   discovery-loop:
@@ -82,7 +99,7 @@ services:
       dockerfile: deploy/nas/Dockerfile
     image: pm-robot:nas
     container_name: pm-robot-discovery-loop
-    restart: unless-stopped
+    restart: always
     env_file:
       - ./.env
     working_dir: /app
@@ -90,15 +107,16 @@ services:
       - /bin/sh
       - /app/deploy/nas/discovery-loop.sh
     depends_on:
-      - proxy-tunnel
+      proxy-tunnel:
+        condition: service_healthy
     volumes:
       - ./app/src:/app/src:ro
       - ./app/deploy:/app/deploy:ro
       - ./app/scripts:/app/scripts:ro
-      - ${PM_ROBOT_STORAGE_ROOT:-.}/data:/app/data
-      - ${PM_ROBOT_STORAGE_ROOT:-.}/logs:/app/logs
-      - ${PM_ROBOT_STORAGE_ROOT:-.}/backups:/app/backups
-      - ${PM_ROBOT_STORAGE_ROOT:-.}/reports:/app/reports
+      - ${PM_ROBOT_STORAGE_ROOT:-/volume1/poly_data/pmbot}/data:/app/data
+      - ${PM_ROBOT_STORAGE_ROOT:-/volume1/poly_data/pmbot}/logs:/app/logs
+      - ${PM_ROBOT_STORAGE_ROOT:-/volume1/poly_data/pmbot}/backups:/app/backups
+      - ${PM_ROBOT_STORAGE_ROOT:-/volume1/poly_data/pmbot}/reports:/app/reports
       - ./config:/app/config:ro
 
   rtds-discovery:
@@ -107,7 +125,7 @@ services:
       dockerfile: deploy/nas/Dockerfile
     image: pm-robot:nas
     container_name: pm-robot-rtds-discovery
-    restart: unless-stopped
+    restart: always
     env_file:
       - ./.env
     working_dir: /app
@@ -115,181 +133,252 @@ services:
       - /bin/sh
       - /app/deploy/nas/rtds-discovery-loop.sh
     depends_on:
-      - proxy-tunnel
+      proxy-tunnel:
+        condition: service_healthy
     volumes:
       - ./app/src:/app/src:ro
       - ./app/deploy:/app/deploy:ro
       - ./app/scripts:/app/scripts:ro
-      - ${PM_ROBOT_STORAGE_ROOT:-.}/data:/app/data
-      - ${PM_ROBOT_STORAGE_ROOT:-.}/logs:/app/logs
-      - ${PM_ROBOT_STORAGE_ROOT:-.}/backups:/app/backups
-      - ${PM_ROBOT_STORAGE_ROOT:-.}/reports:/app/reports
+      - ${PM_ROBOT_STORAGE_ROOT:-/volume1/poly_data/pmbot}/data:/app/data
+      - ${PM_ROBOT_STORAGE_ROOT:-/volume1/poly_data/pmbot}/logs:/app/logs
+      - ${PM_ROBOT_STORAGE_ROOT:-/volume1/poly_data/pmbot}/backups:/app/backups
+      - ${PM_ROBOT_STORAGE_ROOT:-/volume1/poly_data/pmbot}/reports:/app/reports
       - ./config:/app/config:ro
 
-  pipeline-worker-0:
+  wallet-screen-planner:
     build:
       context: ./app
       dockerfile: deploy/nas/Dockerfile
     image: pm-robot:nas
-    container_name: pm-robot-pipeline-worker-0
-    restart: unless-stopped
+    container_name: pm-robot-wallet-screen-planner
+    restart: always
     env_file:
       - ./.env
     environment:
-      PM_ROBOT_PIPELINE_SHARD_INDEX: "0"
+      PM_ROBOT_WALLET_SCREEN_MODE: planner
     working_dir: /app
     command:
       - /bin/sh
-      - /app/deploy/nas/wallet-pipeline-worker-loop.sh
-    depends_on:
-      - proxy-tunnel
-      - research-control
+      - /app/deploy/nas/wallet-screen-loop.sh
     volumes:
       - ./app/src:/app/src:ro
       - ./app/deploy:/app/deploy:ro
       - ./app/scripts:/app/scripts:ro
-      - ${PM_ROBOT_STORAGE_ROOT:-.}/data:/app/data
-      - ${PM_ROBOT_STORAGE_ROOT:-.}/logs:/app/logs
-      - ${PM_ROBOT_STORAGE_ROOT:-.}/backups:/app/backups
-      - ${PM_ROBOT_STORAGE_ROOT:-.}/reports:/app/reports
+      - ${PM_ROBOT_STORAGE_ROOT:-/volume1/poly_data/pmbot}/data:/app/data
+      - ${PM_ROBOT_STORAGE_ROOT:-/volume1/poly_data/pmbot}/logs:/app/logs
+      - ${PM_ROBOT_STORAGE_ROOT:-/volume1/poly_data/pmbot}/backups:/app/backups
+      - ${PM_ROBOT_STORAGE_ROOT:-/volume1/poly_data/pmbot}/reports:/app/reports
       - ./config:/app/config:ro
 
-  pipeline-worker-1:
+  wallet-screen-worker-0:
     build:
       context: ./app
       dockerfile: deploy/nas/Dockerfile
     image: pm-robot:nas
-    container_name: pm-robot-pipeline-worker-1
-    restart: unless-stopped
+    container_name: pm-robot-wallet-screen-worker-0
+    restart: always
     env_file:
       - ./.env
     environment:
-      PM_ROBOT_PIPELINE_SHARD_INDEX: "1"
+      PM_ROBOT_WALLET_SCREEN_MODE: worker
+      PM_ROBOT_WALLET_SCREEN_SHARD_INDEX: "0"
     working_dir: /app
     command:
       - /bin/sh
-      - /app/deploy/nas/wallet-pipeline-worker-loop.sh
+      - /app/deploy/nas/wallet-screen-loop.sh
     depends_on:
-      - proxy-tunnel
-      - research-control
+      proxy-tunnel:
+        condition: service_healthy
+      wallet-screen-planner:
+        condition: service_started
     volumes:
       - ./app/src:/app/src:ro
       - ./app/deploy:/app/deploy:ro
       - ./app/scripts:/app/scripts:ro
-      - ${PM_ROBOT_STORAGE_ROOT:-.}/data:/app/data
-      - ${PM_ROBOT_STORAGE_ROOT:-.}/logs:/app/logs
-      - ${PM_ROBOT_STORAGE_ROOT:-.}/backups:/app/backups
-      - ${PM_ROBOT_STORAGE_ROOT:-.}/reports:/app/reports
+      - ${PM_ROBOT_STORAGE_ROOT:-/volume1/poly_data/pmbot}/data:/app/data
+      - ${PM_ROBOT_STORAGE_ROOT:-/volume1/poly_data/pmbot}/logs:/app/logs
+      - ${PM_ROBOT_STORAGE_ROOT:-/volume1/poly_data/pmbot}/backups:/app/backups
+      - ${PM_ROBOT_STORAGE_ROOT:-/volume1/poly_data/pmbot}/reports:/app/reports
       - ./config:/app/config:ro
 
-  pipeline-worker-2:
+  wallet-screen-worker-1:
     build:
       context: ./app
       dockerfile: deploy/nas/Dockerfile
     image: pm-robot:nas
-    container_name: pm-robot-pipeline-worker-2
-    restart: unless-stopped
+    container_name: pm-robot-wallet-screen-worker-1
+    restart: always
     env_file:
       - ./.env
     environment:
-      PM_ROBOT_PIPELINE_SHARD_INDEX: "2"
+      PM_ROBOT_WALLET_SCREEN_MODE: worker
+      PM_ROBOT_WALLET_SCREEN_SHARD_INDEX: "1"
     working_dir: /app
     command:
       - /bin/sh
-      - /app/deploy/nas/wallet-pipeline-worker-loop.sh
+      - /app/deploy/nas/wallet-screen-loop.sh
     depends_on:
-      - proxy-tunnel
-      - research-control
+      proxy-tunnel:
+        condition: service_healthy
+      wallet-screen-planner:
+        condition: service_started
     volumes:
       - ./app/src:/app/src:ro
       - ./app/deploy:/app/deploy:ro
       - ./app/scripts:/app/scripts:ro
-      - ${PM_ROBOT_STORAGE_ROOT:-.}/data:/app/data
-      - ${PM_ROBOT_STORAGE_ROOT:-.}/logs:/app/logs
-      - ${PM_ROBOT_STORAGE_ROOT:-.}/backups:/app/backups
-      - ${PM_ROBOT_STORAGE_ROOT:-.}/reports:/app/reports
+      - ${PM_ROBOT_STORAGE_ROOT:-/volume1/poly_data/pmbot}/data:/app/data
+      - ${PM_ROBOT_STORAGE_ROOT:-/volume1/poly_data/pmbot}/logs:/app/logs
+      - ${PM_ROBOT_STORAGE_ROOT:-/volume1/poly_data/pmbot}/backups:/app/backups
+      - ${PM_ROBOT_STORAGE_ROOT:-/volume1/poly_data/pmbot}/reports:/app/reports
       - ./config:/app/config:ro
 
-  copyability-worker-0:
+  wallet-screen-worker-2:
     build:
       context: ./app
       dockerfile: deploy/nas/Dockerfile
     image: pm-robot:nas
-    container_name: pm-robot-copyability-worker-0
-    restart: unless-stopped
+    container_name: pm-robot-wallet-screen-worker-2
+    restart: always
     env_file:
       - ./.env
     environment:
-      PM_ROBOT_COPYABILITY_SHARD_INDEX: "0"
-      PM_ROBOT_COPYABILITY_WORKER_ID: "nas-copyability-worker-0"
+      PM_ROBOT_WALLET_SCREEN_MODE: worker
+      PM_ROBOT_WALLET_SCREEN_SHARD_INDEX: "2"
     working_dir: /app
     command:
       - /bin/sh
-      - /app/deploy/nas/copyability-worker-loop.sh
+      - /app/deploy/nas/wallet-screen-loop.sh
     depends_on:
-      - research-control
+      proxy-tunnel:
+        condition: service_healthy
+      wallet-screen-planner:
+        condition: service_started
     volumes:
       - ./app/src:/app/src:ro
       - ./app/deploy:/app/deploy:ro
       - ./app/scripts:/app/scripts:ro
-      - ${PM_ROBOT_STORAGE_ROOT:-.}/data:/app/data
-      - ${PM_ROBOT_STORAGE_ROOT:-.}/logs:/app/logs
-      - ${PM_ROBOT_STORAGE_ROOT:-.}/backups:/app/backups
-      - ${PM_ROBOT_STORAGE_ROOT:-.}/reports:/app/reports
+      - ${PM_ROBOT_STORAGE_ROOT:-/volume1/poly_data/pmbot}/data:/app/data
+      - ${PM_ROBOT_STORAGE_ROOT:-/volume1/poly_data/pmbot}/logs:/app/logs
+      - ${PM_ROBOT_STORAGE_ROOT:-/volume1/poly_data/pmbot}/backups:/app/backups
+      - ${PM_ROBOT_STORAGE_ROOT:-/volume1/poly_data/pmbot}/reports:/app/reports
       - ./config:/app/config:ro
 
-  copyability-worker-1:
+  wallet-history-worker-0:
     build:
       context: ./app
       dockerfile: deploy/nas/Dockerfile
     image: pm-robot:nas
-    container_name: pm-robot-copyability-worker-1
-    restart: unless-stopped
+    container_name: pm-robot-wallet-history-worker-0
+    restart: always
     env_file:
       - ./.env
     environment:
-      PM_ROBOT_COPYABILITY_SHARD_INDEX: "0"
-      PM_ROBOT_COPYABILITY_WORKER_ID: "nas-copyability-worker-1"
-      PM_ROBOT_COPYABILITY_PREFER_SCAN_MODE: "light_missing_copyability"
+      PM_ROBOT_WALLET_HISTORY_SHARD_INDEX: "0"
     working_dir: /app
     command:
       - /bin/sh
-      - /app/deploy/nas/copyability-worker-loop.sh
+      - /app/deploy/nas/wallet-history-loop.sh
     depends_on:
-      - research-control
+      proxy-tunnel:
+        condition: service_healthy
+      research-control:
+        condition: service_started
     volumes:
       - ./app/src:/app/src:ro
       - ./app/deploy:/app/deploy:ro
       - ./app/scripts:/app/scripts:ro
-      - ${PM_ROBOT_STORAGE_ROOT:-.}/data:/app/data
-      - ${PM_ROBOT_STORAGE_ROOT:-.}/logs:/app/logs
-      - ${PM_ROBOT_STORAGE_ROOT:-.}/backups:/app/backups
-      - ${PM_ROBOT_STORAGE_ROOT:-.}/reports:/app/reports
+      - ${PM_ROBOT_STORAGE_ROOT:-/volume1/poly_data/pmbot}/data:/app/data
+      - ${PM_ROBOT_STORAGE_ROOT:-/volume1/poly_data/pmbot}/logs:/app/logs
+      - ${PM_ROBOT_STORAGE_ROOT:-/volume1/poly_data/pmbot}/backups:/app/backups
+      - ${PM_ROBOT_STORAGE_ROOT:-/volume1/poly_data/pmbot}/reports:/app/reports
       - ./config:/app/config:ro
 
-  paper-observer-loop:
+  wallet-history-worker-1:
     build:
       context: ./app
       dockerfile: deploy/nas/Dockerfile
     image: pm-robot:nas
-    container_name: pm-robot-paper-observer-loop
-    restart: unless-stopped
+    container_name: pm-robot-wallet-history-worker-1
+    restart: always
+    env_file:
+      - ./.env
+    environment:
+      PM_ROBOT_WALLET_HISTORY_SHARD_INDEX: "1"
+    working_dir: /app
+    command:
+      - /bin/sh
+      - /app/deploy/nas/wallet-history-loop.sh
+    depends_on:
+      proxy-tunnel:
+        condition: service_healthy
+      research-control:
+        condition: service_started
+    volumes:
+      - ./app/src:/app/src:ro
+      - ./app/deploy:/app/deploy:ro
+      - ./app/scripts:/app/scripts:ro
+      - ${PM_ROBOT_STORAGE_ROOT:-/volume1/poly_data/pmbot}/data:/app/data
+      - ${PM_ROBOT_STORAGE_ROOT:-/volume1/poly_data/pmbot}/logs:/app/logs
+      - ${PM_ROBOT_STORAGE_ROOT:-/volume1/poly_data/pmbot}/backups:/app/backups
+      - ${PM_ROBOT_STORAGE_ROOT:-/volume1/poly_data/pmbot}/reports:/app/reports
+      - ./config:/app/config:ro
+
+  wallet-history-worker-2:
+    build:
+      context: ./app
+      dockerfile: deploy/nas/Dockerfile
+    image: pm-robot:nas
+    container_name: pm-robot-wallet-history-worker-2
+    restart: always
+    env_file:
+      - ./.env
+    environment:
+      PM_ROBOT_WALLET_HISTORY_SHARD_INDEX: "2"
+    working_dir: /app
+    command:
+      - /bin/sh
+      - /app/deploy/nas/wallet-history-loop.sh
+    depends_on:
+      proxy-tunnel:
+        condition: service_healthy
+      research-control:
+        condition: service_started
+    volumes:
+      - ./app/src:/app/src:ro
+      - ./app/deploy:/app/deploy:ro
+      - ./app/scripts:/app/scripts:ro
+      - ${PM_ROBOT_STORAGE_ROOT:-/volume1/poly_data/pmbot}/data:/app/data
+      - ${PM_ROBOT_STORAGE_ROOT:-/volume1/poly_data/pmbot}/logs:/app/logs
+      - ${PM_ROBOT_STORAGE_ROOT:-/volume1/poly_data/pmbot}/backups:/app/backups
+      - ${PM_ROBOT_STORAGE_ROOT:-/volume1/poly_data/pmbot}/reports:/app/reports
+      - ./config:/app/config:ro
+
+  l6-validation-worker:
+    build:
+      context: ./app
+      dockerfile: deploy/nas/Dockerfile
+    image: pm-robot:nas
+    container_name: pm-robot-l6-validation-worker
+    restart: always
     env_file:
       - ./.env
     working_dir: /app
     command:
       - /bin/sh
-      - /app/deploy/nas/paper-observer-loop.sh
+      - /app/deploy/nas/l6-validation-loop.sh
     depends_on:
-      - proxy-tunnel
+      proxy-tunnel:
+        condition: service_healthy
+      research-control:
+        condition: service_started
     volumes:
       - ./app/src:/app/src:ro
       - ./app/deploy:/app/deploy:ro
       - ./app/scripts:/app/scripts:ro
-      - ${PM_ROBOT_STORAGE_ROOT:-.}/data:/app/data
-      - ${PM_ROBOT_STORAGE_ROOT:-.}/logs:/app/logs
-      - ${PM_ROBOT_STORAGE_ROOT:-.}/backups:/app/backups
-      - ${PM_ROBOT_STORAGE_ROOT:-.}/reports:/app/reports
+      - ${PM_ROBOT_STORAGE_ROOT:-/volume1/poly_data/pmbot}/data:/app/data
+      - ${PM_ROBOT_STORAGE_ROOT:-/volume1/poly_data/pmbot}/logs:/app/logs
+      - ${PM_ROBOT_STORAGE_ROOT:-/volume1/poly_data/pmbot}/backups:/app/backups
+      - ${PM_ROBOT_STORAGE_ROOT:-/volume1/poly_data/pmbot}/reports:/app/reports
       - ./config:/app/config:ro
 
   maintenance-loop:
@@ -298,7 +387,7 @@ services:
       dockerfile: deploy/nas/Dockerfile
     image: pm-robot:nas
     container_name: pm-robot-maintenance-loop
-    restart: unless-stopped
+    restart: always
     env_file:
       - ./.env
     working_dir: /app
@@ -309,35 +398,10 @@ services:
       - ./app/src:/app/src:ro
       - ./app/deploy:/app/deploy:ro
       - ./app/scripts:/app/scripts:ro
-      - ${PM_ROBOT_STORAGE_ROOT:-.}/data:/app/data
-      - ${PM_ROBOT_STORAGE_ROOT:-.}/logs:/app/logs
-      - ${PM_ROBOT_STORAGE_ROOT:-.}/backups:/app/backups
-      - ${PM_ROBOT_STORAGE_ROOT:-.}/reports:/app/reports
-      - ./config:/app/config:ro
-
-  backup-loop:
-    profiles:
-      - manual-backup
-    build:
-      context: ./app
-      dockerfile: deploy/nas/Dockerfile
-    image: pm-robot:nas
-    container_name: pm-robot-backup-loop
-    restart: unless-stopped
-    env_file:
-      - ./.env
-    working_dir: /app
-    command:
-      - /bin/sh
-      - /app/deploy/nas/backup-loop.sh
-    volumes:
-      - ./app/src:/app/src:ro
-      - ./app/deploy:/app/deploy:ro
-      - ./app/scripts:/app/scripts:ro
-      - ${PM_ROBOT_STORAGE_ROOT:-.}/data:/app/data
-      - ${PM_ROBOT_STORAGE_ROOT:-.}/logs:/app/logs
-      - ${PM_ROBOT_STORAGE_ROOT:-.}/backups:/app/backups
-      - ${PM_ROBOT_STORAGE_ROOT:-.}/reports:/app/reports
+      - ${PM_ROBOT_STORAGE_ROOT:-/volume1/poly_data/pmbot}/data:/app/data
+      - ${PM_ROBOT_STORAGE_ROOT:-/volume1/poly_data/pmbot}/logs:/app/logs
+      - ${PM_ROBOT_STORAGE_ROOT:-/volume1/poly_data/pmbot}/backups:/app/backups
+      - ${PM_ROBOT_STORAGE_ROOT:-/volume1/poly_data/pmbot}/reports:/app/reports
       - ./config:/app/config:ro
 
   task:
@@ -360,10 +424,10 @@ services:
       - ./app/src:/app/src:ro
       - ./app/deploy:/app/deploy:ro
       - ./app/scripts:/app/scripts:ro
-      - ${PM_ROBOT_STORAGE_ROOT:-.}/data:/app/data
-      - ${PM_ROBOT_STORAGE_ROOT:-.}/logs:/app/logs
-      - ${PM_ROBOT_STORAGE_ROOT:-.}/backups:/app/backups
-      - ${PM_ROBOT_STORAGE_ROOT:-.}/reports:/app/reports
+      - ${PM_ROBOT_STORAGE_ROOT:-/volume1/poly_data/pmbot}/data:/app/data
+      - ${PM_ROBOT_STORAGE_ROOT:-/volume1/poly_data/pmbot}/logs:/app/logs
+      - ${PM_ROBOT_STORAGE_ROOT:-/volume1/poly_data/pmbot}/backups:/app/backups
+      - ${PM_ROBOT_STORAGE_ROOT:-/volume1/poly_data/pmbot}/reports:/app/reports
       - ./config:/app/config:ro
     command:
       - status

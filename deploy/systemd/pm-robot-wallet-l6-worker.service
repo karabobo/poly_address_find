@@ -1,0 +1,11 @@
+[Unit]
+Description=pm-robot low-volume L6 independent-validation worker
+After=network-online.target pm-robot-wallet-l6-planner.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/pm-robot
+EnvironmentFile=/opt/pm-robot/.env
+TimeoutStartSec=2100
+Environment=PM_ROBOT_TASK_NAME=wallet-l6-worker
+ExecStart=/opt/pm-robot/deploy/scripts/run-wallet-l6-worker.sh

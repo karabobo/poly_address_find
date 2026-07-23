@@ -1,0 +1,12 @@
+[Unit]
+Description=Run bounded pm-robot wallet screen worker %i
+
+[Timer]
+OnBootSec=4min
+OnUnitInactiveSec=1min
+AccuracySec=15s
+Persistent=true
+Unit=pm-robot-wallet-screen-worker@%i.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,12 @@
+[Unit]
+Description=pm-robot bounded wallet screen planner
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/pm-robot
+EnvironmentFile=/opt/pm-robot/.env
+TimeoutStartSec=120
+Environment=PM_ROBOT_LOCK_WAIT=60
+Environment=PM_ROBOT_TASK_NAME=wallet-screen-planner
+ExecStart=/opt/pm-robot/deploy/scripts/run_locked.sh /opt/pm-robot/.venv/bin/python -m pm_robot.cli --env /opt/pm-robot/.env wallet-screen-plan --limit 24 --max-active-jobs 72 --rescreen-after-seconds 604800 --shard-count 3

@@ -1,7 +1,7 @@
 [project]
-name = "polymarket-copy-robot"
+name = "polymarket-wallet-research"
 version = "0.1.0"
-description = "Paper-driven Polymarket wallet discovery, scoring, and research evaluation system."
+description = "Polymarket wallet discovery, evidence collection, and L0-L6 research ranking system."
 requires-python = ">=3.11"
 dependencies = [
     "duckdb>=1.5,<2",

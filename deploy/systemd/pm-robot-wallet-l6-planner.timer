@@ -1,0 +1,11 @@
+[Unit]
+Description=Plan bounded pm-robot L6 independent-validation jobs
+
+[Timer]
+OnBootSec=6min
+OnUnitInactiveSec=3min
+AccuracySec=20s
+Persistent=true
+
+[Install]
+WantedBy=timers.target

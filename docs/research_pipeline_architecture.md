@@ -1,231 +1,280 @@
-# Wallet Research Pipeline Architecture
+# Wallet Discovery Architecture
 
-This document is the canonical architecture reference for the repository. The default NAS deployment is
-`research/scoring`: it discovers wallets, builds evidence, scores candidates, and observes paper-stage signals.
-It does not submit real orders or start the opt-in execution profile.
+## Product Boundary
+
+This repository discovers and ranks Polymarket wallets for research. Its output is a current,
+evidence-backed L0-L6 wallet list. It does not execute downstream trading, order submission,
+settlement, or publication to another system.
+
+Historical migration files remain so an existing SQLite database can be upgraded in place. The
+final research-only migration removes their retired runtime tables; they are not authorities for
+the L0-L6 funnel.
 
 ## End-to-End Flow
 
-```text
-leaderboards / large trades / RTDS / curated imports
-  -> observed_wallets
-  -> promotion gate
-  -> candidate_wallets
-  -> wallet_processing_state (L0-L3 evidence truth)
-  -> pipeline_jobs[job_type=wallet_evidence_backfill]
-  -> wallet_activity + wallet_positions + wallet_evidence_summary
-  -> wallet_features
-  -> leader_scores
-  -> candidate_wallets.candidate_stage
-  -> wallet_registry (durable decision summary)
-  -> verified Parquet archive before low-value raw evidence leaves SQLite
-  -> paper observer quoteability evidence
-  -> paper_observer_trials (research-only marks and resolved outcomes)
-  -> read-only handoff
-  -> leader_publish for explicit downstream consumption
+```mermaid
+flowchart LR
+    A["Polymarket sources"] --> B["wallet_sightings"]
+    B --> C["L0 observed"]
+    C -->|trusted source or observed sample >= 100 USDC| D["L1 admitted"]
+    D --> E["recent 10-trade screen"]
+    E -->|sample volume >= 100 USDC| F["L2 screened"]
+    F --> G["light history <= 200 rows"]
+    G -->|evidence floor + relative rank| H["L3 promising"]
+    H --> I["deep history <= 1000 rows"]
+    I -->|evidence floor + relative rank| J["L4 strong"]
+    J -->|stronger floor + relative rank| K["L5 scoring elite"]
+    K -->|current deep evidence| L["independent profit, persistence, anomaly validation"]
+    L -->|pass only| M["L6 independently verified"]
+    L -->|warning or fail| K
 ```
 
-Copyability is a separate evidence lane:
+There is no absolute score that declares a wallet universally good. A wallet must first have enough
+evidence to be comparable, then it competes against wallets with comparable source and strategy
+profiles. This prevents a fixed threshold from making the system permanently empty while also
+preventing very thin histories from promoting each other.
 
-```text
-promising scored wallet
-  -> pipeline_jobs[job_type=copyability_evidence]
-  -> copy graph + copied-stream backtest
-  -> wallet feature refresh
-  -> score refresh
-```
+## Level Contract
 
-## State Ownership
+| Level | Meaning | Required work | Storage cost |
+| --- | --- | --- | --- |
+| L0 | A syntactically valid address observed from a source | Provenance and compact recent sightings only | Very low |
+| L1 | Trusted source, or up to 10 verified observed trades total at least 100 USDC | Fetch at most 10 recent trades | Very low |
+| L2 | Recent sample contains at least one trade and at least 100 USDC total volume | Fetch light history and bounded PnL evidence | Low |
+| L3 | Light evidence passed the L3 floor and relative-rank selection | Fetch deep history | Medium |
+| L4 | Deep evidence passed the L4 floor and relative-rank selection | Reuse and refresh deep evidence | Medium |
+| L5 | Deep evidence passed the strongest floor and relative-rank selection | Wait for or refresh independent validation | Medium |
+| L6 | The current L5 evidence also passed independent profit, persistence, and anomaly validation | Revalidate independently every 14 days or after evidence changes | Medium |
 
-| Store | Responsibility | Must not be used as |
-| --- | --- | --- |
-| `observed_wallets` | Cheap recent sightings and promotion inputs | A scored candidate registry |
-| `candidate_wallets` | Canonical wallet registry and current `candidate_stage` | L1/L2/L3 evidence state |
-| `wallet_processing_state` | Current evidence tier, evidence status, priority, and next action | A worker queue |
-| `pipeline_jobs` | Leased execution tasks, retries, errors, and dedupe scope | Wallet evidence truth |
-| `wallet_evidence_summary` | Materialized historical evidence summary | Candidate-stage authority |
-| `wallet_features` | Current scoring inputs | Score history |
-| `leader_scores` | Append-only scoring/review decisions | Worker execution state |
-| `wallet_registry` | Durable wallet decision, retention policy, and archive pointer | Raw event storage |
-| `evidence_archive_*` | Archive run, wallet, file, checksum, and recovery state | Candidate or queue authority |
-| Parquet files | Compressed cold evidence removed from the SQLite hot store | Mutable workflow state |
-| `paper_signal_evaluations` | Point-in-time quote, latency, slippage, and actionability evidence | Strategy return evidence or an order ledger |
-| `paper_observer_trials` | First actionable quote plus Gamma mark/resolution PnL for a research-only trial | `paper_orders`, execution permission, or publication permission |
-| `leader_publish` | Explicit read-only output for downstream consumers | Permission to trade from this repository |
+Levels are monotonic research achievements. They do not bounce downward because of one short-term
+sample. L5 remains the highest result produced by the scoring and relative-ranking system. A current
+elite wallet is stricter than merely having `level = l5` or `level = l6`: health and UI exposure also
+require a recent deep summary, the current summary methodology, no hard risk block, and a selected L5
+decision for the same active artifact under the current selection policy.
 
-The historical database column `wallet_processing_state.discovery_tier` is called `evidence_tier` in code.
-`pipeline_jobs.tier` is a job scope/dedupe field, not the wallet's real evidence tier.
+L6 does not rescore or replace L5. It is a separate verification achievement. A currently verified
+L6 additionally requires a recent passing validation for the same active deep artifact. Warning or
+fail leaves an L5 wallet at L5. A historical L6 is not automatically demoted, but it is no longer
+presented as currently verified when its validation is stale or its deep artifact has changed.
 
-The NAS research/scoring stack has one control-plane owner: `research-control-loop.sh`. Its full cycle executes the
-ordered `pipeline-cycle` handoff across eligibility preparation, stale wallet state, wallet/copyability queue
-admission, feature materialization, incremental scoring, and paper handoff export. Discovery and queue workers
-remain asynchronous. The control loop materializes only wallets with changed candidate metadata, evidence budgets,
-or activity watermarks.
-When feature or scoring batches remain full, the same owner uses bounded `scoring_only` catch-up cycles. Those cycles
-refresh features and scores but deliberately skip eligibility repair, evidence promotion, and both queue planners.
-After a bounded catch-up burst, the next pass is always a full cycle; this keeps queue admission fresh without making
-retention compete with the complete research pipeline every minute.
-Each database phase commits independently. In NAS mode, a failed phase is rolled back and recorded, while later
-phases continue against the latest committed data. Paper handoff export runs after every cycle attempt, including
-partial cycles, so planner contention cannot make an otherwise valid handoff stale.
-The frequent control loop skips full smoothness diagnostics; those scans remain available through the explicit
-audit/report commands instead of being repeated during every scheduling pass.
-The NAS control loop uses a short SQLite busy timeout and a bounded planner retry budget. Lock contention therefore
-fails one isolated phase and yields to the next control pass instead of blocking workers for minutes. Every phase
-records its own start time, finish time, result count, and error; the system-health panel shows the latest six phase
-heartbeats only after phase data exists.
-An executing `pipeline-cycle` holds the shared control-plane priority lock for its complete ordered pass. Retention
-takes that lock only around one bounded prune batch and releases it before the inter-batch delay. If research-control
-already owns the lock, retention reports `yielded_to_research` and retries later instead of competing for SQLite's
-single writer slot. Direct `prune-evidence --execute` follows the same lock order.
-Wallet and copyability planners run candidate selection and copyability priority calculation before opening their
-short queue-admission write transaction. Under the write lock they recheck mutable eligibility, exact-scope dedupe,
-retry cooldown, and active-queue capacity before enqueueing.
-Eligibility repair only prepares evidence budgets and planner-ready actions; it never writes `pipeline_jobs`.
-Queue admission remains delegated to the canonical wallet and copyability planners, and unchanged repair budgets
-are not rewritten on every control pass.
-The files under `deploy/systemd` describe the older non-NAS deployment and do not share this scheduler. Do not run
-those timers beside the NAS Compose stack. The NAS Compose control loop is the supported scheduling architecture
-for this repository's current research/scoring deployment.
+## Admission and Validation
 
-## Evidence Tiers
+### Single ingress
 
-- `l0_discovered`: candidate registered, no useful history yet.
-- `l1_light`: light activity history for a fast continue/stop decision.
-- `l2_medium`: enough history to assess market diversity, fast-market concentration, and strategy shape.
-- `l3_deep`: deep evidence suitable for scoring, paper-stage observation, and publication review.
+`orchestration/wallet_sightings.py` is the only source boundary. Leaderboards, public activity,
+RTDS, curated CSV files, and Polydata imports call it. It validates and normalizes EVM addresses,
+records provenance in `observed_wallets`, and creates the canonical `wallet_levels` row.
 
-There is no L4. `candidate_stage` is a separate scoring/research lifecycle and must not be used to infer an
-evidence tier.
+Health enforces this boundary as a data invariant: every candidate must have an observation and a
+level, and every observation must have a level. Migration 65 repairs candidates imported by older
+runtimes before this single-ingress contract existed.
 
-Paper-stage evidence readiness is reported separately from the persisted tier:
+L0 to L1 is intentionally cheap:
 
-- `full_l3`: `l3_deep` with `summary_ready`.
-- `bounded_deep`: the deep-history request completed with finite source history, while the wallet remains
-  truthfully labeled `l2_medium`; it requires `deep_done`, `summary_ready`, at least 500 activities, 20 markets,
-  and 100 non-fast trades.
-- `incomplete`: neither evidence path is sufficient for paper-stage research.
+- a curated or otherwise trusted source is enough;
+- otherwise, the compact sample of up to 10 verified observed trades must total at least 100 USDC;
+- an unverified address remains L0.
 
-`deep_done` means the deep job finished; it does not by itself promote a wallet to `l3_deep`. The bounded path is
-a conservative paper-research exception for finite histories. It never rewrites `wallet_processing_state`, never
-claims full L3 coverage, and does not grant live execution or publication permission.
+Ingress never fetches full history and never scores a wallet.
 
-## Candidate Stages
+### L1 recent screen
 
-- `needs_data`: evidence or scoring inputs are incomplete.
-- `needs_manual_review`: conservative holding stage; automated evidence work may continue.
-- `paper_candidate`: research gates passed for paper-stage observation.
-- `paper_approved`: research score and historical copyability validation passed; the wallet is admitted to
-  paper observation, but paper performance has not passed yet.
-- `live_eligible`: publishable research label for a separate execution system.
-- `blocked_hygiene`, `blocked_copyability`, `rejected`: explicit blocking outcomes.
+`orchestration/wallet_screening.py` fetches at most 10 recent public trades. The only promotion gate
+is total sampled volume of at least 100 USDC. A failed screen is not retried continuously. It may be
+screened again after seven days only when a newer source sighting exists.
 
-Missing maker/taker evidence is not a hard gate in the current research pipeline. Reliable role evidence may
-adjust risk, but role inference remains a future enhancement. Hygiene uses conservative risk signals and can
-block only when configured evidence is strong enough.
+This gate is cheap by design. It removes dormant and dust-only addresses without requiring market
+diversity, ROI, strategy labels, or long history before the project knows whether the wallet is
+economically active.
 
-## NAS Runtime
+### History evidence and score
 
-The default Compose stack runs:
+`orchestration/wallet_history_pipeline.py` fetches only the depth authorized by the current level:
 
-- proxy tunnel and web console;
-- polling and RTDS discovery;
-- one ordered research control loop for eligibility, queue admission, features, scoring, and handoff export;
-- sharded wallet and copyability workers;
-- the read-only paper-observer loop, including bounded Gamma refresh and research-trial outcome tracking;
-- lightweight maintenance with bounded, archive-aware evidence pruning.
+- L2: light history, up to 200 activity rows;
+- L3-L6: deep history, up to 1,000 activity rows;
+- light PnL: up to 50 closed positions;
+- deep PnL: paginated up to 500 closed positions.
 
-Full SQLite backups are manual in the current development phase. The default research stack does not start the
-backup loop. Cold Parquet evidence is not a database backup: it preserves reusable historical rows while SQLite
-remains the only workflow truth source.
+`research/wallet_history_summary.py` produces a strategy-neutral score from PnL, estimated ROI,
+market breadth, activity, persistence, and concentration. Missing ROI is weak evidence, not a
+neutral return. Strategy tags describe behavior; they are not automatic rejection rules. Risk flags
+remain visible research facts unless an explicit, independently justified hard-risk rule is set.
 
-The opt-in execution profile contains paper-run, paper-settle, and publish loops. It is not started by the
-default `up`, `restart`, `runtime-ensure`, or watchdog commands.
+### Relative selection
 
-The observer loop has a separate result lifecycle from paper execution. An actionable CLOB quote fixes one
-`paper_observer_trials` entry at the first observed executable price. The loop then refreshes only referenced Gamma
-markets and records marks or final 0/1 settlements. It never writes `paper_orders`, `paper_fills`, `paper_positions`,
-or `leader_publish`. Observer ROI is research evidence about signal timeliness and outcome quality; it is not a claim
-that an order was submitted or filled by an execution system.
+`orchestration/wallet_level_selection.py` applies evidence floors before ranking:
 
-Observer validation uses `wallet + market_slug` as the independent sample. Repeated actionable trades in the same
-market remain visible as trials but contribute only one market result, one market-level win/loss, and one share of
-capital concentration. A market contributes to settled ROI only after all of that wallet's trials in the market are
-resolved. Configured minimum resolved markets, settled cost, ROI, and maximum one-market cost share produce a
-separate research status such as `collecting_outcomes`, `validated_promising`, or `validation_concentrated`.
-This status is descriptive: it never rewrites `candidate_stage` and never grants execution or publication permission.
+| Transition | Required depth | Activity | Markets | Volume | Bucket share | Global baseline |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| L2 -> L3 | light | 10 | 1 | 100 USDC | top 25% | none; L3 allocates bounded deep research |
+| L3 -> L4 | deep | 50 | 3 | 500 USDC | top 20% | top 50% globally |
+| L4 -> L5 | deep | 100 | 5 | 1,000 USDC | top 10% | top 25% globally |
 
-## Reliability Rules
+The default cohort needs 20 comparable wallets. After one hour, a cohort of at least five may be
+processed so sparse sources do not wait forever. Selection is balanced across sufficiently populated
+source and strategy buckets, with source-wide and global fallbacks for small buckets. Promotion caps
+bound each control pass to 12 new L3, 6 new L4, and 2 new L5 promotions by default. L4 and L5 must
+also clear their global relative baseline, so the best wallet in a weak isolated bucket cannot become
+a strong or elite wallet solely through bucket fairness.
 
-- Queue claims use SQLite write serialization and leases.
-- Evidence pruning is a state machine: wallets are frozen, jobs are closed, Parquet files are written to partial
-  paths, row counts and SHA-256 checksums are verified, manifests are atomically promoted, and only then are raw
-  SQLite rows deleted. Failed exports keep the SQLite rows and resume the same archive run on the next pass.
-- Archive batches are written per table rather than per wallet to avoid a NAS tiny-file explosion. The default
-  batch remains five wallets per hour.
-- `parquet-wallet://<address>` is the stable wallet-level archive locator. It resolves every verified, partial,
-  and completed archive run for that wallet; an individual archive run id is audit metadata, not a restore pointer.
-- Workers renew leases around long work and can only complete or retry jobs they still own.
-- Maintenance requeues expired leases and stale runtime records.
-- Lightweight maintenance retains `loop_*` runtime heartbeats for 30 days by default even when broad database
-  cleanup is skipped. It does not delete worker audit runs or wallet evidence in that path.
-- Maintenance marks expired or queued jobs failed once their attempt budget is exhausted, so unclaimable jobs
-  cannot occupy planner queue capacity indefinitely. Failed jobs respect `next_attempt_at`; after the cooldown,
-  planners may reopen them with a fresh attempt budget while retaining the previous error for diagnosis.
-- Retention catch-up is bounded. Maintenance runs up to four short passes only when newly classified eligible raw
-  rows outpace completed deletion or when retention yielded to research-control; every batch still releases the
-  control lock so research remains the priority. While the backlog remains above the configured high-water mark,
-  `draining`, `inflow_outpacing_cleanup`, and `yielded_to_research` all schedule the next bounded cycle on the short
-  interval instead of falling back to the normal 15-minute maintenance cadence.
-- Retention reports control-lock wait, prune work, inter-batch sleep, and unclassified overhead separately. Its
-  SQLite page cache and mmap window are private to the single retention connection, bounded to 1 GiB each, and do
-  not change discovery, worker, scoring, or web connections. NAS defaults are 128 MiB cache and 256 MiB mmap.
-- Production zero-raw pruning revalidates wallet eligibility inside the write transaction, then resets activity
-  watermarks in one batch and skips the redundant post-delete evidence scan. Archive or keep-recent modes retain
-  exact per-wallet watermark reconciliation and residual checks. Reports split delete, watermark, residual,
-  finalization, and commit time so later tuning remains evidence-led.
-- The retention connection uses SQLite `secure_delete=FAST`: public market evidence is zeroed when SQLite can do so
-  without extra I/O, while discovery, scoring, web, and other database connections keep their normal setting.
-- Planner backpressure limits queued/running wallet evidence and copyability jobs. Copyability planning keeps
-  its per-pass batch limit separate from the active-queue waterline and only fills currently available slots.
-- Research control keeps feature and scoring transactions bounded. A full batch schedules a `scoring_only` pass on
-  the shorter active interval. Catch-up bursts are capped before forcing another full cycle; idle, failed, or
-  malformed summaries restore the conservative interval and full-cycle mode.
-- When queue capacity is tight, the planner allocates slots across light, medium, and deep evidence stages by
-  configured weight, current active-job share, and a persistent smooth weighted round-robin cursor. Priority
-  ordering remains intact within each stage, while fully drained planner cycles cannot reset stage fairness.
-- Wallet and copyability queue capacity checks and job admission run in one SQLite write transaction, so
-  concurrent planners cannot reserve the same high-waterline slot.
-- Workers normally claim by wallet priority, then promote the oldest queued job after the configured aging
-  threshold. This preserves urgent-wallet ordering without allowing low-priority L2/L3 work to wait forever.
-- Pipeline audits report fresh candidate-state and score handoffs as waiting work. They become warnings only after
-  the 10-minute handoff grace period; never-scored wallets and wallets with an existing stale score are reported as
-  separate, non-overlapping failure classes.
-- `wallet-pipeline-jobs` and the research console expose the same per-stage queue counts, configured weights,
-  scheduler cursor, and aged-job totals. Queue age is measured from `pipeline_jobs.updated_at` only when
-  `attempts < max_attempts` and `next_attempt_at` is due, matching the worker claim rule and avoiding false
-  alerts during retry backoff or after attempts are exhausted.
-- Public Polymarket HTTP clients reserve global and endpoint request slots atomically through the shared
-  `api_rate_limit_state` table, while retaining the existing per-process limiter.
-- Activity polling rebuilds wallet episodes only when new rows were stored or an existing trade history has no
-  episode snapshot. Zero-change paper-observer polls therefore remain read-mostly instead of rewriting derived
-  evidence every minute.
-- HTTP `429 Retry-After` cooldowns are shared across containers. Short waits are handled in the HTTP client;
-  waits longer than 30 seconds return to the queue scheduler so workers do not hold leases while sleeping.
-- Upstream cooldown and coordination deferrals do not consume a wallet job's failure-attempt budget, and the
-  worker stops the current batch instead of churning through more wallets during the same cooldown. Run
-  summaries count only wallets actually attempted and do not classify scheduler deferrals as job failures.
-- Shared limiter lock contention defers the caller instead of allowing an uncoordinated request. The
-  coordination transaction uses a short timeout and never contains network I/O or sleep.
-- Optional SQLite recovery points are integrity-checked when explicitly created. Their freshness is not part of
-  default runtime health while scheduled backups are paused.
-- Paper handoff and paper eligibility share the same accepted hygiene statuses; the UI does not maintain a
-  second status vocabulary that can contradict the scoring gate.
-- `paper_candidate` and `live_eligible` are research states, never implicit permission to place real orders.
+Selection policy `relative_rank_v3` also retains the latest score snapshot previously evaluated for
+the same transition and policy. A late wallet therefore competes with the established transition
+benchmark instead of being promoted merely because it arrived in a tiny new process-local batch.
+Current evidence replaces an older snapshot for the same wallet.
 
-## Current Follow-Up Work
+The deployed selection policy version is code-owned. NAS and systemd services do not override it
+through environment variables; a policy change requires a reviewed code/version update and fresh
+selection decisions.
 
-- Verify proxy reachability and logical loop liveness from the NAS runtime, not only container presence.
-- Measure shared request-budget write latency under the real NAS worker count before increasing concurrency.
-- Measure Parquet archive latency and compression on the real NAS before increasing the five-wallet batch size.
-- Measure net retention backlog movement after the research-priority lock has run through normal discovery load.
+Do not add a second fixed quality threshold on top of these relative ranks without measured false
+positive and false negative data. Hard evidence floors answer "is this comparison meaningful";
+relative rank answers "which wallets deserve the next unit of research work".
+
+### Independent L6 validation
+
+`orchestration/l6_validation_pipeline.py` queues only current L5/L6 wallets. It fetches a separate,
+bounded 90-day evidence set plus official WEEK/MONTH/ALL leaderboard cross-checks.
+`research/l6_validation.py` evaluates four questions without using the wallet's research score:
+
+- profit: realized PnL must be positive and recent 30-day realized PnL must not be negative;
+- persistence: at least 10 timestamped closed positions, four active weeks, 90% timestamp coverage,
+  and at least half of active weeks profitable;
+- anomaly risk: no extreme single-market or single-day profit concentration and no realized
+  drawdown larger than total positive realized PnL.
+- official contradiction: official all-time PnL must be positive. Official PnL divided by official
+  cumulative volume is stored as profit intensity, never as account ROI; a positive value below
+  0.2% produces a review warning rather than a false failure.
+
+Incomplete source pagination, thin history, missing official cross-checks, weak official profit
+intensity, or weak timestamp coverage produces `warning`, not a false failure. Activity anomalies
+such as mechanical timing, extreme bursts, or high turnover with
+little net flow are retained as visible flags. Only a complete `pass` advances L5 to L6. This module
+does not use paper results, copyability, maker/taker roles, or any execution signal.
+
+## Queue Contract
+
+`pipeline_jobs` is a bounded work queue, not wallet truth. Only three production job types are active:
+
+- `wallet_recent_screen`: bounded L1 screen;
+- `wallet_history_collect`: light or deep history authorized by `wallet_levels`;
+- `wallet_l6_validate`: low-volume independent validation for current L5/L6 wallets.
+
+`pipeline_jobs.job_scope` is a bounded fetch scope such as `sample`, `light`, or `deep`; it is not
+the wallet's L level. `pipeline_jobs.job_action` is the immutable action/deduplication key. The
+canonical wallet level is always `wallet_levels.level`.
+
+Planners cap queued plus running jobs and exclude exhausted queued jobs from active waterlines.
+History candidate limits are applied independently to light and deep work before source-aware
+rotation, so one depth cannot disappear during SQL truncation. Workers lease jobs by stable wallet
+shard, perform network requests outside long SQLite write transactions, and commit compact results.
+Jobs waiting more than one hour age ahead of normal priority. Expired leases and exhausted jobs are
+recovered by maintenance.
+
+## Storage Contract
+
+### SQLite control plane
+
+SQLite stores small mutable state:
+
+- `observed_wallets`: provenance and the compact recent sample;
+- `candidate_wallets`: admitted-wallet metadata retained for database compatibility;
+- `wallet_levels` and `wallet_level_events`: canonical level and audit trail;
+- `wallet_screen_summaries`: L1 screen result;
+- `wallet_pnl_summaries`: bounded PnL/ROI estimate and coverage;
+- `wallet_history_summaries`: current compact research facts and score;
+- `wallet_level_selections`: policy-versioned rank decisions;
+- `wallet_l6_validations`: compact policy-versioned independent-validation verdicts and metrics;
+- `wallet_history_artifacts`: Parquet catalog and lifecycle state;
+- `pipeline_jobs`: bounded worker leases;
+- runtime heartbeats and API-rate state.
+
+SQLite must not become the long-term raw trade warehouse.
+
+### Parquet evidence plane
+
+Raw light and deep wallet histories are written directly to versioned Parquet files under the
+configured archive root. L6 source rows are written separately under the versioned `l6_validation`
+tree. Files are written and verified before their compact SQLite metadata is committed; wallet-history
+catalog switches also mark the previous active history artifact as `superseded`.
+
+GC is conservative:
+
+- active artifacts are never selected;
+- superseded artifacts must exceed the configured age;
+- the newest configured number of superseded artifacts per wallet is retained;
+- paths outside the archive root, parent traversal, absolute paths, and symlinks are rejected;
+- deleted catalog rows are retained as tombstones with `purged_at` for auditability.
+
+Deletion is two-phase: `purge_started_at` is committed before unlinking the verified file, then
+`purged_at` is committed after deletion. If the process stops between those steps, the next GC pass
+finishes the pending purge instead of misclassifying the missing file as unexplained catalog drift.
+
+Before GC, NAS maintenance audits every unpurged catalog path for existence and byte size, rejects
+unsafe paths, and scans the wallet-history tree for uncatalogued Parquet files. Orphans younger than
+seven days are left alone so an in-flight write is never collected; bounded older orphans may be
+removed. Full SHA-256 verification is an explicit slower mode rather than a 15-minute maintenance
+default.
+
+The default keeps one superseded artifact and waits 30 days. A dry run is the CLI default; NAS
+maintenance uses the explicit execute flag.
+
+### Refresh policy
+
+Evidence is refreshed when the summary methodology changes, or when there is a newer real wallet
+sighting than the current summary after the normal refresh window:
+
+- any summary written by an older methodology: immediately, with L6 through L2 processed in that
+  order;
+
+- failed L1 screen: no sooner than seven days;
+- L2 light history: no sooner than 30 days;
+- L3-L6 deep history: no sooner than seven days;
+- L6 independent validation: every 14 days, or immediately after the active deep artifact changes.
+
+Level transitions do not update `last_seen_at`; otherwise internal processing would manufacture a
+false market sighting and create an endless refresh loop.
+
+## Runtime Ownership
+
+| Module | Responsibility | Validation boundary | Main pitfall |
+| --- | --- | --- | --- |
+| `wallet_sightings.py` | Normalize all source events and admit L0/L1 | EVM address, verified/trusted source | Never fetch history or score here |
+| `wallet_screening.py` | Plan and execute the 10-trade screen | Current level, hard block, sample volume | Do not turn source labels into quality gates |
+| `wallet_history_pipeline.py` | Plan depth-limited fetches and persist summaries/artifacts | Level-authorized depth, lease ownership, refresh age | Do not store fetched raw rows back in SQLite |
+| `wallet_history_summary.py` | Derive versioned comparable facts | Row normalization and bounded components | Strategy labels are descriptions, not exclusions |
+| `wallet_level_selection.py` | Allocate deeper work by evidence floor and relative rank | Depth, minimum evidence, cohort readiness | Do not rank thin rows or promote twice in one pass |
+| `l6_validation_pipeline.py` | Plan and execute low-volume independent validation | Current L5 selection, active artifact, lease ownership | Warning/fail must not demote or promote a wallet |
+| `l6_validation.py` | Derive profit, persistence, and anomaly verdicts | Complete evidence before hard conclusions | Do not reuse the relative research score as proof |
+| `wallet_history_store.py` | Atomic Parquet lifecycle and GC | Checksum/readback, path containment, one active artifact | Never delete an active or unverified path |
+| `l6_validation_store.py` | Persist immutable raw L6 source rows | Checksum/readback and relative path containment | Never expose host-absolute paths in metadata |
+| `storage/wallet_levels.py` | Canonical monotonic level/event writes | Address and legal transition | Do not use queue state or legacy stages as authority |
+| `ops.py` | Health, backup, bounded SQLite maintenance | Schema/readiness and safe cleanup | SQLite backup alone is not a Parquet backup |
+| `web.py` | Read-only research console | Current L5 and verified-L6 freshness contracts | Do not present historical L5/L6 as current evidence |
+
+Runtime health uses a 15-minute default freshness window for continuous and short-interval loops.
+Hourly leaderboard and activity discovery use a two-hour override, so health reflects the deployed
+schedule instead of reporting a false outage while those loops are sleeping normally.
+
+## Recovery and Long-Term Maintenance
+
+1. Back up the SQLite database and Parquet archive as one logical dataset. SQLite contains the
+   catalog; Parquet contains the raw evidence. Either half alone is incomplete.
+2. Run migrations before starting workers.
+3. Keep raw source inputs replayable when possible. Replaying sightings is safe because ingress and
+   job admission are idempotent.
+4. Preserve methodology, storage, and selection policy versions. New policies write new decisions;
+   they do not silently reinterpret old rows.
+5. Use bounded maintenance and passive WAL checkpoints during normal operation. Reserve VACUUM and
+   full filesystem snapshots for a controlled maintenance window.
+6. Treat missing catalog files, orphan Parquet files, and checksum mismatches as health failures to
+   repair before GC or restore operations.
+
+## Compatibility Boundary
+
+Old migration files retain the pre-research upgrade history. Migration 62 collapses the resulting
+database into the current research-only schema and drops every retired runtime table. Runtime code,
+health, web views, and L0-L6 transitions must use only the compact schema listed above.
+
+Do not add new writes or compatibility aliases for retired lifecycles. Any future schema evolution
+must preserve the research-only boundary and use a forward migration.

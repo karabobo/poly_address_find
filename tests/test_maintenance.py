@@ -1,849 +1,276 @@
-import json
+import sqlite3
 import time
-
-import pytest
+from pathlib import Path
 
 from pm_robot.config import RobotSettings
-from pm_robot.models import CandidateAddress
-from pm_robot.ops import maintenance
-from pm_robot.orchestration.wallet_pipeline import (
-    JOB_TYPE as WALLET_EVIDENCE_JOB_TYPE,
-    plan_wallet_pipeline_jobs,
-)
-from pm_robot.pipeline_terms import DEFAULT_EVIDENCE_JOB_STAGE, EvidenceTier
-from pm_robot.storage.db import connect, initialize_database, run_migrations
-from pm_robot.storage.repository import (
-    claim_pipeline_job,
-    complete_pipeline_job,
-    enqueue_pipeline_job,
-    upsert_candidate,
-)
+from pm_robot.ops import _delete_metadata_batch, maintenance
+from pm_robot.storage.db import connect, run_migrations
 
 
-def _settings(tmp_path):
-    db_path = tmp_path / "data" / "robot.sqlite"
-    backup_dir = tmp_path / "backups"
-    backup_dir.mkdir(parents=True)
-    return RobotSettings(db_path=db_path, backup_dir=backup_dir, execution_mode="research")
-
-
-def _prepare_wal_database(settings):
-    initialize_database(settings.db_path)
+def _settings(tmp_path: Path) -> RobotSettings:
+    settings = RobotSettings(
+        db_path=tmp_path / "data" / "robot.sqlite",
+        log_dir=tmp_path / "logs",
+        backup_dir=tmp_path / "backups",
+        archive_dir=tmp_path / "parquet",
+    )
+    for path in (
+        settings.db_path.parent,
+        settings.log_dir,
+        settings.backup_dir,
+        settings.archive_dir,
+    ):
+        path.mkdir(parents=True, exist_ok=True)
     conn = connect(settings.db_path)
     try:
-        conn.execute("CREATE TABLE IF NOT EXISTS sample_rows(id INTEGER PRIMARY KEY, value TEXT)")
-        conn.execute("INSERT INTO sample_rows(value) VALUES ('x')")
+        run_migrations(conn)
+    finally:
+        conn.close()
+    return settings
+
+
+def _insert_job(
+    conn,
+    *,
+    job_type: str,
+    wallet: str,
+    status: str,
+    attempts: int = 0,
+    max_attempts: int = 3,
+    lease_until: int = 0,
+    updated_at: int = 1,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO pipeline_jobs(
+            job_type, wallet, job_action, job_scope, priority, shard, status,
+            lease_owner, lease_until, attempts, max_attempts,
+            next_attempt_at, created_at, updated_at
+        ) VALUES (?, ?, 'test', 'sample', 10, 0, ?, 'worker', ?, ?, ?, 0, ?, ?)
+        """,
+        (
+            job_type,
+            wallet,
+            status,
+            lease_until,
+            attempts,
+            max_attempts,
+            updated_at,
+            updated_at,
+        ),
+    )
+
+
+def test_maintenance_dry_run_reports_legacy_jobs_without_changing_them(tmp_path):
+    settings = _settings(tmp_path)
+    conn = connect(settings.db_path)
+    try:
+        _insert_job(
+            conn,
+            job_type="copyability_evidence",
+            wallet="0x" + "1" * 40,
+            status="queued",
+        )
         conn.commit()
     finally:
         conn.close()
 
+    result = maintenance(settings, dry_run=True)
 
-def test_maintenance_dry_run_reports_but_skips_wal_checkpoint(tmp_path):
-    settings = _settings(tmp_path)
-    _prepare_wal_database(settings)
-
-    result = maintenance(settings, dry_run=True, wal_checkpoint="passive")
-
-    assert result["ok"] is True
-    assert result["dry_run"] is True
-    assert result["wal_checkpoint"] == {
-        "mode": "passive",
-        "executed": False,
-        "skipped_reason": "dry_run",
-        "busy": None,
-        "log_frames": None,
-        "checkpointed_frames": None,
-    }
-    assert "storage_before" in result
-    assert "db_wal_mb" in result["storage"]
-
-
-def test_maintenance_can_run_passive_wal_checkpoint(tmp_path):
-    settings = _settings(tmp_path)
-    _prepare_wal_database(settings)
-
-    result = maintenance(settings, wal_checkpoint="passive")
-
-    checkpoint = result["wal_checkpoint"]
-    assert checkpoint["mode"] == "passive"
-    assert checkpoint["executed"] is True
-    assert checkpoint["skipped_reason"] == ""
-    assert isinstance(checkpoint["busy"], int)
-    assert isinstance(checkpoint["log_frames"], int)
-    assert isinstance(checkpoint["checkpointed_frames"], int)
-
-
-def test_maintenance_skip_cleanup_avoids_cleanup_scan(tmp_path, monkeypatch):
-    settings = _settings(tmp_path)
-
-    def fail_if_called(*args, **kwargs):
-        raise AssertionError("cleanup scan should be skipped")
-
-    monkeypatch.setattr("pm_robot.ops._cleanup_database", fail_if_called)
-
-    result = maintenance(settings, dry_run=True, skip_cleanup=True)
-
-    assert result["cleanup_skipped"] is True
-    assert result["deleted"] == {}
-
-
-def test_maintenance_cleanup_batch_limit_bounds_each_retention_table(tmp_path):
-    settings = _settings(tmp_path)
-    initialize_database(settings.db_path)
-    now = int(time.time())
-    old = now - 8 * 86_400
+    assert result["legacy_jobs_disabled"]["total"] == 1
+    assert result["legacy_jobs_disabled"]["executed"] is False
     conn = connect(settings.db_path)
     try:
-        run_migrations(conn)
-        conn.executemany(
+        assert conn.execute(
+            "SELECT status FROM pipeline_jobs WHERE job_type = 'copyability_evidence'"
+        ).fetchone()[0] == "queued"
+    finally:
+        conn.close()
+
+
+def test_maintenance_disables_legacy_jobs_and_bounds_metadata(tmp_path):
+    settings = _settings(tmp_path)
+    now = int(time.time())
+    conn = connect(settings.db_path)
+    try:
+        _insert_job(
+            conn,
+            job_type="wallet_evidence_backfill",
+            wallet="0x" + "2" * 40,
+            status="running",
+            lease_until=now + 60,
+        )
+        conn.execute(
             """
             INSERT INTO api_request_log(
-                ts, base_url, endpoint, status_code, latency_ms,
-                retry_count, error_type, ok
-            ) VALUES (?, 'https://example.test', '/data', 200, 10, 0, '', 1)
+                ts, base_url, endpoint, latency_ms, retry_count, error_type, ok
+            ) VALUES (?, 'https://example.invalid', '/old', 1, 0, '', 1)
             """,
-            [(old - 2,), (old - 1,), (old,), (now,)],
-        )
-        conn.commit()
-    finally:
-        conn.close()
-
-    result = maintenance(settings, api_log_days=7, cleanup_batch_limit=2)
-
-    assert result["cleanup_batch_limit"] == 2
-    assert result["optimize"] is False
-    assert result["deleted"]["api_request_log"] == 2
-    conn = connect(settings.db_path)
-    try:
-        old_count = conn.execute(
-            "SELECT COUNT(*) FROM api_request_log WHERE ts < ?",
-            (now - 7 * 86_400,),
-        ).fetchone()[0]
-        current_count = conn.execute(
-            "SELECT COUNT(*) FROM api_request_log WHERE ts >= ?",
-            (now - 7 * 86_400,),
-        ).fetchone()[0]
-    finally:
-        conn.close()
-    assert old_count == 1
-    assert current_count == 1
-
-
-def test_retention_timestamp_indexes_are_installed(tmp_path):
-    settings = _settings(tmp_path)
-    initialize_database(settings.db_path)
-    conn = connect(settings.db_path)
-    try:
-        run_migrations(conn)
-        indexes = {
-            str(row[0])
-            for row in conn.execute(
-                "SELECT name FROM sqlite_master WHERE type = 'index'"
-            ).fetchall()
-        }
-    finally:
-        conn.close()
-
-    assert {
-        "idx_wallet_positions_captured_at",
-        "idx_leader_scores_scored_at",
-        "idx_review_events_created_at",
-        "idx_ingest_runs_started_at",
-    } <= indexes
-    assert {
-        "idx_paper_marks_marked_at",
-        "idx_paper_readiness_observations_observed_at",
-    }.isdisjoint(indexes)
-
-
-def test_maintenance_retains_each_wallet_latest_score_summary(tmp_path):
-    settings = _settings(tmp_path)
-    initialize_database(settings.db_path)
-    wallet = "0x" + "a" * 40
-    old = int(time.time()) - 31 * 86_400
-    conn = connect(settings.db_path)
-    try:
-        run_migrations(conn)
-        upsert_candidate(conn, CandidateAddress(address=wallet, sources="maintenance-test"))
-        conn.executemany(
-            """
-            INSERT INTO leader_scores(
-                address, leader_score, review_stage, review_reason,
-                components_json, penalties_json, policy_version, scored_at
-            ) VALUES (?, ?, 'needs_data', 'test', '{}', '{}', 'test-v1', ?)
-            """,
-            [(wallet, 10.0, old - 1), (wallet, 20.0, old)],
-        )
-        conn.commit()
-    finally:
-        conn.close()
-
-    result = maintenance(settings, scores_days=30, cleanup_batch_limit=10)
-
-    assert result["deleted"]["leader_scores"] == 1
-    conn = connect(settings.db_path)
-    try:
-        scores = conn.execute(
-            "SELECT leader_score FROM leader_scores WHERE address = ? ORDER BY score_id",
-            (wallet,),
-        ).fetchall()
-        latest = conn.execute(
-            "SELECT leader_score FROM leader_latest_scores WHERE address = ?",
-            (wallet,),
-        ).fetchone()
-    finally:
-        conn.close()
-    assert [float(row[0]) for row in scores] == [20.0]
-    assert float(latest[0]) == 20.0
-
-
-def test_unbounded_manual_maintenance_keeps_sqlite_optimize(tmp_path):
-    settings = _settings(tmp_path)
-    initialize_database(settings.db_path)
-
-    result = maintenance(settings)
-
-    assert result["cleanup_batch_limit"] == 0
-    assert result["optimize"] is True
-
-
-def test_generic_ttl_cleanup_never_deletes_paper_evidence(tmp_path):
-    settings = _settings(tmp_path)
-    initialize_database(settings.db_path)
-    old = int(time.time()) - 120 * 86_400
-    wallet = "0x" + "b" * 40
-    conn = connect(settings.db_path)
-    try:
-        run_migrations(conn)
-        conn.execute(
-            """
-            INSERT INTO paper_marks(
-                wallet, market_slug, asset_id, mark_price, mark_source, marked_at
-            ) VALUES (?, 'market', 'asset', 0.5, 'gamma', ?)
-            """,
-            (wallet, old),
+            (now - 10 * 86_400,),
         )
         conn.execute(
             """
-            INSERT INTO paper_readiness_observations(
-                wallet, observed_at, orders, settled_positions, mark_coverage,
-                settled_roi, total_roi, production_ready, blockers_json
-            ) VALUES (?, ?, 10, 2, 1.0, 0.1, 0.1, 1, '[]')
+            INSERT INTO runtime_heartbeats(
+                name, started_at, finished_at, status
+            ) VALUES ('loop_rtds_discovery', ?, ?, 'ok')
             """,
-            (wallet, old),
+            (now - 40 * 86_400, now - 40 * 86_400 + 1),
         )
         conn.commit()
     finally:
         conn.close()
 
-    result = maintenance(settings, cleanup_batch_limit=500)
-
-    assert result["deleted"]["paper_marks"] == 0
-    assert result["deleted"]["paper_readiness_observations"] == 0
-    conn = connect(settings.db_path)
-    try:
-        assert conn.execute("SELECT COUNT(*) FROM paper_marks").fetchone()[0] == 1
-        assert conn.execute(
-            "SELECT COUNT(*) FROM paper_readiness_observations"
-        ).fetchone()[0] == 1
-    finally:
-        conn.close()
-
-
-def test_maintenance_skip_cleanup_prunes_only_old_runtime_heartbeats(tmp_path):
-    settings = _settings(tmp_path)
-    initialize_database(settings.db_path)
-    now = int(time.time())
-    old = now - 31 * 86_400
-    conn = connect(settings.db_path)
-    try:
-        run_migrations(conn)
-        conn.executemany(
-            """
-            INSERT INTO ingest_runs(
-                ingest_type, started_at, finished_at, status,
-                wallets_attempted, wallets_succeeded, rows_written, error
-            ) VALUES (?, ?, ?, 'ok', 0, 0, 0, '')
-            """,
-            [
-                ("loop_research_control_step_wallet_pipeline_plan", old, old + 1),
-                ("loopX_worker", old, old + 1),
-                ("loopback_worker", old, old + 1),
-                ("wallet_pipeline_worker_0", old, old + 1),
-                ("loop_recent", now - 60, now - 50),
-            ],
-        )
-        conn.commit()
-    finally:
-        conn.close()
-
-    dry_run = maintenance(
+    result = maintenance(
         settings,
-        skip_cleanup=True,
-        dry_run=True,
-        runtime_heartbeat_days=30,
+        api_log_days=7,
+        heartbeat_days=30,
+        cleanup_batch_limit=100,
     )
-    assert dry_run["runtime_heartbeat_cleanup"]["matched"] == 1
-    assert dry_run["runtime_heartbeat_cleanup"]["deleted"] == 0
 
-    result = maintenance(settings, skip_cleanup=True, runtime_heartbeat_days=30)
-    assert result["runtime_heartbeat_cleanup"]["deleted"] == 1
-
+    assert result["legacy_jobs_disabled"]["total"] == 1
+    assert result["deleted"]["api_request_log"] == 1
+    assert result["deleted"]["runtime_heartbeats"] == 1
     conn = connect(settings.db_path)
     try:
-        remaining = {
-            str(row[0])
-            for row in conn.execute("SELECT ingest_type FROM ingest_runs ORDER BY ingest_type").fetchall()
-        }
-    finally:
-        conn.close()
-    assert remaining == {
-        "loopX_worker",
-        "loop_recent",
-        "loopback_worker",
-        "wallet_pipeline_worker_0",
-    }
-
-
-def test_maintenance_rejects_unknown_wal_checkpoint_mode(tmp_path):
-    settings = _settings(tmp_path)
-    _prepare_wal_database(settings)
-
-    with pytest.raises(ValueError, match="wal_checkpoint"):
-        maintenance(settings, wal_checkpoint="force")
-
-
-def test_maintenance_can_requeue_only_expired_running_pipeline_jobs(tmp_path):
-    settings = _settings(tmp_path)
-    initialize_database(settings.db_path)
-    now = 2_000
-    conn = connect(settings.db_path)
-    try:
-        run_migrations(conn)
-        conn.executemany(
-            """
-            INSERT INTO pipeline_jobs(
-                job_type, wallet, subject_key, tier, priority, shard, status,
-                lease_owner, lease_until, attempts, max_attempts, next_attempt_at,
-                input_json, output_json, last_error, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, 10, 0, ?, 'worker', ?, 1, 3, 0, '{}', '{}', '', ?, ?)
-            """,
-            [
-                ("copyability_evidence", "0x" + "1" * 40, "copyability", "copyability", "running", 1, now, now),
-                ("wallet_evidence_backfill", "0x" + "2" * 40, "light_pending", "l0_discovered", "running", 4_000_000_000, now, now),
-            ],
-        )
-        conn.execute(
-            """
-            INSERT INTO pipeline_jobs(
-                job_type, wallet, subject_key, tier, priority, shard, status,
-                lease_owner, lease_until, attempts, max_attempts, next_attempt_at,
-                input_json, output_json, last_error, created_at, updated_at
-            ) VALUES ('wallet_evidence_backfill', ?, 'deep_pending', 'l2_medium',
-                      20, 0, 'running', 'worker-exhausted', 1, 3, 3, 0,
-                      '{}', '{}', '', ?, ?)
-            """,
-            ("0x" + "3" * 40, now, now),
-        )
-        conn.commit()
-    finally:
-        conn.close()
-
-    dry_run = maintenance(settings, skip_cleanup=True, dry_run=True, reset_stale_jobs=True)
-    assert dry_run["stale_jobs"]["reset"] is False
-    assert dry_run["stale_jobs"]["total"] == 2
-    assert dry_run["stale_jobs"]["requeued_count"] == 1
-    assert dry_run["stale_jobs"]["failed_count"] == 1
-
-    result = maintenance(settings, skip_cleanup=True, reset_stale_jobs=True)
-    assert result["stale_jobs"]["reset"] is True
-    assert result["stale_jobs"]["total"] == 2
-    assert result["stale_jobs"]["requeued_count"] == 1
-    assert result["stale_jobs"]["failed_count"] == 1
-
-    conn = connect(settings.db_path)
-    try:
-        expired = conn.execute(
-            "SELECT status, lease_owner, lease_until, last_error FROM pipeline_jobs WHERE wallet = ?",
-            ("0x" + "1" * 40,),
-        ).fetchone()
-        live = conn.execute(
-            "SELECT status, lease_owner, lease_until, last_error FROM pipeline_jobs WHERE wallet = ?",
-            ("0x" + "2" * 40,),
-        ).fetchone()
-        exhausted = conn.execute(
-            "SELECT status, lease_owner, lease_until, attempts, last_error FROM pipeline_jobs WHERE wallet = ?",
-            ("0x" + "3" * 40,),
-        ).fetchone()
-    finally:
-        conn.close()
-    assert dict(expired) == {
-        "status": "queued",
-        "lease_owner": None,
-        "lease_until": 0,
-        "last_error": "expired_lease_requeued_by_maintenance",
-    }
-    assert live["status"] == "running"
-    assert live["lease_owner"] == "worker"
-    assert live["lease_until"] == 4_000_000_000
-    assert dict(exhausted) == {
-        "status": "failed",
-        "lease_owner": None,
-        "lease_until": 0,
-        "attempts": 3,
-        "last_error": "expired_lease_attempts_exhausted_by_maintenance",
-    }
-
-
-def test_maintenance_marks_legacy_exhausted_queued_jobs_failed(tmp_path):
-    settings = _settings(tmp_path)
-    initialize_database(settings.db_path)
-    exhausted_wallet = "0x" + "4" * 40
-    claimable_wallet = "0x" + "5" * 40
-    conn = connect(settings.db_path)
-    try:
-        run_migrations(conn)
-        conn.executemany(
-            """
-            INSERT INTO pipeline_jobs(
-                job_type, wallet, subject_key, tier, priority, shard, status,
-                lease_owner, lease_until, attempts, max_attempts, next_attempt_at,
-                input_json, output_json, last_error, created_at, updated_at
-            ) VALUES ('wallet_evidence_backfill', ?, 'light_pending', 'l0_discovered',
-                      10, 0, 'queued', NULL, 0, ?, 3, 0, '{}', '{}', '', 1000, 1000)
-            """,
-            [(exhausted_wallet, 3), (claimable_wallet, 2)],
-        )
-        conn.commit()
-    finally:
-        conn.close()
-
-    dry_run = maintenance(settings, skip_cleanup=True, dry_run=True, reset_stale_jobs=True)
-    assert dry_run["exhausted_queued_jobs"] == {
-        "available": True,
-        "reset": False,
-        "total": 1,
-        "failed_count": 1,
-        "by_job_type": [{"job_type": "wallet_evidence_backfill", "count": 1}],
-    }
-
-    result = maintenance(settings, skip_cleanup=True, reset_stale_jobs=True)
-    assert result["exhausted_queued_jobs"]["reset"] is True
-    assert result["exhausted_queued_jobs"]["total"] == 1
-
-    conn = connect(settings.db_path)
-    try:
-        rows = conn.execute(
-            """
-            SELECT wallet, status, attempts, last_error
-            FROM pipeline_jobs
-            ORDER BY wallet
-            """
-        ).fetchall()
-    finally:
-        conn.close()
-
-    assert [dict(row) for row in rows] == [
-        {
-            "wallet": exhausted_wallet,
-            "status": "failed",
-            "attempts": 3,
-            "last_error": "attempts_exhausted_marked_failed_by_maintenance",
-        },
-        {
-            "wallet": claimable_wallet,
-            "status": "queued",
-            "attempts": 2,
-            "last_error": "",
-        },
-    ]
-
-
-def test_maintenance_releases_exhausted_wallet_pipeline_waterline(tmp_path, monkeypatch):
-    settings = _settings(tmp_path)
-    initialize_database(settings.db_path)
-    exhausted_wallet = "0x" + "8" * 40
-    pending_wallet = "0x" + "9" * 40
-    conn = connect(settings.db_path)
-    try:
-        run_migrations(conn)
-        for wallet, priority in ((exhausted_wallet, 1), (pending_wallet, 10)):
-            upsert_candidate(
-                conn,
-                CandidateAddress(address=wallet, sources="maintenance-test"),
-            )
-            conn.execute(
-                """
-                INSERT INTO wallet_processing_state(
-                    wallet, discovery_tier, evidence_status, evidence_depth,
-                    evidence_confidence, priority, current_stage, next_action,
-                    next_action_at, activity_count, distinct_markets,
-                    non_fast_trade_count, updated_at
-                ) VALUES (?, 'l0_discovered', 'needs_light', 0, 0.0, ?, '',
-                          'light_pending', 0, 0, 0, 0, 1000)
-                """,
-                (wallet, priority),
-            )
-        conn.execute(
-            """
-            INSERT INTO pipeline_jobs(
-                job_type, wallet, subject_key, tier, priority, shard, status,
-                lease_owner, lease_until, attempts, max_attempts, next_attempt_at,
-                input_json, output_json, last_error, created_at, updated_at
-            ) VALUES ('wallet_evidence_backfill', ?, 'light_pending', 'l0_discovered',
-                      1, 0, 'queued', NULL, 0, 3, 3, 0, '{}', '{}', '', 1000, 1000)
-            """,
-            (exhausted_wallet,),
-        )
-        conn.commit()
-
-        before = plan_wallet_pipeline_jobs(
-            conn,
-            light_limit=1,
-            medium_limit=0,
-            deep_limit=0,
-            shard_count=1,
-            max_active_jobs=1,
-            now=2_000,
-        )
-    finally:
-        conn.close()
-
-    assert before.throttled is True
-    assert before.reason == "active_queue_waterline"
-
-    monkeypatch.setattr("pm_robot.ops.time.time", lambda: 2_000)
-    maintenance(settings, skip_cleanup=True, reset_stale_jobs=True)
-
-    conn = connect(settings.db_path)
-    try:
-        after = plan_wallet_pipeline_jobs(
-            conn,
-            light_limit=1,
-            medium_limit=0,
-            deep_limit=0,
-            shard_count=1,
-            max_active_jobs=1,
-            now=3_000,
-        )
-        statuses = {
-            str(row["wallet"]): str(row["status"])
-            for row in conn.execute(
-                "SELECT wallet, status FROM pipeline_jobs ORDER BY wallet"
-            ).fetchall()
-        }
-    finally:
-        conn.close()
-
-    assert after.throttled is False
-    assert after.jobs_enqueued == 1
-    assert statuses == {
-        exhausted_wallet: "failed",
-        pending_wallet: "queued",
-    }
-
-    conn = connect(settings.db_path)
-    try:
-        conn.execute(
-            "UPDATE pipeline_jobs SET status = 'done' WHERE wallet = ?",
-            (pending_wallet,),
-        )
-        conn.commit()
-        cooldown_elapsed = plan_wallet_pipeline_jobs(
-            conn,
-            light_limit=1,
-            medium_limit=0,
-            deep_limit=0,
-            shard_count=1,
-            max_active_jobs=1,
-            now=23_600,
-        )
-        reopened = conn.execute(
-            """
-            SELECT status, attempts, max_attempts, next_attempt_at, last_error
-            FROM pipeline_jobs
-            WHERE wallet = ?
-            """,
-            (exhausted_wallet,),
-        ).fetchone()
-    finally:
-        conn.close()
-
-    assert cooldown_elapsed.jobs_enqueued == 1
-    assert dict(reopened) == {
-        "status": "queued",
-        "attempts": 0,
-        "max_attempts": 3,
-        "next_attempt_at": 0,
-        "last_error": "attempts_exhausted_marked_failed_by_maintenance",
-    }
-
-
-def test_expired_job_is_recovered_and_completed_by_replacement_worker(tmp_path, monkeypatch):
-    settings = _settings(tmp_path)
-    initialize_database(settings.db_path)
-    wallet = "0x" + "9" * 40
-    conn = connect(settings.db_path)
-    try:
-        run_migrations(conn)
-        assert enqueue_pipeline_job(
-            conn,
-            job_type=WALLET_EVIDENCE_JOB_TYPE,
-            wallet=wallet,
-            subject_key=DEFAULT_EVIDENCE_JOB_STAGE,
-            tier=EvidenceTier.L1_LIGHT.value,
-            shard=0,
-            now=1_000,
-        )
-        conn.commit()
-        abandoned = claim_pipeline_job(
-            conn,
-            job_type=WALLET_EVIDENCE_JOB_TYPE,
-            shard=0,
-            worker_id="worker-crashed",
-            lease_seconds=10,
-            now=1_001,
-        )
-        assert abandoned is not None
-    finally:
-        conn.close()
-
-    monkeypatch.setattr("pm_robot.ops.time.time", lambda: 1_012)
-    recovered = maintenance(settings, skip_cleanup=True, reset_stale_jobs=True)
-    assert recovered["stale_jobs"]["total"] == 1
-
-    conn = connect(settings.db_path)
-    try:
-        replacement = claim_pipeline_job(
-            conn,
-            job_type=WALLET_EVIDENCE_JOB_TYPE,
-            shard=0,
-            worker_id="worker-replacement",
-            lease_seconds=60,
-            now=1_013,
-        )
-        assert replacement is not None
-        assert replacement["attempts"] == 2
-        assert complete_pipeline_job(
-            conn,
-            job_id=int(replacement["job_id"]),
-            worker_id="worker-replacement",
-            output_data={"recovered": True},
-            now=1_014,
-        ) is True
-        conn.commit()
         row = conn.execute(
-            "SELECT status, attempts, lease_owner, output_json FROM pipeline_jobs WHERE job_id = ?",
-            (replacement["job_id"],),
+            "SELECT status, lease_owner, last_error FROM pipeline_jobs "
+            "WHERE job_type = 'wallet_evidence_backfill'"
         ).fetchone()
-    finally:
-        conn.close()
-
-    assert row["status"] == "done"
-    assert row["attempts"] == 2
-    assert row["lease_owner"] is None
-    assert json.loads(row["output_json"]) == {"recovered": True}
-
-
-def test_maintenance_requeues_older_duplicate_running_pipeline_leases(tmp_path):
-    settings = _settings(tmp_path)
-    initialize_database(settings.db_path)
-    now = 2_000
-    wallet_old = "0x" + "1" * 40
-    wallet_new = "0x" + "2" * 40
-    wallet_other = "0x" + "3" * 40
-    conn = connect(settings.db_path)
-    try:
-        run_migrations(conn)
-        conn.executemany(
-            """
-            INSERT INTO pipeline_jobs(
-                job_type, wallet, subject_key, tier, priority, shard, status,
-                lease_owner, lease_until, attempts, max_attempts, next_attempt_at,
-                input_json, output_json, last_error, created_at, updated_at
-            ) VALUES ('copyability_evidence', ?, 'copyability', 'copyability', 10, 0,
-                'running', ?, 4000000000, 1, 3, 0, '{}', '{}', '', ?, ?)
-            """,
-            [
-                (wallet_old, "copyability-worker-a", now, now),
-                (wallet_new, "copyability-worker-a", now + 10, now + 10),
-                (wallet_other, "copyability-worker-b", now, now),
-            ],
+        assert tuple(row) == (
+            "cancelled",
+            None,
+            "retired_job_type_disabled_by_research_runtime",
         )
-        conn.commit()
     finally:
         conn.close()
 
-    dry_run = maintenance(settings, skip_cleanup=True, dry_run=True, reset_stale_jobs=True)
-    assert dry_run["duplicate_running_jobs"]["reset"] is False
-    assert dry_run["duplicate_running_jobs"]["total"] == 1
 
-    result = maintenance(settings, skip_cleanup=True, reset_stale_jobs=True)
-    assert result["duplicate_running_jobs"]["reset"] is True
-    assert result["duplicate_running_jobs"]["total"] == 1
-    assert result["duplicate_running_jobs"]["by_job_type"] == [
-        {"job_type": "copyability_evidence", "count": 1}
-    ]
-
-    conn = connect(settings.db_path)
-    try:
-        old = conn.execute(
-            "SELECT status, lease_owner, lease_until, last_error FROM pipeline_jobs WHERE wallet = ?",
-            (wallet_old,),
-        ).fetchone()
-        new = conn.execute(
-            "SELECT status, lease_owner, lease_until, last_error FROM pipeline_jobs WHERE wallet = ?",
-            (wallet_new,),
-        ).fetchone()
-        other = conn.execute(
-            "SELECT status, lease_owner, lease_until, last_error FROM pipeline_jobs WHERE wallet = ?",
-            (wallet_other,),
-        ).fetchone()
-    finally:
-        conn.close()
-
-    assert dict(old) == {
-        "status": "queued",
-        "lease_owner": None,
-        "lease_until": 0,
-        "last_error": "duplicate_running_owner_requeued_by_maintenance",
-    }
-    assert new["status"] == "running"
-    assert new["lease_owner"] == "copyability-worker-a"
-    assert new["lease_until"] == 4_000_000_000
-    assert new["last_error"] == ""
-    assert other["status"] == "running"
-    assert other["lease_owner"] == "copyability-worker-b"
-    assert other["lease_until"] == 4_000_000_000
-    assert other["last_error"] == ""
-
-
-def test_maintenance_marks_exhausted_duplicate_running_job_failed(tmp_path):
+def test_maintenance_recovers_only_expired_active_jobs(tmp_path):
     settings = _settings(tmp_path)
-    initialize_database(settings.db_path)
-    exhausted_wallet = "0x" + "6" * 40
-    live_wallet = "0x" + "7" * 40
+    now = int(time.time())
     conn = connect(settings.db_path)
     try:
-        run_migrations(conn)
-        conn.executemany(
-            """
-            INSERT INTO pipeline_jobs(
-                job_type, wallet, subject_key, tier, priority, shard, status,
-                lease_owner, lease_until, attempts, max_attempts, next_attempt_at,
-                input_json, output_json, last_error, created_at, updated_at
-            ) VALUES ('copyability_evidence', ?, 'copyability', 'copyability', 10, 0,
-                      'running', 'copyability-worker-c', 4000000000, ?, 3, 0,
-                      '{}', '{}', '', ?, ?)
-            """,
-            [
-                (exhausted_wallet, 3, 1_000, 1_000),
-                (live_wallet, 1, 2_000, 2_000),
-            ],
+        _insert_job(
+            conn,
+            job_type="wallet_recent_screen",
+            wallet="0x" + "3" * 40,
+            status="running",
+            attempts=1,
+            lease_until=now - 1,
+        )
+        _insert_job(
+            conn,
+            job_type="wallet_history_collect",
+            wallet="0x" + "4" * 40,
+            status="running",
+            attempts=3,
+            max_attempts=3,
+            lease_until=now - 1,
+        )
+        _insert_job(
+            conn,
+            job_type="wallet_recent_screen",
+            wallet="0x" + "5" * 40,
+            status="running",
+            attempts=1,
+            lease_until=now + 600,
         )
         conn.commit()
     finally:
         conn.close()
 
     result = maintenance(settings, skip_cleanup=True, reset_stale_jobs=True)
-    assert result["duplicate_running_jobs"]["total"] == 1
-    assert result["duplicate_running_jobs"]["requeued_count"] == 0
-    assert result["duplicate_running_jobs"]["failed_count"] == 1
 
+    assert result["stale_jobs"]["expired_running"] == 2
     conn = connect(settings.db_path)
     try:
-        exhausted = conn.execute(
-            "SELECT status, lease_owner, lease_until, last_error FROM pipeline_jobs WHERE wallet = ?",
-            (exhausted_wallet,),
-        ).fetchone()
-        live = conn.execute(
-            "SELECT status, lease_owner, lease_until, last_error FROM pipeline_jobs WHERE wallet = ?",
-            (live_wallet,),
-        ).fetchone()
+        statuses = {
+            row["wallet"]: row["status"]
+            for row in conn.execute("SELECT wallet, status FROM pipeline_jobs")
+        }
     finally:
         conn.close()
-
-    assert dict(exhausted) == {
-        "status": "failed",
-        "lease_owner": None,
-        "lease_until": 0,
-        "last_error": "duplicate_running_owner_attempts_exhausted_by_maintenance",
-    }
-    assert dict(live) == {
-        "status": "running",
-        "lease_owner": "copyability-worker-c",
-        "lease_until": 4_000_000_000,
-        "last_error": "",
-    }
+    assert statuses["0x" + "3" * 40] == "queued"
+    assert statuses["0x" + "4" * 40] == "failed"
+    assert statuses["0x" + "5" * 40] == "running"
 
 
-def test_maintenance_marks_only_stale_running_ingest_runs_interrupted(tmp_path):
+def test_maintenance_closes_only_stale_active_runtime_runs(tmp_path):
     settings = _settings(tmp_path)
-    initialize_database(settings.db_path)
+    now = int(time.time())
     conn = connect(settings.db_path)
     try:
-        run_migrations(conn)
         conn.executemany(
             """
-            INSERT INTO ingest_runs(
-                ingest_type, started_at, finished_at, status,
-                wallets_attempted, wallets_succeeded, rows_written, error
-            ) VALUES (?, ?, NULL, 'running', 0, 0, 0, '')
+            INSERT INTO runtime_heartbeats(name, started_at, finished_at, status)
+            VALUES (?, ?, ?, 'running')
             """,
-            [
-                ("copyability_evidence_worker_legacy", 1_000),
-                ("copyability_evidence_worker_live", 4_000_000_000),
-            ],
+            (
+                ("loop_wallet_screen_worker_0", now - 10_000, now - 10_000),
+                ("loop_wallet_history_worker_0", now, now),
+                ("retired_score_loop", now - 10_000, now - 10_000),
+            ),
         )
         conn.commit()
     finally:
         conn.close()
-
-    dry_run = maintenance(
-        settings,
-        skip_cleanup=True,
-        dry_run=True,
-        reset_stale_ingest_runs=True,
-        stale_ingest_run_seconds=3_600,
-    )
-    assert dry_run["stale_ingest_runs"]["reset"] is False
-    assert dry_run["stale_ingest_runs"]["total"] == 1
 
     result = maintenance(
         settings,
         skip_cleanup=True,
-        reset_stale_ingest_runs=True,
-        stale_ingest_run_seconds=3_600,
+        reset_stale_heartbeats=True,
+        stale_heartbeat_seconds=3_600,
     )
-    assert result["stale_ingest_runs"]["reset"] is True
-    assert result["stale_ingest_runs"]["total"] == 1
-    assert result["stale_ingest_runs"]["by_ingest_type"] == [
-        {"ingest_type": "copyability_evidence_worker_legacy", "count": 1}
-    ]
 
+    assert result["stale_heartbeats"]["total"] == 1
     conn = connect(settings.db_path)
     try:
-        legacy = conn.execute(
-            """
-            SELECT status, started_at, finished_at, error
-            FROM ingest_runs
-            WHERE ingest_type = 'copyability_evidence_worker_legacy'
-            """
-        ).fetchone()
-        live = conn.execute(
-            """
-            SELECT status, finished_at, error
-            FROM ingest_runs
-            WHERE ingest_type = 'copyability_evidence_worker_live'
-            """
-        ).fetchone()
+        statuses = {
+            row["name"]: row["status"]
+            for row in conn.execute("SELECT name, status FROM runtime_heartbeats")
+        }
     finally:
         conn.close()
+    assert statuses["loop_wallet_screen_worker_0"] == "interrupted"
+    assert statuses["loop_wallet_history_worker_0"] == "running"
+    assert statuses["retired_score_loop"] == "running"
 
-    assert dict(legacy) == {
-        "status": "interrupted",
-        "started_at": 1_000,
-        "finished_at": 4_600,
-        "error": "stale_running_marked_interrupted_by_maintenance",
-    }
-    assert dict(live) == {"status": "running", "finished_at": None, "error": ""}
+
+def test_metadata_cleanup_retries_transient_sqlite_writer_lock(monkeypatch):
+    class Cursor:
+        rowcount = 3
+
+    class LockOnceConnection:
+        def __init__(self):
+            self.execute_calls = 0
+            self.commits = 0
+            self.rollbacks = 0
+
+        def execute(self, sql, params):
+            del sql, params
+            self.execute_calls += 1
+            if self.execute_calls == 1:
+                raise sqlite3.OperationalError("database is locked")
+            return Cursor()
+
+        def commit(self):
+            self.commits += 1
+
+        def rollback(self):
+            self.rollbacks += 1
+
+    monkeypatch.setattr("pm_robot.storage.db.time.sleep", lambda _seconds: None)
+    conn = LockOnceConnection()
+
+    deleted = _delete_metadata_batch(
+        conn,
+        table="api_request_log",
+        where="ts < ?",
+        params=(123,),
+        limit=500,
+    )
+
+    assert deleted == 3
+    assert conn.execute_calls == 2
+    assert conn.commits == 1
+    assert conn.rollbacks == 1

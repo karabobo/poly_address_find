@@ -9,7 +9,7 @@ if [[ "${EUID}" -ne 0 ]]; then
   exit 1
 fi
 
-mkdir -p "$ROOT"/{data,logs,backups,reports,config}
+mkdir -p "$ROOT"/{data/parquet,logs,backups,reports,config}
 rsync -a --delete \
   --exclude '.git' \
   --exclude '.venv' \
@@ -31,6 +31,21 @@ python3 -m venv "$ROOT/.venv"
 "$ROOT/.venv/bin/pip" install -e "$ROOT"
 
 chmod +x "$ROOT/deploy/scripts/"*.sh
+"$ROOT/.venv/bin/python" -m pm_robot.cli --env "$ROOT/.env" migrate
+
+# Remove any previously installed pm-robot unit that is absent from the current
+# research-only manifest. This keeps upgrades self-cleaning without naming old products.
+shopt -s nullglob
+for installed_path in /etc/systemd/system/pm-robot-*.service /etc/systemd/system/pm-robot-*.timer; do
+  installed_unit="$(basename "$installed_path")"
+  if [[ ! -f "$ROOT/deploy/systemd/$installed_unit" ]]; then
+    systemctl disable --now "$installed_unit" >/dev/null 2>&1 || true
+    rm -f "$installed_path"
+    rm -f "/etc/systemd/system/timers.target.wants/$installed_unit"
+    rm -f "/etc/systemd/system/multi-user.target.wants/$installed_unit"
+  fi
+done
+shopt -u nullglob
 
 cp "$ROOT/deploy/systemd/"*.service /etc/systemd/system/
 cp "$ROOT/deploy/systemd/"*.timer /etc/systemd/system/
@@ -39,29 +54,17 @@ systemctl daemon-reload
 systemctl enable --now pm-robot-health.timer
 systemctl enable --now pm-robot-discover.timer
 systemctl enable --now pm-robot-discover-activity.timer
-systemctl disable --now pm-robot-evidence-backfill.timer >/dev/null 2>&1 || true
-systemctl enable --now pm-robot-evidence-planner.timer
-systemctl enable --now pm-robot-evidence-worker@0.timer
-systemctl enable --now pm-robot-evidence-worker@1.timer
-systemctl enable --now pm-robot-evidence-worker@2.timer
-systemctl enable --now pm-robot-materialize-features.timer
-systemctl enable --now pm-robot-trade-role.timer
-systemctl enable --now pm-robot-ingest.timer
-systemctl enable --now pm-robot-activity.timer
-systemctl enable --now pm-robot-gamma-paper.timer
-systemctl enable --now pm-robot-gamma.timer
-systemctl enable --now pm-robot-copy-backtest.timer
-systemctl enable --now pm-robot-score.timer
-systemctl enable --now pm-robot-paper.timer
-systemctl enable --now pm-robot-paper-settle.timer
-systemctl enable --now pm-robot-publish.timer
-if grep -q '^PM_ROBOT_GDRIVE_REMOTE=.' "$ROOT/.env" && command -v rclone >/dev/null 2>&1; then
-  systemctl enable --now pm-robot-gdrive-backup.timer
-  systemctl disable --now pm-robot-backup.timer >/dev/null 2>&1 || true
-else
-  systemctl enable --now pm-robot-backup.timer
-  systemctl disable --now pm-robot-gdrive-backup.timer >/dev/null 2>&1 || true
-fi
+systemctl enable --now pm-robot-wallet-screen-planner.timer
+systemctl enable --now pm-robot-wallet-screen-worker@0.timer
+systemctl enable --now pm-robot-wallet-screen-worker@1.timer
+systemctl enable --now pm-robot-wallet-screen-worker@2.timer
+systemctl enable --now pm-robot-wallet-level-select.timer
+systemctl enable --now pm-robot-wallet-history-planner.timer
+systemctl enable --now pm-robot-wallet-history-worker@0.timer
+systemctl enable --now pm-robot-wallet-history-worker@1.timer
+systemctl enable --now pm-robot-wallet-history-worker@2.timer
+systemctl enable --now pm-robot-wallet-l6-planner.timer
+systemctl enable --now pm-robot-wallet-l6-worker.timer
 systemctl enable --now pm-robot-maintenance.timer
 if grep -q '^PM_ROBOT_UI_TOKEN=.' "$ROOT/.env"; then
   systemctl enable --now pm-robot-web.service
@@ -70,7 +73,7 @@ else
 fi
 
 echo "Installed pm-robot to $ROOT"
-echo "Edit $ROOT/.env for research ingestion and paper-evaluation settings."
-echo "pm-robot-copy-graph.timer is installed but not enabled by default; enable it after the copy graph job is optimized for your dataset size."
-echo "pm-robot-gdrive-backup.timer starts after rclone is installed and PM_ROBOT_GDRIVE_REMOTE is set."
+echo "Edit $ROOT/.env for L0-L6 wallet discovery settings."
+echo "Units absent from the current research manifest were stopped and removed."
+echo "Database backups are explicit CLI operations; no backup timer is installed."
 echo "pm-robot-web.service starts after PM_ROBOT_UI_TOKEN is set in $ROOT/.env."

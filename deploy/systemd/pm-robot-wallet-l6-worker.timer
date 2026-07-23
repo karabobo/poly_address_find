@@ -1,0 +1,11 @@
+[Unit]
+Description=Run low-volume pm-robot L6 independent validation
+
+[Timer]
+OnBootSec=7min
+OnUnitInactiveSec=5min
+AccuracySec=20s
+Persistent=true
+
+[Install]
+WantedBy=timers.target

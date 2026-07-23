@@ -2,7 +2,19 @@ from pm_robot.clients.http import HttpClientError
 from pm_robot.orchestration.leaderboard_discovery import discover_leaderboard_candidates
 from pm_robot.storage.db import connect, run_migrations
 from pm_robot.storage.repository import get_wallet_features, upsert_candidate, upsert_wallet_feature
+from pm_robot.storage.wallet_levels import get_wallet_level
 from pm_robot.models import CandidateAddress, WalletFeatures
+from pm_robot.wallet_levels import WalletLevel
+
+
+def _table_exists(conn, name: str) -> bool:
+    return (
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (name,),
+        ).fetchone()
+        is not None
+    )
 
 
 class FakeLeaderboardClient:
@@ -81,6 +93,10 @@ def test_discover_leaderboard_candidates_imports_official_v1_category_rankings(t
             "SELECT * FROM candidate_source_events WHERE address = ? AND source LIKE '%polymarket_v1_leaderboard%'",
             (wallet,),
         ).fetchone()
+        observed = conn.execute(
+            "SELECT promoted_at, promotion_reason FROM observed_wallets WHERE wallet = ?",
+            (wallet,),
+        ).fetchone()
         features = get_wallet_features(conn)[wallet]
 
         assert summary.status == "ok"
@@ -93,6 +109,9 @@ def test_discover_leaderboard_candidates_imports_official_v1_category_rankings(t
         assert "OVERALL_MONTH_PNL" in candidate["notes"]
         assert "OVERALL_MONTH_VOL" in candidate["notes"]
         assert source_event is not None
+        assert observed["promoted_at"] is not None
+        assert observed["promotion_reason"] == "trusted_source"
+        assert get_wallet_level(conn, wallet).level is WalletLevel.L1
         assert features.recent_30d_volume_usdc == 18_000
         assert features.net_pnl_usdc == 2_500
         assert "official_v1_leaderboard_discovery" in features.extra
@@ -128,22 +147,13 @@ def test_leaderboard_discovery_stops_batch_on_shared_cooldown(tmp_path):
         conn.close()
 
 
-def test_leaderboard_discovery_does_not_revive_summary_only_wallet(tmp_path):
+def test_leaderboard_discovery_ignores_legacy_summary_only_state(tmp_path):
     conn = connect(tmp_path / "robot.sqlite")
     wallet = "0x" + "1" * 40
     try:
         run_migrations(conn)
         upsert_candidate(conn, CandidateAddress(address=wallet, sources="archived_source"))
         upsert_wallet_feature(conn, WalletFeatures(address=wallet, net_pnl_usdc=42))
-        conn.execute(
-            """
-            INSERT INTO wallet_registry(
-                address, candidate_stage, registry_status, raw_retention_tier,
-                last_evaluated_at, updated_at
-            ) VALUES (?, 'needs_data', 'archived_raw_pruned', 'summary_only', ?, ?)
-            """,
-            (wallet, 10_000, 10_000),
-        )
         conn.commit()
 
         summary = discover_leaderboard_candidates(
@@ -163,10 +173,14 @@ def test_leaderboard_discovery_does_not_revive_summary_only_wallet(tmp_path):
             (wallet,),
         ).fetchone()
         feature = get_wallet_features(conn)[wallet]
+        assert not _table_exists(conn, "wallet_registry")
         assert summary.candidates_seen == 1
-        assert summary.candidates_inserted_or_updated == 0
-        assert summary.features_updated == 0
-        assert candidate["sources"] == "archived_source"
-        assert feature.net_pnl_usdc == 42
+        assert summary.candidates_inserted_or_updated == 1
+        assert summary.features_updated == 1
+        assert candidate["sources"] == (
+            "archived_source | polymarket_leaderboard | polymarket_v1_leaderboard"
+        )
+        assert get_wallet_level(conn, wallet).level is WalletLevel.L1
+        assert feature.net_pnl_usdc == 2_500
     finally:
         conn.close()

@@ -1,4 +1,4 @@
-"""Polymarket copy-trading robot framework."""
+"""Polymarket wallet discovery and research framework."""
 
 __all__ = ["__version__"]
 

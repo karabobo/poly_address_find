@@ -1,8 +1,9 @@
 from pathlib import Path
 
 from pm_robot.io import load_candidate_addresses
-from pm_robot.orchestration.review_pipeline import import_candidates_from_csv
+from pm_robot.orchestration.wallet_imports import import_candidates_from_csv
 from pm_robot.storage.db import connect, run_migrations
+from pm_robot.wallet_levels import WalletLevel
 
 
 BITGET_SOURCE = "bitget_smart_money_20260407"
@@ -31,12 +32,10 @@ def test_bitget_curated_candidates_import_as_single_source_event_per_wallet(tmp_
         first_count = import_candidates_from_csv(
             conn,
             addresses_path=BITGET_CANDIDATES_PATH,
-            source_event_mode="upsert_source",
         )
         second_count = import_candidates_from_csv(
             conn,
             addresses_path=BITGET_CANDIDATES_PATH,
-            source_event_mode="upsert_source",
         )
 
         candidate_count = conn.execute(
@@ -47,6 +46,14 @@ def test_bitget_curated_candidates_import_as_single_source_event_per_wallet(tmp_
             "SELECT COUNT(*) FROM candidate_source_events WHERE source = ?",
             (BITGET_SOURCE,),
         ).fetchone()[0]
+        observed_count = conn.execute(
+            "SELECT COUNT(*) FROM observed_wallets WHERE sources = ? AND promoted_at IS NOT NULL",
+            (BITGET_SOURCE,),
+        ).fetchone()[0]
+        l1_count = conn.execute(
+            "SELECT COUNT(*) FROM wallet_levels WHERE level = ?",
+            (WalletLevel.L1.value,),
+        ).fetchone()[0]
     finally:
         conn.close()
 
@@ -54,3 +61,5 @@ def test_bitget_curated_candidates_import_as_single_source_event_per_wallet(tmp_
     assert second_count == 26
     assert candidate_count == 26
     assert event_count == 26
+    assert observed_count == 26
+    assert l1_count == 26

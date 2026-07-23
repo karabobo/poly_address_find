@@ -48,8 +48,6 @@ while true; do
   if python -m pm_robot.cli --env /app/.env discover-activity \
       --pages "$ACTIVITY_PAGES" \
       --page-limit "$ACTIVITY_PAGE_LIMIT" \
-      --min-trades 1 \
-      --min-usdc-volume 0 \
       --min-trade-filter-usdc "$ACTIVITY_MIN_TRADE_FILTER_USDC" \
       --max-candidates "$ACTIVITY_MAX_CANDIDATES" \
       --sleep "$ACTIVITY_SLEEP"; then

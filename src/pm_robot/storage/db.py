@@ -13,8 +13,53 @@ MIGRATIONS_DIR = Path(__file__).resolve().parents[1] / "migrations"
 T = TypeVar("T")
 DATABASE_ACCESS_LOCK_SUFFIX = ".access.lock"
 CONTROL_PLANE_LOCK_SUFFIX = ".control-plane"
+# Migration 62 establishes the research-only baseline used to recover missing
+# historical migration markers. Later cleanup migrations remain idempotent.
+RESEARCH_SCHEMA_BASELINE_VERSION = 62
 MIGRATION_SCHEMA_POSTCONDITIONS = {
     50: ("wallet_activity_watermarks", "activity_count"),
+    59: ("wallet_history_artifacts", "purged_at"),
+    60: ("wallet_level_selections", "research_score"),
+    61: ("wallet_history_artifacts", "purge_started_at"),
+    62: ("runtime_heartbeats", "name"),
+    66: ("wallet_l6_validations", "validation_id"),
+    67: ("wallet_l6_validations", "official_all_pnl_usdc"),
+}
+
+MIGRATION_POSTCONDITION_REPAIRS = {
+    59: """
+        CREATE INDEX IF NOT EXISTS idx_wallet_history_artifacts_gc
+        ON wallet_history_artifacts(status, purged_at, updated_at, wallet);
+    """,
+    60: """
+        UPDATE wallet_level_selections
+        SET research_score = (
+            SELECT summary.research_score
+            FROM wallet_history_summaries AS summary
+            WHERE summary.wallet = wallet_level_selections.wallet
+              AND summary.artifact_id = wallet_level_selections.evidence_artifact_id
+        )
+        WHERE research_score IS NULL;
+
+        CREATE INDEX IF NOT EXISTS idx_wallet_level_selections_reference
+        ON wallet_level_selections(target_level, policy_version, decided_at DESC, wallet);
+    """,
+    61: """
+        CREATE INDEX IF NOT EXISTS idx_wallet_history_artifacts_purge
+        ON wallet_history_artifacts(
+            status, purged_at, purge_started_at, updated_at, wallet
+        );
+    """,
+    62: """
+        CREATE INDEX IF NOT EXISTS idx_runtime_heartbeats_name_time
+        ON runtime_heartbeats(name, finished_at DESC, heartbeat_id DESC);
+    """,
+    66: """
+        CREATE INDEX IF NOT EXISTS idx_wallet_l6_validations_latest
+        ON wallet_l6_validations(wallet, validated_at DESC, validation_id DESC);
+        CREATE INDEX IF NOT EXISTS idx_wallet_l6_validations_decision
+        ON wallet_l6_validations(decision, validated_at DESC, wallet);
+    """,
 }
 
 
@@ -301,10 +346,43 @@ def run_migrations(conn: sqlite3.Connection) -> list[int]:
         conn.commit()
         applied = _applied_migration_versions(conn) or set()
         newly_applied: list[int] = []
+
+        # Migration 62 replaces the historical all-in-one schema. If its schema
+        # is already present, missing older markers must not recreate retired
+        # runtime tables during recovery from marker drift.
+        if _migration_schema_postcondition_satisfied(
+            conn,
+            RESEARCH_SCHEMA_BASELINE_VERSION,
+        ):
+            superseded = [
+                version
+                for version, _path in migrations
+                if version <= RESEARCH_SCHEMA_BASELINE_VERSION and version not in applied
+            ]
+            if superseded:
+                applied_at = int(time.time())
+                conn.executemany(
+                    "INSERT OR IGNORE INTO schema_migrations(version, applied_at) "
+                    "VALUES (?, ?)",
+                    ((version, applied_at) for version in superseded),
+                )
+                repair_sql = MIGRATION_POSTCONDITION_REPAIRS.get(
+                    RESEARCH_SCHEMA_BASELINE_VERSION,
+                    "",
+                ).strip()
+                if repair_sql:
+                    conn.executescript(repair_sql)
+                conn.commit()
+                applied.update(superseded)
+                newly_applied.extend(superseded)
+
         for version, path in migrations:
             if version in applied:
                 continue
             if _migration_schema_postcondition_satisfied(conn, version):
+                repair_sql = MIGRATION_POSTCONDITION_REPAIRS.get(version, "").strip()
+                if repair_sql:
+                    conn.executescript(repair_sql)
                 conn.execute(
                     "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
                     (version, int(time.time())),

@@ -1,0 +1,12 @@
+[Unit]
+Description=pm-robot bounded L6 independent-validation planner
+After=network-online.target pm-robot-wallet-level-select.service pm-robot-wallet-history-planner.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/pm-robot
+EnvironmentFile=/opt/pm-robot/.env
+TimeoutStartSec=120
+Environment=PM_ROBOT_LOCK_WAIT=60
+Environment=PM_ROBOT_TASK_NAME=wallet-l6-planner
+ExecStart=/opt/pm-robot/deploy/scripts/run_locked.sh /opt/pm-robot/.venv/bin/python -m pm_robot.cli --env /opt/pm-robot/.env wallet-l6-plan --limit 5 --max-active-jobs 10 --shard-count 1 --refresh-seconds 1209600

@@ -1,6 +1,6 @@
 [Unit]
-Description=pm-robot database and backup maintenance
-After=network-online.target pm-robot-backup.service
+Description=pm-robot L0-L6 control-plane maintenance
+After=network-online.target
 
 [Service]
 Type=oneshot
@@ -9,4 +9,4 @@ EnvironmentFile=/opt/pm-robot/.env
 TimeoutStartSec=900
 Environment=PM_ROBOT_LOCK_WAIT=120
 Environment=PM_ROBOT_TASK_NAME=maintenance
-ExecStart=/opt/pm-robot/deploy/scripts/run_locked.sh /opt/pm-robot/.venv/bin/python -m pm_robot.cli --env /opt/pm-robot/.env maintenance --keep-backups 2 --reset-stale-jobs --failed-job-cooldown-seconds 21600 --reset-stale-ingest-runs --stale-ingest-run-seconds 21600
+ExecStart=/opt/pm-robot/deploy/scripts/run_locked.sh /opt/pm-robot/.venv/bin/python -m pm_robot.cli --env /opt/pm-robot/.env maintenance --keep-backups 2 --heartbeat-days 30 --reset-stale-jobs --failed-job-cooldown-seconds 21600 --reset-stale-heartbeats --stale-heartbeat-seconds 21600

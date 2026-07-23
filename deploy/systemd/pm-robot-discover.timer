@@ -3,7 +3,7 @@ Description=Run pm-robot leaderboard discovery hourly
 
 [Timer]
 OnBootSec=2min
-OnUnitActiveSec=1h
+OnUnitInactiveSec=1h
 AccuracySec=2min
 Persistent=true
 

@@ -1,0 +1,11 @@
+[Unit]
+Description=pm-robot bounded wallet screen worker %i
+After=network-online.target pm-robot-wallet-screen-planner.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/pm-robot
+EnvironmentFile=/opt/pm-robot/.env
+TimeoutStartSec=600
+Environment=PM_ROBOT_TASK_NAME=wallet-screen-worker-%i
+ExecStart=/opt/pm-robot/.venv/bin/python -m pm_robot.cli --env /opt/pm-robot/.env wallet-screen-worker --shard-index %i --shard-count 3 --limit 2 --lease-seconds 600 --worker-id wallet-screen-worker-%i

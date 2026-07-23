@@ -1,0 +1,11 @@
+[Unit]
+Description=Reconcile pm-robot relative L3-L5 cohorts
+
+[Timer]
+OnBootSec=3min
+OnUnitInactiveSec=3min
+AccuracySec=20s
+Persistent=true
+
+[Install]
+WantedBy=timers.target

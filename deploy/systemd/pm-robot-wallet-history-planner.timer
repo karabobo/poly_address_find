@@ -1,0 +1,11 @@
+[Unit]
+Description=Plan bounded pm-robot light/deep history jobs
+
+[Timer]
+OnBootSec=4min
+OnUnitInactiveSec=3min
+AccuracySec=20s
+Persistent=true
+
+[Install]
+WantedBy=timers.target

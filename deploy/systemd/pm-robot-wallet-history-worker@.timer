@@ -1,0 +1,12 @@
+[Unit]
+Description=Run direct-to-Parquet pm-robot wallet history worker %i
+
+[Timer]
+OnBootSec=5min
+OnUnitInactiveSec=1min
+AccuracySec=15s
+Persistent=true
+Unit=pm-robot-wallet-history-worker@%i.service
+
+[Install]
+WantedBy=timers.target
