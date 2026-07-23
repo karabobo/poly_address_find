@@ -1,21 +1,25 @@
 services:
-  proxy-tunnel:
+  proxy-tunnel-primary:
     build:
       context: ./app
       dockerfile: deploy/nas/Dockerfile.tunnel
     image: pm-robot:ssh-tunnel
-    container_name: pm-robot-proxy-tunnel
+    container_name: pm-robot-proxy-tunnel-primary
     restart: always
     network_mode: host
     env_file:
       - ./.env
     environment:
-      PM_ROBOT_PROXY_LOCAL_HOST: ${PM_ROBOT_PROXY_LOCAL_HOST:-0.0.0.0}
-      PM_ROBOT_PROXY_LOCAL_PORT: ${PM_ROBOT_PROXY_LOCAL_PORT:-18082}
+      PM_ROBOT_VPS_USER: ${PM_ROBOT_PROXY_PRIMARY_VPS_USER:-root}
+      PM_ROBOT_VPS_HOST: ${PM_ROBOT_PROXY_PRIMARY_VPS_HOST:-}
+      PM_ROBOT_PROXY_LOCAL_HOST: 127.0.0.1
+      PM_ROBOT_PROXY_LOCAL_PORT: ${PM_ROBOT_PROXY_PRIMARY_TUNNEL_PORT:-18083}
       PM_ROBOT_PROXY_REMOTE_HOST: ${PM_ROBOT_PROXY_REMOTE_HOST:-127.0.0.1}
       PM_ROBOT_PROXY_REMOTE_PORT: ${PM_ROBOT_PROXY_REMOTE_PORT:-18081}
       PM_ROBOT_VPS_KEY_PATH: /ssh/id_ed25519_pmrobot_vps
-      PM_ROBOT_PROXY_TUNNEL_LOG_PATH: /logs/vps-http-proxy-tunnel.log
+      PM_ROBOT_VPS_KNOWN_HOSTS_PATH: /ssh/known_hosts
+      PM_ROBOT_PROXY_TUNNEL_NAME: primary
+      PM_ROBOT_PROXY_TUNNEL_LOG_PATH: /logs/vps-http-proxy-tunnel-primary.log
     volumes:
       - ./ssh:/ssh:ro
       - ${PM_ROBOT_STORAGE_ROOT:-/volume1/poly_data/pmbot}/logs:/logs
@@ -36,6 +40,72 @@ services:
       timeout: 10s
       retries: 3
       start_period: 15s
+
+  proxy-tunnel-secondary:
+    image: pm-robot:ssh-tunnel
+    container_name: pm-robot-proxy-tunnel-secondary
+    restart: always
+    network_mode: host
+    env_file:
+      - ./.env
+    environment:
+      PM_ROBOT_VPS_USER: ${PM_ROBOT_PROXY_SECONDARY_VPS_USER:-ubuntu}
+      PM_ROBOT_VPS_HOST: ${PM_ROBOT_PROXY_SECONDARY_VPS_HOST:-}
+      PM_ROBOT_PROXY_LOCAL_HOST: 127.0.0.1
+      PM_ROBOT_PROXY_LOCAL_PORT: ${PM_ROBOT_PROXY_SECONDARY_TUNNEL_PORT:-18084}
+      PM_ROBOT_PROXY_REMOTE_HOST: ${PM_ROBOT_PROXY_REMOTE_HOST:-127.0.0.1}
+      PM_ROBOT_PROXY_REMOTE_PORT: ${PM_ROBOT_PROXY_REMOTE_PORT:-18081}
+      PM_ROBOT_VPS_KEY_PATH: /ssh/id_ed25519_pmrobot_vps
+      PM_ROBOT_VPS_KNOWN_HOSTS_PATH: /ssh/known_hosts
+      PM_ROBOT_PROXY_TUNNEL_NAME: secondary
+      PM_ROBOT_PROXY_TUNNEL_LOG_PATH: /logs/vps-http-proxy-tunnel-secondary.log
+    volumes:
+      - ./ssh:/ssh:ro
+      - ${PM_ROBOT_STORAGE_ROOT:-/volume1/poly_data/pmbot}/logs:/logs
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          python -c 'import os, socket, sys;
+          host, port = os.environ.get("PM_ROBOT_PROXY_HEALTHCHECK_TARGET", "ws-live-data.polymarket.com:443").rsplit(":", 1);
+          bind_host = os.environ.get("PM_ROBOT_PROXY_LOCAL_HOST", "127.0.0.1");
+          s = socket.create_connection((bind_host, int(os.environ.get("PM_ROBOT_PROXY_LOCAL_PORT", "18084"))), 5);
+          s.sendall(f"CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n\r\n".encode("ascii"));
+          data = s.recv(128);
+          s.close();
+          sys.exit(0 if b" 200 " in data.split(b"\r\n", 1)[0] else 1)'
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
+  # Stable proxy endpoint for research containers. Existing connections reconnect
+  # through the secondary tunnel only after the primary path becomes unavailable.
+  proxy-tunnel:
+    image: haproxy:3.0-alpine
+    container_name: pm-robot-proxy-tunnel
+    restart: always
+    network_mode: host
+    environment:
+      PM_ROBOT_PROXY_LOCAL_HOST: ${PM_ROBOT_PROXY_LOCAL_HOST:-0.0.0.0}
+      PM_ROBOT_PROXY_LOCAL_PORT: ${PM_ROBOT_PROXY_LOCAL_PORT:-18082}
+      PM_ROBOT_PROXY_PRIMARY_TUNNEL_PORT: ${PM_ROBOT_PROXY_PRIMARY_TUNNEL_PORT:-18083}
+      PM_ROBOT_PROXY_SECONDARY_TUNNEL_PORT: ${PM_ROBOT_PROXY_SECONDARY_TUNNEL_PORT:-18084}
+    volumes:
+      - ./app/deploy/nas/haproxy-proxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    depends_on:
+      proxy-tunnel-primary:
+        condition: service_started
+      proxy-tunnel-secondary:
+        condition: service_started
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - wget -q -O /dev/null http://127.0.0.1:18085/health
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
 
   web:
     build:

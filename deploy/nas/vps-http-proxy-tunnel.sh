@@ -8,15 +8,25 @@ LOCAL_PROXY_PORT="${PM_ROBOT_PROXY_LOCAL_PORT:-18082}"
 REMOTE_PROXY_HOST="${PM_ROBOT_PROXY_REMOTE_HOST:-127.0.0.1}"
 REMOTE_PROXY_PORT="${PM_ROBOT_PROXY_REMOTE_PORT:-18081}"
 KEY_PATH="${PM_ROBOT_VPS_KEY_PATH:-/ssh/id_ed25519_pmrobot_vps}"
+KNOWN_HOSTS_PATH="${PM_ROBOT_VPS_KNOWN_HOSTS_PATH:-/ssh/known_hosts}"
+TUNNEL_NAME="${PM_ROBOT_PROXY_TUNNEL_NAME:-proxy}"
 LOG_PATH="${PM_ROBOT_PROXY_TUNNEL_LOG_PATH:-/logs/vps-http-proxy-tunnel.log}"
 
 : "${REMOTE_HOST:?Set PM_ROBOT_VPS_HOST}"
+: "${KNOWN_HOSTS_PATH:?Set PM_ROBOT_VPS_KNOWN_HOSTS_PATH}"
+
+if [[ ! -r "$KNOWN_HOSTS_PATH" ]]; then
+  printf '%s [%s] known_hosts is missing or unreadable: %s\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$TUNNEL_NAME" "$KNOWN_HOSTS_PATH" >&2
+  exit 2
+fi
 
 mkdir -p "$(dirname "$LOG_PATH")"
 
 while true; do
-  printf '%s starting VPS HTTP proxy tunnel local=%s:%s remote=%s:%s\n' \
+  printf '%s [%s] starting VPS HTTP proxy tunnel local=%s:%s remote=%s:%s\n' \
     "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    "$TUNNEL_NAME" \
     "$LOCAL_PROXY_HOST" "$LOCAL_PROXY_PORT" "$REMOTE_PROXY_HOST" "$REMOTE_PROXY_PORT" >>"$LOG_PATH"
   ssh \
     -i "$KEY_PATH" \
@@ -26,9 +36,12 @@ while true; do
     -o ExitOnForwardFailure=yes \
     -o ServerAliveInterval=30 \
     -o ServerAliveCountMax=3 \
-    -o StrictHostKeyChecking=accept-new \
+    -o HostKeyAlgorithms=ssh-ed25519 \
+    -o StrictHostKeyChecking=yes \
+    -o UserKnownHostsFile="$KNOWN_HOSTS_PATH" \
     -L "${LOCAL_PROXY_HOST}:${LOCAL_PROXY_PORT}:${REMOTE_PROXY_HOST}:${REMOTE_PROXY_PORT}" \
     "${REMOTE_USER}@${REMOTE_HOST}" >>"$LOG_PATH" 2>&1 || true
-  printf '%s VPS HTTP proxy tunnel stopped; restarting shortly\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >>"$LOG_PATH"
+  printf '%s [%s] VPS HTTP proxy tunnel stopped; restarting shortly\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$TUNNEL_NAME" >>"$LOG_PATH"
   sleep 5
 done

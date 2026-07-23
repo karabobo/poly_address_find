@@ -38,6 +38,8 @@ def test_nas_active_services_run_only_the_l0_l6_discovery_funnel():
 
     for service in {
         "proxy-tunnel",
+        "proxy-tunnel-primary",
+        "proxy-tunnel-secondary",
         "web",
         "research-control",
         "discovery-loop",
@@ -67,6 +69,8 @@ def test_nas_active_services_run_only_the_l0_l6_discovery_funnel():
 def test_nas_active_services_restart_after_container_manager_restart():
     for service in {
         "proxy-tunnel",
+        "proxy-tunnel-primary",
+        "proxy-tunnel-secondary",
         "web",
         "research-control",
         "discovery-loop",
@@ -178,12 +182,16 @@ def test_nas_helper_manages_only_discovery_funnel_services():
     assert 'HISTORY_SERVICES="wallet-history-worker-0 wallet-history-worker-1 wallet-history-worker-2"' in helper
     assert 'SCREEN_SERVICES="wallet-screen-planner wallet-screen-worker-0 wallet-screen-worker-1 wallet-screen-worker-2"' in helper
     assert 'L6_SERVICES="l6-validation-worker"' in helper
+    assert 'PROXY_SERVICES="proxy-tunnel-primary proxy-tunnel-secondary proxy-tunnel"' in helper
     assert "--remove-orphans" in helper
     assert "--no-build" in helper
     assert "validate_proxy_config" in helper
-    assert "PM_ROBOT_VPS_HOST is required" in helper
+    assert "PM_ROBOT_PROXY_PRIMARY_VPS_HOST is required" in helper
+    assert "PM_ROBOT_PROXY_SECONDARY_VPS_HOST is required" in helper
     assert "VPS tunnel key is missing or unreadable" in helper
+    assert "VPS known_hosts is missing or unreadable" in helper
     assert '[[ "$key_path" == /ssh/* ]]' in helper
+    assert '[[ "$known_hosts_path" == /ssh/* ]]' in helper
     for obsolete in (
         "copyability",
         "validation-observer",
@@ -195,15 +203,53 @@ def test_nas_helper_manages_only_discovery_funnel_services():
         assert obsolete not in helper.lower()
 
 
-def test_nas_proxy_tunnel_has_real_healthcheck_and_gates_network_workers():
+def test_nas_proxy_failover_has_two_checked_tunnels_and_gates_network_workers():
     compose = COMPOSE_PATH.read_text(encoding="utf-8")
+    env = Path("deploy/nas/env.example").read_text(encoding="utf-8")
+    haproxy = Path("deploy/nas/haproxy-proxy.cfg").read_text(encoding="utf-8")
+    tunnel_script = Path("deploy/nas/vps-http-proxy-tunnel.sh").read_text(encoding="utf-8")
 
+    primary = _service_block("proxy-tunnel-primary")
+    secondary = _service_block("proxy-tunnel-secondary")
     proxy = _service_block("proxy-tunnel")
-    assert "healthcheck:" in proxy
-    assert "CONNECT {host}:{port} HTTP/1.1" in proxy
-    assert "PM_ROBOT_PROXY_HEALTHCHECK_TARGET" in proxy
-    assert 'bind_host = os.environ.get("PM_ROBOT_PROXY_LOCAL_HOST"' in proxy
-    assert 'probe_host = "127.0.0.1" if bind_host in ("0.0.0.0", "::") else bind_host' in proxy
+    assert "build:" in primary
+    assert "build:" not in secondary
+    for tunnel in (primary, secondary):
+        assert "image: pm-robot:ssh-tunnel" in tunnel
+        assert "network_mode: host" in tunnel
+        assert "healthcheck:" in tunnel
+        assert "CONNECT {host}:{port} HTTP/1.1" in tunnel
+        assert "PM_ROBOT_PROXY_HEALTHCHECK_TARGET" in tunnel
+        assert "PM_ROBOT_PROXY_LOCAL_HOST: 127.0.0.1" in tunnel
+        assert "PM_ROBOT_VPS_KNOWN_HOSTS_PATH: /ssh/known_hosts" in tunnel
+    assert "PM_ROBOT_PROXY_PRIMARY_VPS_HOST" in primary
+    assert "PM_ROBOT_PROXY_PRIMARY_TUNNEL_PORT" in primary
+    assert "PM_ROBOT_PROXY_SECONDARY_VPS_HOST" in secondary
+    assert "PM_ROBOT_PROXY_SECONDARY_TUNNEL_PORT" in secondary
+    assert "image: haproxy:3.0-alpine" in proxy
+    assert "./app/deploy/nas/haproxy-proxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro" in proxy
+    assert "proxy-tunnel-primary:" in proxy
+    assert "proxy-tunnel-secondary:" in proxy
+    assert proxy.count("condition: service_started") == 2
+    assert "tcp-check send-binary" in haproxy
+    assert "server primary" in haproxy
+    assert "server secondary" in haproxy
+    assert "backup" in haproxy
+    assert "nbsrv(proxy_backends)" in haproxy
+    assert "default-server inter 5s fall 2 rise 2" in haproxy
+    assert "HostKeyAlgorithms=ssh-ed25519" in tunnel_script
+    assert "StrictHostKeyChecking=yes" in tunnel_script
+    assert 'UserKnownHostsFile="$KNOWN_HOSTS_PATH"' in tunnel_script
+    for variable in (
+        "PM_ROBOT_PROXY_PRIMARY_VPS_USER=",
+        "PM_ROBOT_PROXY_PRIMARY_VPS_HOST=",
+        "PM_ROBOT_PROXY_PRIMARY_TUNNEL_PORT=18083",
+        "PM_ROBOT_PROXY_SECONDARY_VPS_USER=",
+        "PM_ROBOT_PROXY_SECONDARY_VPS_HOST=",
+        "PM_ROBOT_PROXY_SECONDARY_TUNNEL_PORT=18084",
+    ):
+        assert variable in env
+    assert "PM_ROBOT_VPS_HOST=" not in env
     for service_name in (
         "discovery-loop",
         "rtds-discovery",

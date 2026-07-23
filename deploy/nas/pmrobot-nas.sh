@@ -8,7 +8,8 @@ DOCKER_SUDO="${PM_ROBOT_DOCKER_SUDO:-auto}"
 DOCKER_RUNNER_READY=0
 DOCKER_RUNNER=()
 
-CORE_SERVICES="proxy-tunnel web"
+PROXY_SERVICES="proxy-tunnel-primary proxy-tunnel-secondary proxy-tunnel"
+CORE_SERVICES="$PROXY_SERVICES web"
 DISCOVERY_SERVICES="discovery-loop rtds-discovery"
 SCREEN_SERVICES="wallet-screen-planner wallet-screen-worker-0 wallet-screen-worker-1 wallet-screen-worker-2"
 CONTROL_SERVICES="research-control"
@@ -83,13 +84,22 @@ task_compose() {
 }
 
 validate_proxy_config() {
-  local remote_host key_path remote_port local_port
-  remote_host="${PM_ROBOT_VPS_HOST:-$(env_file_value PM_ROBOT_VPS_HOST)}"
+  local primary_host secondary_host key_path known_hosts_path remote_port local_port
+  local primary_tunnel_port secondary_tunnel_port
+  primary_host="${PM_ROBOT_PROXY_PRIMARY_VPS_HOST:-$(env_file_value PM_ROBOT_PROXY_PRIMARY_VPS_HOST)}"
+  secondary_host="${PM_ROBOT_PROXY_SECONDARY_VPS_HOST:-$(env_file_value PM_ROBOT_PROXY_SECONDARY_VPS_HOST)}"
   key_path="${PM_ROBOT_VPS_KEY_PATH:-$(env_file_value PM_ROBOT_VPS_KEY_PATH)}"
+  known_hosts_path="${PM_ROBOT_VPS_KNOWN_HOSTS_PATH:-$(env_file_value PM_ROBOT_VPS_KNOWN_HOSTS_PATH)}"
   remote_port="${PM_ROBOT_PROXY_REMOTE_PORT:-$(env_file_value PM_ROBOT_PROXY_REMOTE_PORT)}"
   local_port="${PM_ROBOT_PROXY_LOCAL_PORT:-$(env_file_value PM_ROBOT_PROXY_LOCAL_PORT)}"
-  if [[ -z "$remote_host" ]]; then
-    echo "PM_ROBOT_VPS_HOST is required before starting proxy-dependent services." >&2
+  primary_tunnel_port="${PM_ROBOT_PROXY_PRIMARY_TUNNEL_PORT:-$(env_file_value PM_ROBOT_PROXY_PRIMARY_TUNNEL_PORT)}"
+  secondary_tunnel_port="${PM_ROBOT_PROXY_SECONDARY_TUNNEL_PORT:-$(env_file_value PM_ROBOT_PROXY_SECONDARY_TUNNEL_PORT)}"
+  if [[ -z "$primary_host" ]]; then
+    echo "PM_ROBOT_PROXY_PRIMARY_VPS_HOST is required before starting proxy-dependent services." >&2
+    exit 2
+  fi
+  if [[ -z "$secondary_host" ]]; then
+    echo "PM_ROBOT_PROXY_SECONDARY_VPS_HOST is required before starting proxy-dependent services." >&2
     exit 2
   fi
   if [[ -z "$key_path" ]]; then
@@ -103,12 +113,37 @@ validate_proxy_config() {
     echo "VPS tunnel key is missing or unreadable: $key_path" >&2
     exit 2
   fi
-  for port_value in "${local_port:-18082}" "${remote_port:-18081}"; do
+  if [[ -z "$known_hosts_path" ]]; then
+    known_hosts_path="$ROOT/ssh/known_hosts"
+  elif [[ "$known_hosts_path" == /ssh/* ]]; then
+    known_hosts_path="$ROOT/ssh/$(basename "$known_hosts_path")"
+  elif [[ "$known_hosts_path" != /* ]]; then
+    known_hosts_path="$ROOT/$known_hosts_path"
+  fi
+  if [[ ! -r "$known_hosts_path" ]]; then
+    echo "VPS known_hosts is missing or unreadable: $known_hosts_path" >&2
+    exit 2
+  fi
+  local_port="${local_port:-18082}"
+  remote_port="${remote_port:-18081}"
+  primary_tunnel_port="${primary_tunnel_port:-18083}"
+  secondary_tunnel_port="${secondary_tunnel_port:-18084}"
+  for port_value in \
+    "$local_port" \
+    "$remote_port" \
+    "$primary_tunnel_port" \
+    "$secondary_tunnel_port"; do
     if [[ ! "$port_value" =~ ^[0-9]+$ ]] || (( port_value < 1 || port_value > 65535 )); then
       echo "Proxy port must be an integer in 1..65535: $port_value" >&2
       exit 2
     fi
   done
+  if [[ "$local_port" == "$primary_tunnel_port" ||
+        "$local_port" == "$secondary_tunnel_port" ||
+        "$primary_tunnel_port" == "$secondary_tunnel_port" ]]; then
+    echo "Proxy listener and tunnel ports must be distinct." >&2
+    exit 2
+  fi
 }
 
 ensure_layout() {
@@ -241,7 +276,7 @@ case "$cmd" in
     ;;
   build)
     ensure_layout
-    compose build proxy-tunnel web
+    compose build proxy-tunnel-primary web
     ;;
   migrate)
     ensure_layout
@@ -295,9 +330,9 @@ case "$cmd" in
   maintenance-up) start_group $MAINTENANCE_SERVICES ;;
   maintenance-down) stop_group $MAINTENANCE_SERVICES ;;
   maintenance-restart) restart_group $MAINTENANCE_SERVICES ;;
-  proxy-up) validate_proxy_config; start_group proxy-tunnel ;;
-  proxy-down) stop_group proxy-tunnel ;;
-  proxy-restart) validate_proxy_config; restart_group proxy-tunnel ;;
+  proxy-up) validate_proxy_config; start_group $PROXY_SERVICES ;;
+  proxy-down) stop_group $PROXY_SERVICES ;;
+  proxy-restart) validate_proxy_config; restart_group $PROXY_SERVICES ;;
   help|-h|--help)
     usage
     ;;
