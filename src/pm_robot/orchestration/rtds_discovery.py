@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
 import time
 from dataclasses import dataclass
@@ -14,9 +15,11 @@ from pm_robot.orchestration.activity_discovery import (
     process_activity_rows,
 )
 from pm_robot.storage.repository import record_runtime_heartbeat
+from pm_robot.storage.wallet_levels import try_normalize_wallet
 
 
 RTDS_ENDPOINT = "wss://ws-live-data.polymarket.com"
+DEFAULT_RTDS_MIN_TRADE_USDC = 10.0
 RTDS_HEARTBEAT_MIN_SECONDS = 60.0
 DEFAULT_RTDS_MAX_IDLE_SECONDS = 300.0
 RTDS_SQLITE_LOCK_RETRY_DELAYS = (0.25, 0.5, 1.0, 2.0)
@@ -82,7 +85,7 @@ def run_rtds_activity_discovery(
     conn: sqlite3.Connection,
     *,
     endpoint: str = RTDS_ENDPOINT,
-    min_trade_usdc: float = 1.0,
+    min_trade_usdc: float = DEFAULT_RTDS_MIN_TRADE_USDC,
     batch_size: int = 25,
     flush_interval: float = 10.0,
     ping_interval: float = 5.0,
@@ -374,7 +377,7 @@ def rtds_trade_to_activity_row(message: dict[str, Any]) -> dict[str, Any] | None
     if "timestamp" not in row and message.get("timestamp") is not None:
         try:
             row["timestamp"] = int(float(message["timestamp"]) / 1000)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             pass
     row["usdcSize"] = _trade_usdc(row)
     row.setdefault("type", "TRADE")
@@ -461,8 +464,8 @@ def _discovery_rows_written(result: ActivityDiscoverySummary) -> int:
 
 def _wallet_from_activity_row(row: dict[str, Any]) -> str:
     for key in RTDS_WALLET_KEYS:
-        value = str(row.get(key) or "").lower().strip()
-        if value.startswith("0x") and len(value) == 42:
+        value = try_normalize_wallet(row.get(key))
+        if value:
             return value
     return ""
 
@@ -479,17 +482,19 @@ def _trade_usdc(row: dict[str, Any]) -> float:
     for key in ("usdcSize", "usdc_size"):
         explicit = _float(row.get(key))
         if explicit is not None:
-            return explicit
-    return (_float(row.get("size")) or 0.0) * (_float(row.get("price")) or 0.0)
+            return max(0.0, explicit)
+    total = (_float(row.get("size")) or 0.0) * (_float(row.get("price")) or 0.0)
+    return max(0.0, total) if math.isfinite(total) else 0.0
 
 
 def _float(value: Any) -> float | None:
     try:
         if value is None or value == "":
             return None
-        return float(value)
+        parsed = float(value)
     except (TypeError, ValueError):
         return None
+    return parsed if math.isfinite(parsed) else None
 
 
 def _sqlite_lock_error(exc: sqlite3.OperationalError) -> bool:

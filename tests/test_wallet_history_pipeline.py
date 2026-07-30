@@ -1,3 +1,5 @@
+import json
+import sqlite3
 from pathlib import Path
 
 import duckdb
@@ -8,7 +10,12 @@ from pm_robot.models import CandidateAddress
 from pm_robot.orchestration import wallet_history_pipeline as wallet_history_module
 from pm_robot.orchestration.wallet_history_pipeline import (
     DEFAULT_PRIORITY_AGING_SECONDS,
+    DEEP_ACTION,
     JOB_TYPE,
+    LIGHT_ACTION,
+    PNL_INCOMPLETE_REFRESH_SECONDS,
+    PNL_METHODOLOGY_VERSION,
+    _fetch_official_all_profit,
     plan_wallet_history_jobs,
     run_wallet_history_worker,
 )
@@ -20,12 +27,22 @@ from pm_robot.wallet_levels import WalletLevel
 
 
 class FakeHistoryClient:
-    def __init__(self, rows, *, positions=None, closed=None, values=None):
+    def __init__(
+        self,
+        rows,
+        *,
+        positions=None,
+        closed=None,
+        values=None,
+        leaderboard=None,
+    ):
         self.rows = rows
         self.positions_payload = positions or []
         self.closed_payload = closed or []
         self.values_payload = values or []
+        self.leaderboard_payload = leaderboard or []
         self.calls = []
+        self.closed_sort_calls = []
 
     def activity(self, wallet, *, limit, offset):
         self.calls.append(("activity", wallet, limit, offset))
@@ -35,13 +52,26 @@ class FakeHistoryClient:
         self.calls.append(("positions", wallet, size_threshold))
         return self.positions_payload
 
-    def closed_positions(self, wallet, *, limit, offset, size_threshold):
+    def closed_positions(
+        self,
+        wallet,
+        *,
+        limit,
+        offset,
+        size_threshold,
+        sort_by=None,
+        sort_direction=None,
+    ):
+        self.closed_sort_calls.append((sort_by, sort_direction))
         self.calls.append(("closed", wallet, limit, offset, size_threshold))
         return self.closed_payload[offset : offset + limit]
 
     def position_values(self, wallet):
         self.calls.append(("value", wallet))
         return self.values_payload
+
+    def trader_leaderboard(self, **kwargs):
+        return self.leaderboard_payload
 
 
 class DeferredHistoryClient:
@@ -180,10 +210,11 @@ def test_history_planner_refreshes_old_methodology_without_age_or_new_sighting(
             "FROM pipeline_jobs WHERE wallet = ?",
             (wallet,),
         ).fetchone()
-        assert job["job_action"] == f"collect_{depth}_history:v1:refresh:1900"
+        action = LIGHT_ACTION if depth == "light" else DEEP_ACTION
+        assert job["job_action"] == f"{action}:refresh:1900"
         assert job["job_scope"] == depth
         assert '"refresh_reason":"methodology_upgrade"' in job["input_json"]
-        assert '"methodology_version":"wallet_history_summary_v2"' in job["input_json"]
+        assert f'"methodology_version":"{METHODOLOGY_VERSION}"' in job["input_json"]
     finally:
         conn.close()
 
@@ -230,6 +261,133 @@ def test_history_planner_prioritizes_l5_methodology_upgrade_when_slots_are_limit
         conn.close()
 
 
+def test_history_planner_reserves_capacity_for_first_evidence_during_rollout(
+    tmp_path,
+):
+    conn = connect(tmp_path / "robot.sqlite")
+    stale_wallets = ["0x" + f"{index:040x}" for index in range(1, 5)]
+    first_evidence_wallet = "0x" + "f" * 40
+    try:
+        run_migrations(conn)
+        for wallet in stale_wallets:
+            _seed_level(conn, wallet, WalletLevel.L3)
+            _seed_history_summary(
+                conn,
+                wallet,
+                depth="deep",
+                updated_at=1_900,
+                methodology_version="wallet_history_summary_v1",
+            )
+        _seed_level(conn, first_evidence_wallet, WalletLevel.L2)
+        conn.commit()
+
+        summary = plan_wallet_history_jobs(
+            conn,
+            limit=3,
+            max_active_jobs=10,
+            shard_count=1,
+            now=2_000,
+        )
+        conn.commit()
+
+        queued = conn.execute(
+            "SELECT wallet, job_scope FROM pipeline_jobs WHERE status = 'queued' "
+            "ORDER BY job_id"
+        ).fetchall()
+        assert summary.jobs_enqueued == 3
+        assert any(
+            row["wallet"] == first_evidence_wallet and row["job_scope"] == "light"
+            for row in queued
+        )
+        assert sum(row["job_scope"] == "deep" for row in queued) == 2
+    finally:
+        conn.close()
+
+
+def test_history_planner_preserves_first_evidence_inside_a_stale_light_pool(
+    tmp_path,
+):
+    conn = connect(tmp_path / "robot.sqlite")
+    first_evidence_wallet = "0x" + "f" * 40
+    try:
+        run_migrations(conn)
+        for index in range(1, 61):
+            wallet = "0x" + f"{index:040x}"
+            _seed_level(conn, wallet, WalletLevel.L2)
+            _seed_history_summary(
+                conn,
+                wallet,
+                depth="light",
+                updated_at=1_900,
+                methodology_version="wallet_history_summary_v1",
+            )
+        _seed_level(conn, first_evidence_wallet, WalletLevel.L2)
+        conn.commit()
+
+        summary = plan_wallet_history_jobs(
+            conn,
+            limit=3,
+            max_active_jobs=10,
+            shard_count=1,
+            now=2_000,
+        )
+        conn.commit()
+
+        queued = conn.execute(
+            "SELECT wallet, input_json FROM pipeline_jobs WHERE status = 'queued' "
+            "ORDER BY job_id"
+        ).fetchall()
+        assert summary.jobs_enqueued == 3
+        assert any(
+            row["wallet"] == first_evidence_wallet
+            and '"refresh_reason":"required_depth"' in row["input_json"]
+            for row in queued
+        )
+    finally:
+        conn.close()
+
+
+def test_history_planner_treats_missing_required_depth_as_initial_evidence(
+    tmp_path,
+):
+    conn = connect(tmp_path / "robot.sqlite")
+    wallet = "0x" + "d" * 40
+    try:
+        run_migrations(conn)
+        _seed_level(conn, wallet, WalletLevel.L3)
+        _seed_history_summary(
+            conn,
+            wallet,
+            depth="light",
+            updated_at=1_900,
+            methodology_version="wallet_history_summary_v1",
+        )
+        conn.commit()
+
+        summary = plan_wallet_history_jobs(
+            conn,
+            limit=1,
+            max_active_jobs=10,
+            shard_count=1,
+            now=2_000,
+        )
+        conn.commit()
+
+        queued = conn.execute(
+            "SELECT job_action, job_scope, priority, max_attempts, input_json "
+            "FROM pipeline_jobs WHERE wallet = ?",
+            (wallet,),
+        ).fetchone()
+        assert summary.jobs_enqueued == 1
+        assert queued["job_action"] == DEEP_ACTION
+        assert queued["job_scope"] == "deep"
+        assert queued["priority"] == 5
+        assert queued["max_attempts"] == 3
+        assert '"refresh_reason":"required_depth"' in queued["input_json"]
+    finally:
+        conn.close()
+
+
 def test_history_planner_does_not_refresh_current_methodology_without_new_activity(
     tmp_path,
 ):
@@ -239,6 +397,16 @@ def test_history_planner_does_not_refresh_current_methodology_without_new_activi
         run_migrations(conn)
         _seed_level(conn, wallet, WalletLevel.L5)
         _seed_history_summary(conn, wallet, depth="deep", updated_at=1_900)
+        conn.execute(
+            """
+            INSERT INTO wallet_pnl_summaries(
+                wallet, official_all_pnl_usdc, official_all_volume_usdc,
+                official_profit_intensity, coverage, methodology_version,
+                captured_at, updated_at
+            ) VALUES (?, 100, 10000, 0.01, 'deep_recent_bounded', ?, 1900, 1900)
+            """,
+            (wallet, PNL_METHODOLOGY_VERSION),
+        )
         conn.commit()
 
         summary = plan_wallet_history_jobs(
@@ -253,6 +421,264 @@ def test_history_planner_does_not_refresh_current_methodology_without_new_activi
         assert summary.jobs_enqueued == 0
     finally:
         conn.close()
+
+
+def test_methodology_refresh_repairs_missing_artifact_with_authorized_network_fetch(
+    tmp_path,
+):
+    conn = connect(tmp_path / "robot.sqlite")
+    wallet = "0x" + "d" * 40
+    client = FakeHistoryClient(_rows(2))
+    try:
+        run_migrations(conn)
+        _seed_level(conn, wallet, WalletLevel.L5)
+        _seed_history_summary(
+            conn,
+            wallet,
+            depth="deep",
+            updated_at=1_900,
+            methodology_version="wallet_history_summary_v1",
+        )
+        conn.commit()
+        plan_wallet_history_jobs(conn, limit=1, shard_count=1, now=2_000)
+        conn.commit()
+
+        result = run_wallet_history_worker(
+            conn,
+            archive_dir=tmp_path / "missing-parquet",
+            shard_index=0,
+            shard_count=1,
+            limit=1,
+            worker_id="missing-methodology-artifact",
+            client=client,
+        )
+
+        assert result.jobs_succeeded == 1
+        assert result.jobs_failed == 0
+        assert ("activity", wallet, 100, 0) in client.calls
+        completed_job = conn.execute(
+            "SELECT status, output_json FROM pipeline_jobs WHERE wallet = ?",
+            (wallet,),
+        ).fetchone()
+        assert completed_job["status"] == "done"
+        output = json.loads(completed_job["output_json"])
+        assert output["artifact_repaired"] is True
+        assert output["artifact_reused"] is False
+    finally:
+        conn.close()
+
+
+def test_failed_reuse_job_does_not_starve_a_healthy_methodology_target(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    blocked_wallets = ["0x" + f"{index:040x}" for index in range(1, 6)]
+    healthy_wallet = "0x" + "f" * 40
+    try:
+        run_migrations(conn)
+        for wallet in (*blocked_wallets, healthy_wallet):
+            _seed_level(conn, wallet, WalletLevel.L5)
+            _seed_history_summary(
+                conn,
+                wallet,
+                depth="deep",
+                updated_at=1_900,
+                methodology_version="wallet_history_summary_v1",
+            )
+        conn.executemany(
+            """
+            INSERT INTO pipeline_jobs(
+                job_type, wallet, job_action, job_scope, priority, shard,
+                status, attempts, max_attempts, next_attempt_at, last_error,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, 'deep', 0, 0, 'failed', 1, 1, 999999, ?,
+                      1900, 1900)
+            """,
+            [
+                (
+                    JOB_TYPE,
+                    wallet,
+                    f"{DEEP_ACTION}:refresh:1900",
+                    "methodology_upgrade requires a valid active history artifact",
+                )
+                for wallet in blocked_wallets
+            ],
+        )
+        conn.commit()
+
+        plan = plan_wallet_history_jobs(
+            conn,
+            limit=1,
+            max_active_jobs=1,
+            shard_count=1,
+            now=2_000,
+        )
+        conn.commit()
+
+        queued = conn.execute(
+            "SELECT wallet FROM pipeline_jobs WHERE status = 'queued'"
+        ).fetchall()
+        assert plan.jobs_enqueued == 1
+        assert [row["wallet"] for row in queued] == [healthy_wallet]
+    finally:
+        conn.close()
+
+
+def test_failed_not_due_refresh_does_not_starve_a_healthy_methodology_target(
+    tmp_path,
+):
+    conn = connect(tmp_path / "robot.sqlite")
+    blocked_wallets = ["0x" + f"{index:040x}" for index in range(1, 6)]
+    healthy_wallet = "0x" + "e" * 40
+    try:
+        run_migrations(conn)
+        for wallet in (*blocked_wallets, healthy_wallet):
+            _seed_level(conn, wallet, WalletLevel.L5)
+            _seed_history_summary(
+                conn,
+                wallet,
+                depth="deep",
+                updated_at=1_900,
+                methodology_version="wallet_history_summary_v1",
+            )
+        conn.executemany(
+            """
+            INSERT INTO pipeline_jobs(
+                job_type, wallet, job_action, job_scope, priority, shard,
+                status, attempts, max_attempts, next_attempt_at, last_error,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, 'deep', 0, 0, 'failed', 1, 1, 999999,
+                      'HTTP 500 upstream', 1900, 1900)
+            """,
+            [
+                (
+                    JOB_TYPE,
+                    wallet,
+                    f"{DEEP_ACTION}:refresh:1900",
+                )
+                for wallet in blocked_wallets
+            ],
+        )
+        conn.commit()
+
+        plan = plan_wallet_history_jobs(
+            conn,
+            limit=1,
+            max_active_jobs=1,
+            shard_count=1,
+            now=2_000,
+        )
+        conn.commit()
+
+        queued = conn.execute(
+            "SELECT wallet FROM pipeline_jobs WHERE status = 'queued'"
+        ).fetchall()
+        assert plan.jobs_enqueued == 1
+        assert [row["wallet"] for row in queued] == [healthy_wallet]
+    finally:
+        conn.close()
+
+
+def test_missing_official_pnl_is_retried_with_parquet_reuse_only(
+    tmp_path,
+    monkeypatch,
+):
+    conn = connect(tmp_path / "robot.sqlite")
+    archive_dir = tmp_path / "parquet"
+    wallet = "0x" + "e" * 40
+    initial_now = 2_000
+    retry_now = initial_now + PNL_INCOMPLETE_REFRESH_SECONDS + 1
+    try:
+        run_migrations(conn)
+        _seed_level(conn, wallet, WalletLevel.L4)
+        plan_wallet_history_jobs(conn, limit=1, shard_count=1, now=initial_now)
+        conn.commit()
+        monkeypatch.setattr(
+            "pm_robot.orchestration.wallet_history_pipeline.time.time",
+            lambda: initial_now,
+        )
+        initial = run_wallet_history_worker(
+            conn,
+            archive_dir=archive_dir,
+            shard_index=0,
+            shard_count=1,
+            limit=1,
+            worker_id="initial-missing-official",
+            client=FakeHistoryClient(_rows(80)),
+        )
+        conn.commit()
+
+        plan = plan_wallet_history_jobs(
+            conn,
+            limit=1,
+            max_active_jobs=10,
+            shard_count=1,
+            deep_refresh_seconds=10_000_000,
+            now=retry_now,
+        )
+        conn.commit()
+        job = conn.execute(
+            "SELECT input_json FROM pipeline_jobs WHERE wallet = ? ORDER BY job_id DESC LIMIT 1",
+            (wallet,),
+        ).fetchone()
+        job_input = json.loads(job["input_json"])
+        assert job_input["refresh_reason"] == "pnl_evidence_refresh"
+        assert job_input["job_action"] == f"{DEEP_ACTION}:pnl:{initial_now}"
+
+        retry_client = FakeHistoryClient(
+            [],
+            leaderboard=[{"proxyWallet": wallet, "pnl": 250, "vol": 10_000}],
+        )
+        monkeypatch.setattr(
+            "pm_robot.orchestration.wallet_history_pipeline.time.time",
+            lambda: retry_now,
+        )
+        refreshed = run_wallet_history_worker(
+            conn,
+            archive_dir=archive_dir,
+            shard_index=0,
+            shard_count=1,
+            limit=1,
+            worker_id="retry-missing-official",
+            client=retry_client,
+        )
+
+        pnl = conn.execute(
+            "SELECT official_all_pnl_usdc FROM wallet_pnl_summaries WHERE wallet = ?",
+            (wallet,),
+        ).fetchone()
+        assert initial.jobs_succeeded == 1
+        assert plan.jobs_enqueued == 1
+        assert refreshed.jobs_succeeded == 1
+        assert all(call[0] != "activity" for call in retry_client.calls)
+        assert pnl["official_all_pnl_usdc"] == pytest.approx(250)
+    finally:
+        conn.close()
+
+
+def test_official_pnl_crosscheck_rejects_a_different_wallet():
+    wallet = "0x" + "a" * 40
+    other = "0x" + "b" * 40
+    client = FakeHistoryClient(
+        [],
+        leaderboard=[{"proxyWallet": other, "pnl": 1_000_000, "vol": 1}],
+    )
+
+    assert _fetch_official_all_profit(client, wallet) == (None, None)
+
+
+def test_official_pnl_crosscheck_propagates_upstream_failure():
+    wallet = "0x" + "a" * 40
+
+    class FailedLeaderboardClient:
+        def trader_leaderboard(self, **kwargs):
+            del kwargs
+            raise HttpClientError(
+                "service unavailable",
+                status_code=503,
+                error_type="server_error",
+            )
+
+    with pytest.raises(HttpClientError, match="service unavailable"):
+        _fetch_official_all_profit(FailedLeaderboardClient(), wallet)
 
 
 def test_history_planner_maps_l2_to_light_and_ignores_l1(tmp_path):
@@ -282,7 +708,7 @@ def test_history_planner_maps_l2_to_light_and_ignores_l1(tmp_path):
         assert dict(job) == {
             "wallet": l2_wallet,
             "job_type": JOB_TYPE,
-            "job_action": "collect_light_history:v1",
+            "job_action": LIGHT_ACTION,
             "job_scope": "light",
         }
     finally:
@@ -378,7 +804,7 @@ def test_light_history_refresh_requires_both_staleness_and_a_new_sighting(tmp_pa
             (wallet,),
         ).fetchone()
         assert dict(job) == {
-            "job_action": "collect_light_history:v1:refresh:1500",
+            "job_action": f"{LIGHT_ACTION}:activity:2500",
             "job_scope": "light",
         }
     finally:
@@ -543,6 +969,35 @@ def test_history_worker_enables_priority_aging_when_claiming(tmp_path, monkeypat
         conn.close()
 
 
+def test_history_worker_defers_sqlite_claim_contention_without_crashing(
+    tmp_path, monkeypatch
+):
+    conn = connect(tmp_path / "robot.sqlite")
+
+    def locked_claim(*_args, **_kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+    try:
+        monkeypatch.setattr(wallet_history_module, "claim_pipeline_job", locked_claim)
+        result = run_wallet_history_worker(
+            conn,
+            archive_dir=tmp_path / "parquet",
+            shard_index=0,
+            shard_count=1,
+            limit=1,
+            worker_id="lock-test",
+            client=FakeHistoryClient([]),
+        )
+
+        assert result.jobs_attempted == 0
+        assert result.jobs_deferred == 1
+        assert result.status == "partial"
+        assert "writer contention" in result.error
+        assert not conn.in_transaction
+    finally:
+        conn.close()
+
+
 def test_light_history_worker_writes_parquet_and_compact_summary_only(tmp_path):
     conn = connect(tmp_path / "robot.sqlite")
     archive_dir = tmp_path / "parquet"
@@ -599,7 +1054,7 @@ def test_light_history_worker_writes_parquet_and_compact_summary_only(tmp_path):
         ).fetchone()
         assert feature["net_pnl_usdc"] == pytest.approx(12)
         assert feature["total_volume_usdc"] == pytest.approx(750)
-        assert "wallet_history_summary_v2" in feature["extra_json"]
+        assert METHODOLOGY_VERSION in feature["extra_json"]
         pnl = conn.execute(
             "SELECT * FROM wallet_pnl_summaries WHERE wallet = ?", (wallet,)
         ).fetchone()
@@ -613,6 +1068,44 @@ def test_light_history_worker_writes_parquet_and_compact_summary_only(tmp_path):
             ("closed", wallet, 50, 0, 0.0),
             ("value", wallet),
         ]
+    finally:
+        conn.close()
+
+
+def test_history_worker_commits_pnl_cache_before_parquet_io(tmp_path, monkeypatch):
+    conn = connect(tmp_path / "robot.sqlite")
+    archive_dir = tmp_path / "parquet"
+    wallet = "0x" + "8" * 40
+    original_persist = wallet_history_module.persist_wallet_history_artifact
+    transaction_states = []
+
+    def assert_clean_transaction(*args, **kwargs):
+        transaction_states.append(conn.in_transaction)
+        return original_persist(*args, **kwargs)
+
+    try:
+        run_migrations(conn)
+        _seed_level(conn, wallet, WalletLevel.L2)
+        plan_wallet_history_jobs(conn, limit=1, shard_count=1, now=2_000)
+        conn.commit()
+        monkeypatch.setattr(
+            wallet_history_module,
+            "persist_wallet_history_artifact",
+            assert_clean_transaction,
+        )
+
+        result = run_wallet_history_worker(
+            conn,
+            archive_dir=archive_dir,
+            shard_index=0,
+            shard_count=1,
+            limit=1,
+            worker_id="transaction-boundary-test",
+            client=FakeHistoryClient(_rows(10)),
+        )
+
+        assert result.jobs_succeeded == 1
+        assert transaction_states == [False]
     finally:
         conn.close()
 
@@ -849,6 +1342,222 @@ def test_history_worker_removes_uncatalogued_parquet_after_transaction_failure(
         assert conn.execute(
             "SELECT status FROM pipeline_jobs WHERE wallet = ?",
             (wallet,),
+        ).fetchone()[0] == "queued"
+    finally:
+        conn.close()
+
+
+def test_bounded_recent_profit_cannot_override_negative_official_all_time_pnl(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    archive_dir = tmp_path / "parquet"
+    wallet = "0x" + "a" * 40
+    closed = [
+        {
+            "realizedPnl": "100",
+            "totalBought": "100",
+            "timestamp": 10_000 - index,
+            "asset": f"asset-{index}",
+        }
+        for index in range(250)
+    ]
+    client = FakeHistoryClient(
+        _rows(250),
+        closed=closed,
+        leaderboard=[{"proxyWallet": wallet, "pnl": -1_000, "vol": 10_000}],
+    )
+    try:
+        run_migrations(conn)
+        _seed_level(conn, wallet, WalletLevel.L3)
+        plan_wallet_history_jobs(conn, limit=1, shard_count=1, now=2_000)
+        conn.commit()
+
+        result = run_wallet_history_worker(
+            conn,
+            archive_dir=archive_dir,
+            shard_index=0,
+            shard_count=1,
+            limit=1,
+            worker_id="negative-official-test",
+            client=client,
+        )
+
+        assert result.deep_completed == 1
+        pnl = conn.execute(
+            """
+            SELECT total_estimated_pnl_usdc, coverage, methodology_version,
+                   official_all_pnl_usdc, official_all_volume_usdc,
+                   official_profit_intensity
+            FROM wallet_pnl_summaries
+            WHERE wallet = ?
+            """,
+            (wallet,),
+        ).fetchone()
+        assert dict(pnl) == {
+            "total_estimated_pnl_usdc": pytest.approx(20_000),
+            "coverage": "deep_recent_bounded",
+            "methodology_version": PNL_METHODOLOGY_VERSION,
+            "official_all_pnl_usdc": pytest.approx(-1_000),
+            "official_all_volume_usdc": pytest.approx(10_000),
+            "official_profit_intensity": pytest.approx(-0.1),
+        }
+        summary = conn.execute(
+            "SELECT risk_flags_json, score_components_json "
+            "FROM wallet_history_summaries WHERE wallet = ?",
+            (wallet,),
+        ).fetchone()
+        assert "non_positive_official_all_time_pnl" in json.loads(
+            summary["risk_flags_json"]
+        )
+        assert json.loads(summary["score_components_json"])["pnl"] < 50
+        assert conn.execute(
+            "SELECT net_pnl_usdc FROM wallet_features WHERE address = ?",
+            (wallet,),
+        ).fetchone()[0] == pytest.approx(-1_000)
+        assert client.closed_sort_calls == [("TIMESTAMP", "DESC")] * 4
+    finally:
+        conn.close()
+
+
+def test_methodology_only_refresh_reuses_active_parquet_without_activity_refetch(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    archive_dir = tmp_path / "parquet"
+    wallet = "0x" + "b" * 40
+    try:
+        run_migrations(conn)
+        _seed_level(conn, wallet, WalletLevel.L2)
+        plan_wallet_history_jobs(conn, limit=1, shard_count=1, now=2_000)
+        conn.commit()
+        first_client = FakeHistoryClient(
+            _rows(60),
+            leaderboard=[{"proxyWallet": wallet, "pnl": 100, "vol": 10_000}],
+        )
+        first = run_wallet_history_worker(
+            conn,
+            archive_dir=archive_dir,
+            shard_index=0,
+            shard_count=1,
+            limit=1,
+            worker_id="initial-history",
+            client=first_client,
+        )
+        original = conn.execute(
+            "SELECT artifact_id, relative_path FROM wallet_history_artifacts "
+            "WHERE wallet = ? AND status = 'active'",
+            (wallet,),
+        ).fetchone()
+        conn.execute(
+            "UPDATE wallet_history_summaries SET methodology_version = 'old-method' "
+            "WHERE wallet = ?",
+            (wallet,),
+        )
+        conn.commit()
+        plan = plan_wallet_history_jobs(
+            conn,
+            limit=1,
+            shard_count=1,
+            now=2_100,
+        )
+        conn.commit()
+
+        no_fetch_client = FakeHistoryClient([])
+        refreshed = run_wallet_history_worker(
+            conn,
+            archive_dir=archive_dir,
+            shard_index=0,
+            shard_count=1,
+            limit=1,
+            worker_id="methodology-refresh",
+            client=no_fetch_client,
+        )
+
+        current = conn.execute(
+            "SELECT artifact_id, relative_path FROM wallet_history_artifacts "
+            "WHERE wallet = ? AND status = 'active'",
+            (wallet,),
+        ).fetchone()
+        output = json.loads(
+            conn.execute(
+                "SELECT output_json FROM pipeline_jobs WHERE wallet = ? "
+                "ORDER BY job_id DESC LIMIT 1",
+                (wallet,),
+            ).fetchone()[0]
+        )
+        assert first.jobs_succeeded == 1
+        assert plan.jobs_enqueued == 1
+        assert refreshed.jobs_succeeded == 1
+        assert refreshed.rows_archived == 0
+        assert dict(current) == dict(original)
+        assert conn.execute(
+            "SELECT COUNT(*) FROM wallet_history_artifacts WHERE wallet = ?",
+            (wallet,),
+        ).fetchone()[0] == 1
+        assert output["artifact_reused"] is True
+        assert no_fetch_client.calls == []
+    finally:
+        conn.close()
+
+
+def test_light_history_planner_prioritizes_stronger_screen_sample(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    weak = "0x" + "c" * 40
+    strong = "0x" + "d" * 40
+    try:
+        run_migrations(conn)
+        _seed_level(conn, weak, WalletLevel.L2)
+        _seed_level(conn, strong, WalletLevel.L2)
+        conn.executemany(
+            """
+            INSERT INTO wallet_screen_summaries(
+                wallet, sample_trade_count, sample_volume_usdc,
+                sample_market_count, screen_complete, screen_qualified,
+                computed_at, updated_at
+            ) VALUES (?, 10, ?, ?, 1, 1, 1_900, 1_900)
+            """,
+            ((weak, 110, 1), (strong, 900, 5)),
+        )
+        conn.commit()
+
+        plan_wallet_history_jobs(conn, limit=1, shard_count=1, now=2_000)
+        conn.commit()
+
+        assert conn.execute(
+            "SELECT wallet FROM pipeline_jobs WHERE job_type = ?",
+            (JOB_TYPE,),
+        ).fetchone()[0] == strong
+    finally:
+        conn.close()
+
+
+def test_new_methodology_action_is_not_blocked_by_old_done_job(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    wallet = "0x" + "e" * 40
+    try:
+        run_migrations(conn)
+        _seed_level(conn, wallet, WalletLevel.L2)
+        conn.execute(
+            """
+            INSERT INTO pipeline_jobs(
+                job_type, wallet, job_action, job_scope, status,
+                attempts, max_attempts, created_at, updated_at, completed_at
+            ) VALUES (?, ?, 'collect_light_history:v1', 'light', 'done',
+                      1, 3, 1_000, 1_000, 1_000)
+            """,
+            (JOB_TYPE, wallet),
+        )
+        conn.commit()
+
+        plan = plan_wallet_history_jobs(conn, limit=1, shard_count=1, now=2_000)
+        conn.commit()
+
+        assert plan.jobs_enqueued == 1
+        assert conn.execute(
+            "SELECT COUNT(*) FROM pipeline_jobs WHERE wallet = ?",
+            (wallet,),
+        ).fetchone()[0] == 2
+        assert conn.execute(
+            "SELECT status FROM pipeline_jobs "
+            "WHERE wallet = ? AND job_action = ?",
+            (wallet, LIGHT_ACTION),
         ).fetchone()[0] == "queued"
     finally:
         conn.close()

@@ -2,6 +2,7 @@ import sqlite3
 import time
 from concurrent.futures import ThreadPoolExecutor
 from email.utils import formatdate
+from http.client import RemoteDisconnected
 from threading import Barrier, Thread
 from urllib.error import HTTPError
 
@@ -318,6 +319,76 @@ def test_sqlite_database_path_only_enables_file_backed_coordination(tmp_path):
         readonly_conn.close()
 
 
+def test_http_request_logging_does_not_hold_the_worker_write_transaction(tmp_path):
+    db_path = _prepare_database(tmp_path)
+    worker_conn = connect(db_path)
+    contender = sqlite3.connect(db_path, timeout=0)
+    try:
+        client = RateLimitedHttpClient(
+            conn=worker_conn,
+            shared_limiter=_SharedLimiterSpy(),
+        )
+
+        client._log(
+            "https://data-api.polymarket.com",
+            "/activity",
+            200,
+            time.monotonic(),
+            0,
+            "",
+            True,
+        )
+
+        assert worker_conn.in_transaction is False
+        contender.execute("BEGIN IMMEDIATE")
+        contender.rollback()
+        assert (
+            worker_conn.execute(
+                "SELECT COUNT(*) FROM api_request_log WHERE endpoint = '/activity'"
+            ).fetchone()[0]
+            == 1
+        )
+    finally:
+        contender.close()
+        worker_conn.close()
+
+
+def test_http_request_logging_drops_quickly_during_writer_contention(tmp_path):
+    db_path = _prepare_database(tmp_path)
+    worker_conn = connect(db_path)
+    locker = sqlite3.connect(db_path, timeout=0)
+    try:
+        client = RateLimitedHttpClient(
+            conn=worker_conn,
+            shared_limiter=_SharedLimiterSpy(),
+        )
+        locker.execute("BEGIN IMMEDIATE")
+        started = time.monotonic()
+
+        client._log(
+            "https://data-api.polymarket.com",
+            "/activity",
+            200,
+            started,
+            0,
+            "",
+            True,
+        )
+
+        assert time.monotonic() - started < 1.5
+        assert worker_conn.in_transaction is False
+        assert (
+            worker_conn.execute(
+                "SELECT COUNT(*) FROM api_request_log WHERE endpoint = '/activity'"
+            ).fetchone()[0]
+            == 0
+        )
+    finally:
+        locker.rollback()
+        locker.close()
+        worker_conn.close()
+
+
 class _SharedLimiterSpy:
     def __init__(self):
         self.waited = []
@@ -334,6 +405,45 @@ class _SharedLimiterSpy:
 class _DeferredLimiterSpy:
     def wait(self, scopes):
         raise SharedRateLimitDeferred(45.0)
+
+
+class _JsonResponse:
+    status = 200
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        return False
+
+    def read(self):
+        return b'{"ok": true}'
+
+
+def test_http_client_retries_remote_disconnect(monkeypatch):
+    calls = []
+    sleeps = []
+
+    def flaky_request(request, timeout):
+        calls.append(request.full_url)
+        if len(calls) == 1:
+            raise RemoteDisconnected("remote closed")
+        return _JsonResponse()
+
+    monkeypatch.setattr("pm_robot.clients.http.urlopen", flaky_request)
+    monkeypatch.setattr("pm_robot.clients.http.time.sleep", sleeps.append)
+    client = RateLimitedHttpClient(
+        max_retries=1,
+        base_kind={"https://example.test": "data"},
+        shared_limiter=_SharedLimiterSpy(),
+    )
+
+    assert client.get_json("https://example.test", "/activity") == {"ok": True}
+    assert calls == [
+        "https://example.test/activity",
+        "https://example.test/activity",
+    ]
+    assert sleeps == [1.0]
 
 
 def test_http_429_propagates_retry_after_to_shared_limiter(monkeypatch):

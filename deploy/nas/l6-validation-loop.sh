@@ -11,6 +11,7 @@ WORKER_LIMIT="${PM_ROBOT_WALLET_L6_WORKER_LIMIT:-1}"
 LEASE_SECONDS="${PM_ROBOT_WALLET_L6_LEASE_SECONDS:-1800}"
 SLEEP_SECONDS="${PM_ROBOT_WALLET_L6_REQUEST_SLEEP:-0.05}"
 ARCHIVE_DIR="${PM_ROBOT_ARCHIVE_DIR:-/app/data/parquet}"
+EXPORT_PATH="${PM_ROBOT_HIGH_CONFIDENCE_L6_EXPORT_PATH:-/app/data/exports/current_high_confidence_l6.json}"
 HOSTNAME_VALUE="$(hostname 2>/dev/null || echo nas)"
 WORKER_ID="${PM_ROBOT_WALLET_L6_WORKER_ID:-nas-wallet-l6-${HOSTNAME_VALUE}}"
 HEARTBEAT_NAME="loop_wallet_l6_validation_worker"
@@ -68,6 +69,16 @@ print(status, jobs_attempted)
       printf '%s\n' "$command_output"
     fi
     echo "$(date -Iseconds) L6 validation worker failed" >&2
+  fi
+
+  if [ "$command_status" = "ok" ] || [ "$command_status" = "partial" ]; then
+    if export_output="$(python -m pm_robot.cli --env /app/.env export-high-confidence-l6 \
+        --out "$EXPORT_PATH")"; then
+      printf '%s\n' "$export_output"
+    else
+      command_status="partial"
+      echo "$(date -Iseconds) L6 validation worker could not refresh the research handoff" >&2
+    fi
   fi
 
   if [ "$command_status" = "ok" ]; then

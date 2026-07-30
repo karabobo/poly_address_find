@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import sqlite3
 import time
 from dataclasses import dataclass
@@ -16,6 +17,7 @@ from pm_robot.storage.repository import (
     get_wallet_features,
     upsert_wallet_feature,
 )
+from pm_robot.storage.wallet_levels import try_normalize_wallet
 
 
 DEFAULT_METRICS = ("profit", "volume")
@@ -25,6 +27,8 @@ DEFAULT_TIME_PERIODS = ("DAY", "WEEK", "MONTH", "ALL")
 DEFAULT_ORDER_BYS = ("PNL", "VOL")
 DEFAULT_V1_LIMIT = 50
 DEFAULT_V1_PAGES = 2
+DISCOVERY_WRITE_BATCH_SIZE = 10
+DISCOVERY_WRITE_YIELD_SECONDS = 0.1
 
 
 @dataclass(frozen=True)
@@ -168,20 +172,24 @@ def discover_leaderboard_candidates(
     candidate_count = 0
     feature_count = 0
     now = int(time.time())
-    for wallet, item in seen.items():
+    for processed_count, (wallet, item) in enumerate(seen.items(), start=1):
         sighting = record_wallet_sighting(
             conn,
             _candidate_from_item(item, now=now),
             trusted_source=True,
             now=now,
         )
-        if not sighting.candidate_updated:
-            continue
-        candidate_count += 1
-        feature = _feature_from_item(item, existing.get(wallet))
-        if feature is not None:
-            upsert_wallet_feature(conn, feature)
-            feature_count += 1
+        if sighting.candidate_updated:
+            candidate_count += 1
+            feature = _feature_from_item(item, existing.get(wallet))
+            if feature is not None:
+                upsert_wallet_feature(conn, feature)
+                feature_count += 1
+        # Discovery is idempotent, so release SQLite's single-writer lock
+        # between small wallet groups instead of monopolizing it for minutes.
+        if processed_count % DISCOVERY_WRITE_BATCH_SIZE == 0:
+            conn.commit()
+            time.sleep(DISCOVERY_WRITE_YIELD_SECONDS)
     conn.commit()
     if scheduler_deferred:
         status = "partial" if succeeded or v1_succeeded else "limited"
@@ -201,10 +209,9 @@ def discover_leaderboard_candidates(
 
 
 def _wallet_from_row(row: dict[str, Any]) -> str:
-    wallet = str(row.get("proxyWallet") or row.get("wallet") or row.get("address") or "").strip().lower()
-    if wallet.startswith("0x") and len(wallet) == 42:
-        return wallet
-    return ""
+    return try_normalize_wallet(
+        row.get("proxyWallet") or row.get("wallet") or row.get("address")
+    )
 
 
 def _display_name(row: dict[str, Any]) -> str:
@@ -296,6 +303,7 @@ def _float(value: Any) -> float | None:
     try:
         if value is None or value == "":
             return None
-        return float(value)
+        parsed = float(value)
     except (TypeError, ValueError):
         return None
+    return parsed if math.isfinite(parsed) else None

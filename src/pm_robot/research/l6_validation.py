@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import math
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -10,10 +9,14 @@ from enum import Enum
 from statistics import median
 from typing import Any, Iterable
 
+from pm_robot.research.evidence_rows import (
+    dedupe_activity_rows,
+    dedupe_closed_position_rows,
+)
 from pm_robot.research.pnl_estimates import estimate_wallet_pnl
 
 
-L6_VALIDATION_POLICY_VERSION = "l6_independent_v2"
+L6_VALIDATION_POLICY_VERSION = "l6_independent_v4"
 
 
 class L6ValidationDecision(str, Enum):
@@ -88,8 +91,8 @@ def evaluate_l6_validation(
     coverage_start = coverage_end - max(1, int(active_policy.window_seconds))
     recent_start = coverage_end - max(1, int(active_policy.recent_window_seconds))
     current_rows = _dict_rows(current_positions)
-    closed_rows = _dedupe_rows(_dict_rows(closed_positions))
-    activity_rows = _dedupe_rows(_dict_rows(activity))
+    closed_rows = dedupe_closed_position_rows(_dict_rows(closed_positions))
+    activity_rows = dedupe_activity_rows(_dict_rows(activity))
     leaderboard_data = _dict_rows(leaderboard_rows)
     (
         official_all_pnl,
@@ -345,14 +348,6 @@ def _coefficient_of_variation(values: list[int]) -> float | None:
         return None
     variance = sum((value - mean) ** 2 for value in values) / len(values)
     return math.sqrt(variance) / mean
-
-
-def _dedupe_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    unique: dict[str, dict[str, Any]] = {}
-    for row in rows:
-        key = json.dumps(row, sort_keys=True, ensure_ascii=False, default=str)
-        unique[key] = row
-    return list(unique.values())
 
 
 def _dict_rows(rows: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:

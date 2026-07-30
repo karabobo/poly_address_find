@@ -65,6 +65,25 @@ def test_l6_validation_passes_sustained_realized_profit_without_hard_anomaly():
     assert result.official_profit_intensity == pytest.approx(0.01)
 
 
+def test_l6_validation_dedupes_semantic_evidence_with_extra_metadata():
+    closed = _closed_rows()
+    activity = _activity_rows()
+    duplicated_closed = [*closed, {**closed[0], "title": "enriched"}]
+    duplicated_activity = [*activity, {**activity[0], "name": "enriched"}]
+
+    result = evaluate_l6_validation(
+        current_positions=[],
+        closed_positions=duplicated_closed,
+        activity=duplicated_activity,
+        leaderboard_rows=_leaderboard_rows(),
+        now=NOW,
+    )
+
+    assert result.closed_position_count == 12
+    assert result.activity_count == 30
+    assert result.realized_pnl_usdc == pytest.approx(120)
+
+
 def test_l6_validation_warns_when_independent_evidence_is_too_thin():
     result = evaluate_l6_validation(
         current_positions=[],

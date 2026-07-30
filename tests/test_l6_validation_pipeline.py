@@ -3,13 +3,19 @@ from __future__ import annotations
 import time
 from pathlib import Path
 
+import pytest
+
+from pm_robot.clients.http import HttpClientError
 from pm_robot.orchestration.l6_validation_pipeline import (
     MAX_HISTORICAL_ACTIVITY_OFFSET,
     _fetch_activity_window,
+    _fetch_leaderboard_cross_checks,
     plan_l6_validation_jobs,
     run_l6_validation_worker,
 )
+from pm_robot.orchestration.wallet_level_selection import SELECTION_POLICY_VERSION
 from pm_robot.research.current_elite import CURRENT_ELITE_EVIDENCE_MAX_AGE_SECONDS
+from pm_robot.research.wallet_history_summary import METHODOLOGY_VERSION
 from pm_robot.storage.db import connect, run_migrations
 from pm_robot.storage.wallet_levels import get_wallet_level
 from pm_robot.wallet_levels import WalletLevel
@@ -46,8 +52,19 @@ class FakeValidationClient:
         del wallet, size_threshold, limit
         return [] if offset == 0 else []
 
-    def closed_positions(self, wallet, *, limit, offset, size_threshold):
+    def closed_positions(
+        self,
+        wallet,
+        *,
+        limit,
+        offset,
+        size_threshold,
+        sort_by=None,
+        sort_direction=None,
+    ):
         del wallet, size_threshold
+        assert sort_by == "TIMESTAMP"
+        assert sort_direction == "DESC"
         return self.closed[offset : offset + limit]
 
     def activity(self, wallet, *, limit, offset, start, end):
@@ -85,9 +102,9 @@ def _seed_current_l5(conn, *, now: int) -> None:
         INSERT INTO wallet_levels(
             wallet, level, level_reason, policy_version, first_seen_at,
             last_seen_at, level_updated_at, updated_at
-        ) VALUES (?, 'l5', 'relative_rank_selected', 'relative_rank_v3', ?, ?, ?, ?)
+        ) VALUES (?, 'l5', 'relative_rank_selected', ?, ?, ?, ?, ?)
         """,
-        (WALLET, now - 10_000, now, now, now),
+        (WALLET, SELECTION_POLICY_VERSION, now - 10_000, now, now, now),
     )
     conn.execute(
         """
@@ -99,9 +116,9 @@ def _seed_current_l5(conn, *, now: int) -> None:
             score_components_json, methodology_version, computed_at, updated_at
         ) VALUES (?, 'deep-artifact', 'deep', 500, 20, 500, 0, 50000,
                   300, 200, 0.2, '[]', '[]', 90, '{}',
-                  'wallet_history_summary_v2', ?, ?)
+                  ?, ?, ?)
         """,
-        (WALLET, now, now),
+        (WALLET, METHODOLOGY_VERSION, now, now),
     )
     conn.execute(
         """
@@ -109,10 +126,10 @@ def _seed_current_l5(conn, *, now: int) -> None:
             wallet, target_level, evidence_artifact_id, policy_version,
             selected, rank_in_cohort, cohort_size, source_bucket,
             strategy_bucket, reason, decided_at, updated_at, research_score
-        ) VALUES (?, 'l5', 'deep-artifact', 'relative_rank_v3',
+        ) VALUES (?, 'l5', 'deep-artifact', ?,
                   1, 1, 20, 'stream', 'general', 'relative_rank_selected', ?, ?, 90)
         """,
-        (WALLET, now, now),
+        (WALLET, SELECTION_POLICY_VERSION, now, now),
     )
     conn.commit()
 
@@ -301,3 +318,35 @@ def test_activity_fetch_splits_dense_time_ranges_before_offset_limit():
     assert len({row["transactionHash"] for row in fetched}) == len(rows)
     assert max(offset for offset, _start, _end in client.calls) == MAX_HISTORICAL_ACTIVITY_OFFSET
     assert len({(call_start, call_end) for _offset, call_start, call_end in client.calls}) > 1
+
+
+def test_l6_leaderboard_crosscheck_rejects_a_different_wallet():
+    class MismatchedLeaderboardClient:
+        def trader_leaderboard(self, **kwargs):
+            del kwargs
+            return [
+                {
+                    "proxyWallet": "0x" + "f" * 40,
+                    "pnl": 1_000_000,
+                    "vol": 1,
+                }
+            ]
+
+    assert _fetch_leaderboard_cross_checks(
+        MismatchedLeaderboardClient(),
+        WALLET,
+    ) == []
+
+
+def test_l6_leaderboard_crosscheck_propagates_upstream_failure():
+    class FailedLeaderboardClient:
+        def trader_leaderboard(self, **kwargs):
+            del kwargs
+            raise HttpClientError(
+                "service unavailable",
+                status_code=503,
+                error_type="server_error",
+            )
+
+    with pytest.raises(HttpClientError, match="service unavailable"):
+        _fetch_leaderboard_cross_checks(FailedLeaderboardClient(), WALLET)

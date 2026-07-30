@@ -125,6 +125,11 @@ def test_nas_history_workers_are_sharded_direct_to_parquet():
     assert "wallet-history-worker" in loop
     assert 'WORKER_LIMIT="${PM_ROBOT_WALLET_HISTORY_WORKER_LIMIT:-1}"' in loop
     assert 'LEASE_SECONDS="${PM_ROBOT_WALLET_HISTORY_LEASE_SECONDS:-1800}"' in loop
+    assert (
+        'START_STAGGER_SECONDS="${PM_ROBOT_WALLET_HISTORY_START_STAGGER_SECONDS:-7}"'
+        in loop
+    )
+    assert "start_delay=$((SHARD_INDEX * START_STAGGER_SECONDS))" in loop
     assert 'ARCHIVE_DIR="${PM_ROBOT_ARCHIVE_DIR:-/app/data/parquet}"' in loop
     assert 'HEARTBEAT_NAME="loop_wallet_history_worker_${SHARD_INDEX}"' in loop
 
@@ -140,6 +145,9 @@ def test_nas_l6_worker_is_single_low_volume_network_worker():
     assert 'WORKER_LIMIT="${PM_ROBOT_WALLET_L6_WORKER_LIMIT:-1}"' in loop
     assert 'HEARTBEAT_NAME="loop_wallet_l6_validation_worker"' in loop
     assert "wallet-l6-worker" in loop
+    assert 'EXPORT_PATH="${PM_ROBOT_HIGH_CONFIDENCE_L6_EXPORT_PATH:-/app/data/exports/current_high_confidence_l6.json}"' in loop
+    assert "export-high-confidence-l6" in loop
+    assert '--out "$EXPORT_PATH"' in loop
 
 
 def test_nas_screen_loop_records_unique_planner_and_worker_heartbeats():
@@ -157,9 +165,11 @@ def test_nas_env_documents_bounded_new_queue_defaults():
     assert "PM_ROBOT_WALLET_HISTORY_PLANNER_LIMIT=12" in env
     assert "PM_ROBOT_WALLET_HISTORY_MAX_ACTIVE_JOBS=36" in env
     assert "PM_ROBOT_WALLET_HISTORY_WORKER_LIMIT=1" in env
+    assert "PM_ROBOT_WALLET_HISTORY_START_STAGGER_SECONDS=7" in env
     assert "PM_ROBOT_WALLET_L6_MAX_ACTIVE_JOBS=10" in env
     assert "PM_ROBOT_WALLET_L6_WORKER_LIMIT=1" in env
     assert "PM_ROBOT_WALLET_L6_REFRESH_SECONDS=1209600" in env
+    assert "PM_ROBOT_HIGH_CONFIDENCE_L6_EXPORT_PATH=/app/data/exports/current_high_confidence_l6.json" in env
     assert "PM_ROBOT_WALLET_LEVEL_MIN_COHORT_SIZE=20" in env
     assert "PM_ROBOT_WALLET_LEVEL_TIMEOUT_MIN_COHORT_SIZE=5" in env
     assert "PM_ROBOT_WALLET_LEVEL_MAX_WAIT_SECONDS=3600" in env
@@ -192,6 +202,8 @@ def test_nas_helper_manages_only_discovery_funnel_services():
     assert "VPS known_hosts is missing or unreadable" in helper
     assert '[[ "$key_path" == /ssh/* ]]' in helper
     assert '[[ "$known_hosts_path" == /ssh/* ]]' in helper
+    assert "export-high-confidence-l6" in helper
+    assert "/app/data/exports/current_high_confidence_l6.json" in helper
     for obsolete in (
         "copyability",
         "validation-observer",
@@ -303,7 +315,11 @@ def test_nas_maintenance_audits_before_parquet_gc_without_legacy_retention_cycle
     assert loop.index("wallet-history-audit") < loop.index("wallet-history-gc")
     assert "--execute" in loop
     assert "PM_ROBOT_MAINTENANCE_RUNTIME_HEARTBEAT_DAYS=30" in env
+    assert "PM_ROBOT_MAINTENANCE_L0_RETENTION_DAYS=7" in env
+    assert "PM_ROBOT_MAINTENANCE_L0_CLEANUP_BATCH_LIMIT=20000" in env
     assert "--heartbeat-days" in loop
+    assert "--l0-retention-days" in loop
+    assert "--l0-cleanup-batch-limit" in loop
     assert "--pipeline-job-days" not in loop
     assert "retention-cycle" not in loop
     assert "PM_ROBOT_RETENTION_" not in env
@@ -412,6 +428,12 @@ elif "wallet-l6-worker" in args:
         "status": "ok",
         "error": "",
     }}))
+elif "export-high-confidence-l6" in args:
+    print(json.dumps({{
+        "output": args[args.index("--out") + 1],
+        "candidate_count": 1,
+        "automatic_trading_activation": False,
+    }}))
 elif "maintenance" in args:
     print(json.dumps({{"ok": True, "status": "ok"}}))
 elif "wallet-history-audit" in args:
@@ -493,12 +515,14 @@ def test_nas_history_loop_runs_only_its_assigned_shard_once(tmp_path):
 def test_nas_l6_loop_runs_one_bounded_worker_once(tmp_path):
     fake_bin, call_log = _fake_runtime(tmp_path)
     archive_dir = tmp_path / "parquet"
+    export_path = tmp_path / "current_high_confidence_l6.json"
     env = {
         **os.environ,
         "PATH": f"{fake_bin}:{os.environ.get('PATH', '')}",
         "CALL_LOG": str(call_log),
         "PM_ROBOT_WALLET_L6_RUN_ONCE": "1",
         "PM_ROBOT_ARCHIVE_DIR": str(archive_dir),
+        "PM_ROBOT_HIGH_CONFIDENCE_L6_EXPORT_PATH": str(export_path),
     }
 
     result = subprocess.run(
@@ -515,6 +539,8 @@ def test_nas_l6_loop_runs_one_bounded_worker_once(tmp_path):
     assert worker_call[worker_call.index("--shard-count") + 1] == "1"
     assert worker_call[worker_call.index("--limit") + 1] == "1"
     assert worker_call[worker_call.index("--archive-dir") + 1] == str(archive_dir)
+    export_call = next(args for args in calls if "export-high-confidence-l6" in args)
+    assert export_call[export_call.index("--out") + 1] == str(export_path)
     assert "status=ok, jobs=1" in result.stdout
 
 
@@ -544,6 +570,8 @@ def test_nas_maintenance_runs_artifact_audit_before_gc(tmp_path):
     assert commands[:3] == ["maintenance", "wallet-history-audit", "wallet-history-gc"]
     maintenance_call = next(args for args in calls if "maintenance" in args)
     assert "--heartbeat-days" in maintenance_call
+    assert "--l0-retention-days" in maintenance_call
+    assert "--l0-cleanup-batch-limit" in maintenance_call
     assert "--pipeline-job-days" not in maintenance_call
     audit_call = next(args for args in calls if "wallet-history-audit" in args)
     assert "--delete-orphans" in audit_call

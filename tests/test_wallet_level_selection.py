@@ -6,6 +6,7 @@ from pm_robot.orchestration.wallet_level_selection import (
     reconcile_wallet_level_selections,
 )
 from pm_robot.orchestration.wallet_sightings import record_wallet_sighting
+from pm_robot.research.wallet_history_summary import METHODOLOGY_VERSION
 from pm_robot.storage.db import connect, run_migrations
 from pm_robot.storage.wallet_levels import advance_wallet_level, get_wallet_level
 from pm_robot.wallet_levels import WalletLevel
@@ -58,7 +59,7 @@ def _seed_summary(
             distinct_markets, total_volume_usdc,
             strategy_tags_json, risk_flags_json, research_score,
             score_components_json, methodology_version, computed_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, '[]', ?, '{}', 'test', ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, '[]', ?, '{}', ?, ?, ?)
         """,
         (
             wallet,
@@ -69,9 +70,23 @@ def _seed_summary(
             total_volume_usdc,
             json.dumps(tags),
             score,
+            METHODOLOGY_VERSION,
             updated_at,
             updated_at,
         ),
+    )
+    conn.execute(
+        """
+        INSERT INTO wallet_pnl_summaries(
+            wallet, official_all_pnl_usdc, official_all_volume_usdc,
+            official_profit_intensity, methodology_version
+        ) VALUES (?, 100, 10000, 0.01, 'test')
+        ON CONFLICT(wallet) DO UPDATE SET
+            official_all_pnl_usdc = excluded.official_all_pnl_usdc,
+            official_all_volume_usdc = excluded.official_all_volume_usdc,
+            official_profit_intensity = excluded.official_profit_intensity
+        """,
+        (wallet,),
     )
     return artifact_id
 
@@ -470,5 +485,46 @@ def test_late_wallet_is_ranked_against_transition_score_snapshots(tmp_path):
             "rank_in_cohort": 6,
             "cohort_size": 6,
         }
+    finally:
+        conn.close()
+
+
+def test_l5_selection_requires_positive_official_all_time_pnl(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    positive = ["0x" + str(index) * 40 for index in range(1, 5)]
+    negative = "0x" + "f" * 40
+    try:
+        run_migrations(conn)
+        for wallet, score in zip(positive + [negative], (80, 70, 60, 50, 99)):
+            _seed_wallet(conn, wallet, level=WalletLevel.L4)
+            _seed_summary(conn, wallet, depth="deep", score=score)
+        conn.execute(
+            "UPDATE wallet_pnl_summaries "
+            "SET official_all_pnl_usdc = -100, official_profit_intensity = -0.01 "
+            "WHERE wallet = ?",
+            (negative,),
+        )
+        conn.commit()
+
+        result = reconcile_wallet_level_selections(
+            conn,
+            min_cohort_size=4,
+            l5_fraction=1.0,
+            l5_max_promotions=10,
+            now=10_000,
+        )
+        conn.commit()
+
+        assert result.promoted_l5 == 1
+        assert any(
+            get_wallet_level(conn, wallet).level is WalletLevel.L5
+            for wallet in positive
+        )
+        assert get_wallet_level(conn, negative).level is WalletLevel.L4
+        assert conn.execute(
+            "SELECT COUNT(*) FROM wallet_level_selections "
+            "WHERE wallet = ? AND target_level = 'l5'",
+            (negative,),
+        ).fetchone()[0] == 0
     finally:
         conn.close()

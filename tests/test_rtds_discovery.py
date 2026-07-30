@@ -116,6 +116,17 @@ def test_rtds_trade_to_activity_row_rejects_non_trade_or_missing_wallet():
             "payload": {"size": 1000, "price": 1},
         }
     ) is None
+    assert rtds_trade_to_activity_row(
+        {
+            "topic": "activity",
+            "type": "trades",
+            "payload": {
+                "proxyWallet": "0x" + "g" * 40,
+                "size": 1000,
+                "price": 1,
+            },
+        }
+    ) is None
 
 
 def test_run_rtds_activity_discovery_routes_verified_trade_to_l1(tmp_path):

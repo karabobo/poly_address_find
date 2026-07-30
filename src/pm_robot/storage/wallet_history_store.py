@@ -200,6 +200,71 @@ def discard_uncommitted_wallet_history_artifact(
     return _delete_exact_artifact_file(path, expected_checksum=artifact.checksum)
 
 
+def load_active_wallet_history_artifact(
+    conn: sqlite3.Connection,
+    *,
+    archive_dir: Path,
+    wallet: str,
+    history_depth: HistoryDepth,
+) -> tuple[WalletHistoryArtifact, list[dict[str, Any]]] | None:
+    """Load one catalogued active artifact for a methodology-only recompute."""
+
+    normalized_wallet = normalize_wallet(wallet)
+    depth = HistoryDepth(history_depth)
+    row = conn.execute(
+        """
+        SELECT artifact_id, wallet, history_depth, relative_path, row_count,
+               byte_size, checksum, min_timestamp, max_timestamp, created_at
+        FROM wallet_history_artifacts
+        WHERE wallet = ? AND history_depth = ? AND status = 'active'
+        """,
+        (normalized_wallet, depth.value),
+    ).fetchone()
+    if row is None:
+        return None
+    path = _safe_artifact_path(Path(archive_dir), str(row["relative_path"] or ""))
+    if path is None or not path.is_file() or path.is_symlink():
+        raise RuntimeError("active wallet history artifact is missing or unsafe")
+    if path.stat().st_size != int(row["byte_size"] or 0):
+        raise RuntimeError("active wallet history artifact size does not match catalog")
+    expected_checksum = str(row["checksum"] or "")
+    if not expected_checksum or _sha256_file(path) != expected_checksum:
+        raise RuntimeError("active wallet history artifact checksum does not match catalog")
+    with duckdb.connect(":memory:") as db:
+        raw_rows = db.execute(
+            "SELECT raw_json FROM read_parquet(?) ORDER BY timestamp, transaction_hash, asset_id",
+            [str(path)],
+        ).fetchall()
+    rows: list[dict[str, Any]] = []
+    for (raw_json,) in raw_rows:
+        try:
+            parsed = json.loads(str(raw_json))
+        except (json.JSONDecodeError, TypeError) as exc:
+            raise RuntimeError("active wallet history artifact contains invalid raw_json") from exc
+        if not isinstance(parsed, dict):
+            raise RuntimeError("active wallet history artifact contains a non-object row")
+        rows.append(parsed)
+    if len(rows) != int(row["row_count"] or 0):
+        raise RuntimeError("active wallet history artifact row count does not match catalog")
+    artifact = WalletHistoryArtifact(
+        artifact_id=str(row["artifact_id"]),
+        wallet=str(row["wallet"]),
+        history_depth=HistoryDepth(str(row["history_depth"])),
+        relative_path=str(row["relative_path"]),
+        row_count=int(row["row_count"] or 0),
+        byte_size=int(row["byte_size"] or 0),
+        checksum=str(row["checksum"] or ""),
+        min_timestamp=(
+            int(row["min_timestamp"]) if row["min_timestamp"] is not None else None
+        ),
+        max_timestamp=(
+            int(row["max_timestamp"]) if row["max_timestamp"] is not None else None
+        ),
+        created_at=int(row["created_at"] or 0),
+    )
+    return artifact, rows
+
+
 def audit_wallet_history_artifacts(
     conn: sqlite3.Connection,
     *,

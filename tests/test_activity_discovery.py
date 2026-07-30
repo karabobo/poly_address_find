@@ -99,6 +99,64 @@ def test_discover_activity_candidates_keeps_small_trade_at_l0(tmp_path):
         conn.close()
 
 
+def test_activity_ingress_rejects_malformed_wallets_and_nonfinite_trade_values(
+    tmp_path,
+):
+    conn = connect(tmp_path / "robot.sqlite")
+    valid_wallet = "0x" + "1" * 40
+    invalid_wallet = "0x" + "g" * 40
+    try:
+        run_migrations(conn)
+        client = FakeGlobalActivityClient(
+            {
+                0: [
+                    _activity(invalid_wallet, "0xbad", 500),
+                    _activity(valid_wallet, "0xinf", float("inf")),
+                ]
+            }
+        )
+
+        summary = discover_activity_candidates(conn, pages=1, client=client)
+
+        assert summary.status == "ok"
+        assert summary.wallets_seen == 0
+        assert summary.observed_wallets == 0
+        assert conn.execute("SELECT COUNT(*) FROM wallet_levels").fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+def test_activity_ingress_counts_one_semantic_trade_once_across_pages(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    wallet = "0x" + "1" * 40
+    trade = _activity(wallet, "0xduplicate", 120)
+    try:
+        run_migrations(conn)
+        client = FakeGlobalActivityClient(
+            {
+                0: [trade],
+                100: [{**trade, "name": "enriched duplicate"}],
+            }
+        )
+
+        summary = discover_activity_candidates(
+            conn,
+            pages=2,
+            page_limit=100,
+            client=client,
+        )
+        observed = conn.execute(
+            "SELECT observed_trade_count, recent_trade_count, recent_usdc_total "
+            "FROM observed_wallets WHERE wallet = ?",
+            (wallet,),
+        ).fetchone()
+
+        assert summary.wallets_seen == 1
+        assert tuple(observed) == (1, 1, 120)
+    finally:
+        conn.close()
+
+
 def test_discover_activity_candidates_promotes_exceptionally_large_single_trade(tmp_path):
     conn = connect(tmp_path / "robot.sqlite")
     wallet = "0x" + "1" * 40
@@ -383,5 +441,29 @@ def test_discovery_persists_successful_pages_before_shared_cooldown(tmp_path):
             "SELECT COUNT(*) FROM candidate_wallets WHERE address = ?",
             (wallet,),
         ).fetchone()[0] == 1
+    finally:
+        conn.close()
+
+
+def test_activity_discovery_releases_writer_lock_between_wallet_batches(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    statements = []
+    rows = [
+        _activity(f"0x{index:040x}", f"0x{index}", 150)
+        for index in range(1, 13)
+    ]
+    try:
+        run_migrations(conn)
+        conn.set_trace_callback(statements.append)
+
+        summary = discover_activity_candidates(
+            conn,
+            pages=1,
+            client=FakeGlobalActivityClient({0: rows}),
+        )
+
+        commits = [statement for statement in statements if statement == "COMMIT"]
+        assert summary.observed_wallets == 12
+        assert len(commits) >= 2
     finally:
         conn.close()

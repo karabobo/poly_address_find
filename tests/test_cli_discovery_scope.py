@@ -26,6 +26,7 @@ SUPPORTED_COMMANDS = (
     "wallet-l6-worker",
     "pipeline-jobs",
     "health",
+    "export-high-confidence-l6",
     "status",
     "backup",
     "backup-sql-dump",
@@ -152,7 +153,7 @@ def test_discover_rtds_defaults_to_broad_ingress(tmp_path, monkeypatch, capsys):
     )
 
     assert main() == 0
-    assert received["min_trade_usdc"] == 1.0
+    assert received["min_trade_usdc"] == 10.0
     assert "validation_min_trade_usdc" not in received
     assert "paper_min_trade_usdc" not in received
     assert "watch_min_score" not in received

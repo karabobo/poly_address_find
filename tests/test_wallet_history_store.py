@@ -8,6 +8,7 @@ import pm_robot.storage.wallet_history_store as wallet_history_store_module
 from pm_robot.storage.db import connect, run_migrations
 from pm_robot.storage.wallet_history_store import (
     audit_wallet_history_artifacts,
+    load_active_wallet_history_artifact,
     prune_superseded_wallet_history_artifacts,
     persist_wallet_history_artifact,
 )
@@ -239,6 +240,37 @@ def test_history_artifact_deduplicates_repeated_rows_without_transaction_hash(tm
                     [str(archive_dir / artifact.relative_path)],
                 ).fetchone()[0]
                 == 1
+            )
+    finally:
+        conn.close()
+
+
+def test_active_history_loader_rejects_same_size_checksum_tampering(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    archive_dir = tmp_path / "parquet"
+    wallet = "0x" + "9" * 40
+    try:
+        run_migrations(conn)
+        artifact = persist_wallet_history_artifact(
+            conn,
+            archive_dir=archive_dir,
+            wallet=wallet,
+            history_depth=HistoryDepth.LIGHT,
+            rows=_rows(10),
+            now=2_000,
+        )
+        conn.commit()
+        path = archive_dir / artifact.relative_path
+        payload = bytearray(path.read_bytes())
+        payload[len(payload) // 2] ^= 1
+        path.write_bytes(payload)
+
+        with pytest.raises(RuntimeError, match="checksum does not match"):
+            load_active_wallet_history_artifact(
+                conn,
+                archive_dir=archive_dir,
+                wallet=wallet,
+                history_depth=HistoryDepth.LIGHT,
             )
     finally:
         conn.close()

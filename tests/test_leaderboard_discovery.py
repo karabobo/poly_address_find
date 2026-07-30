@@ -69,6 +69,18 @@ class RateLimitedLeaderboardClient:
         raise AssertionError("v1 discovery should not run during shared cooldown")
 
 
+class ManyWalletLeaderboardClient:
+    def trader_leaderboard(self, **kwargs):
+        return [
+            {
+                "proxyWallet": f"0x{index:040x}",
+                "vol": 10_000 + index,
+                "pnl": 1_000 + index,
+            }
+            for index in range(1, 13)
+        ]
+
+
 def test_discover_leaderboard_candidates_imports_official_v1_category_rankings(tmp_path):
     conn = connect(tmp_path / "robot.sqlite")
     wallet = "0x" + "1" * 40
@@ -182,5 +194,30 @@ def test_leaderboard_discovery_ignores_legacy_summary_only_state(tmp_path):
         )
         assert get_wallet_level(conn, wallet).level is WalletLevel.L1
         assert feature.net_pnl_usdc == 2_500
+    finally:
+        conn.close()
+
+
+def test_leaderboard_discovery_releases_writer_lock_between_wallet_batches(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    statements = []
+    try:
+        run_migrations(conn)
+        conn.set_trace_callback(statements.append)
+
+        summary = discover_leaderboard_candidates(
+            conn,
+            metrics=(),
+            windows=(),
+            categories=("OVERALL",),
+            time_periods=("MONTH",),
+            order_bys=("PNL",),
+            v1_pages=1,
+            client=ManyWalletLeaderboardClient(),
+        )
+
+        commits = [statement for statement in statements if statement == "COMMIT"]
+        assert summary.candidates_seen == 12
+        assert len(commits) >= 2
     finally:
         conn.close()

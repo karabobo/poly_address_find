@@ -75,7 +75,7 @@ def test_empty_dashboard_is_l0_l6_research_surface(tmp_path, monkeypatch):
     html = _render_dashboard(settings)
     serialized = str(data).lower()
 
-    assert data["schema_version"] == "wallet_research_v2"
+    assert data["schema_version"] == "wallet_research_v3"
     assert [row["level"] for row in data["level_counts"]] == [f"l{index}" for index in range(7)]
     assert [row["count"] for row in data["level_counts"]] == [0, 0, 0, 0, 0, 0, 0]
     assert [row["job_type"] for row in data["queues"]] == [

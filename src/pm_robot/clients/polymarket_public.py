@@ -21,6 +21,10 @@ LB_BASE = "https://lb-api.polymarket.com"
 MAX_CURRENT_POSITIONS_LIMIT = 500
 MAX_CLOSED_POSITIONS_LIMIT = 50
 MAX_ACTIVITY_LIMIT = 500
+_CLOSED_POSITION_SORT_FIELDS = frozenset(
+    {"REALIZEDPNL", "TITLE", "PRICE", "AVGPRICE", "TIMESTAMP"}
+)
+_SORT_DIRECTIONS = frozenset({"ASC", "DESC"})
 
 @dataclass(frozen=True)
 class PublicPolymarketClient:
@@ -67,16 +71,29 @@ class PublicPolymarketClient:
         limit: int = MAX_CLOSED_POSITIONS_LIMIT,
         offset: int = 0,
         size_threshold: float = 0.0,
+        sort_by: str | None = None,
+        sort_direction: str | None = None,
     ) -> list[dict[str, Any]]:
+        params = {
+            "user": wallet,
+            "limit": str(_bounded_limit(limit, MAX_CLOSED_POSITIONS_LIMIT)),
+            "offset": str(max(0, int(offset))),
+            "sizeThreshold": str(size_threshold),
+        }
+        if sort_by is not None:
+            normalized_sort = str(sort_by).strip().upper()
+            if normalized_sort not in _CLOSED_POSITION_SORT_FIELDS:
+                raise ValueError(f"unsupported closed-position sort field: {sort_by}")
+            params["sortBy"] = normalized_sort
+        if sort_direction is not None:
+            normalized_direction = str(sort_direction).strip().upper()
+            if normalized_direction not in _SORT_DIRECTIONS:
+                raise ValueError(f"unsupported sort direction: {sort_direction}")
+            params["sortDirection"] = normalized_direction
         data = self.get_json(
             DATA_BASE,
             "/closed-positions",
-            {
-                "user": wallet,
-                "limit": str(_bounded_limit(limit, MAX_CLOSED_POSITIONS_LIMIT)),
-                "offset": str(max(0, int(offset))),
-                "sizeThreshold": str(size_threshold),
-            },
+            params,
         )
         return data if isinstance(data, list) else []
 
@@ -204,3 +221,15 @@ class PublicPolymarketClient:
 
 def _bounded_limit(limit: int, maximum: int) -> int:
     return min(maximum, max(1, int(limit)))
+
+
+def leaderboard_row_matches_wallet(row: dict[str, Any], wallet: str) -> bool:
+    """Return whether one leaderboard row belongs to the requested wallet."""
+
+    normalized = wallet.strip().lower()
+    if not normalized:
+        return False
+    return any(
+        str(row.get(key) or "").strip().lower() == normalized
+        for key in ("proxyWallet", "wallet", "address")
+    )

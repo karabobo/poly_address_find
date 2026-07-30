@@ -97,7 +97,7 @@ def main() -> int:
     discover_rtds = sub.add_parser("discover-rtds", help="Discover seed candidates from RTDS real-time activity trades")
     discover_rtds.add_argument("--db", dest="command_db", default=None, help="SQLite database path")
     discover_rtds.add_argument("--endpoint", default="wss://ws-live-data.polymarket.com")
-    discover_rtds.add_argument("--min-trade-usdc", type=float, default=1.0)
+    discover_rtds.add_argument("--min-trade-usdc", type=float, default=10.0)
     discover_rtds.add_argument("--batch-size", type=int, default=25)
     discover_rtds.add_argument("--flush-interval", type=float, default=10.0)
     discover_rtds.add_argument("--ping-interval", type=float, default=5.0)
@@ -317,6 +317,18 @@ def main() -> int:
     health_cmd.add_argument("--db", dest="command_db", default=None, help="SQLite database path")
     health_cmd.add_argument("--out", default="", help="Optional health JSON output path")
 
+    export_l6_cmd = sub.add_parser(
+        "export-high-confidence-l6",
+        help="Write the current high-confidence L6 research handoff as JSON",
+    )
+    export_l6_cmd.add_argument(
+        "--db",
+        dest="command_db",
+        default=None,
+        help="SQLite database path",
+    )
+    export_l6_cmd.add_argument("--out", required=True, help="Output JSON path")
+
     status_cmd = sub.add_parser("status", help="Print JSON status")
     status_cmd.add_argument("--db", dest="command_db", default=None, help="SQLite database path")
 
@@ -349,6 +361,18 @@ def main() -> int:
         type=int,
         default=10_000,
         help="Maximum expired metadata rows deleted per table per run",
+    )
+    maintenance_cmd.add_argument(
+        "--l0-retention-days",
+        type=int,
+        default=7,
+        help="Expire unqualified discovery-only L0 wallets after this many idle days",
+    )
+    maintenance_cmd.add_argument(
+        "--l0-cleanup-batch-limit",
+        type=int,
+        default=20_000,
+        help="Maximum expired L0 wallets deleted per maintenance run",
     )
     maintenance_cmd.add_argument(
         "--wal-checkpoint",
@@ -704,6 +728,24 @@ def main() -> int:
         data = write_health(settings, out)
         print(json.dumps(data, ensure_ascii=False, indent=2))
         return 0 if data["ok"] else 1
+    if args.command == "export-high-confidence-l6":
+        from pm_robot.ops import write_high_confidence_l6_snapshot
+
+        output = Path(args.out)
+        data = write_high_confidence_l6_snapshot(settings, output)
+        print(
+            json.dumps(
+                {
+                    "output": str(output),
+                    "generated_at": data["generated_at"],
+                    "candidate_count": data["candidate_count"],
+                    "automatic_trading_activation": data["automatic_trading_activation"],
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 0
     if args.command == "status":
         from pm_robot.ops import status
 
@@ -738,6 +780,8 @@ def main() -> int:
             failed_job_cooldown_seconds=args.failed_job_cooldown_seconds,
             reset_stale_heartbeats=args.reset_stale_heartbeats,
             stale_heartbeat_seconds=args.stale_heartbeat_seconds,
+            l0_retention_days=args.l0_retention_days,
+            l0_cleanup_batch_limit=args.l0_cleanup_batch_limit,
         )
         print(json.dumps(data, ensure_ascii=False, indent=2))
         return 0 if data["ok"] else 1

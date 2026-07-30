@@ -35,6 +35,22 @@ def test_public_client_closed_positions_uses_bounded_data_api_options():
     ]
 
 
+def test_public_client_closed_positions_sends_explicit_time_sort_when_requested():
+    http = FakeHttp([])
+    client = PublicPolymarketClient(http=http)
+
+    client.closed_positions(
+        "0xabc",
+        limit=50,
+        offset=100,
+        sort_by="timestamp",
+        sort_direction="desc",
+    )
+
+    assert http.calls[0][2]["sortBy"] == "TIMESTAMP"
+    assert http.calls[0][2]["sortDirection"] == "DESC"
+
+
 def test_public_client_position_values_returns_documented_list_shape():
     http = FakeHttp([{"user": "0xabc", "value": 12.5}])
     client = PublicPolymarketClient(http=http)

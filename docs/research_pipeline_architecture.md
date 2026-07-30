@@ -23,7 +23,7 @@ flowchart LR
     G -->|evidence floor + relative rank| H["L3 promising"]
     H --> I["deep history <= 1000 rows"]
     I -->|evidence floor + relative rank| J["L4 strong"]
-    J -->|stronger floor + relative rank| K["L5 scoring elite"]
+    J -->|positive official lifetime PnL + relative rank| K["L5 score candidate"]
     K -->|current deep evidence| L["independent profit, persistence, anomaly validation"]
     L -->|pass only| M["L6 independently verified"]
     L -->|warning or fail| K
@@ -40,17 +40,19 @@ preventing very thin histories from promoting each other.
 | --- | --- | --- | --- |
 | L0 | A syntactically valid address observed from a source | Provenance and compact recent sightings only | Very low |
 | L1 | Trusted source, or up to 10 verified observed trades total at least 100 USDC | Fetch at most 10 recent trades | Very low |
-| L2 | Recent sample contains at least one trade and at least 100 USDC total volume | Fetch light history and bounded PnL evidence | Low |
+| L2 | Recent sample contains at least one trade and at least 100 USDC total volume | Fetch light history, recent position diagnostics, and official lifetime PnL | Low |
 | L3 | Light evidence passed the L3 floor and relative-rank selection | Fetch deep history | Medium |
 | L4 | Deep evidence passed the L4 floor and relative-rank selection | Reuse and refresh deep evidence | Medium |
-| L5 | Deep evidence passed the strongest floor and relative-rank selection | Wait for or refresh independent validation | Medium |
-| L6 | The current L5 evidence also passed independent profit, persistence, and anomaly validation | Revalidate independently every 14 days or after evidence changes | Medium |
+| L5 | Deep evidence has positive official lifetime PnL and passed relative-rank selection | Wait for or refresh independent validation | Medium |
+| L6 | An L5 evidence version passed independent profit, persistence, and anomaly validation | Revalidate independently every 14 days or after evidence changes | Medium |
 
 Levels are monotonic research achievements. They do not bounce downward because of one short-term
 sample. L5 remains the highest result produced by the scoring and relative-ranking system. A current
-elite wallet is stricter than merely having `level = l5` or `level = l6`: health and UI exposure also
+score candidate is stricter than merely having `level = l5` or `level = l6`: health and UI exposure also
 require a recent deep summary, the current summary methodology, no hard risk block, and a selected L5
-decision for the same active artifact under the current selection policy.
+decision for the same active artifact under the current selection policy. A latest independent
+validation `fail` for that same artifact removes it from the current score-candidate view without
+rewriting its historical level. A warning remains visible as a score candidate but is not verified.
 
 L6 does not rescore or replace L5. It is a separate verification achievement. A currently verified
 L6 additionally requires a recent passing validation for the same active deep artifact. Warning or
@@ -75,6 +77,20 @@ L0 to L1 is intentionally cheap:
 - otherwise, the compact sample of up to 10 verified observed trades must total at least 100 USDC;
 - an unverified address remains L0.
 
+RTDS keeps an individual-trade observation floor of 10 USDC. This preserves the intended
+`10 trades / 100 USDC` cumulative path without writing every dust event to SQLite. The hourly public
+activity poll keeps a 500 USDC server-side filter as a lower-volume whale-trade supplement. Source
+passes may cap immediate L1 admissions; the screen planner separately admits qualifying L0 overflow
+under a bounded limit, prioritizing the largest compact sample and then the oldest observation. Each
+admitted wallet leaves L0, so a qualifying wallet cannot remain stranded forever.
+
+L0 is a transient observation buffer rather than permanent research evidence. Maintenance removes
+an L0 wallet only after seven idle days when its compact sample is still below 100 USDC, it was never
+promoted or admitted as a candidate, it is not risk-blocked, it has no job record, and it has no
+history, PnL, selection, or L6 evidence. Any retained job record protects the wallet until normal
+job-metadata expiry removes that audit row. Admission and retention use partial SQLite indexes and bounded
+batches, so the real-time stream cannot turn L0 into an unbounded table scan or database-growth path.
+
 Ingress never fetches full history and never scores a wallet.
 
 ### L1 recent screen
@@ -93,13 +109,29 @@ economically active.
 
 - L2: light history, up to 200 activity rows;
 - L3-L6: deep history, up to 1,000 activity rows;
-- light PnL: up to 50 closed positions;
-- deep PnL: paginated up to 500 closed positions.
+- light recent position diagnostics: up to 50 closed positions;
+- deep recent position diagnostics: paginated up to 200 closed positions;
+- all closed-position pages are explicitly sorted by `TIMESTAMP DESC`, never by the API default
+  `REALIZEDPNL DESC`;
+- official `ALL` leaderboard PnL and cumulative volume are fetched independently for every summary.
 
-`research/wallet_history_summary.py` produces a strategy-neutral score from PnL, estimated ROI,
-market breadth, activity, persistence, and concentration. Missing ROI is weak evidence, not a
-neutral return. Strategy tags describe behavior; they are not automatic rejection rules. Risk flags
-remain visible research facts unless an explicit, independently justified hard-risk rule is set.
+The history planner gives methodology refreshes two scheduling shares and reserves one share for
+first or newly required evidence. This prevents a large methodology rollout from starving new L2
+wallets. API failures while fetching official PnL are retried as upstream failures; they are never
+stored as evidence that official PnL is absent. Missing or corrupt active Parquet artifacts are
+re-fetched at the already authorized history depth.
+
+`research/wallet_history_summary.py` produces a strategy-neutral score from official lifetime PnL,
+official profit intensity, low-weight cost-basis ROI diagnostics, market breadth, activity,
+persistence, concentration, and evidence quality. The official profit intensity is
+`official PnL / official cumulative volume`; it is not account ROI. A bounded recent position sample
+is stored for diagnosis but cannot contribute positive lifetime PnL or ROI score. Strategy tags
+describe behavior; they are not automatic rejection rules. Risk flags remain visible research facts
+unless an explicit, independently justified hard-risk rule is set.
+
+Activity and validation rows are deduplicated by transaction or settlement identity before counts,
+volume, persistence, concentration, and anomaly metrics are calculated. Extra profile or display
+metadata therefore cannot make one economic event count more than once.
 
 ### Relative selection
 
@@ -111,6 +143,10 @@ remain visible research facts unless an explicit, independently justified hard-r
 | L3 -> L4 | deep | 50 | 3 | 500 USDC | top 20% | top 50% globally |
 | L4 -> L5 | deep | 100 | 5 | 1,000 USDC | top 10% | top 25% globally |
 
+L4 -> L5 additionally requires official all-time PnL to be available and positive. This is a
+minimum quality fact, not a fixed research-score threshold; qualified wallets still compete by
+relative rank.
+
 The default cohort needs 20 comparable wallets. After one hour, a cohort of at least five may be
 processed so sparse sources do not wait forever. Selection is balanced across sufficiently populated
 source and strategy buckets, with source-wide and global fallbacks for small buckets. Promotion caps
@@ -118,7 +154,7 @@ bound each control pass to 12 new L3, 6 new L4, and 2 new L5 promotions by defau
 also clear their global relative baseline, so the best wallet in a weak isolated bucket cannot become
 a strong or elite wallet solely through bucket fairness.
 
-Selection policy `relative_rank_v3` also retains the latest score snapshot previously evaluated for
+Selection policy `relative_rank_v5` also retains the latest score snapshot previously evaluated for
 the same transition and policy. A late wallet therefore competes with the established transition
 benchmark instead of being promoted merely because it arrived in a tiny new process-local batch.
 Current evidence replaces an older snapshot for the same wallet.
@@ -168,8 +204,9 @@ Planners cap queued plus running jobs and exclude exhausted queued jobs from act
 History candidate limits are applied independently to light and deep work before source-aware
 rotation, so one depth cannot disappear during SQL truncation. Workers lease jobs by stable wallet
 shard, perform network requests outside long SQLite write transactions, and commit compact results.
-Jobs waiting more than one hour age ahead of normal priority. Expired leases and exhausted jobs are
-recovered by maintenance.
+Within the light-history lane, larger and more diverse 10-trade screen samples are processed first
+while source rotation remains intact. Jobs waiting more than one hour age ahead of normal priority.
+Expired leases and exhausted jobs are recovered by maintenance.
 
 ## Storage Contract
 
@@ -181,7 +218,8 @@ SQLite stores small mutable state:
 - `candidate_wallets`: admitted-wallet metadata retained for database compatibility;
 - `wallet_levels` and `wallet_level_events`: canonical level and audit trail;
 - `wallet_screen_summaries`: L1 screen result;
-- `wallet_pnl_summaries`: bounded PnL/ROI estimate and coverage;
+- `wallet_pnl_summaries`: official lifetime PnL/volume plus bounded recent estimate, coverage,
+  sort/limit audit metadata, and methodology version;
 - `wallet_history_summaries`: current compact research facts and score;
 - `wallet_level_selections`: policy-versioned rank decisions;
 - `wallet_l6_validations`: compact policy-versioned independent-validation verdicts and metrics;
@@ -225,7 +263,17 @@ Evidence is refreshed when the summary methodology changes, or when there is a n
 sighting than the current summary after the normal refresh window:
 
 - any summary written by an older methodology: immediately, with L6 through L2 processed in that
-  order;
+  order. The worker reuses the active Parquet artifact for a methodology-only recompute after
+  verifying its catalogued size and SHA-256 checksum, so a healthy artifact is not redownloaded or
+  duplicated. If that catalogued artifact is missing or corrupt, the worker repairs it by fetching
+  only the history depth already authorized for the wallet. Transient fetch failures use the normal
+  retry window and do not permanently suppress the wallet. A later real market sighting uses a
+  separate activity-refresh key. PnL evidence has its own methodology version and is refreshed
+  independently;
+
+- L4-L6 official all-time PnL that remains missing after six hours: retry the PnL evidence only,
+  reusing the verified active Parquet artifact. A real new-activity refresh takes precedence and may
+  fetch a new history snapshot;
 
 - failed L1 screen: no sooner than seven days;
 - L2 light history: no sooner than 30 days;
@@ -265,8 +313,9 @@ schedule instead of reporting a false outage while those loops are sleeping norm
    job admission are idempotent.
 4. Preserve methodology, storage, and selection policy versions. New policies write new decisions;
    they do not silently reinterpret old rows.
-5. Use bounded maintenance and passive WAL checkpoints during normal operation. Reserve VACUUM and
-   full filesystem snapshots for a controlled maintenance window.
+5. Use bounded maintenance for expired discovery-only L0 rows and metadata, plus passive WAL
+   checkpoints during normal operation. Reserve VACUUM and full filesystem snapshots for a
+   controlled maintenance window.
 6. Treat missing catalog files, orphan Parquet files, and checksum mismatches as health failures to
    repair before GC or restore operations.
 

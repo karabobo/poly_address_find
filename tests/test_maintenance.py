@@ -7,6 +7,48 @@ from pm_robot.ops import _delete_metadata_batch, maintenance
 from pm_robot.storage.db import connect, run_migrations
 
 
+def _insert_observed_l0(
+    conn,
+    *,
+    wallet: str,
+    updated_at: int,
+    recent_usdc_total: float,
+    hard_risk_block: bool = False,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO wallet_levels(
+            wallet, level, level_reason, hard_risk_block, first_seen_at,
+            last_seen_at, level_updated_at, updated_at
+        ) VALUES (?, 'l0', 'test', ?, ?, ?, ?, ?)
+        """,
+        (
+            wallet,
+            1 if hard_risk_block else 0,
+            updated_at,
+            updated_at,
+            updated_at,
+            updated_at,
+        ),
+    )
+    conn.execute(
+        """
+        INSERT INTO observed_wallets(
+            wallet, sources, observed_trade_count, recent_trade_count,
+            recent_usdc_total, recent_max_trade_usdc, recent_trades_json,
+            first_seen_at, updated_at
+        ) VALUES (?, 'polymarket_rtds_activity', 1, 1, ?, ?, '[]', ?, ?)
+        """,
+        (
+            wallet,
+            recent_usdc_total,
+            recent_usdc_total,
+            updated_at,
+            updated_at,
+        ),
+    )
+
+
 def _settings(tmp_path: Path) -> RobotSettings:
     settings = RobotSettings(
         db_path=tmp_path / "data" / "robot.sqlite",
@@ -234,6 +276,194 @@ def test_maintenance_closes_only_stale_active_runtime_runs(tmp_path):
     assert statuses["loop_wallet_screen_worker_0"] == "interrupted"
     assert statuses["loop_wallet_history_worker_0"] == "running"
     assert statuses["retired_score_loop"] == "running"
+
+
+def test_maintenance_prunes_only_stale_unqualified_discovery_only_l0(tmp_path):
+    settings = _settings(tmp_path)
+    now = int(time.time())
+    stale = now - 8 * 86_400
+    fresh = now - 60
+    wallets = {
+        name: "0x" + digit * 40
+        for name, digit in (
+            ("expired", "1"),
+            ("fresh", "2"),
+            ("qualified", "3"),
+            ("candidate", "4"),
+            ("blocked", "5"),
+            ("active_job", "6"),
+            ("has_evidence", "7"),
+            ("terminal_job", "8"),
+        )
+    }
+    conn = connect(settings.db_path)
+    try:
+        _insert_observed_l0(
+            conn,
+            wallet=wallets["expired"],
+            updated_at=stale,
+            recent_usdc_total=30,
+        )
+        _insert_observed_l0(
+            conn,
+            wallet=wallets["fresh"],
+            updated_at=fresh,
+            recent_usdc_total=30,
+        )
+        _insert_observed_l0(
+            conn,
+            wallet=wallets["qualified"],
+            updated_at=stale,
+            recent_usdc_total=100,
+        )
+        _insert_observed_l0(
+            conn,
+            wallet=wallets["candidate"],
+            updated_at=stale,
+            recent_usdc_total=30,
+        )
+        conn.execute(
+            """
+            INSERT INTO candidate_wallets(address, first_seen_at, updated_at)
+            VALUES (?, ?, ?)
+            """,
+            (wallets["candidate"], stale, stale),
+        )
+        _insert_observed_l0(
+            conn,
+            wallet=wallets["blocked"],
+            updated_at=stale,
+            recent_usdc_total=30,
+            hard_risk_block=True,
+        )
+        _insert_observed_l0(
+            conn,
+            wallet=wallets["active_job"],
+            updated_at=stale,
+            recent_usdc_total=30,
+        )
+        _insert_job(
+            conn,
+            job_type="wallet_recent_screen",
+            wallet=wallets["active_job"],
+            status="queued",
+            updated_at=stale,
+        )
+        _insert_observed_l0(
+            conn,
+            wallet=wallets["has_evidence"],
+            updated_at=stale,
+            recent_usdc_total=30,
+        )
+        conn.execute(
+            """
+            INSERT INTO wallet_pnl_summaries(wallet, updated_at)
+            VALUES (?, ?)
+            """,
+            (wallets["has_evidence"], stale),
+        )
+        _insert_observed_l0(
+            conn,
+            wallet=wallets["terminal_job"],
+            updated_at=stale,
+            recent_usdc_total=30,
+        )
+        _insert_job(
+            conn,
+            job_type="wallet_recent_screen",
+            wallet=wallets["terminal_job"],
+            status="failed",
+            updated_at=stale,
+        )
+        conn.execute(
+            """
+            INSERT INTO wallet_level_events(
+                wallet, from_level, to_level, reason, created_at
+            ) VALUES (?, 'l0', 'l0', 'test_only', ?)
+            """,
+            (wallets["expired"], stale),
+        )
+        conn.execute(
+            """
+            INSERT INTO wallet_screen_summaries(wallet, updated_at)
+            VALUES (?, ?)
+            """,
+            (wallets["expired"], stale),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    preview = maintenance(
+        settings,
+        dry_run=True,
+        l0_retention_days=7,
+        l0_cleanup_batch_limit=100,
+    )
+    assert preview["l0_retention"]["eligible_wallets"] == 1
+    assert preview["l0_retention"]["deleted_wallets"] == 0
+
+    result = maintenance(
+        settings,
+        l0_retention_days=7,
+        l0_cleanup_batch_limit=100,
+    )
+
+    assert result["l0_retention"]["eligible_wallets"] == 1
+    assert result["l0_retention"]["deleted_wallets"] == 1
+    assert result["l0_retention"]["deleted_rows"]["observed_wallets"] == 1
+    assert result["l0_retention"]["deleted_rows"]["wallet_levels"] == 1
+    assert result["l0_retention"]["deleted_rows"]["wallet_level_events"] == 1
+    assert result["l0_retention"]["deleted_rows"]["wallet_screen_summaries"] == 1
+    conn = connect(settings.db_path)
+    try:
+        remaining = {
+            str(row["wallet"])
+            for row in conn.execute("SELECT wallet FROM observed_wallets")
+        }
+        assert wallets["expired"] not in remaining
+        assert remaining == set(wallets.values()) - {wallets["expired"]}
+        assert conn.execute(
+            "SELECT 1 FROM wallet_levels WHERE wallet = ?",
+            (wallets["expired"],),
+        ).fetchone() is None
+        assert conn.execute(
+            "SELECT status FROM pipeline_jobs WHERE wallet = ?",
+            (wallets["terminal_job"],),
+        ).fetchone()[0] == "failed"
+    finally:
+        conn.close()
+
+
+def test_maintenance_bounds_l0_pruning_per_run(tmp_path):
+    settings = _settings(tmp_path)
+    stale = int(time.time()) - 8 * 86_400
+    conn = connect(settings.db_path)
+    try:
+        for digit in ("a", "b", "c"):
+            _insert_observed_l0(
+                conn,
+                wallet="0x" + digit * 40,
+                updated_at=stale,
+                recent_usdc_total=10,
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+    result = maintenance(
+        settings,
+        l0_retention_days=7,
+        l0_cleanup_batch_limit=2,
+    )
+
+    assert result["l0_retention"]["eligible_wallets"] == 2
+    assert result["l0_retention"]["deleted_wallets"] == 2
+    conn = connect(settings.db_path)
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM observed_wallets").fetchone()[0] == 1
+    finally:
+        conn.close()
 
 
 def test_metadata_cleanup_retries_transient_sqlite_writer_lock(monkeypatch):

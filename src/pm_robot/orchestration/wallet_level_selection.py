@@ -9,11 +9,12 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
+from pm_robot.research.wallet_history_summary import METHODOLOGY_VERSION
 from pm_robot.storage.wallet_levels import advance_wallet_level
 from pm_robot.wallet_levels import HistoryDepth, WalletLevel
 
 
-SELECTION_POLICY_VERSION = "relative_rank_v3"
+SELECTION_POLICY_VERSION = "relative_rank_v5"
 MIN_FAIRNESS_BUCKET_SIZE = 3
 _LEVEL_RANK = {level: index for index, level in enumerate(WalletLevel)}
 
@@ -249,6 +250,7 @@ def _selection_rows(
         FROM wallet_levels AS levels
         JOIN wallet_history_summaries AS summary ON summary.wallet = levels.wallet
         LEFT JOIN observed_wallets AS observed ON observed.wallet = levels.wallet
+        LEFT JOIN wallet_pnl_summaries AS pnl ON pnl.wallet = levels.wallet
         WHERE (
                 levels.level = ?
              OR (
@@ -259,9 +261,11 @@ def _selection_rows(
           )
           AND levels.hard_risk_block = 0
           AND summary.history_depth = ?
+          AND summary.methodology_version = ?
           AND summary.activity_count >= ?
           AND summary.distinct_markets >= ?
           AND summary.total_volume_usdc >= ?
+          AND (? != 'l5' OR pnl.official_all_pnl_usdc > 0)
           AND NOT EXISTS (
               SELECT 1
               FROM wallet_level_selections AS decision
@@ -276,9 +280,11 @@ def _selection_rows(
             transition.current_level.value,
             transition.target_level.value,
             transition.required_depth.value,
+            METHODOLOGY_VERSION,
             transition.min_activity_count,
             transition.min_distinct_markets,
             transition.min_volume_usdc,
+            transition.target_level.value,
             transition.target_level.value,
             policy_version,
         ),
@@ -304,6 +310,7 @@ def _reference_rows(
         FROM wallet_levels AS levels
         JOIN wallet_history_summaries AS summary ON summary.wallet = levels.wallet
         LEFT JOIN observed_wallets AS observed ON observed.wallet = levels.wallet
+        LEFT JOIN wallet_pnl_summaries AS pnl ON pnl.wallet = levels.wallet
         WHERE (
                 levels.level = ?
              OR (
@@ -314,18 +321,22 @@ def _reference_rows(
           )
           AND levels.hard_risk_block = 0
           AND summary.history_depth = ?
+          AND summary.methodology_version = ?
           AND summary.activity_count >= ?
           AND summary.distinct_markets >= ?
           AND summary.total_volume_usdc >= ?
+          AND (? != 'l5' OR pnl.official_all_pnl_usdc > 0)
         ORDER BY summary.research_score DESC, levels.wallet ASC
         """,
         (
             transition.current_level.value,
             transition.target_level.value,
             transition.required_depth.value,
+            METHODOLOGY_VERSION,
             transition.min_activity_count,
             transition.min_distinct_markets,
             transition.min_volume_usdc,
+            transition.target_level.value,
         ),
     ).fetchall()
     historical_rows = conn.execute(

@@ -16,6 +16,8 @@ from pm_robot.config import RobotSettings
 from pm_robot.pipeline_terms import ACTIVE_PIPELINE_JOB_TYPES
 from pm_robot.research.current_elite import (
     current_elite_wallet_count,
+    current_high_confidence_l6_snapshot,
+    current_high_confidence_l6_wallet_count,
     current_verified_l6_wallet_count,
 )
 from pm_robot.storage.api_rate_limit import (
@@ -31,6 +33,7 @@ from pm_robot.storage.db import (
     run_migrations,
 )
 from pm_robot.storage.repository import api_request_summary
+from pm_robot.wallet_levels import RECENT_SAMPLE_VOLUME_GATE_USDC
 
 
 DAY_SECONDS = 86_400
@@ -311,6 +314,10 @@ def _research_readiness(conn: sqlite3.Connection) -> dict[str, Any]:
         ),
         "fresh_elite_wallets": current_elite_wallet_count(conn, now=int(time.time())),
         "verified_l6_wallets": current_verified_l6_wallet_count(conn, now=int(time.time())),
+        "high_confidence_l6_wallets": current_high_confidence_l6_wallet_count(
+            conn,
+            now=int(time.time()),
+        ),
         "ingress_invariants": ingress_invariants,
         "levels": {f"l{level}": levels.get(f"l{level}", 0) for level in range(7)},
         "jobs": jobs,
@@ -328,6 +335,22 @@ def write_health(settings: RobotSettings, output_path: Path | None = None) -> di
     output = output_path or (settings.log_dir / "health.json")
     output.parent.mkdir(parents=True, exist_ok=True)
     _write_json_atomically(output, data)
+    return data
+
+
+def write_high_confidence_l6_snapshot(
+    settings: RobotSettings,
+    output_path: Path,
+) -> dict[str, Any]:
+    """Write an atomic research handoff; consumers must keep activation disabled."""
+
+    conn = connect_readonly(settings.db_path)
+    try:
+        data = current_high_confidence_l6_snapshot(conn)
+    finally:
+        conn.close()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    _write_json_atomically(output_path, data)
     return data
 
 
@@ -490,8 +513,10 @@ def maintenance(
     failed_job_cooldown_seconds: int = DEFAULT_FAILED_JOB_COOLDOWN_SECONDS,
     reset_stale_heartbeats: bool = False,
     stale_heartbeat_seconds: int = 21_600,
+    l0_retention_days: int = 7,
+    l0_cleanup_batch_limit: int = 20_000,
 ) -> dict[str, Any]:
-    """Bound metadata growth and disable every retired queue type."""
+    """Bound transient research state and disable every retired queue type."""
 
     checkpoint_mode = wal_checkpoint.lower()
     if checkpoint_mode not in WAL_CHECKPOINT_MODES:
@@ -511,6 +536,23 @@ def maintenance(
             conn,
             execute=bool(reset_stale_heartbeats and not dry_run),
             stale_seconds=stale_heartbeat_seconds,
+        )
+        l0_retention = (
+            {
+                "executed": False,
+                "skipped": True,
+                "retention_days": max(1, int(l0_retention_days)),
+                "eligible_wallets": 0,
+                "deleted_wallets": 0,
+                "deleted_rows": {},
+            }
+            if skip_cleanup
+            else _prune_stale_l0_wallets(
+                conn,
+                retention_days=l0_retention_days,
+                batch_limit=l0_cleanup_batch_limit,
+                execute=not dry_run,
+            )
         )
         deleted = (
             {}
@@ -541,12 +583,143 @@ def maintenance(
         "legacy_jobs_disabled": legacy_jobs,
         "stale_jobs": stale_jobs,
         "stale_heartbeats": stale_heartbeats,
+        "l0_retention": l0_retention,
         "deleted": deleted,
         "wal_checkpoint": checkpoint,
         "vacuum": bool(vacuum and not dry_run),
         "backup_cleanup": backup_cleanup,
         "storage_before": storage_before,
         "storage": storage_report(settings),
+    }
+
+
+def _prune_stale_l0_wallets(
+    conn: sqlite3.Connection,
+    *,
+    retention_days: int,
+    batch_limit: int,
+    execute: bool,
+) -> dict[str, Any]:
+    """Delete only expired L0 sightings that never entered the research funnel."""
+
+    days = max(1, int(retention_days))
+    limit = max(1, int(batch_limit))
+    cutoff = int(time.time()) - days * DAY_SECONDS
+    target_query = """
+        SELECT observed.wallet
+        FROM observed_wallets AS observed
+        JOIN wallet_levels AS levels ON levels.wallet = observed.wallet
+        WHERE observed.promoted_at IS NULL
+          AND observed.updated_at < ?
+          AND observed.recent_usdc_total < ?
+          AND levels.level = 'l0'
+          AND levels.hard_risk_block = 0
+          AND levels.last_seen_at < ?
+          AND NOT EXISTS (
+              SELECT 1 FROM candidate_wallets AS candidate
+              WHERE candidate.address = observed.wallet
+          )
+          AND NOT EXISTS (
+              SELECT 1 FROM pipeline_jobs AS job
+              WHERE job.wallet = observed.wallet
+          )
+          AND NOT EXISTS (
+              SELECT 1 FROM wallet_history_artifacts AS artifact
+              WHERE artifact.wallet = observed.wallet
+          )
+          AND NOT EXISTS (
+              SELECT 1 FROM wallet_history_summaries AS summary
+              WHERE summary.wallet = observed.wallet
+          )
+          AND NOT EXISTS (
+              SELECT 1 FROM wallet_pnl_summaries AS pnl
+              WHERE pnl.wallet = observed.wallet
+          )
+          AND NOT EXISTS (
+              SELECT 1 FROM wallet_level_selections AS selection
+              WHERE selection.wallet = observed.wallet
+          )
+          AND NOT EXISTS (
+              SELECT 1 FROM wallet_l6_validations AS validation
+              WHERE validation.wallet = observed.wallet
+          )
+        ORDER BY observed.updated_at ASC, observed.wallet ASC
+        LIMIT ?
+    """
+    params = (cutoff, RECENT_SAMPLE_VOLUME_GATE_USDC, cutoff, limit)
+    if not execute:
+        eligible = _scalar(
+            conn,
+            f"SELECT COUNT(*) FROM ({target_query})",
+            params,
+        )
+        return {
+            "executed": False,
+            "skipped": False,
+            "retention_days": days,
+            "cutoff": cutoff,
+            "volume_gate_usdc": RECENT_SAMPLE_VOLUME_GATE_USDC,
+            "eligible_wallets": eligible,
+            "deleted_wallets": 0,
+            "deleted_rows": {},
+        }
+
+    def prune() -> tuple[int, dict[str, int]]:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            conn.execute(
+                """
+                CREATE TEMP TABLE IF NOT EXISTS l0_prune_targets(
+                    wallet TEXT PRIMARY KEY
+                ) WITHOUT ROWID
+                """
+            )
+            conn.execute("DELETE FROM l0_prune_targets")
+            conn.execute(
+                f"INSERT INTO l0_prune_targets(wallet) {target_query}",
+                params,
+            )
+            eligible = _scalar(conn, "SELECT COUNT(*) FROM l0_prune_targets")
+            deleted_rows: dict[str, int] = {}
+            for table in (
+                "wallet_screen_summaries",
+                "wallet_level_events",
+                "observed_wallets",
+                "wallet_levels",
+            ):
+                cursor = conn.execute(
+                    f"""
+                    DELETE FROM {table}
+                    WHERE wallet IN (SELECT wallet FROM l0_prune_targets)
+                    """
+                )
+                deleted_rows[table] = max(0, int(cursor.rowcount))
+            if (
+                deleted_rows["observed_wallets"] != eligible
+                or deleted_rows["wallet_levels"] != eligible
+            ):
+                raise RuntimeError("L0 retention invariant failed during grouped deletion")
+            conn.commit()
+            return eligible, deleted_rows
+        except BaseException:
+            conn.rollback()
+            raise
+
+    eligible, deleted_rows = retry_sqlite_locked(
+        prune,
+        rollback=conn.rollback,
+        attempts=4,
+        sleep_seconds=2.0,
+    )
+    return {
+        "executed": True,
+        "skipped": False,
+        "retention_days": days,
+        "cutoff": cutoff,
+        "volume_gate_usdc": RECENT_SAMPLE_VOLUME_GATE_USDC,
+        "eligible_wallets": eligible,
+        "deleted_wallets": deleted_rows["observed_wallets"],
+        "deleted_rows": deleted_rows,
     }
 
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import sqlite3
 import time
 from dataclasses import dataclass
@@ -15,6 +16,11 @@ from pm_robot.storage.repository import (
     get_wallet_features,
     upsert_wallet_feature,
 )
+from pm_robot.storage.wallet_levels import try_normalize_wallet
+
+
+DISCOVERY_WRITE_BATCH_SIZE = 10
+DISCOVERY_WRITE_YIELD_SECONDS = 0.1
 
 
 @dataclass(frozen=True)
@@ -236,6 +242,8 @@ def _merge_activity_rows(
         if not wallet:
             continue
         usdc_size = _trade_usdc(row)
+        if usdc_size <= 0:
+            continue
         if min_trade_usdc > 0 and usdc_size < min_trade_usdc:
             continue
         item = wallets.setdefault(
@@ -250,8 +258,13 @@ def _merge_activity_rows(
                 "latest_ts": 0,
                 "names": set(),
                 "recent_trades": [],
+                "trade_keys": set(),
             },
         )
+        observed_trade = _observed_trade_from_activity(row)
+        if observed_trade["key"] in item["trade_keys"]:
+            continue
+        item["trade_keys"].add(observed_trade["key"])
         item["trade_count"] += 1
         side = str(row.get("side") or "").upper()
         if side == "BUY":
@@ -266,7 +279,7 @@ def _merge_activity_rows(
         name = str(row.get("name") or row.get("pseudonym") or "").strip()
         if name:
             item["names"].add(name)
-        item["recent_trades"].append(_observed_trade_from_activity(row))
+        item["recent_trades"].append(observed_trade)
 
 
 def _sorted_activity_items(wallets: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
@@ -292,7 +305,7 @@ def _persist_activity_items(
     features = 0
     observed = 0
     promoted = 0
-    for item in _sorted_activity_items(wallets):
+    for processed_count, item in enumerate(_sorted_activity_items(wallets), start=1):
         existing_candidate = conn.execute(
             "SELECT 1 FROM candidate_wallets WHERE address = ?",
             (item["wallet"].lower(),),
@@ -314,13 +327,17 @@ def _persist_activity_items(
             now=now,
         )
         observed += 1
-        if not sighting.candidate_updated:
-            continue
-        if sighting.promoted:
-            promoted += 1
-        candidates += 1
-        upsert_wallet_feature(conn, _feature_from_activity(item, existing.get(item["wallet"])))
-        features += 1
+        if sighting.candidate_updated:
+            if sighting.promoted:
+                promoted += 1
+            candidates += 1
+            upsert_wallet_feature(conn, _feature_from_activity(item, existing.get(item["wallet"])))
+            features += 1
+        # Keep each wallet internally atomic while yielding SQLite's writer
+        # lock often enough for screening and history workers to make progress.
+        if processed_count % DISCOVERY_WRITE_BATCH_SIZE == 0:
+            conn.commit()
+            time.sleep(DISCOVERY_WRITE_YIELD_SECONDS)
     conn.commit()
     return {
         "candidates": candidates,
@@ -374,8 +391,8 @@ def _observed_trade_key(
 
 def _wallet_from_activity(row: dict[str, Any]) -> str:
     for key in ("proxyWallet", "proxy_wallet", "wallet", "address", "user"):
-        wallet = str(row.get(key) or "").strip().lower()
-        if wallet.startswith("0x") and len(wallet) == 42:
+        wallet = try_normalize_wallet(row.get(key))
+        if wallet:
             return wallet
     return ""
 
@@ -383,16 +400,18 @@ def _wallet_from_activity(row: dict[str, Any]) -> str:
 def _trade_usdc(row: dict[str, Any]) -> float:
     explicit = _float(row.get("usdcSize") or row.get("usdc_size"))
     if explicit is not None:
-        return explicit
+        return max(0.0, explicit)
     size = _float(row.get("size")) or 0.0
     price = _float(row.get("price")) or 0.0
-    return size * price
+    total = size * price
+    return max(0.0, total) if math.isfinite(total) else 0.0
 
 
 def _float(value: Any) -> float | None:
     try:
         if value is None or value == "":
             return None
-        return float(value)
+        parsed = float(value)
     except (TypeError, ValueError):
         return None
+    return parsed if math.isfinite(parsed) else None

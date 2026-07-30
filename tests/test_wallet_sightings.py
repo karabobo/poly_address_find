@@ -1,7 +1,11 @@
 import pytest
 
 from pm_robot.models import CandidateAddress
-from pm_robot.orchestration.wallet_sightings import record_wallet_sighting
+from pm_robot.orchestration.wallet_sightings import (
+    _QUALIFIED_L0_ADMISSION_QUERY,
+    admit_qualified_observed_wallets,
+    record_wallet_sighting,
+)
 from pm_robot.storage.db import connect, run_migrations
 from pm_robot.storage.wallet_levels import get_wallet_level
 from pm_robot.wallet_levels import WalletLevel
@@ -100,6 +104,80 @@ def test_small_verified_trade_stays_l0_without_candidate_or_jobs(tmp_path):
         assert conn.execute(
             "SELECT COUNT(*) FROM pipeline_jobs WHERE wallet = ?", (wallet,)
         ).fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+def test_unverified_trade_sample_cannot_be_admitted_later(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    wallet = "0x" + "9" * 40
+    try:
+        run_migrations(conn)
+        result = record_wallet_sighting(
+            conn,
+            CandidateAddress(address=wallet, sources="unverified_feed"),
+            recent_trades=[_trade("0xunverified", 500)],
+            verified_trade=False,
+            allow_l1=False,
+            now=1_000,
+        )
+        conn.commit()
+
+        observed = conn.execute(
+            "SELECT recent_trade_count, recent_usdc_total FROM observed_wallets "
+            "WHERE wallet = ?",
+            (wallet,),
+        ).fetchone()
+        admitted = admit_qualified_observed_wallets(conn, limit=10, now=2_000)
+
+        assert result.level is WalletLevel.L0
+        assert tuple(observed) == (0, 0.0)
+        assert admitted == 0
+        assert conn.execute(
+            "SELECT 1 FROM candidate_wallets WHERE address = ?",
+            (wallet,),
+        ).fetchone() is None
+    finally:
+        conn.close()
+
+
+def test_deferred_admission_prioritizes_larger_qualified_sample(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    wallets = {
+        "oldest": "0x" + "a" * 40,
+        "largest": "0x" + "b" * 40,
+        "other": "0x" + "c" * 40,
+    }
+    try:
+        run_migrations(conn)
+        for name, volume, now in (
+            ("oldest", 100, 1_000),
+            ("largest", 300, 1_100),
+            ("other", 200, 1_200),
+        ):
+            record_wallet_sighting(
+                conn,
+                _candidate(wallets[name]),
+                recent_trades=[_trade(f"0x{name}", volume)],
+                verified_trade=True,
+                allow_l1=False,
+                now=now,
+            )
+        conn.commit()
+
+        admitted = admit_qualified_observed_wallets(conn, limit=1, now=2_000)
+
+        assert admitted == 1
+        assert get_wallet_level(conn, wallets["largest"]).level is WalletLevel.L1
+        assert get_wallet_level(conn, wallets["oldest"]).level is WalletLevel.L0
+        assert get_wallet_level(conn, wallets["other"]).level is WalletLevel.L0
+        plan = conn.execute(
+            f"EXPLAIN QUERY PLAN {_QUALIFIED_L0_ADMISSION_QUERY}",
+            (100, 72),
+        ).fetchall()
+        plan_details = [str(row["detail"]) for row in plan]
+        assert any("idx_observed_wallets_l0_admission" in detail for detail in plan_details)
+        assert all("TEMP B-TREE" not in detail for detail in plan_details)
     finally:
         conn.close()
 

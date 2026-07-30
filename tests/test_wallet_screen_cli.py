@@ -27,6 +27,7 @@ def test_wallet_screen_plan_cli_exposes_queue_waterline(tmp_path, monkeypatch, c
     assert main() == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload == {
+        "wallets_admitted": 0,
         "targets_seen": 0,
         "jobs_enqueued": 0,
         "active_jobs": 0,

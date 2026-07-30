@@ -253,6 +253,7 @@ Core:
   status               Show containers and compact L0-L6/queue state
   logs [service]       Follow logs (all active services by default)
   task ARGS...         Run a one-off pm-robot CLI command
+  export-l6            Export the current high-confidence L6 research handoff
 
 Groups:
   web-up|web-down|web-restart
@@ -308,6 +309,12 @@ case "$cmd" in
     ;;
   task)
     task_compose "$@"
+    ;;
+  export-l6)
+    ensure_layout
+    task_compose export-high-confidence-l6 \
+      --out /app/data/exports/current_high_confidence_l6.json
+    echo "Research handoff: $STORAGE_ROOT/data/exports/current_high_confidence_l6.json"
     ;;
   web-up) start_group web ;;
   web-down) stop_group web ;;

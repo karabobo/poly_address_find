@@ -10,6 +10,7 @@ from pm_robot.storage.db import connect, run_migrations
 from pm_robot.web import (
     _render_dashboard,
     _render_wallet_detail,
+    _wallet_research_schema_ready,
     dashboard_data,
     wallet_detail_data,
     wallet_table_rows,
@@ -135,7 +136,7 @@ def _seed_wallet_research_data(settings: RobotSettings) -> None:
             (WALLET, now - 120, now - 120),
         )
         for job_type, job_action, job_scope, status, completed_at in (
-            ("wallet_recent_screen", "screen_recent:v1", "sample", "done", now - 200),
+            ("wallet_recent_screen", "screen_recent:v2", "sample", "done", now - 200),
             ("wallet_history_collect", "collect_deep_history:v1", "deep", "done", now - 140),
             ("copyability_evidence", "legacy", "legacy", "queued", None),
         ):
@@ -188,6 +189,10 @@ def test_dashboard_uses_level_truth_and_ignores_legacy_stage_data(tmp_path, monk
             "verified_l6": False,
         "sources": "rtds,polymarket_leaderboard",
         "total_estimated_pnl_usdc": 900.0,
+        "official_all_pnl_usdc": None,
+        "official_all_volume_usdc": None,
+        "official_profit_intensity": None,
+        "pnl_coverage": "current_and_closed",
         "cost_roi_estimate": 0.18,
         "current_position_value_usdc": 2100.0,
         "history_depth": "deep",
@@ -215,6 +220,21 @@ def test_dashboard_uses_level_truth_and_ignores_legacy_stage_data(tmp_path, monk
     assert all(term not in html for term in FORBIDDEN_SURFACE_TERMS)
     assert str(tmp_path).lower() not in serialized
     assert str(tmp_path).lower() not in html
+
+
+def test_wallet_research_schema_requires_official_pnl_columns(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    try:
+        run_migrations(conn)
+        assert _wallet_research_schema_ready(conn) is True
+        conn.execute(
+            "ALTER TABLE wallet_pnl_summaries RENAME TO wallet_pnl_summaries_current"
+        )
+        conn.execute("CREATE TABLE wallet_pnl_summaries(wallet TEXT PRIMARY KEY)")
+
+        assert _wallet_research_schema_ready(conn) is False
+    finally:
+        conn.close()
 
 
 def test_dashboard_hides_stale_l5_but_directory_marks_historical_and_current_elite(tmp_path):
@@ -289,7 +309,7 @@ def test_wallet_list_and_detail_expose_research_evidence_only(tmp_path):
     serialized = json.dumps(detail, ensure_ascii=False, sort_keys=True).lower()
 
     assert [row["wallet"] for row in rows] == [WALLET]
-    assert detail["schema_version"] == "wallet_research_detail_v2"
+    assert detail["schema_version"] == "wallet_research_detail_v3"
     assert detail["found"] is True
     assert detail["level"]["level"] == "l4"
     assert detail["screen"]["sample_trade_count"] == 10
@@ -303,7 +323,8 @@ def test_wallet_list_and_detail_expose_research_evidence_only(tmp_path):
     ]
     assert detail["selections"][0]["target_level"] == "l4"
     assert "L4" in detail_html
-    assert "18.0%" in detail_html
+    assert "官方全历史 PnL" in detail_html
+    assert "缺失时不以有限样本替代" in detail_html
     assert all(term not in serialized for term in FORBIDDEN_SURFACE_TERMS)
     assert all(term not in detail_html.lower() for term in FORBIDDEN_SURFACE_TERMS)
     assert str(tmp_path) not in serialized

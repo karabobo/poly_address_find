@@ -15,6 +15,7 @@ from pm_robot.clients.polymarket_public import (
     MAX_CLOSED_POSITIONS_LIMIT,
     MAX_CURRENT_POSITIONS_LIMIT,
     PublicPolymarketClient,
+    leaderboard_row_matches_wallet,
 )
 from pm_robot.orchestration.retry_policy import (
     is_upstream_scheduling_error,
@@ -432,6 +433,8 @@ def _fetch_closed_positions(
             limit=MAX_CLOSED_POSITIONS_LIMIT,
             offset=offset,
             size_threshold=0.0,
+            sort_by="TIMESTAMP",
+            sort_direction="DESC",
         )
         rows.extend(batch[: MAX_CLOSED_POSITION_ROWS - len(rows)])
         if len(batch) < MAX_CLOSED_POSITIONS_LIMIT:
@@ -530,19 +533,16 @@ def _fetch_leaderboard_cross_checks(
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for period in ("WEEK", "MONTH", "ALL"):
-        try:
-            batch = client.trader_leaderboard(
-                category="OVERALL",
-                time_period=period,
-                order_by="PNL",
-                limit=1,
-                offset=0,
-                user=wallet,
-            )
-        except Exception:
-            continue
+        batch = client.trader_leaderboard(
+            category="OVERALL",
+            time_period=period,
+            order_by="PNL",
+            limit=1,
+            offset=0,
+            user=wallet,
+        )
         for row in batch:
-            if isinstance(row, dict):
+            if isinstance(row, dict) and leaderboard_row_matches_wallet(row, wallet):
                 enriched = dict(row)
                 enriched["validationTimePeriod"] = period
                 rows.append(enriched)

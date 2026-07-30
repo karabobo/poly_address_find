@@ -7,6 +7,7 @@ L0 to L1. It never schedules history collection or performs quality scoring.
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
 import time
 from dataclasses import dataclass
@@ -27,6 +28,23 @@ from pm_robot.wallet_levels import (
 )
 
 
+_QUALIFIED_L0_ADMISSION_QUERY = """
+    SELECT observed.*
+    FROM observed_wallets AS observed
+         INDEXED BY idx_observed_wallets_l0_admission
+    JOIN wallet_levels AS levels ON levels.wallet = observed.wallet
+    WHERE levels.level = 'l0'
+      AND levels.hard_risk_block = 0
+      AND observed.promoted_at IS NULL
+      AND observed.recent_trade_count > 0
+      AND observed.recent_usdc_total >= ?
+    ORDER BY observed.recent_usdc_total DESC,
+             observed.first_seen_at ASC,
+             observed.wallet ASC
+    LIMIT ?
+"""
+
+
 @dataclass(frozen=True)
 class WalletSightingResult:
     wallet: str
@@ -35,6 +53,56 @@ class WalletSightingResult:
     candidate_updated: bool
     promoted: bool
     new_trade_count: int
+
+
+def admit_qualified_observed_wallets(
+    conn: sqlite3.Connection,
+    *,
+    limit: int,
+    now: int | None = None,
+) -> int:
+    """Admit bounded L0 overflow after ingress has stored a qualifying sample."""
+
+    bounded_limit = max(0, int(limit))
+    if bounded_limit == 0:
+        return 0
+    ts = int(time.time()) if now is None else int(now)
+    rows = conn.execute(
+        _QUALIFIED_L0_ADMISSION_QUERY,
+        (RECENT_SAMPLE_VOLUME_GATE_USDC, bounded_limit),
+    ).fetchall()
+    admitted = 0
+    for row in rows:
+        wallet = str(row["wallet"])
+        upsert_candidate(
+            conn,
+            CandidateAddress(
+                address=wallet,
+                sources=str(row["sources"] or ""),
+                labels=str(row["labels"] or ""),
+                notes=str(row["notes"] or ""),
+                links=str(row["links"] or ""),
+                status=str(row["status"] or ""),
+            ),
+            now=ts,
+        )
+        decision = advance_wallet_level(
+            conn,
+            wallet,
+            to_level=WalletLevel.L1,
+            reason="deferred_l0_admission",
+            policy_version="recent_sample_v1",
+            facts={
+                "recent_trade_count": int(row["recent_trade_count"] or 0),
+                "recent_usdc_total": float(row["recent_usdc_total"] or 0.0),
+                "source": str(row["sources"] or ""),
+            },
+            now=ts,
+        )
+        if decision.level is WalletLevel.L1:
+            _mark_promoted(conn, wallet, "deferred_l0_admission", now=ts)
+            admitted += 1
+    return admitted
 
 
 def record_wallet_sighting(
@@ -64,7 +132,8 @@ def record_wallet_sighting(
     new_trade_count, observed_sample_volume = _record_observation(
         conn,
         normalized_candidate,
-        recent_trades=list(recent_trades),
+        # Only source-verified economic events may contribute to the L0 gate.
+        recent_trades=list(recent_trades) if verified_trade else [],
         now=ts,
     )
 
@@ -257,7 +326,7 @@ def _merge_recent_trades(
 def _normalize_trade(row: dict[str, Any], *, now: int) -> dict[str, Any]:
     timestamp = _safe_int(row.get("timestamp"))
     observed_at = _safe_int(row.get("observed_at")) or now
-    usdc_size = _safe_float(row.get("usdc_size"))
+    usdc_size = max(0.0, _safe_float(row.get("usdc_size")))
     market = str(row.get("market") or "").strip()
     side = str(row.get("side") or "").strip().upper()
     tx_hash = str(row.get("transaction_hash") or "").strip()
@@ -297,13 +366,15 @@ def _merge_text(existing: str, incoming: str, *, max_len: int = 4000) -> str:
 
 def _safe_float(value: Any) -> float:
     try:
-        return float(value or 0.0)
+        parsed = float(value or 0.0)
     except (TypeError, ValueError):
         return 0.0
+    return parsed if math.isfinite(parsed) else 0.0
 
 
 def _safe_int(value: Any) -> int:
     try:
-        return int(float(value or 0))
-    except (TypeError, ValueError):
+        parsed = float(value or 0)
+        return int(parsed) if math.isfinite(parsed) else 0
+    except (TypeError, ValueError, OverflowError):
         return 0

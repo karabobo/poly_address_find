@@ -8,6 +8,8 @@ import time
 from dataclasses import dataclass, field
 from datetime import timezone
 from email.utils import parsedate_to_datetime
+from http.client import HTTPException
+from pathlib import Path
 from threading import Lock
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -23,11 +25,13 @@ from pm_robot.storage.api_rate_limit import (
     configured_rate_limit_lock_timeout_seconds,
     writable_sqlite_main_database_path,
 )
+from pm_robot.storage.db import connect
 from pm_robot.storage.repository import log_api_request
 
 
 USER_AGENT = "pm-robot/0.1"
 MAX_RETRY_AFTER_SECONDS = 3_600.0
+REQUEST_LOG_TIMEOUT_SECONDS = 0.25
 
 
 class HttpClientError(RuntimeError):
@@ -86,8 +90,11 @@ class RateLimitedHttpClient:
     limits: dict[tuple[str, str], tuple[int, float]] = field(default_factory=lambda: DEFAULT_LIMITS.copy())
     shared_limiter: SharedApiRateLimiter | None = None
     _buckets: dict[tuple[str, str], TokenBucket] = field(default_factory=dict)
+    _request_log_db_path: Path | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
+        if self.conn is not None:
+            self._request_log_db_path = writable_sqlite_main_database_path(self.conn)
         if self.shared_limiter is not None or self.conn is None:
             return
         dedicated_path = configured_rate_limit_db_path()
@@ -148,6 +155,9 @@ class RateLimitedHttpClient:
                 last_error = HttpClientError(str(exc), error_type=error_type)
             except TimeoutError as exc:
                 error_type = "timeout"
+                last_error = HttpClientError(str(exc), error_type=error_type)
+            except (HTTPException, OSError) as exc:
+                error_type = "connection_error"
                 last_error = HttpClientError(str(exc), error_type=error_type)
             except json.JSONDecodeError as exc:
                 error_type = "json_decode"
@@ -236,9 +246,17 @@ class RateLimitedHttpClient:
         if self.conn is None:
             return
         latency_ms = int((time.monotonic() - started) * 1000)
+        log_conn = self.conn
+        owns_connection = False
         try:
+            if self._request_log_db_path is not None:
+                log_conn = connect(
+                    self._request_log_db_path,
+                    timeout_seconds=REQUEST_LOG_TIMEOUT_SECONDS,
+                )
+                owns_connection = True
             log_api_request(
-                self.conn,
+                log_conn,
                 base_url=base_url,
                 endpoint=path,
                 status_code=status_code,
@@ -247,8 +265,17 @@ class RateLimitedHttpClient:
                 error_type=error_type,
                 ok=ok,
             )
-        except sqlite3.Error:
-            pass
+            if owns_connection:
+                log_conn.commit()
+        except (OSError, TimeoutError, sqlite3.Error):
+            if owns_connection:
+                try:
+                    log_conn.rollback()
+                except sqlite3.Error:
+                    pass
+        finally:
+            if owns_connection:
+                log_conn.close()
 
 
 def _infer_base_kind(base_url: str) -> str:
@@ -279,7 +306,15 @@ def _http_error_type(status_code: int) -> str:
 
 
 def _retryable(error_type: str, status_code: int | None) -> bool:
-    if error_type in {"rate_limited", "cloudflare_or_forbidden", "server_error", "timeout", "url_error", "cloudflare_or_html"}:
+    if error_type in {
+        "rate_limited",
+        "cloudflare_or_forbidden",
+        "server_error",
+        "timeout",
+        "url_error",
+        "connection_error",
+        "cloudflare_or_html",
+    }:
         return True
     return bool(status_code and status_code >= 500)
 

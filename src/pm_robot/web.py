@@ -28,8 +28,8 @@ from pm_robot.storage.db import connect_readonly
 
 
 SESSION_COOKIE = "pm_robot_token"
-SCHEMA_VERSION = "wallet_research_v2"
-DETAIL_SCHEMA_VERSION = "wallet_research_detail_v2"
+SCHEMA_VERSION = "wallet_research_v3"
+DETAIL_SCHEMA_VERSION = "wallet_research_detail_v3"
 MAX_LIST_LIMIT = 250
 DASHBOARD_CACHE_TTL_SEC = 30
 
@@ -39,8 +39,8 @@ LEVEL_DEFINITIONS = (
     ("l2", "样本通过", "最近最多 10 笔成交金额合计达到 100 USDC"),
     ("l3", "轻历史优选", "轻量历史同组相对排名入选"),
     ("l4", "深历史优选", "深度历史同组相对排名入选"),
-    ("l5", "评分精英", "当前评分体系筛出的最高等级钱包"),
-    ("l6", "独立复核", "收益、持续性和异常交易检查已独立通过"),
+    ("l5", "评分候选", "曾进入最高评分层；当前有效性由最新评分单独标记"),
+    ("l6", "复核里程碑", "曾完成独立复核；当前有效性由最新复核单独标记"),
 )
 LEVEL_VALUES = tuple(level for level, _, _ in LEVEL_DEFINITIONS)
 HIGH_LEVEL_VALUES = ("l3", "l4", "l5", "l6")
@@ -243,7 +243,9 @@ def wallet_detail_data(settings: RobotSettings, address: str) -> dict[str, Any]:
                    closed_realized_pnl_usdc, total_estimated_pnl_usdc,
                    capital_basis_usdc, cost_roi_estimate, open_position_count,
                    closed_position_count, coverage, methodology_version,
-                   captured_at, updated_at
+                   captured_at, updated_at, official_all_pnl_usdc,
+                   official_all_volume_usdc, official_profit_intensity,
+                   evidence_metrics_json
             FROM wallet_pnl_summaries
             WHERE wallet = ?
             """,
@@ -533,7 +535,27 @@ def _wallet_research_schema_ready(conn: sqlite3.Connection) -> bool:
         ),
         tuple(sorted(required)),
     ).fetchall()
-    return {str(row[0]) for row in rows} == required
+    if {str(row[0]) for row in rows} != required:
+        return False
+    required_columns = {
+        "wallet_pnl_summaries": {
+            "official_all_pnl_usdc",
+            "official_all_volume_usdc",
+            "official_profit_intensity",
+            "evidence_metrics_json",
+        },
+        "wallet_l6_validations": {
+            "official_all_pnl_usdc",
+            "official_all_volume_usdc",
+            "official_profit_intensity",
+            "official_month_pnl_usdc",
+            "official_week_pnl_usdc",
+        },
+    }
+    return all(
+        columns.issubset(_table_columns(conn, table))
+        for table, columns in required_columns.items()
+    )
 
 
 def _empty_level_counts() -> list[dict[str, Any]]:
@@ -634,7 +656,7 @@ def _wallet_rows(
         current_parts = ["wl.level NOT IN ('l5', 'l6')"]
         if current_elites:
             current_parts.append(
-                f"(wl.level = 'l5' AND wl.wallet IN ({','.join('?' for _ in current_elites)}))"
+                f"(wl.level IN ('l5', 'l6') AND wl.wallet IN ({','.join('?' for _ in current_elites)}))"
             )
             params.extend(sorted(current_elites))
         if verified_l6:
@@ -660,6 +682,10 @@ def _wallet_rows(
             COALESCE(ow.sources, '') AS sources,
             COALESCE(wp.total_estimated_pnl_usdc, 0) AS total_estimated_pnl_usdc,
             wp.cost_roi_estimate,
+            wp.official_all_pnl_usdc,
+            wp.official_all_volume_usdc,
+            wp.official_profit_intensity,
+            COALESCE(wp.coverage, 'none') AS pnl_coverage,
             COALESCE(wp.current_position_value_usdc, 0) AS current_position_value_usdc,
             COALESCE(wh.history_depth, 'none') AS history_depth,
             COALESCE(wh.activity_count, 0) AS activity_count,
@@ -735,6 +761,22 @@ def _normalize_wallet_row(
         "verified_l6": bool(verified_l6),
         "sources": str(row.get("sources") or ""),
         "total_estimated_pnl_usdc": float(row.get("total_estimated_pnl_usdc") or 0),
+        "official_all_pnl_usdc": (
+            float(row["official_all_pnl_usdc"])
+            if row.get("official_all_pnl_usdc") is not None
+            else None
+        ),
+        "official_all_volume_usdc": (
+            float(row["official_all_volume_usdc"])
+            if row.get("official_all_volume_usdc") is not None
+            else None
+        ),
+        "official_profit_intensity": (
+            float(row["official_profit_intensity"])
+            if row.get("official_profit_intensity") is not None
+            else None
+        ),
+        "pnl_coverage": str(row.get("pnl_coverage") or "none"),
         "cost_roi_estimate": (
             float(row["cost_roi_estimate"]) if row.get("cost_roi_estimate") is not None else None
         ),
@@ -905,7 +947,7 @@ def _render_dashboard(settings: RobotSettings) -> str:
         + '<span class="section-meta">24 小时完成量</span></section>'
         + _queue_board(queues)
         + '<section class="section-head split"><div><h2>高等级钱包</h2>'
-        + f'<p>L3-L5 当前优选与 L6 独立复核钱包；当前 L5/L6 {_fmt_int(data.get("current_elite_wallet_count"))} 个，已验证 L6 {_fmt_int(data.get("verified_l6_wallet_count"))} 个。</p></div>'
+        + f'<p>L3-L4 历史优选、当前评分候选与独立复核钱包；当前评分候选 {_fmt_int(data.get("current_elite_wallet_count"))} 个，当前验证 L6 {_fmt_int(data.get("verified_l6_wallet_count"))} 个。</p></div>'
         + f'<a href="/wallets?level=l3">查看目录</a></section>'
         + _wallet_table(high_rows)
         + '<section class="grid two-col">'
@@ -973,8 +1015,16 @@ def _render_wallet_detail(settings: RobotSettings, address: str) -> str:
         + _e(address)
         + '">JSON</a><a class="button" href="/wallets">返回目录</a></div></header>'
         + '<section class="metric-row">'
-        + _metric("预估总收益", _fmt_money(pnl.get("total_estimated_pnl_usdc")), "收益接口覆盖范围内")
-        + _metric("成本口径 ROI", _fmt_pct(pnl.get("cost_roi_estimate")), "无成本基数时不估算")
+        + _metric(
+            "官方全历史 PnL",
+            _fmt_money(pnl.get("official_all_pnl_usdc")),
+            "缺失时不以有限样本替代",
+        )
+        + _metric(
+            "利润强度",
+            _fmt_pct(pnl.get("official_profit_intensity")),
+            "官方 PnL / 累计成交量，非账户 ROI",
+        )
         + _metric("研究分", _fmt_score(history.get("research_score")), "用于同组相对排序")
         + _metric("历史深度", _history_label(history.get("history_depth")), f'{_fmt_int(history.get("activity_count"))} 条活动')
         + '</section>'
@@ -994,9 +1044,12 @@ def _render_wallet_detail(settings: RobotSettings, address: str) -> str:
             ("计算时间", _fmt_ts(screen.get("computed_at"))),
         ])
         + _detail_panel("收益概况", [
+            ("官方全历史 PnL", _fmt_money(pnl.get("official_all_pnl_usdc"))),
+            ("官方累计成交量", _fmt_money(pnl.get("official_all_volume_usdc"))),
+            ("利润强度（非 ROI）", _fmt_pct(pnl.get("official_profit_intensity"))),
             ("当前持仓价值", _fmt_money(pnl.get("current_position_value_usdc"))),
             ("持仓预估收益", _fmt_money(pnl.get("open_estimated_pnl_usdc"))),
-            ("已结束持仓收益", _fmt_money(pnl.get("closed_realized_pnl_usdc"))),
+            ("最近已结束样本收益", _fmt_money(pnl.get("closed_realized_pnl_usdc"))),
             ("成本基数", _fmt_money(pnl.get("capital_basis_usdc"))),
             ("覆盖范围", pnl.get("coverage") or "none"),
         ])
@@ -1109,15 +1162,27 @@ def _wallet_table(rows: list[dict[str, Any]]) -> str:
         level_value = str(row.get("level") or "l0")
         level_note = _reason_label(row.get("level_reason"))
         if level_value == "l5":
-            level_note = "评分精英，等待独立复核" if row.get("current_elite") else "历史 L5，等待新证据复核"
+            level_note = "当前评分候选" if row.get("current_elite") else "历史 L5，当前未入选"
         elif level_value == "l6":
-            level_note = "独立复核已通过" if row.get("verified_l6") else "历史 L6，等待定期复核"
+            if row.get("verified_l6"):
+                level_note = "当前独立复核通过"
+            elif row.get("current_elite"):
+                level_note = "历史 L6，当前仍为评分候选"
+            else:
+                level_note = "历史 L6，当前未通过有效性检查"
+        official_pnl = row.get("official_all_pnl_usdc")
+        if official_pnl is not None:
+            pnl_value = _fmt_money(official_pnl)
+            pnl_note = f'利润强度 {_fmt_pct(row.get("official_profit_intensity"))}'
+        else:
+            pnl_value = _fmt_money(row.get("total_estimated_pnl_usdc"))
+            pnl_note = f'有限样本 · {_e(row.get("pnl_coverage") or "none")}'
         body.append(
             '<tr>'
             f'<td><a class="wallet-link mono" href="/wallet/{_e(wallet)}" title="{_e(wallet)}">{_e(_short_wallet(wallet))}</a>'
             f'<small>{_e(row.get("sources") or "来源待记录")}</small></td>'
             f'<td><span class="level-badge">{_e(level_value.upper())}</span><small class="level-reason">{_e(level_note)}</small></td>'
-            f'<td class="num"><strong>{_fmt_money(row.get("total_estimated_pnl_usdc"))}</strong><small>ROI {_fmt_pct(row.get("cost_roi_estimate"))}</small></td>'
+            f'<td class="num"><strong>{pnl_value}</strong><small>{pnl_note}</small></td>'
             f'<td class="num"><strong>{_fmt_score(row.get("research_score"))}</strong><small>组内 {rank}</small></td>'
             f'<td><strong>{_e(_history_label(row.get("history_depth")))}</strong><small>{_fmt_int(row.get("activity_count"))} 条 · {_fmt_int(row.get("distinct_markets"))} 市场</small></td>'
             f'<td>{_tag_inline(row.get("strategy_tags") or [], empty="未归类")}</td>'
@@ -1127,7 +1192,7 @@ def _wallet_table(rows: list[dict[str, Any]]) -> str:
         )
     return (
         '<div class="table-wrap"><table class="data-table"><thead><tr>'
-        '<th>钱包 / 来源</th><th>等级</th><th>预估收益</th><th>研究分</th>'
+        '<th>钱包 / 来源</th><th>等级</th><th>官方 / 样本收益</th><th>研究分</th>'
         '<th>历史</th><th>策略</th><th>风险</th><th>更新</th>'
         '</tr></thead><tbody>' + "".join(body) + '</tbody></table></div>'
     )
@@ -1177,9 +1242,11 @@ def _l6_status_label(level: dict[str, Any], validation: dict[str, Any]) -> str:
         return "已通过"
     decision = str(validation.get("decision") or "")
     if decision == "warning":
-        return "需进一步复核，保留 L5"
+        return "需进一步复核，当前未验证"
     if decision == "fail":
-        return "未通过，保留 L5"
+        if str(level.get("level") or "") == "l6":
+            return "历史 L6，当前复核未通过"
+        return "未通过，当前未验证"
     if decision == "pass":
         return "历史通过，等待刷新"
     return "等待复核" if str(level.get("level") or "") == "l5" else "未进入复核"
@@ -1380,6 +1447,10 @@ def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
         (name,),
     ).fetchone() is not None
+
+
+def _table_columns(conn: sqlite3.Connection, name: str) -> set[str]:
+    return {str(row[1]) for row in conn.execute(f'PRAGMA table_info("{name}")')}
 
 
 def _rows(conn: sqlite3.Connection, sql: str, params: tuple[Any, ...] = ()) -> list[dict[str, Any]]:

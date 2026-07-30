@@ -23,7 +23,25 @@ MIGRATION_SCHEMA_POSTCONDITIONS = {
     61: ("wallet_history_artifacts", "purge_started_at"),
     62: ("runtime_heartbeats", "name"),
     66: ("wallet_l6_validations", "validation_id"),
-    67: ("wallet_l6_validations", "official_all_pnl_usdc"),
+    67: (
+        "wallet_l6_validations",
+        (
+            "official_all_pnl_usdc",
+            "official_all_volume_usdc",
+            "official_profit_intensity",
+            "official_month_pnl_usdc",
+            "official_week_pnl_usdc",
+        ),
+    ),
+    68: (
+        "wallet_pnl_summaries",
+        (
+            "official_all_pnl_usdc",
+            "official_all_volume_usdc",
+            "official_profit_intensity",
+            "evidence_metrics_json",
+        ),
+    ),
 }
 
 MIGRATION_POSTCONDITION_REPAIRS = {
@@ -78,20 +96,30 @@ class _AccessLockedConnection(sqlite3.Connection):
                 _release_database_access_lock(lock_file)
 
 
-def connect(db_path: Path, *, check_same_thread: bool = True) -> sqlite3.Connection:
+def connect(
+    db_path: Path,
+    *,
+    check_same_thread: bool = True,
+    timeout_seconds: float = 120.0,
+) -> sqlite3.Connection:
     """Open a writable application connection."""
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    access_lock = _acquire_database_access_lock(db_path, exclusive=False)
+    bounded_timeout = max(0.0, float(timeout_seconds))
+    access_lock = _acquire_database_access_lock(
+        db_path,
+        exclusive=False,
+        timeout_seconds=bounded_timeout,
+    )
     conn: _AccessLockedConnection | None = None
     try:
         conn = sqlite3.connect(
             db_path,
-            timeout=120,
+            timeout=bounded_timeout,
             check_same_thread=check_same_thread,
             factory=_AccessLockedConnection,
         )
         conn._pm_robot_access_lock = access_lock
-        conn.execute("PRAGMA busy_timeout = 120000")
+        conn.execute(f"PRAGMA busy_timeout = {int(bounded_timeout * 1000)}")
         conn.execute("PRAGMA synchronous = NORMAL")
         conn.execute("PRAGMA foreign_keys = ON")
         conn.row_factory = sqlite3.Row
@@ -295,11 +323,13 @@ def _migration_schema_postcondition_satisfied(
     postcondition = MIGRATION_SCHEMA_POSTCONDITIONS.get(version)
     if postcondition is None:
         return False
-    table, column = postcondition
-    return any(
-        str(row[1]) == column
+    table, columns = postcondition
+    required_columns = {columns} if isinstance(columns, str) else set(columns)
+    existing_columns = {
+        str(row[1])
         for row in conn.execute(f'PRAGMA table_info("{table}")').fetchall()
-    )
+    }
+    return required_columns.issubset(existing_columns)
 
 
 @contextlib.contextmanager

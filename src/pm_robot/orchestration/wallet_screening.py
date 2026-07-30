@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import sqlite3
 import time
 from dataclasses import dataclass
@@ -19,6 +20,8 @@ from pm_robot.orchestration.retry_policy import (
     is_upstream_scheduling_error,
     upstream_aware_retry_at,
 )
+from pm_robot.orchestration.wallet_sightings import admit_qualified_observed_wallets
+from pm_robot.research.evidence_rows import dedupe_activity_rows
 from pm_robot.storage.repository import (
     claim_pipeline_job,
     complete_pipeline_job,
@@ -35,7 +38,7 @@ from pm_robot.wallet_levels import (
 
 
 JOB_TYPE = PipelineJobType.WALLET_RECENT_SCREEN.value
-SCREEN_POLICY_VERSION = "v1"
+SCREEN_POLICY_VERSION = "v2"
 JOB_ACTION = f"screen_recent:{SCREEN_POLICY_VERSION}"
 JOB_SCOPE = HistoryDepth.SAMPLE.value
 SAMPLE_TRADE_LIMIT = RECENT_SAMPLE_TRADE_LIMIT
@@ -45,6 +48,7 @@ DEFAULT_RESCREEN_AFTER_SECONDS = 7 * 86_400
 
 @dataclass(frozen=True)
 class WalletScreenPlanSummary:
+    wallets_admitted: int
     targets_seen: int
     jobs_enqueued: int
     active_jobs: int
@@ -70,14 +74,20 @@ def plan_wallet_screen_jobs(
     limit: int = 100,
     max_active_jobs: int = 500,
     shard_count: int = 3,
+    admission_limit: int | None = None,
     rescreen_after_seconds: int = DEFAULT_RESCREEN_AFTER_SECONDS,
     now: int | None = None,
 ) -> WalletScreenPlanSummary:
-    """Queue first screens, plus stale failures that have a newer sighting."""
+    """Admit bounded L0 overflow, then queue L1 screens under the waterline."""
 
     if shard_count <= 0:
         raise ValueError("shard_count must be positive")
     ts = int(time.time()) if now is None else int(now)
+    wallets_admitted = admit_qualified_observed_wallets(
+        conn,
+        limit=max(0, int(limit if admission_limit is None else admission_limit)),
+        now=ts,
+    )
     active_jobs = int(
         conn.execute(
             "SELECT COUNT(*) FROM pipeline_jobs "
@@ -91,6 +101,7 @@ def plan_wallet_screen_jobs(
         slots = min(slots, max(0, int(max_active_jobs) - active_jobs))
     if slots == 0:
         return WalletScreenPlanSummary(
+            wallets_admitted=wallets_admitted,
             targets_seen=0,
             jobs_enqueued=0,
             active_jobs=active_jobs,
@@ -133,12 +144,10 @@ def plan_wallet_screen_jobs(
              )
           )
         ORDER BY levels.last_seen_at DESC, levels.wallet ASC
-        LIMIT ?
         """,
         (
             JOB_TYPE,
             ts - max(0, int(rescreen_after_seconds)),
-            max(slots * 4, slots),
         ),
     ).fetchall()
     targets = _fair_targets([dict(row) for row in rows], limit=slots)
@@ -166,6 +175,7 @@ def plan_wallet_screen_jobs(
             )
         )
     return WalletScreenPlanSummary(
+        wallets_admitted=wallets_admitted,
         targets_seen=len(targets),
         jobs_enqueued=enqueued,
         active_jobs=active_jobs,
@@ -357,7 +367,13 @@ def _persist_screen(
             sample["latest_trade_at"],
             int(qualified),
             reason,
-            json.dumps({"method": "recent_trades", "limit": SAMPLE_TRADE_LIMIT}),
+            json.dumps(
+                {
+                    "method": "recent_trades",
+                    "limit": SAMPLE_TRADE_LIMIT,
+                    "policy_version": SCREEN_POLICY_VERSION,
+                }
+            ),
             now,
             now,
         ),
@@ -365,7 +381,7 @@ def _persist_screen(
 
 
 def _summarize_trades(rows: list[dict[str, Any]]) -> dict[str, Any]:
-    trades = [row for row in rows[:SAMPLE_TRADE_LIMIT] if isinstance(row, dict)]
+    trades = dedupe_activity_rows(rows)[:SAMPLE_TRADE_LIMIT]
     volumes = [_trade_usdc(row) for row in trades]
     markets = {
         str(row.get("slug") or row.get("marketSlug") or row.get("market_slug") or "")
@@ -441,13 +457,15 @@ def _wallet_shard(wallet: str, shard_count: int) -> int:
 
 def _float(value: Any) -> float:
     try:
-        return float(value or 0.0)
+        parsed = float(value or 0.0)
     except (TypeError, ValueError):
         return 0.0
+    return parsed if math.isfinite(parsed) else 0.0
 
 
 def _int(value: Any) -> int:
     try:
-        return int(float(value or 0))
-    except (TypeError, ValueError):
+        parsed = float(value or 0)
+        return int(parsed) if math.isfinite(parsed) else 0
+    except (TypeError, ValueError, OverflowError):
         return 0

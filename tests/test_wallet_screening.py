@@ -39,7 +39,16 @@ class FakeScreenClient:
         self.calls.append(("positions", wallet, size_threshold))
         return self.positions_payload
 
-    def closed_positions(self, wallet, *, limit, offset, size_threshold):
+    def closed_positions(
+        self,
+        wallet,
+        *,
+        limit,
+        offset,
+        size_threshold,
+        sort_by=None,
+        sort_direction=None,
+    ):
         self.calls.append(("closed", wallet, limit, offset, size_threshold))
         return self.closed_payload[:limit]
 
@@ -115,11 +124,64 @@ def test_screen_planner_only_queues_l1_wallets_under_waterline(tmp_path):
             {
                 "wallet": l1_wallet,
                 "job_type": JOB_TYPE,
-                "job_action": "screen_recent:v1",
+                "job_action": "screen_recent:v2",
                 "job_scope": "sample",
                 "status": "queued",
             }
         ]
+    finally:
+        conn.close()
+
+
+def test_screen_planner_admits_qualifying_l0_overflow_before_queueing(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    wallet = "0x" + "2" * 40
+    try:
+        run_migrations(conn)
+        record_wallet_sighting(
+            conn,
+            CandidateAddress(address=wallet, sources="stream"),
+            recent_trades=[
+                {
+                    "transaction_hash": "0x" + "a" * 64,
+                    "timestamp": 1_000,
+                    "market": "market-a",
+                    "side": "BUY",
+                    "usdc_size": 120,
+                }
+            ],
+            verified_trade=True,
+            allow_l1=False,
+            now=1_000,
+        )
+        conn.commit()
+        assert get_wallet_level(conn, wallet).level is WalletLevel.L0
+        assert conn.execute(
+            "SELECT 1 FROM candidate_wallets WHERE address = ?",
+            (wallet,),
+        ).fetchone() is None
+
+        summary = plan_wallet_screen_jobs(
+            conn,
+            limit=1,
+            max_active_jobs=1,
+            shard_count=1,
+            now=2_000,
+        )
+        conn.commit()
+
+        assert summary.wallets_admitted == 1
+        assert summary.jobs_enqueued == 1
+        assert get_wallet_level(conn, wallet).level is WalletLevel.L1
+        observed = conn.execute(
+            "SELECT promoted_at, promotion_reason FROM observed_wallets WHERE wallet = ?",
+            (wallet,),
+        ).fetchone()
+        assert tuple(observed) == (2_000, "deferred_l0_admission")
+        assert conn.execute(
+            "SELECT status FROM pipeline_jobs WHERE wallet = ?",
+            (wallet,),
+        ).fetchone()[0] == "queued"
     finally:
         conn.close()
 
@@ -148,7 +210,7 @@ def test_screen_planner_waterline_ignores_exhausted_queued_jobs(tmp_path):
                 (
                     JOB_TYPE,
                     wallet,
-                    f"screen_recent:v1:{wallet[-4:]}",
+                    f"screen_recent:v2:{wallet[-4:]}",
                     status,
                     attempts,
                     max_attempts,
@@ -324,8 +386,8 @@ def test_failed_screen_requeues_only_after_new_sighting_and_cooldown(tmp_path, m
             (wallet,),
         ).fetchall()
         assert [dict(row) for row in jobs] == [
-            {"job_action": "screen_recent:v1", "status": "done"},
-            {"job_action": "screen_recent:v1:refresh:2100", "status": "queued"},
+            {"job_action": "screen_recent:v2", "status": "done"},
+            {"job_action": "screen_recent:v2:refresh:2100", "status": "queued"},
         ]
     finally:
         conn.close()
@@ -333,7 +395,7 @@ def test_failed_screen_requeues_only_after_new_sighting_and_cooldown(tmp_path, m
 
 def test_screen_planner_rotates_source_buckets_to_avoid_stream_starvation(tmp_path):
     conn = connect(tmp_path / "robot.sqlite")
-    stream_wallets = ["0x" + f"{index:040x}" for index in range(1, 5)]
+    stream_wallets = ["0x" + f"{index:040x}" for index in range(1, 21)]
     curated_wallet = "0x" + "a" * 40
     try:
         run_migrations(conn)

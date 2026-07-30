@@ -40,11 +40,23 @@ class FakePublicClient:
     def positions(self, wallet, *, size_threshold):
         return [{"cashPnl": 20, "initialValue": 200}]
 
-    def closed_positions(self, wallet, *, limit, offset, size_threshold):
+    def closed_positions(
+        self,
+        wallet,
+        *,
+        limit,
+        offset,
+        size_threshold,
+        sort_by=None,
+        sort_direction=None,
+    ):
         return [{"realizedPnl": 30, "totalBought": 300}]
 
     def position_values(self, wallet):
         return [{"user": wallet, "value": 220}]
+
+    def trader_leaderboard(self, **kwargs):
+        return [{"proxyWallet": kwargs["user"], "pnl": 50, "vol": 1_000}]
 
     def activity(self, wallet, *, limit, offset):
         return self.history[offset : offset + limit]

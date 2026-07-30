@@ -151,10 +151,13 @@ def test_research_only_migration_preserves_current_state_and_drops_raw_legacy_ta
             "SELECT name, status, rows_written FROM runtime_heartbeats"
         ).fetchone()
 
-        assert applied == [62, 63, 64, 65, 66, 67]
+        assert applied == [62, 63, 64, 65, 66, 67, 68, 69]
         assert "wallet_l6_validations" in tables
         assert "official_all_pnl_usdc" in {
             row["name"] for row in conn.execute("PRAGMA table_info(wallet_l6_validations)")
+        }
+        assert "official_all_pnl_usdc" in {
+            row["name"] for row in conn.execute("PRAGMA table_info(wallet_pnl_summaries)")
         }
         assert "candidate_stage" not in candidate_columns
         assert "wallet_activity" not in tables

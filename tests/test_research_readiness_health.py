@@ -5,6 +5,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pm_robot.ops import _write_json_atomically, health_check
 from pm_robot.storage.api_rate_limit import RateLimitScope, SharedApiRateLimiter
 from pm_robot.orchestration.wallet_level_selection import SELECTION_POLICY_VERSION
+from pm_robot.research.wallet_history_summary import METHODOLOGY_VERSION
 from pm_robot.storage.db import connect, run_migrations
 from pm_robot.storage.wallet_levels import advance_wallet_level, ensure_wallet_level
 from pm_robot.wallet_levels import WalletLevel
@@ -279,9 +280,9 @@ def test_health_only_exposes_l5_with_recent_deep_evidence_as_current_elite(
                 risk_flags_json, research_score, score_components_json,
                 methodology_version, computed_at, updated_at
             ) VALUES (?, 'artifact-fresh', 'deep', 200, 10, 5000,
-                      '[]', '[]', 80, '{}', 'wallet_history_summary_v2', ?, ?)
+                      '[]', '[]', 80, '{}', ?, ?, ?)
             """,
-            (wallet, now - 1_000, now - 1_000),
+            (wallet, METHODOLOGY_VERSION, now - 1_000, now - 1_000),
         )
         conn.execute(
             """

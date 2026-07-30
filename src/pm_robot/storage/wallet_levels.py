@@ -38,6 +38,15 @@ def normalize_wallet(wallet: str) -> str:
     return normalized
 
 
+def try_normalize_wallet(wallet: Any) -> str:
+    """Return one normalized EVM wallet, or an empty string for source noise."""
+
+    try:
+        return normalize_wallet(str(wallet or ""))
+    except ValueError:
+        return ""
+
+
 def get_wallet_level(conn: sqlite3.Connection, wallet: str) -> WalletLevelRecord:
     """Return the canonical level row for one wallet."""
 
