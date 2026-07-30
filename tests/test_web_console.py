@@ -72,6 +72,7 @@ def test_empty_dashboard_is_l0_l6_research_surface(tmp_path, monkeypatch):
     monkeypatch.setenv("PM_ROBOT_WEB_DASHBOARD_CACHE_TTL_SEC", "0")
 
     data = dashboard_data(settings)
+    monkeypatch.setattr(web_module, "_dashboard_data_cached", lambda _settings: data)
     html = _render_dashboard(settings)
     serialized = str(data).lower()
 
@@ -93,3 +94,20 @@ def test_empty_dashboard_is_l0_l6_research_surface(tmp_path, monkeypatch):
     assert str(tmp_path) not in html
     assert all(term not in serialized for term in FORBIDDEN_SURFACE_TERMS)
     assert all(term not in html.lower() for term in FORBIDDEN_SURFACE_TERMS)
+
+
+def test_dashboard_returns_loading_page_while_refresh_is_in_flight(tmp_path, monkeypatch):
+    settings = _settings(tmp_path)
+    conn = connect(settings.db_path)
+    try:
+        run_migrations(conn)
+    finally:
+        conn.close()
+
+    monkeypatch.setattr(web_module, "_schedule_dashboard_refresh", lambda _settings: None)
+    web_module._DASHBOARD_CACHE.clear()
+    data = web_module._dashboard_data_cached(settings)
+    html = _render_dashboard(settings)
+
+    assert data["loading"] is True
+    assert "仪表盘正在加载" in html

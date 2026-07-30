@@ -827,19 +827,21 @@ def _recent_level_changes(conn: sqlite3.Connection) -> list[dict[str, Any]]:
 
 def _dashboard_data_cached(settings: RobotSettings, *, force_refresh: bool = False) -> dict[str, Any]:
     ttl = _dashboard_cache_ttl()
-    if ttl <= 0:
-        return dashboard_data(settings)
     key = str(settings.db_path.resolve())
     now = time.time()
-    if not force_refresh:
-        with _DASHBOARD_CACHE_LOCK:
-            cached = _DASHBOARD_CACHE.get(key)
-            if cached and now - cached[0] <= ttl:
-                return cached[1]
-    data = dashboard_data(settings)
+
     with _DASHBOARD_CACHE_LOCK:
-        _DASHBOARD_CACHE[key] = (time.time(), data)
-    return data
+        cached = _DASHBOARD_CACHE.get(key)
+        cache_is_fresh = cached is not None and ttl > 0 and now - cached[0] <= ttl
+
+    if cache_is_fresh and not force_refresh:
+        return cached[1]
+
+    # A slow SQLite read must never keep the authenticated redirect open. The
+    # refresh is single-flight; callers receive the last snapshot or a clear
+    # loading page while the background worker catches up.
+    _schedule_dashboard_refresh(settings)
+    return cached[1] if cached is not None else _dashboard_loading_data(settings)
 
 
 def _dashboard_cache_ttl() -> int:
@@ -858,7 +860,9 @@ def _start_dashboard_cache_prewarm(settings: RobotSettings) -> None:
 
     def prewarm() -> None:
         try:
-            _dashboard_data_cached(settings, force_refresh=True)
+            data = dashboard_data(settings)
+            with _DASHBOARD_CACHE_LOCK:
+                _DASHBOARD_CACHE[key] = (time.time(), data)
         except Exception as exc:  # pragma: no cover - startup remains available for diagnostics.
             print(f"pm-robot dashboard cache prewarm skipped: {type(exc).__name__}: {exc}")
         finally:
@@ -866,6 +870,22 @@ def _start_dashboard_cache_prewarm(settings: RobotSettings) -> None:
                 _DASHBOARD_REFRESHING.discard(key)
 
     threading.Thread(target=prewarm, name="pm-robot-dashboard-prewarm", daemon=True).start()
+
+
+def _schedule_dashboard_refresh(settings: RobotSettings) -> None:
+    """Refresh the dashboard snapshot once without blocking an HTTP request."""
+
+    _start_dashboard_cache_prewarm(settings)
+
+
+def _dashboard_loading_data(settings: RobotSettings) -> dict[str, Any]:
+    """Return a non-misleading placeholder while a dashboard read is in flight."""
+
+    return {
+        "loading": True,
+        "generated_at": int(time.time()),
+        "database_size_bytes": settings.db_path.stat().st_size if settings.db_path.exists() else 0,
+    }
 
 
 @lru_cache(maxsize=1)
@@ -922,6 +942,14 @@ def _pyproject_version() -> str:
 
 def _render_dashboard(settings: RobotSettings) -> str:
     data = _dashboard_data_cached(settings)
+    if data.get("loading"):
+        return _render_page(
+            "钱包研究分级",
+            _top_nav("overview")
+            + '<main class="empty-page"><h1>仪表盘正在加载</h1>'
+            + '<p>研究数据正在从本地存储读取。登录已成功，稍后刷新此页面即可。</p>'
+            + '<a class="button" href="/">刷新</a></main>',
+        )
     levels = data["level_counts"]
     queues = data["queues"]
     high_rows = data["high_level_wallets"]
