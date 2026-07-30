@@ -67,8 +67,8 @@ class WebConsoleConfig:
 
 
 def run_web_console(config: WebConsoleConfig) -> None:
-    conn = connect_readonly(config.settings.db_path)
-    conn.close()
+    # Keep the authentication surface available even when NAS storage is busy.
+    # Dashboard reads run asynchronously and render an explicit loading page.
     server = ThreadingHTTPServer((config.host, config.port), _handler_factory(config))
     _start_dashboard_cache_prewarm(config.settings)
     print(f"pm-robot wallet research console listening on http://{config.host}:{config.port}")

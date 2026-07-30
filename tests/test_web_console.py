@@ -52,6 +52,26 @@ def test_web_console_binds_before_starting_dashboard_prewarm(tmp_path, monkeypat
     assert [event[0] for event in events] == ["bind", "prewarm", "serve"]
 
 
+def test_web_console_does_not_open_sqlite_before_binding(tmp_path, monkeypatch):
+    settings = _settings(tmp_path)
+    events = []
+
+    class FakeServer:
+        def __init__(self, address, handler):
+            events.append(("bind", address, handler))
+
+        def serve_forever(self):
+            events.append(("serve",))
+
+    monkeypatch.setattr(web_module, "ThreadingHTTPServer", FakeServer)
+    monkeypatch.setattr(web_module, "connect_readonly", lambda _path: (_ for _ in ()).throw(AssertionError()))
+    monkeypatch.setattr(web_module, "_start_dashboard_cache_prewarm", lambda _settings: events.append(("prewarm",)))
+
+    run_web_console(WebConsoleConfig(settings=settings, host="127.0.0.1", port=8787))
+
+    assert [event[0] for event in events] == ["bind", "prewarm", "serve"]
+
+
 def test_canonical_routes_are_wallet_research_only():
     source = inspect.getsource(web_module._handler_factory).lower()
 
