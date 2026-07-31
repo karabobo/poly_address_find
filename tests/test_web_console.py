@@ -4,7 +4,7 @@ from pathlib import Path
 import pm_robot.web as web_module
 from pm_robot.config import RobotSettings
 from pm_robot.storage.db import connect, run_migrations
-from pm_robot.web import WebConsoleConfig, _render_dashboard, dashboard_data, run_web_console
+from pm_robot.web import WebConsoleConfig, _render_dashboard, _render_wallets, dashboard_data, run_web_console
 
 
 FORBIDDEN_SURFACE_TERMS = (
@@ -131,3 +131,16 @@ def test_dashboard_returns_loading_page_while_refresh_is_in_flight(tmp_path, mon
 
     assert data["loading"] is True
     assert "仪表盘正在加载" in html
+
+
+def test_wallet_directory_returns_loading_page_while_snapshot_is_in_flight(tmp_path, monkeypatch):
+    settings = _settings(tmp_path)
+    monkeypatch.setattr(web_module, "_schedule_directory_refresh", lambda *_args: None)
+    web_module._DIRECTORY_CACHE.clear()
+
+    data = web_module.discovery_data_cached(settings, level="l3")
+    html = _render_wallets(settings, level="l3")
+
+    assert data["loading"] is True
+    assert "钱包目录正在加载" in html
+    assert "location.replace" in html

@@ -55,6 +55,9 @@ JOB_STATUS_ORDER = ("queued", "running", "done", "failed", "cancelled", "superse
 _DASHBOARD_CACHE_LOCK = threading.Lock()
 _DASHBOARD_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 _DASHBOARD_REFRESHING: set[str] = set()
+_DIRECTORY_CACHE_LOCK = threading.Lock()
+_DIRECTORY_CACHE: dict[tuple[str, str, str, int], tuple[float, dict[str, Any]]] = {}
+_DIRECTORY_REFRESHING: set[tuple[str, str, str, int]] = set()
 
 
 @dataclass(frozen=True)
@@ -181,6 +184,41 @@ def discovery_data(
         "level_counts": levels["level_counts"],
         "wallet_count": len(rows),
         "wallets": rows,
+    }
+
+
+def discovery_data_cached(
+    settings: RobotSettings,
+    *,
+    level: str = "",
+    query: str = "",
+    limit: int = 150,
+) -> dict[str, Any]:
+    """Return a cached directory snapshot without holding an HTTP request on SQLite I/O."""
+
+    normalized_level = level if level in LEVEL_VALUES else ""
+    normalized_query = query.strip()
+    normalized_limit = min(max(int(limit), 1), MAX_LIST_LIMIT)
+    key = (str(settings.db_path.resolve()), normalized_level, normalized_query, normalized_limit)
+    now = time.time()
+
+    with _DIRECTORY_CACHE_LOCK:
+        cached = _DIRECTORY_CACHE.get(key)
+        cache_is_fresh = cached is not None and now - cached[0] <= _dashboard_cache_ttl()
+
+    if cache_is_fresh:
+        return cached[1]
+
+    _schedule_directory_refresh(settings, key, normalized_level, normalized_query, normalized_limit)
+    if cached is not None:
+        return cached[1]
+    return {
+        "loading": True,
+        "generated_at": int(now),
+        "filters": {"level": normalized_level, "query": normalized_query, "limit": normalized_limit},
+        "level_counts": _empty_level_counts(),
+        "wallet_count": 0,
+        "wallets": [],
     }
 
 
@@ -406,16 +444,18 @@ def _handler_factory(config: WebConsoleConfig) -> type[BaseHTTPRequestHandler]:
                 return
             if parsed.path == "/api/wallets":
                 params = parse_qs(parsed.query)
+                data = discovery_data_cached(
+                    config.settings,
+                    level=_first(params, "level"),
+                    query=_first(params, "q"),
+                    limit=_int_param(params, "limit", 100),
+                )
                 self._send_json(
                     {
                         "schema_version": SCHEMA_VERSION,
                         "generated_at": int(time.time()),
-                        "wallets": wallet_table_rows(
-                            config.settings,
-                            level=_first(params, "level"),
-                            query=_first(params, "q"),
-                            limit=_int_param(params, "limit", 100),
-                        ),
+                        "loading": bool(data.get("loading")),
+                        "wallets": data.get("wallets") or [],
                     }
                 )
                 return
@@ -878,6 +918,34 @@ def _schedule_dashboard_refresh(settings: RobotSettings) -> None:
     _start_dashboard_cache_prewarm(settings)
 
 
+def _schedule_directory_refresh(
+    settings: RobotSettings,
+    key: tuple[str, str, str, int],
+    level: str,
+    query: str,
+    limit: int,
+) -> None:
+    """Refresh one filtered directory snapshot; it never blocks the requesting browser."""
+
+    with _DIRECTORY_CACHE_LOCK:
+        if key in _DIRECTORY_REFRESHING:
+            return
+        _DIRECTORY_REFRESHING.add(key)
+
+    def refresh() -> None:
+        try:
+            data = discovery_data(settings, level=level, query=query, limit=limit)
+            with _DIRECTORY_CACHE_LOCK:
+                _DIRECTORY_CACHE[key] = (time.time(), data)
+        except Exception as exc:  # pragma: no cover - the UI remains available for diagnostics.
+            print(f"pm-robot directory cache refresh skipped: {type(exc).__name__}: {exc}")
+        finally:
+            with _DIRECTORY_CACHE_LOCK:
+                _DIRECTORY_REFRESHING.discard(key)
+
+    threading.Thread(target=refresh, name="pm-robot-directory-refresh", daemon=True).start()
+
+
 def _dashboard_loading_data(settings: RobotSettings) -> dict[str, Any]:
     """Return a non-misleading placeholder while a dashboard read is in flight."""
 
@@ -988,7 +1056,20 @@ def _render_dashboard(settings: RobotSettings) -> str:
 
 def _render_wallets(settings: RobotSettings, *, level: str = "", query: str = "") -> str:
     selected_level = level if level in LEVEL_VALUES else ""
-    data = discovery_data(settings, level=selected_level, query=query, limit=150)
+    data = discovery_data_cached(settings, level=selected_level, query=query, limit=150)
+    if data.get("loading"):
+        target = "/wallets"
+        params = urlencode({key: value for key, value in {"level": selected_level, "q": query}.items() if value})
+        if params:
+            target += f"?{params}"
+        return _render_page(
+            "钱包目录加载中",
+            _top_nav("wallets")
+            + '<main class="empty-page"><h1>钱包目录正在加载</h1>'
+            + '<p>研究数据正在从 NAS 读取，页面会自动重试。</p>'
+            + f'<a class="button" href="{_e(target)}">立即重试</a></main>'
+            + f'<script>setTimeout(function(){{location.replace("{_e(target)}")}}, 3000)</script>',
+        )
     options = ['<option value="">全部等级</option>']
     for value, label, _ in LEVEL_DEFINITIONS:
         selected = " selected" if selected_level == value else ""
