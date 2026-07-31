@@ -334,6 +334,7 @@ def test_wallet_list_and_detail_expose_research_evidence_only(tmp_path):
 def test_web_exposes_only_fresh_independently_verified_l6(tmp_path):
     settings = _settings(tmp_path)
     wallet = "0x" + "6" * 40
+    historical_wallet = "0x" + "7" * 40
     artifact_id = "artifact-l6-current"
     now = int(time.time())
     conn = connect(settings.db_path)
@@ -394,6 +395,27 @@ def test_web_exposes_only_fresh_independently_verified_l6(tmp_path):
             (wallet, artifact_id, L6_VALIDATION_POLICY_VERSION,
              now - 90 * 86_400, now, now - 10, now - 10),
         )
+        conn.execute(
+            """
+            INSERT INTO wallet_levels(
+                wallet, level, level_reason, policy_version,
+                first_seen_at, last_seen_at, level_updated_at, updated_at
+            ) VALUES (?, 'l6', 'historical_validation', ?, ?, ?, ?, ?)
+            """,
+            (historical_wallet, L6_VALIDATION_POLICY_VERSION, now - 2_000, now, now, now),
+        )
+        conn.execute(
+            """
+            INSERT INTO wallet_history_summaries(
+                wallet, artifact_id, history_depth, activity_count,
+                distinct_markets, total_volume_usdc, strategy_tags_json,
+                risk_flags_json, research_score, score_components_json,
+                methodology_version, computed_at, updated_at
+            ) VALUES (?, 'artifact-l6-historical', 'deep', 400, 14, 10000,
+                      '[]', '[]', 99, '{}', ?, ?, ?)
+            """,
+            (historical_wallet, METHODOLOGY_VERSION, now, now),
+        )
         conn.commit()
     finally:
         conn.close()
@@ -401,10 +423,12 @@ def test_web_exposes_only_fresh_independently_verified_l6(tmp_path):
     data = dashboard_data(settings)
     detail = wallet_detail_data(settings, wallet)
     html = _render_wallet_detail(settings, wallet)
+    directory = wallet_table_rows(settings, level="l6", limit=10)
 
     assert data["verified_l6_wallet_count"] == 1
     assert data["high_level_wallets"][0]["wallet"] == wallet
     assert data["high_level_wallets"][0]["verified_l6"] is True
+    assert [row["wallet"] for row in directory] == [wallet, historical_wallet]
     assert detail["level"]["verified_l6"] is True
     assert detail["l6_validations"][0]["decision"] == "pass"
     assert "L6 独立复核" in html

@@ -710,7 +710,24 @@ def _wallet_rows(
         where.append("(LOWER(wl.wallet) LIKE ? OR LOWER(COALESCE(ow.sources, '')) LIKE ?)")
         needle = f"%{clean_query}%"
         params.extend((needle, needle))
+
+    # Current validation is more meaningful than a historical L6 label. Keep
+    # verified L6 wallets first, then current L5 score candidates, everywhere.
+    priority_order: list[str] = []
+    if verified_l6:
+        priority_order.append(
+            f"CASE WHEN wl.wallet IN ({','.join('?' for _ in verified_l6)}) THEN 0 ELSE 1 END"
+        )
+        params.extend(sorted(verified_l6))
+    if current_elites:
+        priority_order.append(
+            f"CASE WHEN wl.wallet IN ({','.join('?' for _ in current_elites)}) THEN 0 ELSE 1 END"
+        )
+        params.extend(sorted(current_elites))
     params.append(min(max(int(limit), 1), MAX_LIST_LIMIT))
+    order_prefix = ",\n            ".join(priority_order)
+    if order_prefix:
+        order_prefix += ",\n            "
     rows = _rows(
         conn,
         f"""
@@ -763,7 +780,7 @@ def _wallet_rows(
           )
         WHERE {' AND '.join(where)}
         ORDER BY
-            CASE wl.level
+            {order_prefix}CASE wl.level
                 WHEN 'l6' THEN 6 WHEN 'l5' THEN 5 WHEN 'l4' THEN 4 WHEN 'l3' THEN 3
                 WHEN 'l2' THEN 2 WHEN 'l1' THEN 1 ELSE 0
             END DESC,
