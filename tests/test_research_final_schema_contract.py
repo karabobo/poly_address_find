@@ -1,3 +1,7 @@
+import ast
+import re
+from pathlib import Path
+
 from pm_robot.storage.db import connect, run_migrations
 
 
@@ -38,6 +42,10 @@ CURRENT_RESEARCH_TABLES = {
     "wallet_screen_summaries",
 }
 
+SQL_NUMERIC_SEPARATOR = re.compile(
+    r"(?<![A-Za-z0-9])\d[\d_]*_\d[\d_]*(?![A-Za-z0-9])"
+)
+
 
 def _columns(conn, table: str) -> set[str]:
     return {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
@@ -45,6 +53,21 @@ def _columns(conn, table: str) -> set[str]:
 
 def _index_columns(conn, index: str) -> list[str]:
     return [row["name"] for row in conn.execute(f"PRAGMA index_info({index})")]
+
+
+def test_python_sql_strings_use_legacy_sqlite_compatible_numeric_literals():
+    violations = []
+    for root in (Path("src"), Path("tests")):
+        for path in root.rglob("*.py"):
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Constant) or not isinstance(node.value, str):
+                    continue
+                values = sorted(set(SQL_NUMERIC_SEPARATOR.findall(node.value)))
+                if values:
+                    violations.append(f"{path}:{node.lineno}: {', '.join(values)}")
+
+    assert violations == []
 
 
 def test_final_research_schema_exposes_only_current_control_plane(tmp_path):

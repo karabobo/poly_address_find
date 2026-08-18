@@ -367,7 +367,7 @@ def test_empty_pending_cohort_does_not_load_reference_rows(tmp_path, monkeypatch
                     forward_score_components_json, methodology_version,
                     computed_at, updated_at
                 ) VALUES (?, ?, 'deep', 100, 5, 1000, '[]', '[]',
-                          50, 50, 50, '{}', '{}', ?, 1_000, 1_000)
+                          50, 50, 50, '{}', '{}', ?, 1000, 1000)
                 """,
                 (wallet, f"artifact-{index}", METHODOLOGY_VERSION),
             )

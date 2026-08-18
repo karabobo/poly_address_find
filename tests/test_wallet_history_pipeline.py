@@ -157,7 +157,7 @@ def _seed_level(conn, wallet: str, level: WalletLevel) -> None:
                 source_snapshot_json, computed_at, updated_at
             ) VALUES (?, 25, 500, 2, 1, 1,
                       '{"policy_version":"v3","sample_max_trade_usdc":100}',
-                      1_000, 1_000)
+                      1000, 1000)
             ON CONFLICT(wallet) DO UPDATE SET
                 sample_trade_count = excluded.sample_trade_count,
                 sample_volume_usdc = excluded.sample_volume_usdc,
@@ -572,7 +572,7 @@ def test_history_planner_snapshot_candidates_match_legacy_sql_on_random_data(tmp
             """
             INSERT INTO observed_wallets(
                 wallet, sources, labels, first_seen_at, updated_at
-            ) VALUES (?, ?, 'synthetic', 1_000, ?)
+            ) VALUES (?, ?, 'synthetic', 1000, ?)
             """,
             [
                 (
@@ -587,7 +587,7 @@ def test_history_planner_snapshot_candidates_match_legacy_sql_on_random_data(tmp
             """
             INSERT INTO wallet_levels(
                 wallet, level, hard_risk_block, first_seen_at, last_seen_at, updated_at
-            ) VALUES (?, ?, ?, 1_000, ?, ?)
+            ) VALUES (?, ?, ?, 1000, ?, ?)
             """,
             [
                 (
@@ -608,7 +608,7 @@ def test_history_planner_snapshot_candidates_match_legacy_sql_on_random_data(tmp
                     source_snapshot_json, computed_at, updated_at
                 ) VALUES (?, ?, ?, ?, 1, 1,
                           '{"policy_version":"v3","sample_max_trade_usdc":1000}',
-                          1_000, 1_000)
+                          1000, 1000)
             """,
             [
                 (
@@ -683,7 +683,7 @@ def test_history_planner_snapshot_candidates_match_legacy_sql_on_random_data(tmp
                 INSERT INTO pipeline_jobs(
                     job_type, wallet, job_action, job_scope, status,
                     attempts, max_attempts, next_attempt_at, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, 1, 3, ?, 1_000, 1_000)
+                ) VALUES (?, ?, ?, ?, ?, 1, 3, ?, 1000, 1000)
                 """,
                 (
                     JOB_TYPE,
@@ -853,7 +853,7 @@ def test_history_planner_30k_candidate_scan_eqp_has_no_temp_cte_or_sort(tmp_path
             """
             INSERT INTO observed_wallets(
                 wallet, sources, labels, first_seen_at, updated_at
-            ) VALUES (?, 'stream', 'synthetic', 1_000, 1_000)
+            ) VALUES (?, 'stream', 'synthetic', 1000, 1000)
             """,
             [("0x" + f"{index:040x}",) for index in range(30_000)],
         )
@@ -861,7 +861,7 @@ def test_history_planner_30k_candidate_scan_eqp_has_no_temp_cte_or_sort(tmp_path
             """
             INSERT INTO wallet_levels(
                 wallet, level, first_seen_at, last_seen_at, updated_at
-            ) VALUES (?, 'l2', 1_000, 1_000, 1_000)
+            ) VALUES (?, 'l2', 1000, 1000, 1000)
             """,
             [("0x" + f"{index:040x}",) for index in range(30_000)],
         )
@@ -873,7 +873,7 @@ def test_history_planner_30k_candidate_scan_eqp_has_no_temp_cte_or_sort(tmp_path
                     source_snapshot_json, computed_at, updated_at
                 ) VALUES (?, 25, 500, 2, 1, 1,
                           '{"policy_version":"v3","sample_max_trade_usdc":100}',
-                          1_000, 1_000)
+                          1000, 1000)
             """,
             [("0x" + f"{index:040x}",) for index in range(30_000)],
         )
@@ -1203,7 +1203,7 @@ def test_history_planner_refresh_preserves_concurrent_dirty_generation(
                 wrote_concurrently = True
                 concurrent.execute(
                     "UPDATE wallet_screen_summaries "
-                    "SET sample_trade_count = 99, updated_at = 2_001 "
+                    "SET sample_trade_count = 99, updated_at = 2001 "
                     "WHERE wallet = ?",
                     (wallet,),
                 )
@@ -1290,7 +1290,7 @@ def test_history_planner_cold_large_side_tables_are_loaded_by_level_batch(
             """
             INSERT INTO observed_wallets(
                 wallet, sources, labels, first_seen_at, updated_at
-            ) VALUES (?, 'stream', 'synthetic', 1_000, 1_000)
+            ) VALUES (?, 'stream', 'synthetic', 1000, 1000)
             """,
             [(wallet,) for wallet in wallets + unrelated],
         )
@@ -1298,7 +1298,7 @@ def test_history_planner_cold_large_side_tables_are_loaded_by_level_batch(
             """
             INSERT INTO wallet_levels(
                 wallet, level, first_seen_at, last_seen_at, updated_at
-            ) VALUES (?, 'l2', 1_000, 1_000, 1_000)
+            ) VALUES (?, 'l2', 1000, 1000, 1000)
             """,
             [(wallet,) for wallet in wallets],
         )
@@ -1310,7 +1310,7 @@ def test_history_planner_cold_large_side_tables_are_loaded_by_level_batch(
                 source_snapshot_json, computed_at, updated_at
             ) VALUES (?, 25, 500, 2, 1, 1,
                       '{"policy_version":"v3","sample_max_trade_usdc":100}',
-                      1_000, 1_000)
+                      1000, 1000)
             """,
             [(wallet,) for wallet in wallets + unrelated],
         )
@@ -1324,7 +1324,7 @@ def test_history_planner_cold_large_side_tables_are_loaded_by_level_batch(
                 forward_score_components_json, methodology_version,
                 computed_at, updated_at
             ) VALUES (?, ?, 'light', 100, 10, 1000, '[]', '[]',
-                      50, 50, 50, '{}', '{}', ?, 1_000, 1_000)
+                      50, 50, 50, '{}', '{}', ?, 1000, 1000)
             """,
             [
                 (wallet, f"artifact-{index}", METHODOLOGY_VERSION)
@@ -1336,7 +1336,7 @@ def test_history_planner_cold_large_side_tables_are_loaded_by_level_batch(
             INSERT INTO pipeline_jobs(
                 job_type, wallet, job_action, job_scope, status,
                 attempts, max_attempts, created_at, updated_at
-            ) VALUES (?, ?, ?, 'light', 'done', 1, 3, 1_000, 1_000)
+            ) VALUES (?, ?, ?, 'light', 'done', 1, 3, 1000, 1000)
             """,
             [(JOB_TYPE, wallet, f"{LIGHT_ACTION}:old") for wallet in unrelated],
         )
@@ -1689,7 +1689,7 @@ def test_history_planner_cleans_1600_dirty_generations_without_expression_limit(
             """
             INSERT INTO wallet_levels(
                 wallet, level, first_seen_at, last_seen_at, updated_at
-            ) VALUES (?, 'l2', 1_000, 1_000, 1_000)
+            ) VALUES (?, 'l2', 1000, 1000, 1000)
             """,
             ((wallet,) for wallet in wallets),
         )
@@ -1701,7 +1701,7 @@ def test_history_planner_cleans_1600_dirty_generations_without_expression_limit(
                 source_snapshot_json, computed_at, updated_at
             ) VALUES (?, 25, 500, 2, 1, 1,
                       '{"policy_version":"v3","sample_max_trade_usdc":100}',
-                      1_000, 1_000)
+                      1000, 1000)
             """,
             ((wallet,) for wallet in wallets),
         )
@@ -1754,7 +1754,7 @@ def test_history_planner_l0_l1_writes_stay_clean_until_l2_promotion(
             """
             INSERT INTO wallet_levels(
                 wallet, level, first_seen_at, last_seen_at, updated_at
-            ) VALUES (?, ?, 1_000, 1_000, 1_000)
+            ) VALUES (?, ?, 1000, 1000, 1000)
             """,
             [
                 (
@@ -1772,7 +1772,7 @@ def test_history_planner_l0_l1_writes_stay_clean_until_l2_promotion(
                     source_snapshot_json, computed_at, updated_at
                 ) VALUES (?, 77, 900, 5, 1, 1,
                           '{"policy_version":"v3","sample_max_trade_usdc":100}',
-                          1_000, 1_000)
+                          1000, 1000)
             """,
             (promoted_wallet,),
         )
@@ -1782,7 +1782,7 @@ def test_history_planner_l0_l1_writes_stay_clean_until_l2_promotion(
         ).fetchone()[0]
 
         conn.execute(
-            "UPDATE wallet_levels SET level = 'l2', updated_at = 1_100 "
+            "UPDATE wallet_levels SET level = 'l2', updated_at = 1100 "
             "WHERE wallet = ?",
             (promoted_wallet,),
         )
@@ -1848,7 +1848,7 @@ def test_history_planner_last_seen_uses_state_only_sighting_queue(tmp_path):
         conn.commit()
 
         conn.execute(
-            "UPDATE wallet_levels SET last_seen_at = 1_500, updated_at = 1_500 "
+            "UPDATE wallet_levels SET last_seen_at = 1500, updated_at = 1500 "
             "WHERE wallet = ?",
             (wallet,),
         )
@@ -1913,7 +1913,7 @@ def test_history_planner_full_dirty_outranks_later_sighting(tmp_path):
         conn.commit()
 
         conn.execute(
-            "UPDATE wallet_levels SET last_seen_at = 1_200 WHERE wallet = ?",
+            "UPDATE wallet_levels SET last_seen_at = 1200 WHERE wallet = ?",
             (wallet,),
         )
         conn.execute(
@@ -1922,7 +1922,7 @@ def test_history_planner_full_dirty_outranks_later_sighting(tmp_path):
             (wallet,),
         )
         conn.execute(
-            "UPDATE wallet_levels SET last_seen_at = 1_300 WHERE wallet = ?",
+            "UPDATE wallet_levels SET last_seen_at = 1300 WHERE wallet = ?",
             (wallet,),
         )
         conn.commit()
@@ -1994,7 +1994,7 @@ def test_history_planner_sighting_generation_survives_concurrent_update(tmp_path
         )
         conn.commit()
         conn.execute(
-            "UPDATE wallet_levels SET last_seen_at = 1_200 WHERE wallet = ?",
+            "UPDATE wallet_levels SET last_seen_at = 1200 WHERE wallet = ?",
             (wallet,),
         )
         conn.commit()
@@ -2006,7 +2006,7 @@ def test_history_planner_sighting_generation_survives_concurrent_update(tmp_path
 
         concurrent = connect(db_path)
         concurrent.execute(
-            "UPDATE wallet_levels SET last_seen_at = 1_300 WHERE wallet = ?",
+            "UPDATE wallet_levels SET last_seen_at = 1300 WHERE wallet = ?",
             (wallet,),
         )
         concurrent.commit()
@@ -2047,7 +2047,7 @@ def test_history_planner_stale_sighting_cannot_overwrite_full_rebuild(tmp_path):
         )
         conn.commit()
         conn.execute(
-            "UPDATE wallet_levels SET last_seen_at = 1_200 WHERE wallet = ?",
+            "UPDATE wallet_levels SET last_seen_at = 1200 WHERE wallet = ?",
             (wallet,),
         )
         conn.commit()
@@ -2119,17 +2119,17 @@ def test_history_planner_drains_10000_sightings_without_evidence_reads(tmp_path)
         run_migrations(conn)
         conn.executemany(
             "INSERT INTO wallet_levels(wallet, level, first_seen_at, "
-            "last_seen_at, updated_at) VALUES (?, 'l2', 1_000, 1_000, 1_000)",
+            "last_seen_at, updated_at) VALUES (?, 'l2', 1000, 1000, 1000)",
             ((wallet,) for wallet in wallets),
         )
         conn.executemany(
             "INSERT INTO wallet_history_planner_state(wallet, level, "
-            "last_seen_at, target_depth) VALUES (?, 'l2', 1_000, 'light')",
+            "last_seen_at, target_depth) VALUES (?, 'l2', 1000, 'light')",
             ((wallet,) for wallet in wallets),
         )
         conn.execute("DELETE FROM wallet_history_planner_dirty")
         conn.executemany(
-            "UPDATE wallet_levels SET last_seen_at = 2_000, updated_at = 2_000 "
+            "UPDATE wallet_levels SET last_seen_at = 2000, updated_at = 2000 "
             "WHERE wallet = ?",
             ((wallet,) for wallet in wallets),
         )
@@ -2148,7 +2148,7 @@ def test_history_planner_drains_10000_sightings_without_evidence_reads(tmp_path)
         ).fetchone()[0]
         updated = conn.execute(
             "SELECT COUNT(*) FROM wallet_history_planner_state "
-            "WHERE last_seen_at = 2_000"
+            "WHERE last_seen_at = 2000"
         ).fetchone()[0]
     finally:
         conn.close()
@@ -2179,12 +2179,12 @@ def test_history_planner_sighting_backlog_does_not_starve_ready_candidates(
         run_migrations(conn)
         conn.executemany(
             "INSERT INTO wallet_levels(wallet, level, first_seen_at, "
-            "last_seen_at, updated_at) VALUES (?, 'l2', 1_000, 1_000, 1_000)",
+            "last_seen_at, updated_at) VALUES (?, 'l2', 1000, 1000, 1000)",
             ((wallet,) for wallet in sighted),
         )
         conn.executemany(
             "INSERT INTO wallet_history_planner_state(wallet, level, "
-            "last_seen_at, target_depth) VALUES (?, 'l2', 1_000, 'light')",
+            "last_seen_at, target_depth) VALUES (?, 'l2', 1000, 'light')",
             ((wallet,) for wallet in sighted),
         )
         _seed_level(conn, ready_wallet, WalletLevel.L2)
@@ -2193,12 +2193,12 @@ def test_history_planner_sighting_backlog_does_not_starve_ready_candidates(
             "INSERT INTO wallet_history_planner_state("
             "wallet, level, last_seen_at, target_depth, refresh_lane, urgency, "
             "is_eligible, sample_trade_count, sample_volume_usdc, "
-            "sample_market_count) VALUES (?, 'l2', 1_000, 'light', "
+            "sample_market_count) VALUES (?, 'l2', 1000, 'light', "
             "'required_depth', 10, 1, 25, 500, 2)",
             (ready_wallet,),
         )
         conn.executemany(
-            "UPDATE wallet_levels SET last_seen_at = 2_000, updated_at = 2_000 "
+            "UPDATE wallet_levels SET last_seen_at = 2000, updated_at = 2000 "
             "WHERE wallet = ?",
             ((wallet,) for wallet in sighted),
         )
@@ -2247,7 +2247,7 @@ def test_history_planner_demoted_wallet_dirty_row_deletes_stale_state(tmp_path):
         ).fetchone()[0] == 1
 
         conn.execute(
-            "UPDATE wallet_levels SET level = 'l1', updated_at = 2_100 WHERE wallet = ?",
+            "UPDATE wallet_levels SET level = 'l1', updated_at = 2100 WHERE wallet = ?",
             (wallet,),
         )
         conn.commit()
@@ -3541,7 +3541,7 @@ def test_deep_history_refreshes_fresh_light_bounded_pnl_and_paginates(tmp_path, 
             INSERT INTO wallet_pnl_summaries(
                 wallet, total_estimated_pnl_usdc, coverage,
                 methodology_version, captured_at, updated_at
-            ) VALUES (?, 999, 'light_bounded', 'test', 9_900, 9_900)
+            ) VALUES (?, 999, 'light_bounded', 'test', 9900, 9900)
             """,
             (wallet,),
         )
@@ -3921,7 +3921,7 @@ def test_light_history_planner_prioritizes_stronger_screen_sample(tmp_path):
                 wallet, sample_trade_count, sample_volume_usdc,
                 sample_market_count, screen_complete, screen_qualified,
                 computed_at, updated_at
-            ) VALUES (?, 10, ?, ?, 1, 1, 1_900, 1_900)
+            ) VALUES (?, 10, ?, ?, 1, 1, 1900, 1900)
             ON CONFLICT(wallet) DO UPDATE SET
                 sample_trade_count = excluded.sample_trade_count,
                 sample_volume_usdc = excluded.sample_volume_usdc,
@@ -3955,7 +3955,7 @@ def test_new_methodology_action_is_not_blocked_by_old_done_job(tmp_path):
                 job_type, wallet, job_action, job_scope, status,
                 attempts, max_attempts, created_at, updated_at, completed_at
             ) VALUES (?, ?, 'collect_light_history:v1', 'light', 'done',
-                      1, 3, 1_000, 1_000, 1_000)
+                      1, 3, 1000, 1000, 1000)
             """,
             (JOB_TYPE, wallet),
         )
@@ -3993,12 +3993,12 @@ def test_history_planner_active_count_uses_type_claim_index_when_capacity_is_ful
         conn.execute(
             "INSERT OR REPLACE INTO wallet_history_planner_state("
             "wallet, level, last_seen_at, target_depth) "
-            "VALUES (?, 'l2', 1_000, 'light')",
+            "VALUES (?, 'l2', 1000, 'light')",
             (target_wallet,),
         )
         conn.execute("DELETE FROM wallet_history_planner_dirty")
         conn.execute(
-            "UPDATE wallet_levels SET last_seen_at = 2_000, updated_at = 2_000 "
+            "UPDATE wallet_levels SET last_seen_at = 2000, updated_at = 2000 "
             "WHERE wallet = ?",
             (target_wallet,),
         )
