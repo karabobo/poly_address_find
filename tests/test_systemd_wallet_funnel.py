@@ -130,12 +130,11 @@ def test_install_removes_units_absent_from_current_manifest_before_enabling_funn
 
 
 def test_systemd_deployment_is_marked_as_non_nas_server_install():
-    readme = Path("deploy/README.md").read_text(encoding="utf-8")
     env = Path("deploy/env.example").read_text(encoding="utf-8")
     maintenance = _read("pm-robot-maintenance.service")
 
-    assert "# Non-NAS Linux Server Deployment" in readme
-    assert "not the Synology NAS Compose stack" in readme
+    assert "Non-NAS Linux server environment" in env
+    assert "not the Synology NAS Compose stack" in env
     assert "PM_ROBOT_REQUIRED_RUNTIME_HEARTBEATS=" in env
     assert "PM_ROBOT_RUNTIME_HEARTBEAT_MAX_AGE_SECONDS=21600" in env
     assert "--heartbeat-days 30" in maintenance

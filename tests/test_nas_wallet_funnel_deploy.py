@@ -1,3 +1,4 @@
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -799,11 +800,22 @@ else:
     )
     fake_python.chmod(0o755)
     fake_date = fake_bin / "date"
-    fake_date.write_text("#!/bin/sh\nprintf '%s\\n' '2026-07-15T00:00:00Z'\n", encoding="utf-8")
+    fake_date.write_text(
+        "#!/bin/sh\n"
+        "if [ \"${1:-}\" = \"+%s\" ]; then\n"
+        "  printf '%s\\n' '1784073600'\n"
+        "else\n"
+        "  printf '%s\\n' '2026-07-15T00:00:00Z'\n"
+        "fi\n",
+        encoding="utf-8",
+    )
     fake_date.chmod(0o755)
     fake_hostname = fake_bin / "hostname"
     fake_hostname.write_text("#!/bin/sh\nprintf '%s\\n' 'test-nas'\n", encoding="utf-8")
     fake_hostname.chmod(0o755)
+    fake_flock = fake_bin / "flock"
+    fake_flock.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    fake_flock.chmod(0o755)
     return fake_bin, call_log
 
 
@@ -1371,7 +1383,9 @@ def test_nas_maintenance_runs_light_cycle_when_history_or_screen_queue_is_active
     maintenance_call = next(args for args in calls if "maintenance" in args)
     assert "--skip-cleanup" in maintenance_call
     assert report_path.exists()
-    assert not lock_path.exists()
+    with lock_path.open("a+", encoding="utf-8") as lock_handle:
+        fcntl.flock(lock_handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(lock_handle, fcntl.LOCK_UN)
     assert not lock_path.with_suffix(".lock.d").exists()
     assert "maintenance light cleanup: skipped reason=disabled" in result.stdout
     assert "wallet history heavy maintenance: skipped reason=active_queue" in result.stdout
