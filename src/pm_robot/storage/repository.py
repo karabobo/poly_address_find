@@ -13,6 +13,7 @@ from pm_robot.pipeline_terms import ACTIVE_PIPELINE_JOB_TYPES
 from pm_robot.storage.db import retry_sqlite_locked
 
 _FEATURE_TEXT_FIELDS = {"hygiene_status", "primary_category"}
+PIPELINE_TERMINAL_FAILED_STATUS = "terminal_failed"
 _FEATURE_FIELDS = tuple(
     field.name
     for field in fields(WalletFeatures)
@@ -25,24 +26,39 @@ def upsert_candidate(
     candidate: CandidateAddress,
     *,
     now: int | None = None,
+    preloaded_existing: CandidateAddress | None = None,
+    existing_preloaded: bool = False,
 ) -> None:
     """Merge one qualified candidate and record its source provenance."""
 
     ts = int(time.time()) if now is None else int(now)
     address = candidate.address.strip().lower()
-    existing = conn.execute(
-        "SELECT sources, labels, notes, links FROM candidate_wallets WHERE address = ?",
-        (address,),
-    ).fetchone()
+    existing = preloaded_existing
+    if not existing_preloaded:
+        row = conn.execute(
+            "SELECT sources, labels, notes, links FROM candidate_wallets WHERE address = ?",
+            (address,),
+        ).fetchone()
+        existing = (
+            CandidateAddress(
+                address=address,
+                sources=str(row["sources"] or ""),
+                labels=str(row["labels"] or ""),
+                notes=str(row["notes"] or ""),
+                links=str(row["links"] or ""),
+            )
+            if row is not None
+            else None
+        )
     sources = candidate.sources
     labels = candidate.labels
     notes = candidate.notes
     links = candidate.links
     if existing is not None:
-        sources = _merge_text(str(existing["sources"] or ""), candidate.sources)
-        labels = _merge_text(str(existing["labels"] or ""), candidate.labels)
-        notes = _merge_text(str(existing["notes"] or ""), candidate.notes)
-        links = _merge_text(str(existing["links"] or ""), candidate.links)
+        sources = _merge_text(existing.sources, candidate.sources)
+        labels = _merge_text(existing.labels, candidate.labels)
+        notes = _merge_text(existing.notes, candidate.notes)
+        links = _merge_text(existing.links, candidate.links)
     conn.execute(
         """
         INSERT INTO candidate_wallets(
@@ -138,15 +154,23 @@ def record_candidate_source_event(
     )
 
 
-def upsert_wallet_feature(conn: sqlite3.Connection, feature: WalletFeatures) -> None:
+def upsert_wallet_feature(
+    conn: sqlite3.Connection,
+    feature: WalletFeatures,
+    *,
+    preloaded_extra: dict[str, Any] | None = None,
+) -> None:
     """Merge current research features while preserving unspecified values."""
 
     address = feature.address.strip().lower()
-    existing = conn.execute(
-        "SELECT extra_json FROM wallet_features WHERE address = ?",
-        (address,),
-    ).fetchone()
-    existing_extra = _json_object(existing["extra_json"]) if existing is not None else {}
+    if preloaded_extra is None:
+        existing = conn.execute(
+            "SELECT extra_json FROM wallet_features WHERE address = ?",
+            (address,),
+        ).fetchone()
+        existing_extra = _json_object(existing["extra_json"]) if existing is not None else {}
+    else:
+        existing_extra = preloaded_extra
     extra = {**existing_extra, **feature.extra}
     db_columns = (*_FEATURE_FIELDS, "extra_json", "updated_at")
     insert_columns = ("address", *db_columns)
@@ -182,6 +206,66 @@ def get_wallet_features(conn: sqlite3.Connection) -> dict[str, WalletFeatures]:
 
     rows = conn.execute("SELECT * FROM wallet_features").fetchall()
     return {str(row["address"]): _feature_from_row(row) for row in rows}
+
+
+def get_wallet_features_for_addresses(
+    conn: sqlite3.Connection,
+    addresses: list[str] | tuple[str, ...] | set[str],
+) -> dict[str, WalletFeatures]:
+    """Return compact feature rows for a bounded wallet-address snapshot."""
+
+    normalized = sorted({address.strip().lower() for address in addresses if address.strip()})
+    if not normalized:
+        return {}
+    snapshot: dict[str, WalletFeatures] = {}
+    chunk_size = max(1, _sqlite_variable_limit(conn))
+    for offset in range(0, len(normalized), chunk_size):
+        chunk = normalized[offset : offset + chunk_size]
+        placeholders = ", ".join("?" for _ in chunk)
+        rows = conn.execute(
+            f"SELECT * FROM wallet_features WHERE address IN ({placeholders})",
+            tuple(chunk),
+        ).fetchall()
+        snapshot.update({str(row["address"]): _feature_from_row(row) for row in rows})
+    return snapshot
+
+
+def get_candidates_for_addresses(
+    conn: sqlite3.Connection,
+    addresses: list[str] | tuple[str, ...] | set[str],
+) -> dict[str, CandidateAddress]:
+    """Return candidate rows for a bounded wallet-address snapshot."""
+
+    normalized = sorted({address.strip().lower() for address in addresses if address.strip()})
+    if not normalized:
+        return {}
+    snapshot: dict[str, CandidateAddress] = {}
+    chunk_size = max(1, _sqlite_variable_limit(conn))
+    for offset in range(0, len(normalized), chunk_size):
+        chunk = normalized[offset : offset + chunk_size]
+        placeholders = ", ".join("?" for _ in chunk)
+        rows = conn.execute(
+            f"""
+            SELECT address, sources, labels, notes, links, status
+            FROM candidate_wallets
+            WHERE address IN ({placeholders})
+            """,
+            tuple(chunk),
+        ).fetchall()
+        snapshot.update(
+            {
+                str(row["address"]): CandidateAddress(
+                    address=str(row["address"]),
+                    sources=str(row["sources"] or ""),
+                    labels=str(row["labels"] or ""),
+                    notes=str(row["notes"] or ""),
+                    links=str(row["links"] or ""),
+                    status=str(row["status"] or ""),
+                )
+                for row in rows
+            }
+        )
+    return snapshot
 
 
 def enqueue_pipeline_job(
@@ -222,8 +306,11 @@ def enqueue_pipeline_job(
                 ELSE MIN(pipeline_jobs.next_attempt_at, excluded.next_attempt_at)
             END,
             input_json = excluded.input_json,
+            terminal_reason = '',
+            terminal_at = NULL,
+            terminal_policy_version = '',
             updated_at = excluded.updated_at
-        WHERE pipeline_jobs.status NOT IN ('running', 'done')
+        WHERE pipeline_jobs.status NOT IN ('running', 'done', 'terminal_failed')
           AND (pipeline_jobs.status != 'failed' OR pipeline_jobs.next_attempt_at <= excluded.updated_at)
         """,
         (
@@ -295,7 +382,7 @@ def claim_pipeline_job(
         """
         UPDATE pipeline_jobs
         SET status = 'running', lease_owner = ?, lease_until = ?,
-            attempts = attempts + 1, last_error = '', updated_at = ?
+            attempts = attempts + 1, updated_at = ?
         WHERE job_id = ?
         """,
         (worker_id, lease_until, ts, int(row["job_id"])),
@@ -307,7 +394,6 @@ def claim_pipeline_job(
         attempts=int(job.get("attempts") or 0) + 1,
         lease_owner=worker_id,
         lease_until=lease_until,
-        last_error="",
     )
     return job
 
@@ -343,6 +429,9 @@ def retry_pipeline_job(
     error: str,
     next_attempt_at: int,
     count_attempt: bool = True,
+    fail_permanently: bool = False,
+    terminal_reason: str = "",
+    terminal_policy_version: str = "",
     now: int | None = None,
 ) -> bool:
     """Release a leased job for retry, or fail it after its attempt budget."""
@@ -353,22 +442,41 @@ def retry_pipeline_job(
         (int(job_id),),
     ).fetchone()
     attempts = int(row["attempts"] or 0) if row is not None else 0
+    max_attempts = int(row["max_attempts"] or 3) if row is not None else 3
     effective_attempts = attempts if count_attempt else max(0, attempts - 1)
-    failed = bool(row is not None and effective_attempts >= int(row["max_attempts"] or 3))
+    failed = bool(fail_permanently or (row is not None and effective_attempts >= max_attempts))
+    effective_terminal_reason = (
+        terminal_reason.strip() if terminal_reason.strip() else "permanent_failure"
+    )
+    terminal = bool(fail_permanently)
     updated = conn.execute(
         """
         UPDATE pipeline_jobs
         SET status = ?, lease_owner = NULL, lease_until = 0,
             next_attempt_at = ?, last_error = ?,
-            attempts = CASE WHEN ? THEN attempts ELSE MAX(0, attempts - 1) END,
+            attempts = CASE
+                WHEN ? THEN max_attempts
+                WHEN ? THEN attempts
+                ELSE MAX(0, attempts - 1)
+            END,
+            terminal_reason = CASE WHEN ? THEN ? ELSE terminal_reason END,
+            terminal_at = CASE WHEN ? THEN ? ELSE terminal_at END,
+            terminal_policy_version = CASE WHEN ? THEN ? ELSE terminal_policy_version END,
             updated_at = ?
         WHERE job_id = ? AND status = 'running' AND lease_owner = ?
         """,
         (
-            "failed" if failed else "queued",
+            PIPELINE_TERMINAL_FAILED_STATUS if terminal else ("failed" if failed else "queued"),
             int(next_attempt_at),
             error[:1000],
+            1 if fail_permanently else 0,
             1 if count_attempt else 0,
+            1 if terminal else 0,
+            effective_terminal_reason[:200],
+            1 if terminal else 0,
+            ts,
+            1 if terminal else 0,
+            terminal_policy_version.strip()[:100],
             ts,
             int(job_id),
             worker_id,
@@ -516,6 +624,21 @@ def _feature_from_row(row: sqlite3.Row) -> WalletFeatures:
         kwargs[name] = row[name] if name in row_keys else None
     kwargs["extra"] = _json_object(row["extra_json"] if "extra_json" in row_keys else "{}")
     return WalletFeatures(**kwargs)
+
+
+def _sqlite_variable_limit(conn: sqlite3.Connection) -> int:
+    try:
+        rows = conn.execute("PRAGMA compile_options").fetchall()
+    except sqlite3.Error:
+        return 999
+    for row in rows:
+        option = str(row[0])
+        if option.startswith("MAX_VARIABLE_NUMBER="):
+            try:
+                return max(1, int(option.partition("=")[2]))
+            except ValueError:
+                return 999
+    return 999
 
 
 def _merge_text(existing: str, incoming: str, *, max_len: int = 4000) -> str:

@@ -11,9 +11,13 @@ from typing import Any
 from pm_robot.clients.http import HttpClientError
 from pm_robot.clients.polymarket_public import PublicPolymarketClient
 from pm_robot.models import CandidateAddress, WalletFeatures
-from pm_robot.orchestration.wallet_sightings import record_wallet_sighting
+from pm_robot.orchestration.wallet_sightings import (
+    get_wallet_sighting_snapshots,
+    record_wallet_sighting,
+)
 from pm_robot.storage.repository import (
-    get_wallet_features,
+    get_candidates_for_addresses,
+    get_wallet_features_for_addresses,
     upsert_wallet_feature,
 )
 from pm_robot.storage.wallet_levels import try_normalize_wallet
@@ -207,7 +211,8 @@ def _candidate_from_activity_source(
         labels=labels,
         notes=" | ".join(notes),
         links=f"https://polymarket.com/profile/{wallet}",
-        status=f"{status_prefix}:{now}",
+        # Discovery time belongs in updated_at and candidate_source_events, not status.
+        status=status_prefix,
     )
 
 
@@ -300,51 +305,78 @@ def _persist_activity_items(
     labels: str,
     status_prefix: str,
 ) -> dict[str, Any]:
-    existing = get_wallet_features(conn)
+    items = _sorted_activity_items(wallets)
     candidates = 0
     features = 0
     observed = 0
     promoted = 0
-    for processed_count, item in enumerate(_sorted_activity_items(wallets), start=1):
-        existing_candidate = conn.execute(
-            "SELECT 1 FROM candidate_wallets WHERE address = ?",
-            (item["wallet"].lower(),),
-        ).fetchone() is not None
-        candidate = _candidate_from_activity_source(
-            item,
-            now=now,
-            source=source,
-            labels=labels,
-            status_prefix=status_prefix,
-        )
-        allow_l1 = existing_candidate or promoted < max_candidates
-        sighting = record_wallet_sighting(
-            conn,
-            candidate,
-            recent_trades=item.get("recent_trades") or [],
-            verified_trade=True,
-            allow_l1=allow_l1,
-            now=now,
-        )
-        observed += 1
-        if sighting.candidate_updated:
-            if sighting.promoted:
-                promoted += 1
-            candidates += 1
-            upsert_wallet_feature(conn, _feature_from_activity(item, existing.get(item["wallet"])))
-            features += 1
-        # Keep each wallet internally atomic while yielding SQLite's writer
+    chunk_size = max(1, int(DISCOVERY_WRITE_BATCH_SIZE))
+    for offset in range(0, len(items), chunk_size):
+        chunk = items[offset : offset + chunk_size]
+        started_transaction = _begin_write_chunk(conn)
+        try:
+            addresses = [item["wallet"] for item in chunk]
+            existing = get_wallet_features_for_addresses(conn, addresses)
+            existing_candidates = get_candidates_for_addresses(conn, addresses)
+            level_snapshot, observed_snapshot = get_wallet_sighting_snapshots(conn, addresses)
+            for item in chunk:
+                existing_candidate = item["wallet"] in existing_candidates
+                candidate = _candidate_from_activity_source(
+                    item,
+                    now=now,
+                    source=source,
+                    labels=labels,
+                    status_prefix=status_prefix,
+                )
+                allow_l1 = existing_candidate or promoted < max_candidates
+                sighting = record_wallet_sighting(
+                    conn,
+                    candidate,
+                    recent_trades=item.get("recent_trades") or [],
+                    verified_trade=True,
+                    allow_l1=allow_l1,
+                    candidate_snapshot=existing_candidates,
+                    level_snapshot=level_snapshot,
+                    observed_snapshot=observed_snapshot,
+                    now=now,
+                )
+                observed += 1
+                if sighting.candidate_updated:
+                    if sighting.promoted:
+                        promoted += 1
+                    candidates += 1
+                    previous_feature = existing.get(item["wallet"])
+                    upsert_wallet_feature(
+                        conn,
+                        _feature_from_activity(item, previous_feature),
+                        preloaded_extra=(
+                            previous_feature.extra if previous_feature is not None else {}
+                        ),
+                    )
+                    features += 1
+            if started_transaction:
+                conn.commit()
+        except Exception:
+            if started_transaction:
+                conn.rollback()
+            raise
+        # Keep each chunk internally atomic while yielding SQLite's writer
         # lock often enough for screening and history workers to make progress.
-        if processed_count % DISCOVERY_WRITE_BATCH_SIZE == 0:
-            conn.commit()
+        if started_transaction and offset + chunk_size < len(items):
             time.sleep(DISCOVERY_WRITE_YIELD_SECONDS)
-    conn.commit()
     return {
         "candidates": candidates,
         "features": features,
         "observed": observed,
         "promoted": promoted,
     }
+
+
+def _begin_write_chunk(conn: sqlite3.Connection) -> bool:
+    if conn.in_transaction:
+        return False
+    conn.execute("BEGIN IMMEDIATE")
+    return True
 
 
 def _observed_trade_from_activity(row: dict[str, Any]) -> dict[str, Any]:

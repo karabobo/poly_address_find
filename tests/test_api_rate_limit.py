@@ -446,6 +446,41 @@ def test_http_client_retries_remote_disconnect(monkeypatch):
     assert sleeps == [1.0]
 
 
+def test_http_client_logs_only_final_success_after_transient_retry(tmp_path, monkeypatch):
+    db_path = _prepare_database(tmp_path)
+    conn = connect(db_path)
+    calls = []
+
+    def flaky_request(request, timeout):
+        calls.append(request.full_url)
+        if len(calls) == 1:
+            raise RemoteDisconnected("remote closed")
+        return _JsonResponse()
+
+    monkeypatch.setattr("pm_robot.clients.http.urlopen", flaky_request)
+    monkeypatch.setattr("pm_robot.clients.http.time.sleep", lambda _: None)
+    try:
+        client = RateLimitedHttpClient(
+            conn=conn,
+            max_retries=1,
+            base_kind={"https://example.test": "data"},
+            shared_limiter=_SharedLimiterSpy(),
+        )
+
+        assert client.get_json("https://example.test", "/activity") == {"ok": True}
+        rows = conn.execute(
+            """
+            SELECT retry_count, error_type, ok
+            FROM api_request_log
+            WHERE endpoint = '/activity'
+            """
+        ).fetchall()
+    finally:
+        conn.close()
+
+    assert [tuple(row) for row in rows] == [(1, "", 1)]
+
+
 def test_http_429_propagates_retry_after_to_shared_limiter(monkeypatch):
     def reject_request(request, timeout):
         raise HTTPError(

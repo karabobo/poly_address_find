@@ -7,12 +7,16 @@ ENV PYTHONUNBUFFERED=1 \
 WORKDIR /app
 
 COPY pyproject.toml /app/
+
+RUN apt-get update && \
+    apt-get install --no-install-recommends -y openssh-client && \
+    rm -rf /var/lib/apt/lists/* && \
+    pip install --no-cache-dir "duckdb>=1.5,<2"
+
 COPY src /app/src
 COPY config /app/config
 COPY deploy /app/deploy
 COPY scripts /app/scripts
-
-RUN pip install --no-cache-dir "duckdb>=1.5,<2"
 
 EXPOSE 8787
 

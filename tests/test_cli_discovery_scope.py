@@ -23,6 +23,7 @@ SUPPORTED_COMMANDS = (
     "wallet-history-audit",
     "wallet-level-select",
     "wallet-l6-plan",
+    "wallet-l6-reconcile",
     "wallet-l6-worker",
     "pipeline-jobs",
     "health",
@@ -31,6 +32,7 @@ SUPPORTED_COMMANDS = (
     "backup",
     "backup-sql-dump",
     "maintenance",
+    "maintenance-preflight",
     "web",
 )
 

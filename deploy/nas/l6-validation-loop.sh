@@ -28,10 +28,15 @@ runtime_heartbeat() {
 while true; do
   sleep_interval="$INTERVAL"
   command_status="failed"
+  reconcile_status="ok"
   jobs_attempted=0
   command_output=""
 
   echo "$(date -Iseconds) L6 validation worker: start"
+  if ! python -m pm_robot.cli --env /app/.env wallet-l6-reconcile --limit 500; then
+    reconcile_status="failed"
+    echo "$(date -Iseconds) L6 current-level reconciliation failed" >&2
+  fi
   if command_output="$(python -m pm_robot.cli --env /app/.env wallet-l6-worker \
       --archive-dir "$ARCHIVE_DIR" \
       --shard-index "$SHARD_INDEX" \
@@ -71,10 +76,22 @@ print(status, jobs_attempted)
     echo "$(date -Iseconds) L6 validation worker failed" >&2
   fi
 
+  if [ "$reconcile_status" != "ok" ] && [ "$command_status" = "ok" ]; then
+    command_status="partial"
+  fi
+
   if [ "$command_status" = "ok" ] || [ "$command_status" = "partial" ]; then
+    # The export readiness check includes this worker. Publish the current loop
+    # state before exporting so a clean restart cannot fail its own readiness gate.
+    runtime_heartbeat "$command_status"
     if export_output="$(python -m pm_robot.cli --env /app/.env export-high-confidence-l6 \
         --out "$EXPORT_PATH")"; then
       printf '%s\n' "$export_output"
+      if [ "${PM_ROBOT_L6_HANDOFF_ENABLED:-0}" = "1" ] && \
+          ! /app/deploy/nas/l6-handoff-push.sh; then
+        command_status="partial"
+        echo "$(date -Iseconds) L6 validation worker could not push the research handoff" >&2
+      fi
     else
       command_status="partial"
       echo "$(date -Iseconds) L6 validation worker could not refresh the research handoff" >&2

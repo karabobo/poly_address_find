@@ -239,7 +239,8 @@ def _candidate_from_item(item: dict[str, Any], *, now: int) -> CandidateAddress:
         labels=labels,
         notes=" | ".join(notes),
         links=f"https://polymarket.com/profile/{item['wallet']}",
-        status=f"leaderboard_discovered:{now}",
+        # Discovery time is already represented by row and provenance timestamps.
+        status="leaderboard_discovered",
     )
 
 

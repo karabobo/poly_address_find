@@ -42,6 +42,14 @@ MIGRATION_SCHEMA_POSTCONDITIONS = {
             "evidence_metrics_json",
         ),
     ),
+    73: (
+        "wallet_level_review_state",
+        (
+            "wallet",
+            "cooldown_until",
+            "no_material_improvement_count",
+        ),
+    ),
 }
 
 MIGRATION_POSTCONDITION_REPAIRS = {

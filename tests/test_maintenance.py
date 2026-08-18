@@ -2,8 +2,9 @@ import sqlite3
 import time
 from pathlib import Path
 
+import pm_robot.ops as ops_module
 from pm_robot.config import RobotSettings
-from pm_robot.ops import _delete_metadata_batch, maintenance
+from pm_robot.ops import _delete_metadata_batch, health_check, maintenance
 from pm_robot.storage.db import connect, run_migrations
 
 
@@ -81,14 +82,15 @@ def _insert_job(
     max_attempts: int = 3,
     lease_until: int = 0,
     updated_at: int = 1,
+    last_error: str = "",
 ) -> None:
     conn.execute(
         """
         INSERT INTO pipeline_jobs(
             job_type, wallet, job_action, job_scope, priority, shard, status,
             lease_owner, lease_until, attempts, max_attempts,
-            next_attempt_at, created_at, updated_at
-        ) VALUES (?, ?, 'test', 'sample', 10, 0, ?, 'worker', ?, ?, ?, 0, ?, ?)
+            next_attempt_at, last_error, created_at, updated_at
+        ) VALUES (?, ?, 'test', 'sample', 10, 0, ?, 'worker', ?, ?, ?, 0, ?, ?, ?)
         """,
         (
             job_type,
@@ -97,6 +99,7 @@ def _insert_job(
             lease_until,
             attempts,
             max_attempts,
+            last_error,
             updated_at,
             updated_at,
         ),
@@ -128,6 +131,63 @@ def test_maintenance_dry_run_reports_legacy_jobs_without_changing_them(tmp_path)
         ).fetchone()[0] == "queued"
     finally:
         conn.close()
+
+
+def test_light_maintenance_reports_parquet_catalog_without_archive_walk(tmp_path, monkeypatch):
+    settings = _settings(tmp_path)
+    artifact_path = settings.archive_dir / "wallet_history" / "depth=light" / "artifact.parquet"
+    artifact_path.parent.mkdir(parents=True)
+    artifact_path.write_bytes(b"parquet placeholder")
+    conn = connect(settings.db_path)
+    try:
+        conn.execute(
+            """
+            INSERT INTO wallet_history_artifacts(
+                artifact_id, wallet, history_depth, storage_version, relative_path,
+                row_count, byte_size, checksum, status, created_at, updated_at
+            ) VALUES (
+                'artifact-light', ?, 'light', 'test',
+                'wallet_history/depth=light/artifact.parquet',
+                10, ?, 'checksum', 'active', 1, 1
+            )
+            """,
+            ("0x" + "1" * 40, 5 * 1_048_576),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    original_rglob = Path.rglob
+
+    def fail_archive_rglob(path, pattern):
+        if path == settings.archive_dir or settings.archive_dir in path.parents:
+            raise AssertionError(
+                f"light maintenance must not scan archive parquet files: {path}/{pattern}"
+            )
+        return original_rglob(path, pattern)
+
+    original_path_size = ops_module._path_size
+
+    def fail_archive_path_size(path):
+        if path == settings.archive_dir or settings.archive_dir in path.parents:
+            raise AssertionError(
+                f"light maintenance must not stat archive parquet files: {path}"
+            )
+        return original_path_size(path)
+
+    monkeypatch.setattr(Path, "rglob", fail_archive_rglob)
+    monkeypatch.setattr("pm_robot.ops._path_size", fail_archive_path_size)
+
+    result = maintenance(settings, skip_cleanup=True)
+
+    assert result["storage_before"]["parquet_artifacts"] == 1
+    assert result["storage_before"]["parquet_active_artifacts"] == 1
+    assert result["storage_before"]["parquet_catalog_size_mb"] == 5.0
+    assert result["storage_before"]["parquet_storage_source"] == "catalog"
+    assert result["storage"]["parquet_artifacts"] == 1
+    assert result["storage"]["parquet_active_artifacts"] == 1
+    assert result["storage"]["parquet_catalog_size_mb"] == 5.0
+    assert result["storage"]["parquet_storage_source"] == "catalog"
 
 
 def test_maintenance_disables_legacy_jobs_and_bounds_metadata(tmp_path):
@@ -235,6 +295,48 @@ def test_maintenance_recovers_only_expired_active_jobs(tmp_path):
     assert statuses["0x" + "3" * 40] == "queued"
     assert statuses["0x" + "4" * 40] == "failed"
     assert statuses["0x" + "5" * 40] == "running"
+
+
+def test_maintenance_preserves_existing_last_error_when_recovering_stale_jobs(tmp_path):
+    settings = _settings(tmp_path)
+    now = int(time.time())
+    conn = connect(settings.db_path)
+    try:
+        _insert_job(
+            conn,
+            job_type="wallet_history_collect",
+            wallet="0x" + "9" * 40,
+            status="running",
+            attempts=3,
+            max_attempts=3,
+            lease_until=now - 1,
+            last_error="original terminal data error",
+        )
+        _insert_job(
+            conn,
+            job_type="wallet_recent_screen",
+            wallet="0x" + "a" * 40,
+            status="running",
+            attempts=1,
+            lease_until=now - 1,
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    maintenance(settings, skip_cleanup=True, reset_stale_jobs=True)
+
+    conn = connect(settings.db_path)
+    try:
+        errors = {
+            row["wallet"]: row["last_error"]
+            for row in conn.execute("SELECT wallet, last_error FROM pipeline_jobs")
+        }
+    finally:
+        conn.close()
+
+    assert errors["0x" + "9" * 40] == "original terminal data error"
+    assert errors["0x" + "a" * 40] == "expired_lease_requeued_by_maintenance"
 
 
 def test_maintenance_closes_only_stale_active_runtime_runs(tmp_path):
@@ -504,3 +606,316 @@ def test_metadata_cleanup_retries_transient_sqlite_writer_lock(monkeypatch):
     assert conn.execute_calls == 2
     assert conn.commits == 1
     assert conn.rollbacks == 1
+
+
+def test_health_check_exposes_pipeline_queue_health(tmp_path):
+    settings = _settings(tmp_path)
+    now = int(time.time())
+    conn = connect(settings.db_path)
+    try:
+        _insert_job(
+            conn,
+            job_type="wallet_history_collect",
+            wallet="0x" + "b" * 40,
+            status="running",
+            attempts=1,
+            lease_until=now - 1,
+        )
+        _insert_job(
+            conn,
+            job_type="wallet_history_collect",
+            wallet="0x" + "c" * 40,
+            status="queued",
+            attempts=3,
+            max_attempts=3,
+        )
+        _insert_job(
+            conn,
+            job_type="wallet_recent_screen",
+            wallet="0x" + "d" * 40,
+            status="failed",
+            attempts=3,
+            max_attempts=3,
+            last_error="",
+        )
+        _insert_job(
+            conn,
+            job_type="wallet_history_collect",
+            wallet="0x" + "e" * 40,
+            status="failed",
+            attempts=3,
+            max_attempts=3,
+            last_error="incompatible history data",
+        )
+        _insert_job(
+            conn,
+            job_type="wallet_recent_screen",
+            wallet="0x" + "f" * 40,
+            status="running",
+            attempts=1,
+            lease_until=now + 600,
+        )
+        _insert_job(
+            conn,
+            job_type="wallet_history_collect",
+            wallet="0x" + "1" * 39 + "0",
+            status="queued",
+            attempts=0,
+            max_attempts=3,
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    result = health_check(settings)
+    queue_health = result["research_readiness"]["metrics"]["queue_health"]
+
+    assert result["pipeline_queue_health"] == queue_health
+    assert queue_health["expired_running"] == 1
+    assert queue_health["queued_exhausted"] == 1
+    assert queue_health["failed_missing_error"] == 1
+    assert queue_health["queued"] == 2
+    assert queue_health["running"] == 2
+    assert queue_health["active"] == 2
+    assert queue_health["wallet_history_screen_active"] == 2
+    assert {row["job_type"] for row in queue_health["failed_by_job_type"]} == {
+        "wallet_history_collect",
+        "wallet_recent_screen",
+    }
+
+
+def test_pipeline_queue_health_distinguishes_stall_from_ordinary_backlog(tmp_path):
+    settings = _settings(tmp_path)
+    now = 2_000_000
+    conn = connect(settings.db_path)
+    try:
+        _insert_job(
+            conn,
+            job_type="wallet_history_collect",
+            wallet="0x" + "a" * 40,
+            status="queued",
+            updated_at=now - 3_601,
+        )
+        _insert_job(
+            conn,
+            job_type="wallet_recent_screen",
+            wallet="0x" + "b" * 40,
+            status="queued",
+            updated_at=now - 30,
+        )
+        conn.commit()
+
+        queue_health = ops_module._pipeline_queue_health(
+            conn,
+            now=now,
+            stall_seconds=3_600,
+        )
+    finally:
+        conn.close()
+
+    assert queue_health["stall_after_seconds"] == 3_600
+    assert queue_health["stalled_by_job_type"] == [
+        {
+            "job_type": "wallet_history_collect",
+            "due_queued": 1,
+            "oldest_due_updated_at": now - 3_601,
+            "last_completed_at": 0,
+        }
+    ]
+
+
+def test_maintenance_preflight_uses_pipeline_job_index_only(tmp_path):
+    settings = _settings(tmp_path)
+    now = int(time.time())
+    conn = connect(settings.db_path)
+    try:
+        _insert_job(
+            conn,
+            job_type="wallet_history_collect",
+            wallet="0x" + "a" * 40,
+            status="queued",
+            attempts=0,
+            max_attempts=3,
+        )
+        _insert_job(
+            conn,
+            job_type="wallet_recent_screen",
+            wallet="0x" + "b" * 40,
+            status="running",
+            attempts=1,
+            lease_until=now + 60,
+        )
+        _insert_job(
+            conn,
+            job_type="wallet_history_collect",
+            wallet="0x" + "c" * 40,
+            status="running",
+            attempts=1,
+            lease_until=now - 60,
+        )
+        conn.commit()
+        sql, params = ops_module._maintenance_preflight_active_queue_query(now)
+        eqp = [
+            row[3]
+            for row in conn.execute(f"EXPLAIN QUERY PLAN {sql}", params).fetchall()
+        ]
+    finally:
+        conn.close()
+
+    result = ops_module.maintenance_preflight(settings, now=now)
+    query_text = " ".join([sql, *eqp]).lower()
+
+    assert result["wallet_history_screen_active"] == 2
+    assert result["defer_maintenance"] is True
+    assert any("idx_pipeline_jobs_type_claim" in detail for detail in eqp)
+    assert "pipeline_jobs" in query_text
+    for forbidden in (
+        "observed_wallets",
+        "wallet_levels",
+        "wallet_history_artifacts",
+        "wallet_history_summaries",
+        "parquet",
+    ):
+        assert forbidden not in query_text
+
+
+def test_truncate_wal_dry_run_and_below_threshold_are_non_destructive(tmp_path):
+    settings = _settings(tmp_path)
+
+    dry = maintenance(settings, dry_run=True, wal_checkpoint="truncate")
+    assert dry["wal_checkpoint"]["skipped_reason"] == "dry_run"
+
+    result = maintenance(
+        settings,
+        skip_cleanup=True,
+        wal_checkpoint="truncate",
+        wal_truncate_threshold_mb=512,
+        wal_truncate_allowed_hours="0-23",
+        wal_checkpoint_timeout_ms=250,
+    )
+
+    assert result["wal_checkpoint"]["executed"] is False
+    assert result["wal_checkpoint"]["skipped_reason"] == "below_threshold"
+    assert result["wal_checkpoint"]["requested_mode"] == "truncate"
+
+
+def test_truncate_wal_outside_allowed_window_skips_without_truncating(tmp_path, monkeypatch):
+    settings = _settings(tmp_path)
+    wal_path = settings.db_path.with_name(f"{settings.db_path.name}-wal")
+    wal_path.touch()
+    calls = []
+
+    def fake_checkpoint(conn, *, mode, timeout_ms):
+        del conn, timeout_ms
+        calls.append(mode)
+        assert mode == "passive"
+        return {
+            "mode": mode,
+            "executed": True,
+            "skipped_reason": "",
+            "busy": 0,
+            "log_frames": 10,
+            "checkpointed_frames": 10,
+        }
+
+    class Noon:
+        tm_hour = 12
+
+    monkeypatch.setattr("pm_robot.ops._execute_wal_checkpoint", fake_checkpoint)
+    monkeypatch.setattr("pm_robot.ops._main_database_path", lambda _conn: settings.db_path)
+    monkeypatch.setattr("pm_robot.ops._path_size", lambda _path: 2 * 1_048_576)
+    monkeypatch.setattr("pm_robot.ops.time.localtime", lambda: Noon())
+
+    result = maintenance(
+        settings,
+        skip_cleanup=True,
+        wal_checkpoint="truncate",
+        wal_truncate_threshold_mb=1,
+        wal_truncate_allowed_hours="0-6",
+    )
+
+    assert calls == ["passive"]
+    assert result["wal_checkpoint"]["executed"] is False
+    assert result["wal_checkpoint"]["skipped_reason"] == "outside_allowed_hours"
+    assert result["wal_checkpoint"]["current_hour"] == 12
+    assert result["wal_checkpoint"]["allowed_hours"] == list(range(7))
+
+
+def test_truncate_wal_busy_readers_skip_without_truncating(tmp_path, monkeypatch):
+    settings = _settings(tmp_path)
+    wal_path = settings.db_path.with_name(f"{settings.db_path.name}-wal")
+    wal_path.touch()
+    calls = []
+
+    def fake_checkpoint(conn, *, mode, timeout_ms):
+        del conn, timeout_ms
+        calls.append(mode)
+        assert mode == "passive"
+        return {
+            "mode": mode,
+            "executed": True,
+            "skipped_reason": "",
+            "busy": 2,
+            "log_frames": 10,
+            "checkpointed_frames": 8,
+        }
+
+    monkeypatch.setattr("pm_robot.ops._execute_wal_checkpoint", fake_checkpoint)
+    monkeypatch.setattr("pm_robot.ops._main_database_path", lambda _conn: settings.db_path)
+    monkeypatch.setattr("pm_robot.ops._path_size", lambda _path: 2 * 1_048_576)
+
+    result = maintenance(
+        settings,
+        skip_cleanup=True,
+        wal_checkpoint="truncate",
+        wal_truncate_threshold_mb=1,
+        wal_truncate_allowed_hours="0-23",
+    )
+
+    assert calls == ["passive"]
+    assert result["wal_checkpoint"]["executed"] is False
+    assert result["wal_checkpoint"]["skipped_reason"] == "busy_readers"
+    assert result["wal_checkpoint"]["busy"] == 2
+
+
+def test_truncate_wal_above_threshold_with_no_busy_readers_executes(tmp_path, monkeypatch):
+    settings = _settings(tmp_path)
+    wal_path = settings.db_path.with_name(f"{settings.db_path.name}-wal")
+    wal_path.touch()
+    calls = []
+
+    def fake_checkpoint(conn, *, mode, timeout_ms):
+        del conn, timeout_ms
+        calls.append(mode)
+        return {
+            "mode": mode,
+            "executed": True,
+            "skipped_reason": "",
+            "busy": 0,
+            "log_frames": 10,
+            "checkpointed_frames": 10,
+        }
+
+    class ThreeAm:
+        tm_hour = 3
+
+    monkeypatch.setattr("pm_robot.ops._execute_wal_checkpoint", fake_checkpoint)
+    monkeypatch.setattr("pm_robot.ops._main_database_path", lambda _conn: settings.db_path)
+    monkeypatch.setattr("pm_robot.ops._path_size", lambda _path: 2 * 1_048_576)
+    monkeypatch.setattr("pm_robot.ops.time.localtime", lambda: ThreeAm())
+
+    result = maintenance(
+        settings,
+        skip_cleanup=True,
+        wal_checkpoint="truncate",
+        wal_truncate_threshold_mb=1,
+        wal_truncate_allowed_hours="0-6",
+        wal_checkpoint_timeout_ms=250,
+    )
+
+    assert calls == ["passive", "truncate"]
+    assert result["wal_checkpoint"]["mode"] == "truncate"
+    assert result["wal_checkpoint"]["executed"] is True
+    assert result["wal_checkpoint"]["skipped_reason"] == ""
+    assert result["wal_checkpoint"]["wal_size_mb"] == 2.0
+    assert result["wal_checkpoint"]["probe"]["probe_mode"] == "passive"

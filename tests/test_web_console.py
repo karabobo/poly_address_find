@@ -4,7 +4,14 @@ from pathlib import Path
 import pm_robot.web as web_module
 from pm_robot.config import RobotSettings
 from pm_robot.storage.db import connect, run_migrations
-from pm_robot.web import WebConsoleConfig, _render_dashboard, _render_wallets, dashboard_data, run_web_console
+from pm_robot.web import (
+    WebConsoleConfig,
+    _render_dashboard,
+    _render_wallets,
+    dashboard_data,
+    dashboard_summary_data,
+    run_web_console,
+)
 
 
 FORBIDDEN_SURFACE_TERMS = (
@@ -131,6 +138,19 @@ def test_dashboard_returns_loading_page_while_refresh_is_in_flight(tmp_path, mon
 
     assert data["loading"] is True
     assert "仪表盘正在加载" in html
+
+
+def test_fresh_dashboard_summary_bypasses_stale_async_cache(tmp_path, monkeypatch):
+    settings = _settings(tmp_path)
+    expected = {"generated_at": 123, "wallet_count": 7}
+    web_module._DASHBOARD_CACHE[str(settings.db_path.resolve())] = (
+        1.0,
+        {"generated_at": 1, "wallet_count": 0},
+    )
+    monkeypatch.setattr(web_module, "dashboard_data", lambda _settings: expected)
+
+    assert dashboard_summary_data(settings, fresh=True) == expected
+    assert web_module._DASHBOARD_CACHE[str(settings.db_path.resolve())][1] == expected
 
 
 def test_wallet_directory_returns_loading_page_while_snapshot_is_in_flight(tmp_path, monkeypatch):

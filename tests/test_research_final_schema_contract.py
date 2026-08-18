@@ -25,8 +25,12 @@ CURRENT_RESEARCH_TABLES = {
     "schema_migrations",
     "wallet_features",
     "wallet_history_artifacts",
+    "wallet_history_planner_dirty",
+    "wallet_history_planner_sighting_dirty",
+    "wallet_history_planner_state",
     "wallet_history_summaries",
     "wallet_level_events",
+    "wallet_level_review_state",
     "wallet_level_selections",
     "wallet_levels",
     "wallet_l6_validations",
@@ -37,6 +41,10 @@ CURRENT_RESEARCH_TABLES = {
 
 def _columns(conn, table: str) -> set[str]:
     return {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+
+
+def _index_columns(conn, index: str) -> list[str]:
+    return [row["name"] for row in conn.execute(f"PRAGMA index_info({index})")]
 
 
 def test_final_research_schema_exposes_only_current_control_plane(tmp_path):
@@ -54,6 +62,14 @@ def test_final_research_schema_exposes_only_current_control_plane(tmp_path):
         feature_columns = _columns(conn, "wallet_features")
         job_columns = _columns(conn, "pipeline_jobs")
         heartbeat_columns = _columns(conn, "runtime_heartbeats")
+        planner_dirty_columns = _columns(conn, "wallet_history_planner_dirty")
+        planner_sighting_columns = _columns(
+            conn, "wallet_history_planner_sighting_dirty"
+        )
+        planner_bootstrap_columns = _index_columns(
+            conn, "idx_wallet_levels_history_planner_bootstrap"
+        )
+        type_claim_columns = _index_columns(conn, "idx_pipeline_jobs_type_claim")
     finally:
         conn.close()
 
@@ -67,3 +83,19 @@ def test_final_research_schema_exposes_only_current_control_plane(tmp_path):
     assert {"name", "started_at", "finished_at", "status"}.issubset(
         heartbeat_columns
     )
+    assert "dirty_generation" in planner_dirty_columns
+    assert {
+        "wallet",
+        "last_seen_at",
+        "dirty_at",
+        "dirty_generation",
+    }.issubset(planner_sighting_columns)
+    assert planner_bootstrap_columns == ["level", "wallet"]
+    assert type_claim_columns == [
+        "job_type",
+        "status",
+        "shard",
+        "next_attempt_at",
+        "priority",
+        "updated_at",
+    ]

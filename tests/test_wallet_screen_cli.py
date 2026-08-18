@@ -110,6 +110,42 @@ def test_wallet_history_plan_cli_exposes_queue_waterline(tmp_path, monkeypatch, 
     }
 
 
+def test_wallet_history_plan_cli_treats_bootstrap_warmup_as_non_error(
+    tmp_path, monkeypatch, capsys
+):
+    from pm_robot.cli import main
+
+    monkeypatch.setattr(
+        "pm_robot.orchestration.wallet_history_pipeline.plan_wallet_history_jobs",
+        lambda *args, **kwargs: SimpleNamespace(
+            targets_seen=0,
+            jobs_enqueued=0,
+            active_jobs=0,
+            max_active_jobs=9,
+            throttled=False,
+            status="warming_up",
+        ),
+    )
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "pm-robot",
+            "--env",
+            str(tmp_path / "missing.env"),
+            "--db",
+            str(tmp_path / "robot.sqlite"),
+            "wallet-history-plan",
+            "--limit",
+            "4",
+            "--max-active-jobs",
+            "9",
+        ],
+    )
+
+    assert main() == 0
+    assert json.loads(capsys.readouterr().out)["status"] == "warming_up"
+
+
 def test_wallet_history_worker_cli_accepts_archive_and_shard(tmp_path, monkeypatch, capsys):
     from pm_robot.cli import main
 

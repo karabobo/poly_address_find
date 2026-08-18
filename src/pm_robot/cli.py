@@ -23,6 +23,9 @@ DEFAULT_DEEP_REFRESH_SECONDS = 7 * 86_400
 DEFAULT_L6_VALIDATION_REFRESH_SECONDS = 14 * 86_400
 DEFAULT_GC_MIN_AGE_SECONDS = 30 * 86_400
 DEFAULT_GC_KEEP_PER_WALLET = 1
+DEFAULT_WAL_TRUNCATE_THRESHOLD_MB = 512
+DEFAULT_WAL_TRUNCATE_ALLOWED_HOURS = "0-6"
+DEFAULT_WAL_CHECKPOINT_TIMEOUT_MS = 250
 
 
 def run_rtds_activity_discovery(*_args, **_kwargs):
@@ -290,6 +293,16 @@ def main() -> int:
         default=DEFAULT_L6_VALIDATION_REFRESH_SECONDS,
     )
 
+    wallet_l6_reconcile_cmd = sub.add_parser(
+        "wallet-l6-reconcile",
+        help="Reclassify historical L6 labels against the current evidence contract",
+    )
+    wallet_l6_reconcile_cmd.add_argument(
+        "--db", dest="command_db", default=None, help="SQLite database path"
+    )
+    wallet_l6_reconcile_cmd.add_argument("--limit", type=int, default=500)
+    wallet_l6_reconcile_cmd.add_argument("--dry-run", action="store_true")
+
     wallet_l6_worker_cmd = sub.add_parser(
         "wallet-l6-worker",
         help="Run one bounded independent L6 validation worker",
@@ -331,6 +344,12 @@ def main() -> int:
 
     status_cmd = sub.add_parser("status", help="Print JSON status")
     status_cmd.add_argument("--db", dest="command_db", default=None, help="SQLite database path")
+
+    maintenance_preflight_cmd = sub.add_parser(
+        "maintenance-preflight",
+        help="Fast maintenance guard using only active screen/history pipeline_jobs",
+    )
+    maintenance_preflight_cmd.add_argument("--db", dest="command_db", default=None, help="SQLite database path")
 
     backup_cmd = sub.add_parser("backup", help="Create a SQLite backup")
     backup_cmd.add_argument("--db", dest="command_db", default=None, help="SQLite database path")
@@ -378,7 +397,24 @@ def main() -> int:
         "--wal-checkpoint",
         choices=("none", "passive", "truncate"),
         default="none",
-        help="Optionally checkpoint the SQLite WAL; truncate is explicit because it can wait on readers",
+        help="Optionally checkpoint the SQLite WAL; truncate is gated by size, readers, and allowed hours",
+    )
+    maintenance_cmd.add_argument(
+        "--wal-truncate-threshold-mb",
+        type=int,
+        default=DEFAULT_WAL_TRUNCATE_THRESHOLD_MB,
+        help="Minimum WAL size before truncate mode may run",
+    )
+    maintenance_cmd.add_argument(
+        "--wal-truncate-allowed-hours",
+        default=DEFAULT_WAL_TRUNCATE_ALLOWED_HOURS,
+        help="Local hours when WAL truncate may run, e.g. 0-6 or 23,0-5",
+    )
+    maintenance_cmd.add_argument(
+        "--wal-checkpoint-timeout-ms",
+        type=int,
+        default=DEFAULT_WAL_CHECKPOINT_TIMEOUT_MS,
+        help="Short busy timeout for WAL truncate probes",
     )
     maintenance_cmd.add_argument(
         "--reset-stale-jobs",
@@ -495,7 +531,7 @@ def main() -> int:
         finally:
             conn.close()
         print(json.dumps(summary.__dict__, ensure_ascii=False, indent=2))
-        return 0 if summary.status == "ok" else 1
+        return 0 if summary.status in {"ok", "warming_up"} else 1
     if args.command == "discover-activity":
         from pm_robot.orchestration.activity_discovery import discover_activity_candidates
 
@@ -553,7 +589,7 @@ def main() -> int:
         finally:
             conn.close()
         print(json.dumps(summary.__dict__, ensure_ascii=False, indent=2))
-        return 0 if summary.status == "ok" else 1
+        return 0 if summary.status in {"ok", "warming_up"} else 1
     if args.command == "wallet-screen-worker":
         from pm_robot.orchestration.wallet_screening import run_wallet_screen_worker
 
@@ -590,7 +626,7 @@ def main() -> int:
         finally:
             conn.close()
         print(json.dumps(summary.__dict__, ensure_ascii=False, indent=2))
-        return 0 if summary.status == "ok" else 1
+        return 0 if summary.status in {"ok", "warming_up"} else 1
     if args.command == "wallet-history-worker":
         from pm_robot.orchestration.wallet_history_pipeline import run_wallet_history_worker
 
@@ -690,6 +726,27 @@ def main() -> int:
             conn.close()
         print(json.dumps(summary.__dict__, ensure_ascii=False, indent=2))
         return 0 if summary.status == "ok" else 1
+    if args.command == "wallet-l6-reconcile":
+        from pm_robot.orchestration.l6_level_reconciliation import (
+            reconcile_historical_l6_levels,
+        )
+
+        conn = connect(db_path)
+        try:
+            run_migrations(conn)
+            summary = reconcile_historical_l6_levels(
+                conn,
+                limit=args.limit,
+                dry_run=args.dry_run,
+            )
+            if args.dry_run:
+                conn.rollback()
+            else:
+                conn.commit()
+        finally:
+            conn.close()
+        print(json.dumps(summary.__dict__, ensure_ascii=False, indent=2))
+        return 0 if summary.status == "ok" else 1
     if args.command == "wallet-l6-worker":
         from pm_robot.orchestration.l6_validation_pipeline import run_l6_validation_worker
 
@@ -751,6 +808,11 @@ def main() -> int:
 
         print(json.dumps(status(settings), ensure_ascii=False, indent=2))
         return 0
+    if args.command == "maintenance-preflight":
+        from pm_robot.ops import maintenance_preflight
+
+        print(json.dumps(maintenance_preflight(settings), ensure_ascii=False, indent=2))
+        return 0
     if args.command == "backup":
         from pm_robot.ops import backup_database
 
@@ -774,6 +836,9 @@ def main() -> int:
             dry_run=args.dry_run,
             vacuum=args.vacuum,
             wal_checkpoint=args.wal_checkpoint,
+            wal_truncate_threshold_mb=args.wal_truncate_threshold_mb,
+            wal_truncate_allowed_hours=args.wal_truncate_allowed_hours,
+            wal_checkpoint_timeout_ms=args.wal_checkpoint_timeout_ms,
             skip_cleanup=args.skip_cleanup,
             cleanup_batch_limit=args.cleanup_batch_limit,
             reset_stale_jobs=args.reset_stale_jobs,

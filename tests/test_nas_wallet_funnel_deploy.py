@@ -6,8 +6,15 @@ import subprocess
 import sys
 
 from pm_robot.ops import ACTIVE_RESEARCH_RUNTIME_EVENTS
+from pm_robot.research.current_elite import current_high_confidence_l6_manifest_checksum
 
 COMPOSE_PATH = Path("deploy/nas/docker-compose.yml")
+
+
+def _with_hcl6_checksum(manifest: dict) -> dict:
+    manifest = dict(manifest)
+    manifest["manifest_checksum"] = current_high_confidence_l6_manifest_checksum(manifest)
+    return manifest
 
 
 def _service_block(name: str) -> str:
@@ -109,6 +116,8 @@ def test_nas_rtds_loop_is_discovery_only():
 
     assert "discover-rtds" in loop
     assert "--min-trade-usdc" in loop
+    assert 'BATCH_SIZE="${PM_ROBOT_RTDS_BATCH_SIZE:-1000}"' in loop
+    assert 'FLUSH_INTERVAL="${PM_ROBOT_RTDS_FLUSH_INTERVAL:-60}"' in loop
     for obsolete in ("validation", "watch-min-score", "copyability", "paper"):
         assert obsolete not in loop.lower()
 
@@ -136,6 +145,7 @@ def test_nas_history_workers_are_sharded_direct_to_parquet():
 
 def test_nas_l6_worker_is_single_low_volume_network_worker():
     loop = Path("deploy/nas/l6-validation-loop.sh").read_text(encoding="utf-8")
+    handoff = Path("deploy/nas/l6-handoff-push.sh").read_text(encoding="utf-8")
     service = _service_block("l6-validation-worker")
 
     assert "/app/deploy/nas/l6-validation-loop.sh" in service
@@ -145,9 +155,245 @@ def test_nas_l6_worker_is_single_low_volume_network_worker():
     assert 'WORKER_LIMIT="${PM_ROBOT_WALLET_L6_WORKER_LIMIT:-1}"' in loop
     assert 'HEARTBEAT_NAME="loop_wallet_l6_validation_worker"' in loop
     assert "wallet-l6-worker" in loop
+    assert loop.index('runtime_heartbeat "$command_status"') < loop.index(
+        'if export_output="$(python -m pm_robot.cli'
+    )
     assert 'EXPORT_PATH="${PM_ROBOT_HIGH_CONFIDENCE_L6_EXPORT_PATH:-/app/data/exports/current_high_confidence_l6.json}"' in loop
     assert "export-high-confidence-l6" in loop
     assert '--out "$EXPORT_PATH"' in loop
+    assert "/app/deploy/nas/l6-handoff-push.sh" in loop
+    assert "./ssh:/app/ssh:ro" in service
+    assert 'PM_ROBOT_L6_HANDOFF_ENABLED:-0' in handoff
+    assert "BatchMode=yes" in handoff
+    assert "HostKeyAlgorithms=ssh-ed25519" in handoff
+    assert "StrictHostKeyChecking=yes" in handoff
+    assert "canonical_manifest_json" in handoff
+    assert "manifest_checksum(manifest)" in handoff
+    assert "L6 handoff manifest_checksum mismatch" in handoff
+    assert 'if handoff_status == "ready" and (' in handoff
+    assert 'L6 handoff must remain research-only' in handoff
+    assert 'PM_ROBOT_L6_HANDOFF_REFRESH_SECONDS:-21600' in handoff
+    assert 'pmrobot-l6-upload < "$MANIFEST_PATH"' in handoff
+
+
+def test_nas_image_installs_dependencies_before_copying_churned_source():
+    dockerfile = Path("deploy/nas/Dockerfile").read_text(encoding="utf-8")
+
+    assert dockerfile.index("RUN apt-get update") < dockerfile.index("COPY src /app/src")
+
+
+def test_nas_l6_handoff_pushes_changed_manifest_once(tmp_path):
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_ssh = fake_bin / "ssh"
+    fake_ssh.write_text(
+        "#!/bin/sh\n"
+        "printf '%s\\n' \"$*\" >> \"$SSH_ARGS\"\n"
+        "cat > \"$SSH_RECEIVED\"\n",
+        encoding="utf-8",
+    )
+    fake_ssh.chmod(0o755)
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(
+        json.dumps(
+            _with_hcl6_checksum(
+                {
+                    "schema_version": 3,
+                    "source": "pm_robot.current_high_confidence_l6",
+                    "handoff_status": "ready",
+                    "replace_active_set_allowed": True,
+                    "automatic_trading_activation": False,
+                    "research_only": True,
+                    "not_for_trading": True,
+                    "generated_at": 100,
+                    "source_version": "hcl6:v3:100:first",
+                    "manifest_checksum": "first",
+                    "candidates": [
+                        {
+                            "wallet": "0x1111111111111111111111111111111111111111",
+                            "research_score": 90,
+                            "evidence_updated_at": 90,
+                            "validated_at": 95,
+                        }
+                    ],
+                }
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    first_manifest_bytes = manifest.read_bytes()
+    key = tmp_path / "id_ed25519"
+    key.write_text("test-key\n", encoding="utf-8")
+    known_hosts = tmp_path / "known_hosts"
+    known_hosts.write_text("host ssh-ed25519 test\n", encoding="utf-8")
+    state = tmp_path / "state" / "handoff.sha256"
+    received = tmp_path / "received.json"
+    args_log = tmp_path / "ssh.args"
+    env = {
+        **os.environ,
+        "PATH": f"{fake_bin}:{os.environ.get('PATH', '')}",
+        "SSH_ARGS": str(args_log),
+        "SSH_RECEIVED": str(received),
+        "PM_ROBOT_L6_HANDOFF_ENABLED": "1",
+        "PM_ROBOT_HIGH_CONFIDENCE_L6_EXPORT_PATH": str(manifest),
+        "PM_ROBOT_L6_HANDOFF_STATE_PATH": str(state),
+        "PM_ROBOT_L6_HANDOFF_HOST": "203.0.113.10",
+        "PM_ROBOT_L6_HANDOFF_IDENTITY_FILE": str(key),
+        "PM_ROBOT_L6_HANDOFF_KNOWN_HOSTS_FILE": str(known_hosts),
+    }
+
+    first = subprocess.run(
+        ["sh", "deploy/nas/l6-handoff-push.sh"],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    updated = json.loads(manifest.read_text(encoding="utf-8"))
+    updated["generated_at"] = 200
+    updated["source_version"] = "hcl6:v3:200:second"
+    updated["manifest_checksum"] = current_high_confidence_l6_manifest_checksum(updated)
+    manifest.write_text(json.dumps(updated) + "\n", encoding="utf-8")
+    second = subprocess.run(
+        ["sh", "deploy/nas/l6-handoff-push.sh"],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    os.utime(state, (0, 0))
+    refreshed = subprocess.run(
+        ["sh", "deploy/nas/l6-handoff-push.sh"],
+        env={**env, "PM_ROBOT_L6_HANDOFF_REFRESH_SECONDS": "1"},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert first.returncode == 0, first.stderr
+    assert second.returncode == 0, second.stderr
+    assert refreshed.returncode == 0, refreshed.stderr
+    assert received.read_bytes() == manifest.read_bytes()
+    assert first_manifest_bytes != received.read_bytes()
+    assert len(args_log.read_text(encoding="utf-8").splitlines()) == 3
+    assert "StrictHostKeyChecking=yes" in args_log.read_text(encoding="utf-8")
+    assert len(state.read_text(encoding="utf-8").strip()) == 64
+
+
+def test_nas_l6_handoff_rejects_manifest_checksum_mismatch_before_ssh(tmp_path):
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_ssh = fake_bin / "ssh"
+    fake_ssh.write_text(
+        "#!/bin/sh\n"
+        "echo ssh-should-not-run >&2\n"
+        "exit 99\n",
+        encoding="utf-8",
+    )
+    fake_ssh.chmod(0o755)
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema_version": 3,
+                "source": "pm_robot.current_high_confidence_l6",
+                "handoff_status": "degraded",
+                "replace_active_set_allowed": False,
+                "automatic_trading_activation": False,
+                "research_only": True,
+                "not_for_trading": True,
+                "candidates": [],
+                "manifest_checksum": "0" * 64,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    key = tmp_path / "id_ed25519"
+    key.write_text("test-key\n", encoding="utf-8")
+    known_hosts = tmp_path / "known_hosts"
+    known_hosts.write_text("host ssh-ed25519 test\n", encoding="utf-8")
+
+    result = subprocess.run(
+        ["sh", "deploy/nas/l6-handoff-push.sh"],
+        env={
+            **os.environ,
+            "PATH": f"{fake_bin}:{os.environ.get('PATH', '')}",
+            "PM_ROBOT_L6_HANDOFF_ENABLED": "1",
+            "PM_ROBOT_HIGH_CONFIDENCE_L6_EXPORT_PATH": str(manifest),
+            "PM_ROBOT_L6_HANDOFF_STATE_PATH": str(tmp_path / "state" / "handoff.sha256"),
+            "PM_ROBOT_L6_HANDOFF_HOST": "203.0.113.10",
+            "PM_ROBOT_L6_HANDOFF_IDENTITY_FILE": str(key),
+            "PM_ROBOT_L6_HANDOFF_KNOWN_HOSTS_FILE": str(known_hosts),
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "L6 handoff manifest_checksum mismatch" in result.stderr
+    assert "ssh-should-not-run" not in result.stderr
+
+
+def test_nas_l6_handoff_pushes_degraded_manifest_to_revoke_execution_readiness(tmp_path):
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_ssh = fake_bin / "ssh"
+    fake_ssh.write_text(
+        "#!/bin/sh\n"
+        "cat > \"$SSH_RECEIVED\"\n",
+        encoding="utf-8",
+    )
+    fake_ssh.chmod(0o755)
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(
+        json.dumps(
+            _with_hcl6_checksum(
+                {
+                "schema_version": 3,
+                "source": "pm_robot.current_high_confidence_l6",
+                "handoff_status": "degraded",
+                "replace_active_set_allowed": False,
+                "automatic_trading_activation": False,
+                "research_only": True,
+                "not_for_trading": True,
+                "candidates": [],
+                }
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    key = tmp_path / "id_ed25519"
+    key.write_text("test-key\n", encoding="utf-8")
+    known_hosts = tmp_path / "known_hosts"
+    known_hosts.write_text("host ssh-ed25519 test\n", encoding="utf-8")
+    state = tmp_path / "state" / "handoff.sha256"
+    received = tmp_path / "received.json"
+
+    result = subprocess.run(
+        ["sh", "deploy/nas/l6-handoff-push.sh"],
+        env={
+            **os.environ,
+            "PATH": f"{fake_bin}:{os.environ.get('PATH', '')}",
+            "SSH_RECEIVED": str(received),
+            "PM_ROBOT_L6_HANDOFF_ENABLED": "1",
+            "PM_ROBOT_HIGH_CONFIDENCE_L6_EXPORT_PATH": str(manifest),
+            "PM_ROBOT_L6_HANDOFF_STATE_PATH": str(state),
+            "PM_ROBOT_L6_HANDOFF_HOST": "203.0.113.10",
+            "PM_ROBOT_L6_HANDOFF_IDENTITY_FILE": str(key),
+            "PM_ROBOT_L6_HANDOFF_KNOWN_HOSTS_FILE": str(known_hosts),
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert received.read_bytes() == manifest.read_bytes()
+    assert len(state.read_text(encoding="utf-8").strip()) == 64
 
 
 def test_nas_screen_loop_records_unique_planner_and_worker_heartbeats():
@@ -156,23 +402,40 @@ def test_nas_screen_loop_records_unique_planner_and_worker_heartbeats():
     assert 'HEARTBEAT_NAME="loop_wallet_screen_planner"' in loop
     assert 'HEARTBEAT_NAME="loop_wallet_screen_worker_${SHARD_INDEX}"' in loop
     assert '--name "$HEARTBEAT_NAME"' in loop
+    assert "run_control_locked" in loop
+    assert '"$0" __planner_once' in loop
+    assert "wallet screen worker" in loop
 
 
 def test_nas_env_documents_bounded_new_queue_defaults():
     env = Path("deploy/nas/env.example").read_text(encoding="utf-8")
 
     assert "PM_ROBOT_WALLET_SCREEN_MAX_ACTIVE_JOBS=72" in env
+    assert "PM_ROBOT_CONTROL_PLANE_LOCK_PATH=/app/data/pm_robot.control_plane.lock" in env
+    assert "PM_ROBOT_CONTROL_PLANE_LOCK_BUSY_INTERVAL=120" in env
     assert "PM_ROBOT_WALLET_HISTORY_PLANNER_LIMIT=12" in env
     assert "PM_ROBOT_WALLET_HISTORY_MAX_ACTIVE_JOBS=36" in env
+    assert "PM_ROBOT_RESEARCH_CONTROL_ACTIVE_MAX_INTERVAL=300" in env
+    assert "PM_ROBOT_RESEARCH_CONTROL_ACTIVE_BACKOFF_STEP=30" in env
+    assert "PM_ROBOT_WALLET_SCREEN_ACTIVE_MAX_INTERVAL=300" in env
+    assert "PM_ROBOT_WALLET_SCREEN_ACTIVE_BACKOFF_STEP=30" in env
     assert "PM_ROBOT_WALLET_HISTORY_WORKER_LIMIT=1" in env
     assert "PM_ROBOT_WALLET_HISTORY_START_STAGGER_SECONDS=7" in env
     assert "PM_ROBOT_WALLET_L6_MAX_ACTIVE_JOBS=10" in env
     assert "PM_ROBOT_WALLET_L6_WORKER_LIMIT=1" in env
     assert "PM_ROBOT_WALLET_L6_REFRESH_SECONDS=1209600" in env
     assert "PM_ROBOT_HIGH_CONFIDENCE_L6_EXPORT_PATH=/app/data/exports/current_high_confidence_l6.json" in env
+    assert "PM_ROBOT_L6_HANDOFF_ENABLED=0" in env
+    assert "PM_ROBOT_L6_HANDOFF_HOST=203.0.113.10" in env
+    assert "PM_ROBOT_L6_HANDOFF_IDENTITY_FILE=/app/ssh/polyhermes-l6-handoff-ed25519" in env
     assert "PM_ROBOT_WALLET_LEVEL_MIN_COHORT_SIZE=20" in env
     assert "PM_ROBOT_WALLET_LEVEL_TIMEOUT_MIN_COHORT_SIZE=5" in env
     assert "PM_ROBOT_WALLET_LEVEL_MAX_WAIT_SECONDS=3600" in env
+    assert "PM_ROBOT_RTDS_BATCH_SIZE=1000" in env
+    assert "PM_ROBOT_RTDS_FLUSH_INTERVAL=60" in env
+    assert "PM_ROBOT_RTDS_L0_BUFFER_TTL_SECONDS=86400" in env
+    assert "PM_ROBOT_RTDS_L0_BUFFER_MAX_WALLETS=50000" in env
+    assert "PM_ROBOT_RTDS_PERSIST_COOLDOWN_SECONDS=300" in env
     assert "PM_ROBOT_REQUIRED_RUNTIME_HEARTBEATS=" in env
     assert "loop_wallet_screen_planner" in env
     assert "loop_wallet_screen_worker_0" in env
@@ -196,7 +459,8 @@ def test_nas_helper_manages_only_discovery_funnel_services():
     assert "--remove-orphans" in helper
     assert "--no-build" in helper
     assert "validate_proxy_config" in helper
-    assert "PM_ROBOT_PROXY_PRIMARY_VPS_HOST is required" in helper
+    assert "PM_ROBOT_PROXY_PRIMARY_ENABLED" in helper
+    assert "At least one VPS proxy tunnel must be enabled" in helper
     assert "PM_ROBOT_PROXY_SECONDARY_VPS_HOST is required" in helper
     assert "VPS tunnel key is missing or unreadable" in helper
     assert "VPS known_hosts is missing or unreadable" in helper
@@ -235,8 +499,10 @@ def test_nas_proxy_failover_has_two_checked_tunnels_and_gates_network_workers():
         assert "PM_ROBOT_PROXY_LOCAL_HOST: 127.0.0.1" in tunnel
         assert "PM_ROBOT_VPS_KNOWN_HOSTS_PATH: /ssh/known_hosts" in tunnel
     assert "PM_ROBOT_PROXY_PRIMARY_VPS_HOST" in primary
+    assert "PM_ROBOT_PROXY_TUNNEL_ENABLED: ${PM_ROBOT_PROXY_PRIMARY_ENABLED:-0}" in primary
     assert "PM_ROBOT_PROXY_PRIMARY_TUNNEL_PORT" in primary
     assert "PM_ROBOT_PROXY_SECONDARY_VPS_HOST" in secondary
+    assert "PM_ROBOT_PROXY_TUNNEL_ENABLED: ${PM_ROBOT_PROXY_SECONDARY_ENABLED:-1}" in secondary
     assert "PM_ROBOT_PROXY_SECONDARY_TUNNEL_PORT" in secondary
     assert "image: haproxy:3.0-alpine" in proxy
     assert "./app/deploy/nas/haproxy-proxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro" in proxy
@@ -252,11 +518,14 @@ def test_nas_proxy_failover_has_two_checked_tunnels_and_gates_network_workers():
     assert "HostKeyAlgorithms=ssh-ed25519" in tunnel_script
     assert "StrictHostKeyChecking=yes" in tunnel_script
     assert 'UserKnownHostsFile="$KNOWN_HOSTS_PATH"' in tunnel_script
+    assert "VPS HTTP proxy tunnel is intentionally disabled" in tunnel_script
     for variable in (
         "PM_ROBOT_PROXY_PRIMARY_VPS_USER=",
+        "PM_ROBOT_PROXY_PRIMARY_ENABLED=0",
         "PM_ROBOT_PROXY_PRIMARY_VPS_HOST=",
         "PM_ROBOT_PROXY_PRIMARY_TUNNEL_PORT=18083",
         "PM_ROBOT_PROXY_SECONDARY_VPS_USER=",
+        "PM_ROBOT_PROXY_SECONDARY_ENABLED=1",
         "PM_ROBOT_PROXY_SECONDARY_VPS_HOST=",
         "PM_ROBOT_PROXY_SECONDARY_TUNNEL_PORT=18084",
     ):
@@ -303,26 +572,47 @@ def test_nas_maintenance_audits_before_parquet_gc_without_legacy_retention_cycle
     loop = Path("deploy/nas/maintenance-loop.sh").read_text(encoding="utf-8")
 
     assert "PM_ROBOT_ARCHIVE_DIR=/app/data/parquet" in env
-    assert "PM_ROBOT_WALLET_HISTORY_GC_ENABLED=1" in env
+    assert "PM_ROBOT_WALLET_HISTORY_GC_ENABLED=0" in env
     assert "PM_ROBOT_WALLET_HISTORY_GC_MIN_AGE_SECONDS=2592000" in env
     assert "PM_ROBOT_WALLET_HISTORY_GC_KEEP_PER_WALLET=1" in env
     assert "PM_ROBOT_WALLET_HISTORY_AUDIT_ENABLED=1" in env
     assert "PM_ROBOT_WALLET_HISTORY_AUDIT_VERIFY_CHECKSUMS=0" in env
     assert "PM_ROBOT_WALLET_HISTORY_AUDIT_ORPHAN_MIN_AGE_SECONDS=604800" in env
-    assert "PM_ROBOT_WALLET_HISTORY_AUDIT_DELETE_ORPHANS=1" in env
+    assert "PM_ROBOT_WALLET_HISTORY_AUDIT_DELETE_ORPHANS=0" in env
+    assert "PM_ROBOT_WALLET_HISTORY_HEAVY_ALLOWED_HOURS=2-5" in env
+    assert "PM_ROBOT_WALLET_HISTORY_HEAVY_INTERVAL_SECONDS=86400" in env
+    assert "PM_ROBOT_WALLET_HISTORY_HEAVY_ON_BACKLOG_ZERO=1" in env
+    assert "PM_ROBOT_WALLET_HISTORY_HEAVY_RUN_NOW=0" in env
+    assert "PM_ROBOT_CONTROL_PLANE_LOCK_STALE_SECONDS=21600" in env
     assert "wallet-history-audit" in loop
     assert "wallet-history-gc" in loop
     assert loop.index("wallet-history-audit") < loop.index("wallet-history-gc")
+    assert "should_run_heavy_history" in loop
+    assert "backlog_is_zero" in loop
+    assert 'LIGHT_INTERVAL_SECONDS="${PM_ROBOT_MAINTENANCE_LIGHT_INTERVAL_SECONDS:-21600}"' in loop
+    assert "maintenance_queue_state" in loop
+    assert "maintenance-preflight" in loop
+    assert " pm_robot.cli --env /app/.env status" not in loop
+    assert "wallet_history_screen_active" in loop
+    assert "--skip-cleanup" in loop
+    assert "--reset-stale-heartbeats" in loop
     assert "--execute" in loop
     assert "PM_ROBOT_MAINTENANCE_RUNTIME_HEARTBEAT_DAYS=30" in env
+    assert "PM_ROBOT_MAINTENANCE_LIGHT_CLEANUP_ENABLED=0" in env
     assert "PM_ROBOT_MAINTENANCE_L0_RETENTION_DAYS=7" in env
     assert "PM_ROBOT_MAINTENANCE_L0_CLEANUP_BATCH_LIMIT=20000" in env
     assert "--heartbeat-days" in loop
     assert "--l0-retention-days" in loop
     assert "--l0-cleanup-batch-limit" in loop
     assert "--pipeline-job-days" not in loop
+    assert "--wal-checkpoint \"$WAL_CHECKPOINT\"" in loop
+    assert "wal-truncate" not in loop.lower()
+    assert "vacuum" not in loop.lower()
+    assert "truncate" not in loop.lower()
     assert "retention-cycle" not in loop
     assert "PM_ROBOT_RETENTION_" not in env
+    assert "TRUNCATE" not in env
+    assert "VACUUM" not in env
 
 
 def test_nas_full_database_backup_is_explicit_cli_only():
@@ -377,6 +667,28 @@ if args and args[0] == "-c":
     raise SystemExit(0)
 with pathlib.Path(os.environ["CALL_LOG"]).open("a", encoding="utf-8") as handle:
     handle.write(json.dumps(args) + "\\n")
+known_commands = (
+    "wallet-level-select",
+    "wallet-history-plan",
+    "wallet-l6-plan",
+    "wallet-screen-plan",
+    "wallet-screen-worker",
+    "wallet-history-worker",
+    "wallet-l6-reconcile",
+    "wallet-l6-worker",
+    "export-high-confidence-l6",
+    "wallet-history-audit",
+    "wallet-history-gc",
+    "runtime-heartbeat",
+    "maintenance-preflight",
+    "maintenance",
+)
+command = next((name for name in known_commands if name in args), "")
+if command and os.environ.get("FAKE_FAIL_COMMAND") == command:
+    raise SystemExit(42)
+if command and os.environ.get("FAKE_INVALID_COMMAND") == command:
+    print(json.dumps({{"status": "bad", "jobs_enqueued": 0}}))
+    raise SystemExit(0)
 if "wallet-level-select" in args:
     print(json.dumps({{
         "cohorts_processed": 1,
@@ -389,11 +701,11 @@ if "wallet-level-select" in args:
 elif "wallet-history-plan" in args:
     print(json.dumps({{
         "targets_seen": 2,
-        "jobs_enqueued": 2,
+        "jobs_enqueued": int(os.environ.get("FAKE_HISTORY_JOBS", "2")),
         "active_jobs": 0,
         "max_active_jobs": 36,
         "throttled": False,
-        "status": "ok",
+        "status": os.environ.get("FAKE_HISTORY_STATUS", "ok"),
     }}))
 elif "wallet-l6-plan" in args:
     print(json.dumps({{
@@ -401,6 +713,20 @@ elif "wallet-l6-plan" in args:
         "jobs_enqueued": 1,
         "active_jobs": 0,
         "max_active_jobs": 10,
+        "status": "ok",
+    }}))
+elif "wallet-screen-plan" in args:
+    print(json.dumps({{
+        "jobs_enqueued": 2,
+        "active_jobs": 0,
+        "throttled": False,
+        "status": "ok",
+    }}))
+elif "wallet-screen-worker" in args:
+    print(json.dumps({{
+        "jobs_attempted": 1,
+        "jobs_succeeded": 1,
+        "jobs_failed": 0,
         "status": "ok",
     }}))
 elif "wallet-history-worker" in args:
@@ -414,6 +740,16 @@ elif "wallet-history-worker" in args:
         "rows_archived": 75,
         "status": "ok",
         "error": "",
+    }}))
+elif "wallet-l6-reconcile" in args:
+    print(json.dumps({{
+        "historical_l6": 4,
+        "current_valid_l6": 4,
+        "retained_l6": 4,
+        "reclassified_l5": 0,
+        "reclassified_l2": 0,
+        "dry_run": False,
+        "status": "ok",
     }}))
 elif "wallet-l6-worker" in args:
     print(json.dumps({{
@@ -435,7 +771,21 @@ elif "export-high-confidence-l6" in args:
         "automatic_trading_activation": False,
     }}))
 elif "maintenance" in args:
-    print(json.dumps({{"ok": True, "status": "ok"}}))
+    print(json.dumps({{
+        "ok": True,
+        "status": "ok",
+        "pipeline_queue_health": {{
+            "queued": int(os.environ.get("FAKE_MAINTENANCE_QUEUED", "1")),
+            "running": 0,
+            "wallet_history_screen_active": int(os.environ.get("FAKE_STATUS_HISTORY_SCREEN_ACTIVE", "0")),
+        }},
+    }}))
+elif "maintenance-preflight" in args:
+    print(json.dumps({{
+        "ok": True,
+        "wallet_history_screen_active": int(os.environ.get("FAKE_STATUS_HISTORY_SCREEN_ACTIVE", "0")),
+        "defer_maintenance": int(os.environ.get("FAKE_STATUS_HISTORY_SCREEN_ACTIVE", "0")) > 0,
+    }}))
 elif "wallet-history-audit" in args:
     print(json.dumps({{"status": "ok", "orphan_files_deleted": 0}}))
 elif "wallet-history-gc" in args:
@@ -457,7 +807,9 @@ else:
     return fake_bin, call_log
 
 
-def test_nas_control_loop_runs_selection_history_and_l6_plan_once(tmp_path):
+def test_nas_control_loop_does_not_starve_selection_and_l6_when_history_enqueues_work(
+    tmp_path,
+):
     fake_bin, call_log = _fake_runtime(tmp_path)
     env = {
         **os.environ,
@@ -477,11 +829,353 @@ def test_nas_control_loop_runs_selection_history_and_l6_plan_once(tmp_path):
     assert result.returncode == 0, result.stderr
     calls = [json.loads(line) for line in call_log.read_text(encoding="utf-8").splitlines()]
     commands = [args[args.index("--env") + 2] for args in calls if "--env" in args]
-    assert commands[:3] == ["wallet-level-select", "wallet-history-plan", "wallet-l6-plan"]
+    assert commands[:3] == ["wallet-history-plan", "wallet-level-select", "wallet-l6-plan"]
     control_loop = Path("deploy/nas/research-control-loop.sh").read_text(encoding="utf-8")
     assert "PM_ROBOT_WALLET_LEVEL_POLICY_VERSION" not in control_loop
     assert "--policy-version" not in control_loop
     assert "status=ok, work=4" in result.stdout
+
+
+def test_nas_control_loop_runs_history_selection_and_l6_when_history_is_empty(tmp_path):
+    fake_bin, call_log = _fake_runtime(tmp_path)
+    env = {
+        **os.environ,
+        "PATH": f"{fake_bin}:{os.environ.get('PATH', '')}",
+        "CALL_LOG": str(call_log),
+        "FAKE_HISTORY_JOBS": "0",
+        "PM_ROBOT_RESEARCH_CONTROL_RUN_ONCE": "1",
+    }
+
+    result = subprocess.run(
+        ["sh", "deploy/nas/research-control-loop.sh"],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    calls = [json.loads(line) for line in call_log.read_text(encoding="utf-8").splitlines()]
+    commands = [args[args.index("--env") + 2] for args in calls if "--env" in args]
+    assert commands[:3] == ["wallet-history-plan", "wallet-level-select", "wallet-l6-plan"]
+    assert "status=ok, work=2" in result.stdout
+
+
+def test_nas_control_loop_marks_invalid_history_partial_without_downstream(tmp_path):
+    fake_bin, call_log = _fake_runtime(tmp_path)
+    env = {
+        **os.environ,
+        "PATH": f"{fake_bin}:{os.environ.get('PATH', '')}",
+        "CALL_LOG": str(call_log),
+        "FAKE_INVALID_COMMAND": "wallet-history-plan",
+        "PM_ROBOT_RESEARCH_CONTROL_RUN_ONCE": "1",
+    }
+
+    result = subprocess.run(
+        ["sh", "deploy/nas/research-control-loop.sh"],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    calls = [json.loads(line) for line in call_log.read_text(encoding="utf-8").splitlines()]
+    commands = [args[args.index("--env") + 2] for args in calls if "--env" in args]
+    assert commands[:2] == ["wallet-history-plan", "runtime-heartbeat"]
+    assert "wallet-level-select" not in commands
+    assert "wallet-l6-plan" not in commands
+    assert "status=invalid, work=0" in result.stdout
+
+
+def test_nas_control_loop_marks_history_failure_partial_without_downstream(tmp_path):
+    fake_bin, call_log = _fake_runtime(tmp_path)
+    env = {
+        **os.environ,
+        "PATH": f"{fake_bin}:{os.environ.get('PATH', '')}",
+        "CALL_LOG": str(call_log),
+        "FAKE_FAIL_COMMAND": "wallet-history-plan",
+        "PM_ROBOT_RESEARCH_CONTROL_RUN_ONCE": "1",
+    }
+
+    result = subprocess.run(
+        ["sh", "deploy/nas/research-control-loop.sh"],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    calls = [json.loads(line) for line in call_log.read_text(encoding="utf-8").splitlines()]
+    commands = [args[args.index("--env") + 2] for args in calls if "--env" in args]
+    assert commands[:2] == ["wallet-history-plan", "runtime-heartbeat"]
+    assert "wallet-level-select" not in commands
+    assert "wallet-l6-plan" not in commands
+    assert "wallet history planning failed" in result.stderr
+    assert "status=partial, work=0" in result.stdout
+
+
+def test_nas_control_loop_treats_history_warmup_as_active_non_error_without_downstream(tmp_path):
+    fake_bin, call_log = _fake_runtime(tmp_path)
+    env = {
+        **os.environ,
+        "PATH": f"{fake_bin}:{os.environ.get('PATH', '')}",
+        "CALL_LOG": str(call_log),
+        "FAKE_HISTORY_JOBS": "0",
+        "FAKE_HISTORY_STATUS": "warming_up",
+        "PM_ROBOT_RESEARCH_CONTROL_RUN_ONCE": "1",
+    }
+
+    result = subprocess.run(
+        ["sh", "deploy/nas/research-control-loop.sh"],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    calls = [json.loads(line) for line in call_log.read_text(encoding="utf-8").splitlines()]
+    commands = [args[args.index("--env") + 2] for args in calls if "--env" in args]
+    assert commands[:2] == ["wallet-history-plan", "runtime-heartbeat"]
+    assert "wallet-level-select" not in commands
+    assert "wallet-l6-plan" not in commands
+    assert "wallet history planning failed" not in result.stderr
+    assert "status=warming, work=0" in result.stdout
+    assert "next cycle in 30s" in result.stdout
+
+
+def test_nas_control_loop_marks_downstream_invalid_partial(tmp_path):
+    fake_bin, call_log = _fake_runtime(tmp_path)
+    env = {
+        **os.environ,
+        "PATH": f"{fake_bin}:{os.environ.get('PATH', '')}",
+        "CALL_LOG": str(call_log),
+        "FAKE_HISTORY_JOBS": "0",
+        "FAKE_INVALID_COMMAND": "wallet-level-select",
+        "PM_ROBOT_RESEARCH_CONTROL_RUN_ONCE": "1",
+    }
+
+    result = subprocess.run(
+        ["sh", "deploy/nas/research-control-loop.sh"],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    calls = [json.loads(line) for line in call_log.read_text(encoding="utf-8").splitlines()]
+    commands = [args[args.index("--env") + 2] for args in calls if "--env" in args]
+    assert commands[:3] == ["wallet-history-plan", "wallet-level-select", "wallet-l6-plan"]
+    assert "status=invalid, work=0" in result.stdout
+
+
+def test_nas_control_lock_fallback_never_reclaims_a_live_owner(tmp_path):
+    fake_bin, call_log = _fake_runtime(tmp_path)
+    lock_path = tmp_path / "control.lock"
+    lock_dir = tmp_path / "control.lock.d"
+    lock_dir.mkdir()
+    owner_token = f"test-nas:{os.getpid()}:1"
+    (lock_dir / "owner").write_text(
+        f"token={owner_token}\npid={os.getpid()}\nstarted_at=1\nhost=test-nas\n",
+        encoding="utf-8",
+    )
+    env = {
+        **os.environ,
+        "PATH": f"{fake_bin}:{os.environ.get('PATH', '')}",
+        "CALL_LOG": str(call_log),
+        "FAKE_HISTORY_JOBS": "0",
+        "PM_ROBOT_RESEARCH_CONTROL_RUN_ONCE": "1",
+        "PM_ROBOT_CONTROL_PLANE_LOCK_PATH": str(lock_path),
+        "PM_ROBOT_CONTROL_PLANE_LOCK_DIR": str(lock_dir),
+        "PM_ROBOT_CONTROL_PLANE_LOCK_STALE_SECONDS": "0",
+        "PM_ROBOT_RUN_LOCKED_SCRIPT": str(tmp_path / "disabled-run-locked"),
+    }
+
+    result = subprocess.run(
+        ["sh", "deploy/nas/research-control-loop.sh"],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert lock_dir.is_dir()
+    assert (lock_dir / "owner").read_text(encoding="utf-8").startswith(
+        f"token={owner_token}\n"
+    )
+    assert "control-plane lock busy" in result.stderr
+    calls = [json.loads(line) for line in call_log.read_text(encoding="utf-8").splitlines()]
+    assert not any("wallet-history-plan" in args for args in calls)
+    assert not any("wallet-level-select" in args for args in calls)
+    assert not any("wallet-l6-plan" in args for args in calls)
+    assert all("runtime-heartbeat" in args for args in calls)
+
+
+def test_nas_control_loop_reports_busy_control_lock_as_healthy_skip(tmp_path):
+    fake_bin, call_log = _fake_runtime(tmp_path)
+    busy_lock = tmp_path / "busy.lock.d"
+    busy_lock.mkdir()
+    env = {
+        **os.environ,
+        "PATH": f"{fake_bin}:{os.environ.get('PATH', '')}",
+        "CALL_LOG": str(call_log),
+        "PM_ROBOT_RESEARCH_CONTROL_RUN_ONCE": "1",
+        "PM_ROBOT_CONTROL_PLANE_LOCK_DIR": str(busy_lock),
+        "PM_ROBOT_RUN_LOCKED_SCRIPT": str(tmp_path / "disabled-run-locked"),
+    }
+
+    result = subprocess.run(
+        ["sh", "deploy/nas/research-control-loop.sh"],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    calls = [json.loads(line) for line in call_log.read_text(encoding="utf-8").splitlines()]
+    assert not any("wallet-history-plan" in args for args in calls)
+    heartbeats = [args for args in calls if "runtime-heartbeat" in args]
+    assert len(heartbeats) == 2
+    for heartbeat in heartbeats:
+        assert heartbeat[heartbeat.index("--status") + 1] == "ok"
+        assert "control-plane lock is busy" in heartbeat[heartbeat.index("--error") + 1]
+    assert "status=skipped, work=0" in result.stdout
+
+
+def test_nas_control_lock_fallback_reclaims_only_stale_dead_owner(tmp_path):
+    fake_bin, call_log = _fake_runtime(tmp_path)
+    lock_path = tmp_path / "control.lock"
+    lock_dir = tmp_path / "control.lock.d"
+    lock_dir.mkdir()
+    (lock_dir / "owner").write_text(
+        "token=test-nas:99999999:1\npid=99999999\nstarted_at=1\nhost=test-nas\n",
+        encoding="utf-8",
+    )
+    env = {
+        **os.environ,
+        "PATH": f"{fake_bin}:{os.environ.get('PATH', '')}",
+        "CALL_LOG": str(call_log),
+        "FAKE_HISTORY_JOBS": "0",
+        "PM_ROBOT_RESEARCH_CONTROL_RUN_ONCE": "1",
+        "PM_ROBOT_CONTROL_PLANE_LOCK_PATH": str(lock_path),
+        "PM_ROBOT_CONTROL_PLANE_LOCK_DIR": str(lock_dir),
+        "PM_ROBOT_CONTROL_PLANE_LOCK_STALE_SECONDS": "1",
+        "PM_ROBOT_RUN_LOCKED_SCRIPT": str(tmp_path / "disabled-run-locked"),
+    }
+
+    result = subprocess.run(
+        ["sh", "deploy/nas/research-control-loop.sh"],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert not lock_dir.exists()
+    assert "control-plane stale lock reclaimed" in result.stderr
+    calls = [json.loads(line) for line in call_log.read_text(encoding="utf-8").splitlines()]
+    assert any("wallet-level-select" in args for args in calls)
+
+
+def test_nas_screen_planner_uses_control_lock_without_blocking_workers(tmp_path):
+    fake_bin, call_log = _fake_runtime(tmp_path)
+    env = {
+        **os.environ,
+        "PATH": f"{fake_bin}:{os.environ.get('PATH', '')}",
+        "CALL_LOG": str(call_log),
+        "PM_ROBOT_WALLET_SCREEN_RUN_ONCE": "1",
+        "PM_ROBOT_WALLET_SCREEN_MODE": "planner",
+    }
+
+    result = subprocess.run(
+        ["sh", "deploy/nas/wallet-screen-loop.sh"],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    calls = [json.loads(line) for line in call_log.read_text(encoding="utf-8").splitlines()]
+    commands = [args[args.index("--env") + 2] for args in calls if "--env" in args]
+    assert commands[0] == "wallet-screen-plan"
+    assert "status=ok, work=2" in result.stdout
+
+
+def test_nas_screen_planner_reports_busy_control_lock_as_healthy_skip(tmp_path):
+    fake_bin, call_log = _fake_runtime(tmp_path)
+    busy_lock = tmp_path / "busy.lock.d"
+    busy_lock.mkdir()
+    env = {
+        **os.environ,
+        "PATH": f"{fake_bin}:{os.environ.get('PATH', '')}",
+        "CALL_LOG": str(call_log),
+        "PM_ROBOT_WALLET_SCREEN_RUN_ONCE": "1",
+        "PM_ROBOT_WALLET_SCREEN_MODE": "planner",
+        "PM_ROBOT_CONTROL_PLANE_LOCK_DIR": str(busy_lock),
+        "PM_ROBOT_RUN_LOCKED_SCRIPT": str(tmp_path / "disabled-run-locked"),
+    }
+
+    result = subprocess.run(
+        ["sh", "deploy/nas/wallet-screen-loop.sh"],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    calls = [json.loads(line) for line in call_log.read_text(encoding="utf-8").splitlines()]
+    assert not any("wallet-screen-plan" in args for args in calls)
+    heartbeat = next(args for args in calls if "runtime-heartbeat" in args)
+    assert heartbeat[heartbeat.index("--status") + 1] == "ok"
+    assert "control-plane lock is busy" in heartbeat[heartbeat.index("--error") + 1]
+    assert "status=skipped, work=0" in result.stdout
+
+
+def test_nas_screen_worker_runs_without_control_lock_when_lock_is_busy(tmp_path):
+    fake_bin, call_log = _fake_runtime(tmp_path)
+    busy_lock = tmp_path / "busy.lock.d"
+    busy_lock.mkdir()
+    env = {
+        **os.environ,
+        "PATH": f"{fake_bin}:{os.environ.get('PATH', '')}",
+        "CALL_LOG": str(call_log),
+        "PM_ROBOT_WALLET_SCREEN_RUN_ONCE": "1",
+        "PM_ROBOT_WALLET_SCREEN_MODE": "worker",
+        "PM_ROBOT_WALLET_SCREEN_SHARD_INDEX": "1",
+        "PM_ROBOT_WALLET_SCREEN_ACTIVE_INTERVAL": "17",
+        "PM_ROBOT_CONTROL_PLANE_LOCK_DIR": str(busy_lock),
+    }
+
+    result = subprocess.run(
+        ["sh", "deploy/nas/wallet-screen-loop.sh"],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    calls = [json.loads(line) for line in call_log.read_text(encoding="utf-8").splitlines()]
+    worker_call = next(args for args in calls if "wallet-screen-worker" in args)
+    assert worker_call[worker_call.index("--shard-index") + 1] == "1"
+    assert "status=ok, work=1" in result.stdout
+    assert "next poll in 17s" in result.stdout
+
+
+def test_nas_screen_worker_does_not_apply_planner_backoff():
+    loop = Path("deploy/nas/wallet-screen-loop.sh").read_text(encoding="utf-8")
+    worker_branch = loop.split('echo "$(date -Iseconds) wallet screen worker', 1)[1]
+
+    assert 'sleep_interval="$ACTIVE_INTERVAL"' in worker_branch
+    assert 'active_sleep_interval "$active_streak"' not in worker_branch
 
 
 def test_nas_history_loop_runs_only_its_assigned_shard_once(tmp_path):
@@ -544,13 +1238,119 @@ def test_nas_l6_loop_runs_one_bounded_worker_once(tmp_path):
     assert "status=ok, jobs=1" in result.stdout
 
 
-def test_nas_maintenance_runs_artifact_audit_before_gc(tmp_path):
+def test_nas_maintenance_light_cycle_skips_history_audit_and_gc_by_default(tmp_path):
     fake_bin, call_log = _fake_runtime(tmp_path)
     report_path = tmp_path / "maintenance.json"
     env = {
         **os.environ,
         "PATH": f"{fake_bin}:{os.environ.get('PATH', '')}",
         "CALL_LOG": str(call_log),
+        "PM_ROBOT_MAINTENANCE_RUN_ONCE": "1",
+        "PM_ROBOT_MAINTENANCE_START_DELAY": "0",
+        "PM_ROBOT_MAINTENANCE_REPORT_PATH": str(report_path),
+        "PM_ROBOT_CONTROL_PLANE_LOCK_PATH": str(tmp_path / "control.lock"),
+        "PM_ROBOT_WALLET_HISTORY_HEAVY_ALLOWED_HOURS": "",
+    }
+
+    result = subprocess.run(
+        ["sh", "deploy/nas/maintenance-loop.sh"],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    calls = [json.loads(line) for line in call_log.read_text(encoding="utf-8").splitlines()]
+    commands = [args[args.index("--env") + 2] for args in calls if "--env" in args]
+    assert commands == ["maintenance-preflight", "maintenance", "runtime-heartbeat"]
+    maintenance_call = next(args for args in calls if "maintenance" in args)
+    assert "--skip-cleanup" in maintenance_call
+    assert report_path.is_file()
+    assert "maintenance light cleanup: skipped reason=disabled" in result.stdout
+    assert "wallet history heavy maintenance: skipped reason=not_due" in result.stdout
+    assert "maintenance loop: ok" in result.stdout
+
+
+def test_nas_maintenance_publishes_liveness_before_start_delay(tmp_path):
+    fake_bin, call_log = _fake_runtime(tmp_path)
+    fake_sleep = fake_bin / "sleep"
+    fake_sleep.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    fake_sleep.chmod(0o755)
+    report_path = tmp_path / "maintenance.json"
+    env = {
+        **os.environ,
+        "PATH": f"{fake_bin}:{os.environ.get('PATH', '')}",
+        "CALL_LOG": str(call_log),
+        "PM_ROBOT_MAINTENANCE_RUN_ONCE": "1",
+        "PM_ROBOT_MAINTENANCE_START_DELAY": "300",
+        "PM_ROBOT_MAINTENANCE_REPORT_PATH": str(report_path),
+        "PM_ROBOT_CONTROL_PLANE_LOCK_PATH": str(tmp_path / "control.lock"),
+        "PM_ROBOT_WALLET_HISTORY_HEAVY_ALLOWED_HOURS": "",
+    }
+
+    result = subprocess.run(
+        ["sh", "deploy/nas/maintenance-loop.sh"],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    calls = [json.loads(line) for line in call_log.read_text(encoding="utf-8").splitlines()]
+    commands = [args[args.index("--env") + 2] for args in calls if "--env" in args]
+    assert commands == [
+        "runtime-heartbeat",
+        "maintenance-preflight",
+        "maintenance",
+        "runtime-heartbeat",
+    ]
+    assert "maintenance loop: initial delay 300s" in result.stdout
+
+
+def test_nas_maintenance_reports_busy_control_lock_as_healthy_skip(tmp_path):
+    fake_bin, call_log = _fake_runtime(tmp_path)
+    busy_lock = tmp_path / "busy.lock.d"
+    busy_lock.mkdir()
+    env = {
+        **os.environ,
+        "PATH": f"{fake_bin}:{os.environ.get('PATH', '')}",
+        "CALL_LOG": str(call_log),
+        "PM_ROBOT_MAINTENANCE_RUN_ONCE": "1",
+        "PM_ROBOT_MAINTENANCE_START_DELAY": "0",
+        "PM_ROBOT_MAINTENANCE_REPORT_PATH": str(tmp_path / "maintenance.json"),
+        "PM_ROBOT_CONTROL_PLANE_LOCK_DIR": str(busy_lock),
+        "PM_ROBOT_RUN_LOCKED_SCRIPT": str(tmp_path / "disabled-run-locked"),
+    }
+
+    result = subprocess.run(
+        ["sh", "deploy/nas/maintenance-loop.sh"],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    calls = [json.loads(line) for line in call_log.read_text(encoding="utf-8").splitlines()]
+    assert not any("maintenance" in args and "maintenance-preflight" not in args for args in calls)
+    heartbeat = next(args for args in calls if "runtime-heartbeat" in args)
+    assert heartbeat[heartbeat.index("--status") + 1] == "ok"
+    assert "control-plane lock busy" in heartbeat[heartbeat.index("--error") + 1]
+    assert "control-plane busy; backing off" in result.stderr
+
+
+def test_nas_maintenance_runs_light_cycle_when_history_or_screen_queue_is_active(tmp_path):
+    fake_bin, call_log = _fake_runtime(tmp_path)
+    report_path = tmp_path / "maintenance.json"
+    lock_path = tmp_path / "control.lock"
+    env = {
+        **os.environ,
+        "PATH": f"{fake_bin}:{os.environ.get('PATH', '')}",
+        "CALL_LOG": str(call_log),
+        "FAKE_STATUS_HISTORY_SCREEN_ACTIVE": "3",
+        "PM_ROBOT_CONTROL_PLANE_LOCK_PATH": str(lock_path),
         "PM_ROBOT_MAINTENANCE_RUN_ONCE": "1",
         "PM_ROBOT_MAINTENANCE_START_DELAY": "0",
         "PM_ROBOT_MAINTENANCE_REPORT_PATH": str(report_path),
@@ -567,14 +1367,145 @@ def test_nas_maintenance_runs_artifact_audit_before_gc(tmp_path):
     assert result.returncode == 0, result.stderr
     calls = [json.loads(line) for line in call_log.read_text(encoding="utf-8").splitlines()]
     commands = [args[args.index("--env") + 2] for args in calls if "--env" in args]
-    assert commands[:3] == ["maintenance", "wallet-history-audit", "wallet-history-gc"]
+    assert commands == ["maintenance-preflight", "maintenance", "runtime-heartbeat"]
+    maintenance_call = next(args for args in calls if "maintenance" in args)
+    assert "--skip-cleanup" in maintenance_call
+    assert report_path.exists()
+    assert not lock_path.exists()
+    assert not lock_path.with_suffix(".lock.d").exists()
+    assert "maintenance light cleanup: skipped reason=disabled" in result.stdout
+    assert "wallet history heavy maintenance: skipped reason=active_queue" in result.stdout
+    assert "maintenance loop: ok" in result.stdout
+
+
+def test_nas_maintenance_uses_fast_recovery_between_full_light_cleanup_windows(tmp_path):
+    fake_bin, call_log = _fake_runtime(tmp_path)
+    report_path = tmp_path / "maintenance.json"
+    stamp_path = tmp_path / "light.last"
+    stamp_path.write_text("4102444800\n", encoding="utf-8")
+    env = {
+        **os.environ,
+        "PATH": f"{fake_bin}:{os.environ.get('PATH', '')}",
+        "CALL_LOG": str(call_log),
+        "PM_ROBOT_MAINTENANCE_RUN_ONCE": "1",
+        "PM_ROBOT_MAINTENANCE_START_DELAY": "0",
+        "PM_ROBOT_MAINTENANCE_REPORT_PATH": str(report_path),
+        "PM_ROBOT_MAINTENANCE_LIGHT_STAMP_PATH": str(stamp_path),
+        "PM_ROBOT_CONTROL_PLANE_LOCK_PATH": str(tmp_path / "control.lock"),
+        "PM_ROBOT_WALLET_HISTORY_HEAVY_ALLOWED_HOURS": "",
+    }
+
+    result = subprocess.run(
+        ["sh", "deploy/nas/maintenance-loop.sh"],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    calls = [json.loads(line) for line in call_log.read_text(encoding="utf-8").splitlines()]
+    commands = [args[args.index("--env") + 2] for args in calls if "--env" in args]
+    assert commands == ["maintenance-preflight", "maintenance", "runtime-heartbeat"]
+    maintenance_call = next(args for args in calls if "maintenance" in args)
+    assert "--skip-cleanup" in maintenance_call
+    assert "--reset-stale-jobs" in maintenance_call
+    assert "--reset-stale-heartbeats" in maintenance_call
+    assert "--l0-retention-days" not in maintenance_call
+    assert "--cleanup-batch-limit" not in maintenance_call
+    assert "maintenance light cleanup: skipped reason=disabled" in result.stdout
+    assert "maintenance loop: ok" in result.stdout
+
+
+def test_nas_maintenance_runs_artifact_audit_before_gc_when_forced(tmp_path):
+    fake_bin, call_log = _fake_runtime(tmp_path)
+    report_path = tmp_path / "maintenance.json"
+    env = {
+        **os.environ,
+        "PATH": f"{fake_bin}:{os.environ.get('PATH', '')}",
+        "CALL_LOG": str(call_log),
+        "PM_ROBOT_MAINTENANCE_RUN_ONCE": "1",
+        "PM_ROBOT_MAINTENANCE_START_DELAY": "0",
+        "PM_ROBOT_MAINTENANCE_REPORT_PATH": str(report_path),
+        "PM_ROBOT_CONTROL_PLANE_LOCK_PATH": str(tmp_path / "control.lock"),
+        "PM_ROBOT_WALLET_HISTORY_HEAVY_RUN_NOW": "1",
+        "PM_ROBOT_MAINTENANCE_LIGHT_CLEANUP_ENABLED": "1",
+        "PM_ROBOT_WALLET_HISTORY_GC_ENABLED": "1",
+        "PM_ROBOT_WALLET_HISTORY_AUDIT_DELETE_ORPHANS": "1",
+    }
+
+    result = subprocess.run(
+        ["sh", "deploy/nas/maintenance-loop.sh"],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    calls = [json.loads(line) for line in call_log.read_text(encoding="utf-8").splitlines()]
+    commands = [args[args.index("--env") + 2] for args in calls if "--env" in args]
+    assert commands[:4] == [
+        "maintenance-preflight",
+        "maintenance",
+        "wallet-history-audit",
+        "wallet-history-gc",
+    ]
     maintenance_call = next(args for args in calls if "maintenance" in args)
     assert "--heartbeat-days" in maintenance_call
     assert "--l0-retention-days" in maintenance_call
     assert "--l0-cleanup-batch-limit" in maintenance_call
     assert "--pipeline-job-days" not in maintenance_call
+    assert "--wal-checkpoint" in maintenance_call
+    assert maintenance_call[maintenance_call.index("--wal-checkpoint") + 1] == "passive"
     audit_call = next(args for args in calls if "wallet-history-audit" in args)
     assert "--delete-orphans" in audit_call
     assert "--verify-checksums" not in audit_call
     assert report_path.is_file()
     assert "maintenance loop: ok" in result.stdout
+
+
+def test_nas_maintenance_zero_backlog_reuses_stamp_and_skips_second_heavy_cycle(tmp_path):
+    fake_bin, call_log = _fake_runtime(tmp_path)
+    report_path = tmp_path / "maintenance.json"
+    stamp_path = tmp_path / "heavy.last"
+    env = {
+        **os.environ,
+        "PATH": f"{fake_bin}:{os.environ.get('PATH', '')}",
+        "CALL_LOG": str(call_log),
+        "FAKE_MAINTENANCE_QUEUED": "0",
+        "PM_ROBOT_MAINTENANCE_RUN_ONCE": "1",
+        "PM_ROBOT_MAINTENANCE_START_DELAY": "0",
+        "PM_ROBOT_MAINTENANCE_REPORT_PATH": str(report_path),
+        "PM_ROBOT_CONTROL_PLANE_LOCK_PATH": str(tmp_path / "control.lock"),
+        "PM_ROBOT_WALLET_HISTORY_HEAVY_ALLOWED_HOURS": "",
+        "PM_ROBOT_WALLET_HISTORY_HEAVY_INTERVAL_SECONDS": "86400",
+        "PM_ROBOT_WALLET_HISTORY_HEAVY_STAMP_PATH": str(stamp_path),
+    }
+
+    first = subprocess.run(
+        ["sh", "deploy/nas/maintenance-loop.sh"],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    second = subprocess.run(
+        ["sh", "deploy/nas/maintenance-loop.sh"],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert first.returncode == 0, first.stderr
+    assert second.returncode == 0, second.stderr
+    assert stamp_path.is_file()
+    assert "reason=backlog_zero" in first.stdout
+    assert "wallet history heavy maintenance: skipped reason=not_due" in second.stdout
+    calls = [json.loads(line) for line in call_log.read_text(encoding="utf-8").splitlines()]
+    commands = [args[args.index("--env") + 2] for args in calls if "--env" in args]
+    assert commands.count("maintenance-preflight") == 2
+    assert commands.count("maintenance") == 2
+    assert commands.count("wallet-history-audit") == 1
+    assert commands.count("wallet-history-gc") == 0

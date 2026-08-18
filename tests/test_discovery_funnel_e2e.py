@@ -10,7 +10,7 @@ from pm_robot.orchestration.wallet_screening import (
 )
 from pm_robot.orchestration.wallet_sightings import record_wallet_sighting
 from pm_robot.storage.db import connect, run_migrations
-from pm_robot.storage.wallet_levels import get_wallet_level
+from pm_robot.storage.wallet_levels import advance_wallet_level, get_wallet_level
 from pm_robot.wallet_levels import WalletLevel
 
 
@@ -27,7 +27,7 @@ class FakePublicClient:
                 "side": "BUY" if index % 2 == 0 else "SELL",
                 "price": 0.5,
                 "size": 40,
-                "usdcSize": 20,
+                "usdcSize": 100,
                 "transactionHash": f"0x{index:064x}",
             }
             for index in range(120)

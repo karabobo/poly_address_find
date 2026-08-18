@@ -1,9 +1,18 @@
+import random
+
 import pytest
 
+import pm_robot.orchestration.wallet_screening as wallet_screening_module
 from pm_robot.clients.http import HttpClientError
 from pm_robot.models import CandidateAddress
 from pm_robot.orchestration.wallet_screening import (
+    DEFAULT_PRIORITY_AGING_SECONDS,
     JOB_TYPE,
+    _candidate_bucket_sql,
+    _fair_targets,
+    _screen_job_action,
+    _screen_priority,
+    _wallet_shard,
     plan_wallet_screen_jobs,
     run_wallet_screen_worker,
 )
@@ -90,6 +99,74 @@ def _trades(*amounts: float) -> list[dict]:
     ]
 
 
+def _legacy_screen_candidates(conn, *, cutoff: int) -> list[dict]:
+    return [
+        dict(row)
+        for row in conn.execute(
+            """
+            SELECT
+                levels.wallet,
+                levels.last_seen_at,
+                COALESCE(observed.sources, '') AS sources,
+                COALESCE(observed.recent_usdc_total, 0) AS observed_usdc,
+                COALESCE(observed.recent_trade_count, 0) AS observed_trades,
+                COALESCE(screen.updated_at, 0) AS screen_updated_at
+            FROM wallet_levels AS levels
+            LEFT JOIN observed_wallets AS observed ON observed.wallet = levels.wallet
+            LEFT JOIN wallet_screen_summaries AS screen ON screen.wallet = levels.wallet
+            WHERE levels.level = 'l1'
+              AND levels.hard_risk_block = 0
+              AND NOT EXISTS (
+                    SELECT 1
+                    FROM pipeline_jobs AS active_job
+                    WHERE active_job.job_type = ?
+                      AND active_job.wallet = levels.wallet
+                      AND (
+                            active_job.status = 'running'
+                         OR (active_job.status = 'queued' AND active_job.attempts < active_job.max_attempts)
+                      )
+              )
+              AND (
+                    screen.wallet IS NULL
+                 OR screen.screen_complete = 0
+                 OR (
+                        screen.screen_qualified = 0
+                    AND screen.updated_at <= ?
+                    AND levels.last_seen_at > screen.updated_at
+                 )
+              )
+            ORDER BY levels.last_seen_at DESC, levels.wallet ASC
+            """,
+            (JOB_TYPE, cutoff),
+        ).fetchall()
+    ]
+
+
+def test_screen_worker_enables_priority_aging_when_claiming(tmp_path, monkeypatch):
+    conn = connect(tmp_path / "robot.sqlite")
+    captured = {}
+
+    def fake_claim(*_args, **kwargs):
+        captured.update(kwargs)
+        return None
+
+    try:
+        monkeypatch.setattr(wallet_screening_module, "claim_pipeline_job", fake_claim)
+        result = run_wallet_screen_worker(
+            conn,
+            shard_index=0,
+            shard_count=1,
+            limit=1,
+            worker_id="aging-test",
+            client=FakeScreenClient(trades=[]),
+        )
+
+        assert result.jobs_attempted == 0
+        assert captured["priority_aging_seconds"] == DEFAULT_PRIORITY_AGING_SECONDS
+    finally:
+        conn.close()
+
+
 def test_screen_planner_only_queues_l1_wallets_under_waterline(tmp_path):
     conn = connect(tmp_path / "robot.sqlite")
     l1_wallet = "0x" + "1" * 40
@@ -124,7 +201,7 @@ def test_screen_planner_only_queues_l1_wallets_under_waterline(tmp_path):
             {
                 "wallet": l1_wallet,
                 "job_type": JOB_TYPE,
-                "job_action": "screen_recent:v2",
+                    "job_action": "screen_recent:v3",
                 "job_scope": "sample",
                 "status": "queued",
             }
@@ -147,8 +224,15 @@ def test_screen_planner_admits_qualifying_l0_overflow_before_queueing(tmp_path):
                     "timestamp": 1_000,
                     "market": "market-a",
                     "side": "BUY",
-                    "usdc_size": 120,
-                }
+                    "usdc_size": 60,
+                },
+                {
+                    "transaction_hash": "0x" + "b" * 64,
+                    "timestamp": 1_001,
+                    "market": "market-b",
+                    "side": "BUY",
+                    "usdc_size": 60,
+                },
             ],
             verified_trade=True,
             allow_l1=False,
@@ -237,10 +321,10 @@ def test_screen_planner_waterline_ignores_exhausted_queued_jobs(tmp_path):
         conn.close()
 
 
-def test_screen_worker_promotes_to_l2_at_100_usdc_with_one_bounded_trade_call(tmp_path):
+def test_screen_worker_promotes_to_l2_after_a_material_bounded_recent_screen(tmp_path):
     conn = connect(tmp_path / "robot.sqlite")
     wallet = "0x" + "3" * 40
-    client = FakeScreenClient(trades=_trades(20, 30, 50))
+    client = FakeScreenClient(trades=_trades(100, 100, 100))
     try:
         run_migrations(conn)
         _seed_l1(conn, wallet)
@@ -264,7 +348,7 @@ def test_screen_worker_promotes_to_l2_at_100_usdc_with_one_bounded_trade_call(tm
             "SELECT * FROM wallet_screen_summaries WHERE wallet = ?", (wallet,)
         ).fetchone()
         assert screen["sample_trade_count"] == 3
-        assert screen["sample_volume_usdc"] == pytest.approx(100)
+        assert screen["sample_volume_usdc"] == pytest.approx(300)
         assert screen["sample_market_count"] == 3
         assert screen["screen_complete"] == 1
         assert screen["screen_qualified"] == 1
@@ -319,7 +403,7 @@ def test_screen_worker_keeps_sub_100_usdc_wallet_at_l1_without_retry_loop(tmp_pa
         assert dict(screen) == {
             "screen_complete": 1,
             "screen_qualified": 0,
-            "screen_reason": "sample_volume_below_100_usdc",
+            "screen_reason": "sample_volume_below_300_usdc",
         }
         assert client.calls == [("trades", wallet, 10, 0, False)]
         assert second_plan.jobs_enqueued == 0
@@ -386,8 +470,8 @@ def test_failed_screen_requeues_only_after_new_sighting_and_cooldown(tmp_path, m
             (wallet,),
         ).fetchall()
         assert [dict(row) for row in jobs] == [
-            {"job_action": "screen_recent:v2", "status": "done"},
-            {"job_action": "screen_recent:v2:refresh:2100", "status": "queued"},
+            {"job_action": "screen_recent:v3", "status": "done"},
+            {"job_action": "screen_recent:v3:refresh:2100", "status": "queued"},
         ]
     finally:
         conn.close()
@@ -436,6 +520,205 @@ def test_screen_planner_rotates_source_buckets_to_avoid_stream_starvation(tmp_pa
         assert _table_exists(conn, "pipeline_jobs")
     finally:
         conn.close()
+
+
+def test_screen_planner_bounded_bucket_queries_match_legacy_fair_targets(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    rng = random.Random(20260811)
+    sources = [
+        "stream",
+        "manual_watchlist",
+        "bitget_import",
+        "polydata",
+        "leaderboard",
+        "manual_watchlist,polydata",
+        "leaderboard,manual_watchlist",
+        "",
+    ]
+    now = 10_000
+    limit = 11
+    shard_count = 3
+    cutoff = now - 500
+    try:
+        run_migrations(conn)
+        for index in range(96):
+            wallet = "0x" + f"{index + 1:040x}"
+            record_wallet_sighting(
+                conn,
+                CandidateAddress(address=wallet, sources=rng.choice(sources)),
+                trusted_source=True,
+                now=1_000 + rng.randrange(0, 4_000),
+            )
+            if index % 17 == 0:
+                conn.execute(
+                    "UPDATE wallet_levels SET hard_risk_block = 1 WHERE wallet = ?",
+                    (wallet,),
+                )
+            if index % 19 == 0:
+                conn.execute(
+                    "UPDATE wallet_levels SET level = 'l2' WHERE wallet = ?",
+                    (wallet,),
+                )
+            if index % 13 == 0:
+                conn.execute(
+                    """
+                    INSERT INTO pipeline_jobs(
+                        job_type, wallet, job_action, job_scope, status,
+                        attempts, max_attempts, created_at, updated_at
+                    ) VALUES (?, ?, ?, 'sample', 'running', 1, 3, 8000, 8000)
+                    """,
+                    (JOB_TYPE, wallet, f"screen_recent:v2:active:{index}"),
+                )
+            if index % 7 == 0:
+                conn.execute(
+                    """
+                    INSERT INTO wallet_screen_summaries(
+                        wallet, screen_complete, screen_qualified, updated_at
+                    ) VALUES (?, 1, 1, ?)
+                    """,
+                    (wallet, now - 100),
+                )
+            elif index % 5 == 0:
+                conn.execute(
+                    """
+                    INSERT INTO wallet_screen_summaries(
+                        wallet, screen_complete, screen_qualified, updated_at
+                    ) VALUES (?, 1, 0, ?)
+                    """,
+                    (wallet, now - 700),
+                )
+            elif index % 11 == 0:
+                conn.execute(
+                    """
+                    INSERT INTO wallet_screen_summaries(
+                        wallet, screen_complete, screen_qualified, updated_at
+                    ) VALUES (?, 0, 0, ?)
+                    """,
+                    (wallet, now - 20),
+                )
+        conn.commit()
+
+        expected_targets = _fair_targets(
+            _legacy_screen_candidates(conn, cutoff=cutoff),
+            limit=limit,
+        )
+        summary = plan_wallet_screen_jobs(
+            conn,
+            limit=limit,
+            max_active_jobs=72,
+            shard_count=shard_count,
+            admission_limit=0,
+            rescreen_after_seconds=500,
+            now=now,
+        )
+        conn.commit()
+
+        planned_jobs = [
+            dict(row)
+            for row in conn.execute(
+                """
+                SELECT wallet, priority, shard, job_action
+                FROM pipeline_jobs
+                WHERE job_type = ?
+                  AND created_at = ?
+                ORDER BY job_id
+                """,
+                (JOB_TYPE, now),
+            ).fetchall()
+        ]
+    finally:
+        conn.close()
+
+    assert summary.targets_seen == len(expected_targets)
+    assert summary.jobs_enqueued == len(expected_targets)
+    assert planned_jobs == [
+        {
+            "wallet": str(target["wallet"]),
+            "priority": _screen_priority(target),
+            "shard": _wallet_shard(str(target["wallet"]), shard_count),
+            "job_action": _screen_job_action(target),
+        }
+        for target in expected_targets
+    ]
+
+
+def test_screen_planner_candidate_sql_is_bounded_and_not_correlated(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    statements = []
+    try:
+        run_migrations(conn)
+        for index in range(20):
+            record_wallet_sighting(
+                conn,
+                CandidateAddress(address="0x" + f"{index + 1:040x}", sources="stream"),
+                trusted_source=True,
+                now=1_000 + index,
+            )
+        conn.commit()
+
+        conn.set_trace_callback(statements.append)
+        plan_wallet_screen_jobs(
+            conn,
+            limit=3,
+            max_active_jobs=72,
+            shard_count=3,
+            admission_limit=0,
+            now=2_000,
+        )
+        conn.set_trace_callback(None)
+    finally:
+        conn.close()
+
+    candidate_statements = [
+        statement
+        for statement in statements
+        if "FROM wallet_levels AS levels" in statement
+        and "LEFT JOIN pipeline_jobs AS active_job" in statement
+    ]
+    assert len(candidate_statements) == 4
+    assert all(" LIMIT " in statement.upper() for statement in candidate_statements)
+    assert all("NOT EXISTS" not in statement.upper() for statement in candidate_statements)
+
+
+def test_screen_planner_candidate_query_uses_planner_indexes(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    try:
+        run_migrations(conn)
+        for index in range(200):
+            record_wallet_sighting(
+                conn,
+                CandidateAddress(
+                    address="0x" + f"{index + 1:040x}",
+                    sources="stream" if index % 3 else "manual_watchlist",
+                ),
+                trusted_source=True,
+                now=1_000 + index,
+            )
+        conn.execute(
+            """
+            INSERT INTO pipeline_jobs(
+                job_type, wallet, job_action, job_scope, status,
+                attempts, max_attempts, created_at, updated_at
+            ) VALUES (?, ?, 'screen_recent:v2:active', 'sample', 'queued', 0, 3, 1000, 1000)
+            """,
+            (JOB_TYPE, "0x" + f"{1:040x}"),
+        )
+        conn.commit()
+        plan_details = [
+            row[3]
+            for row in conn.execute(
+                f"EXPLAIN QUERY PLAN {_candidate_bucket_sql('stream')}",
+                (0, 5),
+            ).fetchall()
+        ]
+    finally:
+        conn.close()
+
+    assert any("idx_wallet_levels_l1_screen_plan" in detail for detail in plan_details)
+    assert any(
+        "idx_pipeline_jobs_wallet_screen_active_lookup" in detail
+        for detail in plan_details
+    )
 
 
 def test_screen_worker_defers_shared_cooldown_without_consuming_attempt(tmp_path, monkeypatch):

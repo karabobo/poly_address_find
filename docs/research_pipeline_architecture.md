@@ -25,7 +25,8 @@ flowchart LR
     I -->|evidence floor + relative rank| J["L4 strong"]
     J -->|positive official lifetime PnL + relative rank| K["L5 score candidate"]
     K -->|current deep evidence| L["independent profit, persistence, anomaly validation"]
-    L -->|pass only| M["L6 independently verified"]
+    L -->|quality pass| M["L6 independently verified"]
+    M --> N["activity state + execution profile"]
     L -->|warning or fail| K
 ```
 
@@ -44,20 +45,24 @@ preventing very thin histories from promoting each other.
 | L3 | Light evidence passed the L3 floor and relative-rank selection | Fetch deep history | Medium |
 | L4 | Deep evidence passed the L4 floor and relative-rank selection | Reuse and refresh deep evidence | Medium |
 | L5 | Deep evidence has positive official lifetime PnL and passed relative-rank selection | Wait for or refresh independent validation | Medium |
-| L6 | An L5 evidence version passed independent profit, persistence, and anomaly validation | Revalidate independently every 14 days or after evidence changes | Medium |
+| L6 | Current L5 evidence passed independent profit-quality validation | Revalidate every 14 days or after evidence changes; classify activity and execution separately | Medium |
 
-Levels are monotonic research achievements. They do not bounce downward because of one short-term
-sample. L5 remains the highest result produced by the scoring and relative-ranking system. A current
+L0-L5 promotions are monotonic within one evidence cycle; L6 is a current verification state rather
+than a permanent trophy. L5 remains the highest result produced by the scoring and relative-ranking system. A current
 score candidate is stricter than merely having `level = l5` or `level = l6`: health and UI exposure also
 require a recent deep summary, the current summary methodology, no hard risk block, and a selected L5
 decision for the same active artifact under the current selection policy. A latest independent
-validation `fail` for that same artifact removes it from the current score-candidate view without
-rewriting its historical level. A warning remains visible as a score candidate but is not verified.
+validation `fail` for that same artifact removes it from L6. A warning remains visible as an L5 score
+candidate but is not verified.
 
-L6 does not rescore or replace L5. It is a separate verification achievement. A currently verified
-L6 additionally requires a recent passing validation for the same active deep artifact. Warning or
-fail leaves an L5 wallet at L5. A historical L6 is not automatically demoted, but it is no longer
-presented as currently verified when its validation is stale or its deep artifact has changed.
+L6 does not rescore or replace L5. It is a separate current quality-verification state. A current L6
+requires a recent passing validation for the same active deep artifact plus the profit-quality
+overlay. A warning, fail, or quality contradiction reclassifies it to L5. Activity freshness and
+replication difficulty are reported as `activity_state`, `execution_profile`, and `execution_flags`;
+they never change the quality level by themselves. A historical L6 with no current L5
+selection chain is reclassified to L2 so it must earn fresh light/deep evidence and ranking again.
+Every reclassification writes `wallet_level_events`; source sightings, summaries, and raw evidence
+are preserved.
 
 ## Admission and Validation
 
@@ -95,9 +100,10 @@ Ingress never fetches full history and never scores a wallet.
 
 ### L1 recent screen
 
-`orchestration/wallet_screening.py` fetches at most 10 recent public trades. The only promotion gate
-is total sampled volume of at least 100 USDC. A failed screen is not retried continuously. It may be
-screened again after seven days only when a newer source sighting exists.
+`orchestration/wallet_screening.py` fetches at most 10 recent public trades. Promotion requires the
+v3 resource gate: at least 3 sampled trades, 2 markets, 300 USDC total sampled volume, and a 100 USDC
+largest sampled trade. A failed screen is not retried continuously. It may be screened again after seven
+days only when a newer source sighting exists.
 
 This gate is cheap by design. It removes dormant and dust-only addresses without requiring market
 diversity, ROI, strategy labels, or long history before the project knows whether the wallet is
@@ -185,8 +191,18 @@ bounded 90-day evidence set plus official WEEK/MONTH/ALL leaderboard cross-check
 Incomplete source pagination, thin history, missing official cross-checks, weak official profit
 intensity, or weak timestamp coverage produces `warning`, not a false failure. Activity anomalies
 such as mechanical timing, extreme bursts, or high turnover with
-little net flow are retained as visible flags. Only a complete `pass` advances L5 to L6. This module
-does not use paper results, copyability, maker/taker roles, or any execution signal.
+little net flow are retained as visible execution flags. A base `pass` is necessary but not sufficient
+for L6: the same current artifact must also pass the quality overlay for official PnL, profit
+intensity, recent WEEK/MONTH evidence, drawdown, and profit/volume concentration. The overlay separates
+hard contradictions from preferred signals. Missing recent official evidence, fewer than six active
+weeks, less than 500 USDC official lifetime PnL, less than 0.2% profit intensity, a severe recent loss,
+or extreme drawdown/concentration blocks L6. Otherwise the wallet must pass at least six of eight
+preferred signals covering persistence, profit intensity, recent direction, drawdown, and
+diversification. A small negative week or month therefore cannot erase a strong long-term record by
+itself. Recent activity, fast-market share, trade rate, burst shape, and strategy shape classify
+replication difficulty but do not reject an otherwise high-quality wallet. Failed quality refreshes
+reclassify an existing L6 to L5. This module does not use paper results, maker/taker roles, or
+downstream order outcomes.
 
 ## Queue Contract
 
@@ -216,6 +232,7 @@ SQLite stores small mutable state:
 
 - `observed_wallets`: provenance and the compact recent sample;
 - `candidate_wallets`: admitted-wallet metadata retained for database compatibility;
+  `status` is categorical while discovery time is stored in timestamp columns and provenance events;
 - `wallet_levels` and `wallet_level_events`: canonical level and audit trail;
 - `wallet_screen_summaries`: L1 screen result;
 - `wallet_pnl_summaries`: official lifetime PnL/volume plus bounded recent estimate, coverage,

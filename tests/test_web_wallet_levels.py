@@ -5,13 +5,16 @@ from pathlib import Path
 from pm_robot.config import RobotSettings
 from pm_robot.orchestration.wallet_level_selection import SELECTION_POLICY_VERSION
 from pm_robot.research.l6_validation import L6_VALIDATION_POLICY_VERSION
+from pm_robot.research.current_elite import current_high_confidence_l6_wallets
 from pm_robot.research.wallet_history_summary import METHODOLOGY_VERSION
-from pm_robot.storage.db import connect, run_migrations
+from pm_robot.storage.db import MIGRATIONS_DIR, connect, run_migrations
 from pm_robot.web import (
+    _recent_level_changes,
     _render_dashboard,
     _render_wallet_detail,
     _wallet_research_schema_ready,
     dashboard_data,
+    discovery_data,
     wallet_detail_data,
     wallet_table_rows,
 )
@@ -36,6 +39,51 @@ def _settings(tmp_path: Path) -> RobotSettings:
         db_path=tmp_path / "pm_robot.sqlite",
         archive_dir=tmp_path / "parquet",
     )
+
+
+def _apply_migrations_through(conn, last_version: int) -> None:
+    conn.execute(
+        "CREATE TABLE schema_migrations ("
+        "version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL)"
+    )
+    conn.commit()
+    for path in sorted(MIGRATIONS_DIR.glob("*.sql")):
+        version_text = path.name.split("_", 1)[0]
+        if not version_text.isdigit():
+            continue
+        version = int(version_text)
+        if version > last_version:
+            continue
+        conn.executescript(path.read_text(encoding="utf-8"))
+        conn.execute(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (?, 1000)",
+            (version,),
+        )
+        conn.commit()
+
+
+def test_recent_level_changes_use_the_global_time_index(tmp_path):
+    conn = connect(tmp_path / "recent-level-events.sqlite")
+    try:
+        run_migrations(conn)
+        plan = [
+            str(row[3])
+            for row in conn.execute(
+                """
+                EXPLAIN QUERY PLAN
+                SELECT wallet, from_level, to_level, reason, policy_version, created_at
+                FROM wallet_level_events
+                ORDER BY created_at DESC, event_id DESC
+                LIMIT 12
+                """
+            )
+        ]
+
+        assert any("idx_wallet_level_events_recent" in detail for detail in plan)
+        assert not any("USE TEMP B-TREE" in detail for detail in plan)
+        assert _recent_level_changes(conn) == []
+    finally:
+        conn.close()
 
 
 def _seed_wallet_research_data(settings: RobotSettings) -> None:
@@ -137,7 +185,13 @@ def _seed_wallet_research_data(settings: RobotSettings) -> None:
         )
         for job_type, job_action, job_scope, status, completed_at in (
             ("wallet_recent_screen", "screen_recent:v2", "sample", "done", now - 200),
-            ("wallet_history_collect", "collect_deep_history:v1", "deep", "done", now - 140),
+            (
+                "wallet_history_collect",
+                "collect_deep_history:v1",
+                "deep",
+                "terminal_failed",
+                now - 140,
+            ),
             ("copyability_evidence", "legacy", "legacy", "queued", None),
         ):
             conn.execute(
@@ -186,6 +240,7 @@ def test_dashboard_uses_level_truth_and_ignores_legacy_stage_data(tmp_path, monk
             "level": "l4",
             "level_reason": "relative_rank_selected",
             "current_elite": False,
+            "current_valid_l6": False,
             "verified_l6": False,
         "sources": "rtds,polymarket_leaderboard",
         "total_estimated_pnl_usdc": 900.0,
@@ -199,6 +254,9 @@ def test_dashboard_uses_level_truth_and_ignores_legacy_stage_data(tmp_path, monk
         "activity_count": 850,
         "distinct_markets": 31,
         "research_score": 87.4,
+        "diagnostic_score": 87.4,
+        "forward_selection_score": None,
+        "current_score_candidate": False,
         "strategy_tags": ["multi_market", "high_frequency"],
         "risk_flags": ["profit_concentration_watch"],
         "rank_in_cohort": 2,
@@ -215,7 +273,7 @@ def test_dashboard_uses_level_truth_and_ignores_legacy_stage_data(tmp_path, monk
         "wallet_l6_validate",
     }
     assert queues["wallet_recent_screen"]["status_counts"]["done"] == 1
-    assert queues["wallet_history_collect"]["status_counts"]["done"] == 1
+    assert queues["wallet_history_collect"]["status_counts"]["terminal_failed"] == 1
     assert all(term not in serialized for term in FORBIDDEN_SURFACE_TERMS)
     assert all(term not in html for term in FORBIDDEN_SURFACE_TERMS)
     assert str(tmp_path).lower() not in serialized
@@ -235,6 +293,64 @@ def test_wallet_research_schema_requires_official_pnl_columns(tmp_path):
         assert _wallet_research_schema_ready(conn) is False
     finally:
         conn.close()
+
+
+def test_wallet_research_schema_requires_0073_forward_selection_columns(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    try:
+        run_migrations(conn)
+        assert _wallet_research_schema_ready(conn) is True
+
+        conn.execute(
+            "ALTER TABLE wallet_history_summaries RENAME TO wallet_history_summaries_current"
+        )
+        conn.execute(
+            """
+            CREATE TABLE wallet_history_summaries(
+                wallet TEXT PRIMARY KEY,
+                diagnostic_score REAL,
+                forward_selection_score REAL
+            )
+            """
+        )
+        assert _wallet_research_schema_ready(conn) is False
+    finally:
+        conn.close()
+
+
+def test_0072_wallet_research_schema_is_not_ready_for_0073_web_queries(tmp_path):
+    settings = _settings(tmp_path)
+    conn = connect(settings.db_path)
+    try:
+        _apply_migrations_through(conn, 72)
+        conn.execute(
+            """
+            INSERT INTO pipeline_jobs(
+                job_type, wallet, job_action, job_scope, priority, shard,
+                status, attempts, max_attempts, created_at, updated_at,
+                completed_at, terminal_reason, terminal_at, terminal_policy_version
+            ) VALUES ('wallet_history_collect', ?, 'collect_deep_history:v1',
+                      'deep', 10, 0, 'terminal_failed', 3, 3, 100, 200,
+                      200, 'wallet_history_data_quality', 200, 'test')
+            """,
+            (WALLET,),
+        )
+        conn.commit()
+        assert _wallet_research_schema_ready(conn) is False
+    finally:
+        conn.close()
+
+    dashboard = dashboard_data(settings)
+    detail = wallet_detail_data(settings, WALLET)
+
+    assert dashboard["schema_ready"] is False
+    assert dashboard["wallet_count"] == 0
+    assert dashboard["high_level_wallets"] == []
+    assert dashboard["selection_summary"] == []
+    assert dashboard["queues"][1]["job_type"] == "wallet_history_collect"
+    assert dashboard["queues"][1]["status_counts"] == {"terminal_failed": 1}
+    assert wallet_table_rows(settings, level="l4", query=WALLET, limit=10) == []
+    assert detail["found"] is False
 
 
 def test_dashboard_hides_stale_l5_but_directory_marks_historical_and_current_elite(tmp_path):
@@ -266,10 +382,12 @@ def test_dashboard_hides_stale_l5_but_directory_marks_historical_and_current_eli
                 INSERT INTO wallet_history_summaries(
                     wallet, artifact_id, history_depth, activity_count,
                     distinct_markets, total_volume_usdc, strategy_tags_json,
-                    risk_flags_json, research_score, score_components_json,
-                    methodology_version, computed_at, updated_at
+                    risk_flags_json, research_score, diagnostic_score,
+                    forward_selection_score, score_components_json,
+                    forward_score_components_json, methodology_version,
+                    computed_at, updated_at
                 ) VALUES (?, ?, 'deep', 200, 10, 5000, '[]', '[]', 80,
-                          '{}', ?, ?, ?)
+                          80, 80, '{}', '{}', ?, ?, ?)
                 """,
                 (wallet, artifact_id, METHODOLOGY_VERSION, now - 40, now - 40),
             )
@@ -278,9 +396,10 @@ def test_dashboard_hides_stale_l5_but_directory_marks_historical_and_current_eli
                 INSERT INTO wallet_level_selections(
                     wallet, target_level, evidence_artifact_id, policy_version,
                     selected, rank_in_cohort, cohort_size, source_bucket,
-                    strategy_bucket, reason, decided_at, updated_at, research_score
+                    strategy_bucket, reason, decided_at, updated_at,
+                    research_score, forward_selection_score, score_status
                 ) VALUES (?, 'l5', ?, ?, ?, 1, 20, 'stream', 'general',
-                          'relative_rank_selected', ?, ?, 80)
+                          'relative_rank_selected', ?, ?, 80, 80, 'valid')
                 """,
                 (wallet, artifact_id, SELECTION_POLICY_VERSION, selected, now - 30, now - 30),
             )
@@ -356,24 +475,27 @@ def test_web_exposes_only_fresh_independently_verified_l6(tmp_path):
         )
         conn.execute(
             """
-            INSERT INTO wallet_history_summaries(
-                wallet, artifact_id, history_depth, activity_count,
-                distinct_markets, total_volume_usdc, strategy_tags_json,
-                risk_flags_json, research_score, score_components_json,
-                methodology_version, computed_at, updated_at
-            ) VALUES (?, ?, 'deep', 300, 12, 9000, '[]', '[]', 88,
-                      '{}', ?, ?, ?)
+                INSERT INTO wallet_history_summaries(
+                    wallet, artifact_id, history_depth, activity_count,
+                    distinct_markets, total_volume_usdc, strategy_tags_json,
+                    risk_flags_json, research_score, diagnostic_score,
+                    forward_selection_score, score_components_json,
+                    forward_score_components_json, methodology_version,
+                    computed_at, updated_at
+                ) VALUES (?, ?, 'deep', 300, 12, 9000, '[]', '[]', 88,
+                          88, 88, '{}', '{}', ?, ?, ?)
             """,
             (wallet, artifact_id, METHODOLOGY_VERSION, now - 30, now - 30),
         )
         conn.execute(
             """
-            INSERT INTO wallet_level_selections(
-                wallet, target_level, evidence_artifact_id, policy_version,
-                selected, rank_in_cohort, cohort_size, source_bucket,
-                strategy_bucket, reason, decided_at, updated_at, research_score
-            ) VALUES (?, 'l5', ?, ?, 1, 1, 20, 'leaderboard', 'general',
-                      'relative_rank_selected', ?, ?, 88)
+                INSERT INTO wallet_level_selections(
+                    wallet, target_level, evidence_artifact_id, policy_version,
+                    selected, rank_in_cohort, cohort_size, source_bucket,
+                    strategy_bucket, reason, decided_at, updated_at,
+                    research_score, forward_selection_score, score_status
+                ) VALUES (?, 'l5', ?, ?, 1, 1, 20, 'leaderboard', 'general',
+                          'relative_rank_selected', ?, ?, 88, 88, 'valid')
             """,
             (wallet, artifact_id, SELECTION_POLICY_VERSION, now - 20, now - 20),
         )
@@ -385,12 +507,16 @@ def test_web_exposes_only_fresh_independently_verified_l6(tmp_path):
                 closed_position_count, activity_count, active_weeks,
                 positive_week_ratio, realized_pnl_usdc,
                 recent_realized_pnl_usdc, top_market_profit_share,
+                max_drawdown_ratio, top_day_profit_share,
                 official_all_pnl_usdc, official_all_volume_usdc,
-                official_profit_intensity,
-                validated_at, updated_at
+                official_profit_intensity, official_month_pnl_usdc,
+                official_week_pnl_usdc,
+                evidence_metrics_json, validated_at, updated_at
             ) VALUES ('validation-l6-current', ?, ?, ?, 'pass',
                       'independent_validation_passed', ?, ?, 18, 240, 8,
-                      0.75, 320, 80, 0.25, 200000, 8000000, 0.025, ?, ?)
+                      0.75, 320, 80, 0.25, 0.2, 0.2,
+                      200000, 8000000, 0.025, 100, 10,
+                      '{"recent_active_days": 12, "last_trade_age_seconds": 60, "max_same_signal_trades_10_seconds": 2}', ?, ?)
             """,
             (wallet, artifact_id, L6_VALIDATION_POLICY_VERSION,
              now - 90 * 86_400, now, now - 10, now - 10),
@@ -424,12 +550,31 @@ def test_web_exposes_only_fresh_independently_verified_l6(tmp_path):
     detail = wallet_detail_data(settings, wallet)
     html = _render_wallet_detail(settings, wallet)
     directory = wallet_table_rows(settings, level="l6", limit=10)
+    discovery = discovery_data(settings, level="l6", limit=10)
+    conn = connect(settings.db_path)
+    try:
+        high_confidence_wallets = current_high_confidence_l6_wallets(conn)
+    finally:
+        conn.close()
 
     assert data["verified_l6_wallet_count"] == 1
+    assert data["current_valid_l6_wallet_count"] == 1
     assert data["high_level_wallets"][0]["wallet"] == wallet
+    assert data["high_level_wallets"][0]["current_valid_l6"] is True
     assert data["high_level_wallets"][0]["verified_l6"] is True
     assert [row["wallet"] for row in directory] == [wallet, historical_wallet]
+    assert {row["wallet"]: row["current_valid_l6"] for row in directory} == {
+        wallet: True,
+        historical_wallet: False,
+    }
+    assert discovery["current_valid_l6_wallet_count"] == 1
+    assert {row["wallet"]: row["current_valid_l6"] for row in discovery["wallets"]} == {
+        wallet: True,
+        historical_wallet: False,
+    }
+    assert high_confidence_wallets == {wallet}
     assert detail["level"]["verified_l6"] is True
+    assert detail["level"]["current_valid_l6"] is True
     assert detail["l6_validations"][0]["decision"] == "pass"
     assert "L6 独立复核" in html
     assert "官方全历史 PnL" in html

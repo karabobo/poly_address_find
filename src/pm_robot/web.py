@@ -21,8 +21,8 @@ from urllib.parse import parse_qs, urlencode, urlparse
 
 from pm_robot.config import RobotSettings
 from pm_robot.research.current_elite import (
-    current_elite_wallets,
-    current_verified_l6_wallets,
+    current_score_candidate_wallets,
+    current_valid_l6_wallets,
 )
 from pm_robot.storage.db import connect_readonly
 
@@ -50,7 +50,15 @@ QUEUE_DEFINITIONS = (
     ("wallet_l6_validate", "L6 独立复核队列", "只复核少量当前 L5/L6 钱包"),
 )
 ACTIVE_JOB_STATUSES = ("queued", "running")
-JOB_STATUS_ORDER = ("queued", "running", "done", "failed", "cancelled", "superseded")
+JOB_STATUS_ORDER = (
+    "queued",
+    "running",
+    "done",
+    "failed",
+    "terminal_failed",
+    "cancelled",
+    "superseded",
+)
 
 _DASHBOARD_CACHE_LOCK = threading.Lock()
 _DASHBOARD_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
@@ -89,8 +97,8 @@ def dashboard_data(
     try:
         schema_ready = _wallet_research_schema_ready(conn)
         level_counts = _level_counts(conn) if schema_ready else _empty_level_counts()
-        elite_wallets = current_elite_wallets(conn) if schema_ready else set()
-        verified_l6_wallets = current_verified_l6_wallets(conn) if schema_ready else set()
+        elite_wallets = current_score_candidate_wallets(conn) if schema_ready else set()
+        current_valid_l6_wallets_set = current_valid_l6_wallets(conn) if schema_ready else set()
         return {
             "schema_version": SCHEMA_VERSION,
             "generated_at": int(time.time()),
@@ -100,7 +108,9 @@ def dashboard_data(
             "wallet_count": sum(int(row["count"]) for row in level_counts),
             "level_counts": level_counts,
             "current_elite_wallet_count": len(elite_wallets),
-            "verified_l6_wallet_count": len(verified_l6_wallets),
+            "current_score_candidate_wallet_count": len(elite_wallets),
+            "verified_l6_wallet_count": len(current_valid_l6_wallets_set),
+            "current_valid_l6_wallet_count": len(current_valid_l6_wallets_set),
             "queues": _queue_summaries(conn),
             "high_level_wallets": (
                 _wallet_rows(
@@ -108,7 +118,7 @@ def dashboard_data(
                     levels=HIGH_LEVEL_VALUES,
                     limit=50,
                     elite_wallets=elite_wallets,
-                    verified_l6_wallets=verified_l6_wallets,
+                    current_valid_l6_wallets_set=current_valid_l6_wallets_set,
                     exclude_stale_l5=True,
                 )
                 if schema_ready
@@ -128,6 +138,11 @@ def dashboard_summary_data(
     full: bool = False,
 ) -> dict[str, Any]:
     del full
+    if fresh:
+        data = dashboard_data(settings)
+        with _DASHBOARD_CACHE_LOCK:
+            _DASHBOARD_CACHE[str(settings.db_path.resolve())] = (time.time(), data)
+        return data
     return _dashboard_data_cached(settings, force_refresh=fresh)
 
 
@@ -136,8 +151,8 @@ def wallet_levels_data(settings: RobotSettings) -> dict[str, Any]:
     try:
         ready = _wallet_research_schema_ready(conn)
         counts = _level_counts(conn) if ready else _empty_level_counts()
-        elite_wallets = current_elite_wallets(conn) if ready else set()
-        verified_l6_wallets = current_verified_l6_wallets(conn) if ready else set()
+        elite_wallets = current_score_candidate_wallets(conn) if ready else set()
+        current_valid_l6_wallets_set = current_valid_l6_wallets(conn) if ready else set()
         return {
             "schema_version": SCHEMA_VERSION,
             "generated_at": int(time.time()),
@@ -145,7 +160,9 @@ def wallet_levels_data(settings: RobotSettings) -> dict[str, Any]:
             "wallet_count": sum(int(row["count"]) for row in counts),
             "level_counts": counts,
             "current_elite_wallet_count": len(elite_wallets),
-            "verified_l6_wallet_count": len(verified_l6_wallets),
+            "current_score_candidate_wallet_count": len(elite_wallets),
+            "verified_l6_wallet_count": len(current_valid_l6_wallets_set),
+            "current_valid_l6_wallet_count": len(current_valid_l6_wallets_set),
         }
     finally:
         conn.close()
@@ -183,6 +200,10 @@ def discovery_data(
         "filters": {"level": level if level in LEVEL_VALUES else "", "query": query, "limit": limit},
         "level_counts": levels["level_counts"],
         "wallet_count": len(rows),
+        "current_elite_wallet_count": levels["current_elite_wallet_count"],
+        "current_score_candidate_wallet_count": levels["current_score_candidate_wallet_count"],
+        "verified_l6_wallet_count": levels["verified_l6_wallet_count"],
+        "current_valid_l6_wallet_count": levels["current_valid_l6_wallet_count"],
         "wallets": rows,
     }
 
@@ -250,8 +271,12 @@ def wallet_detail_data(settings: RobotSettings, address: str) -> dict[str, Any]:
                 "address": wallet,
                 "found": False,
             }
-        level["current_elite"] = wallet in current_elite_wallets(conn, wallets=(wallet,))
-        level["verified_l6"] = wallet in current_verified_l6_wallets(conn, wallets=(wallet,))
+        level["current_score_candidate"] = wallet in current_score_candidate_wallets(
+            conn, wallets=(wallet,)
+        )
+        level["current_elite"] = level["current_score_candidate"]
+        level["current_valid_l6"] = wallet in current_valid_l6_wallets(conn, wallets=(wallet,))
+        level["verified_l6"] = level["current_valid_l6"]
 
         source = _one(
             conn,
@@ -297,7 +322,9 @@ def wallet_detail_data(settings: RobotSettings, address: str) -> dict[str, Any]:
                    buy_count, sell_count, median_gap_sec, trades_per_day,
                    market_volume_top_share, oldest_timestamp, latest_timestamp,
                    strategy_tags_json, risk_flags_json, research_score,
-                   score_components_json, methodology_version, computed_at, updated_at
+                   diagnostic_score, forward_selection_score,
+                   score_components_json, forward_score_components_json,
+                   methodology_version, computed_at, updated_at
             FROM wallet_history_summaries
             WHERE wallet = ?
             """,
@@ -307,6 +334,9 @@ def wallet_detail_data(settings: RobotSettings, address: str) -> dict[str, Any]:
             history["strategy_tags"] = _json_list(history.pop("strategy_tags_json", "[]"))
             history["risk_flags"] = _json_list(history.pop("risk_flags_json", "[]"))
             history["score_components"] = _json_dict(history.pop("score_components_json", "{}"))
+            history["forward_score_components"] = _json_dict(
+                history.pop("forward_score_components_json", "{}")
+            )
             if int(level.get("hard_risk_block") or 0) and "hard_risk_block" not in history["risk_flags"]:
                 history["risk_flags"].insert(0, "hard_risk_block")
 
@@ -455,6 +485,11 @@ def _handler_factory(config: WebConsoleConfig) -> type[BaseHTTPRequestHandler]:
                         "schema_version": SCHEMA_VERSION,
                         "generated_at": int(time.time()),
                         "loading": bool(data.get("loading")),
+                        "level_counts": data.get("level_counts") or [],
+                        "wallet_count": int(data.get("wallet_count") or 0),
+                        "current_elite_wallet_count": int(data.get("current_elite_wallet_count") or 0),
+                        "verified_l6_wallet_count": int(data.get("verified_l6_wallet_count") or 0),
+                        "current_valid_l6_wallet_count": int(data.get("current_valid_l6_wallet_count") or 0),
                         "wallets": data.get("wallets") or [],
                     }
                 )
@@ -566,6 +601,7 @@ def _wallet_research_schema_ready(conn: sqlite3.Connection) -> bool:
         "wallet_pnl_summaries",
         "wallet_history_summaries",
         "wallet_level_selections",
+        "wallet_level_review_state",
         "wallet_l6_validations",
         "pipeline_jobs",
     }
@@ -590,6 +626,30 @@ def _wallet_research_schema_ready(conn: sqlite3.Connection) -> bool:
             "official_profit_intensity",
             "official_month_pnl_usdc",
             "official_week_pnl_usdc",
+        },
+        "wallet_history_summaries": {
+            "diagnostic_score",
+            "forward_selection_score",
+            "forward_score_components_json",
+        },
+        "wallet_level_selections": {
+            "forward_selection_score",
+            "score_status",
+        },
+        "wallet_level_review_state": {
+            "wallet",
+            "target_level",
+            "policy_version",
+            "methodology_version",
+            "review_state",
+            "cooldown_until",
+            "no_material_improvement_count",
+            "last_evidence_artifact_id",
+            "last_activity_count",
+            "last_distinct_markets",
+            "last_total_volume_usdc",
+            "last_reviewed_at",
+            "updated_at",
         },
     }
     return all(
@@ -680,18 +740,21 @@ def _wallet_rows(
     query: str = "",
     limit: int = 100,
     elite_wallets: set[str] | None = None,
-    verified_l6_wallets: set[str] | None = None,
+    current_valid_l6_wallets_set: set[str] | None = None,
     exclude_stale_l5: bool = False,
 ) -> list[dict[str, Any]]:
     clean_levels = tuple(level for level in levels if level in LEVEL_VALUES) or LEVEL_VALUES
     where = [f"wl.level IN ({','.join('?' for _ in clean_levels)})"]
     params: list[Any] = list(clean_levels)
-    current_elites = current_elite_wallets(conn) if elite_wallets is None else set(elite_wallets)
-    verified_l6 = (
-        current_verified_l6_wallets(conn)
-        if verified_l6_wallets is None
-        else set(verified_l6_wallets)
+    current_elites = (
+        current_score_candidate_wallets(conn) if elite_wallets is None else set(elite_wallets)
     )
+    current_valid_l6 = (
+        current_valid_l6_wallets(conn)
+        if current_valid_l6_wallets_set is None
+        else set(current_valid_l6_wallets_set)
+    )
+    verified_l6 = current_valid_l6
     if exclude_stale_l5:
         current_parts = ["wl.level NOT IN ('l5', 'l6')"]
         if current_elites:
@@ -699,11 +762,11 @@ def _wallet_rows(
                 f"(wl.level IN ('l5', 'l6') AND wl.wallet IN ({','.join('?' for _ in current_elites)}))"
             )
             params.extend(sorted(current_elites))
-        if verified_l6:
+        if current_valid_l6:
             current_parts.append(
-                f"(wl.level = 'l6' AND wl.wallet IN ({','.join('?' for _ in verified_l6)}))"
+                f"(wl.level = 'l6' AND wl.wallet IN ({','.join('?' for _ in current_valid_l6)}))"
             )
-            params.extend(sorted(verified_l6))
+            params.extend(sorted(current_valid_l6))
         where.append("(" + " OR ".join(current_parts) + ")")
     clean_query = query.strip().lower()
     if clean_query:
@@ -711,14 +774,14 @@ def _wallet_rows(
         needle = f"%{clean_query}%"
         params.extend((needle, needle))
 
-    # Current validation is more meaningful than a historical L6 label. Keep
-    # verified L6 wallets first, then current L5 score candidates, everywhere.
+    # Current valid L6 evidence is more meaningful than a historical L6 label.
+    # Keep valid L6 wallets first, then current L5 score candidates, everywhere.
     priority_order: list[str] = []
-    if verified_l6:
+    if current_valid_l6:
         priority_order.append(
-            f"CASE WHEN wl.wallet IN ({','.join('?' for _ in verified_l6)}) THEN 0 ELSE 1 END"
+            f"CASE WHEN wl.wallet IN ({','.join('?' for _ in current_valid_l6)}) THEN 0 ELSE 1 END"
         )
-        params.extend(sorted(verified_l6))
+        params.extend(sorted(current_valid_l6))
     if current_elites:
         priority_order.append(
             f"CASE WHEN wl.wallet IN ({','.join('?' for _ in current_elites)}) THEN 0 ELSE 1 END"
@@ -748,6 +811,8 @@ def _wallet_rows(
             COALESCE(wh.activity_count, 0) AS activity_count,
             COALESCE(wh.distinct_markets, 0) AS distinct_markets,
             COALESCE(wh.research_score, 0) AS research_score,
+            COALESCE(wh.diagnostic_score, wh.research_score, 0) AS diagnostic_score,
+            wh.forward_selection_score AS forward_selection_score,
             COALESCE(wh.strategy_tags_json, '[]') AS strategy_tags_json,
             COALESCE(wh.risk_flags_json, '[]') AS risk_flags_json,
             COALESCE(sel.rank_in_cohort, 0) AS rank_in_cohort,
@@ -795,6 +860,7 @@ def _wallet_rows(
         _normalize_wallet_row(
             row,
             current_elite=str(row.get("wallet") or "") in current_elites,
+            current_valid_l6=str(row.get("wallet") or "") in current_valid_l6,
             verified_l6=str(row.get("wallet") or "") in verified_l6,
         )
         for row in rows
@@ -805,6 +871,7 @@ def _normalize_wallet_row(
     row: dict[str, Any],
     *,
     current_elite: bool,
+    current_valid_l6: bool,
     verified_l6: bool,
 ) -> dict[str, Any]:
     risk_flags = _json_list(row.pop("risk_flags_json", "[]"))
@@ -815,6 +882,8 @@ def _normalize_wallet_row(
         "level": str(row.get("level") or "l0"),
         "level_reason": str(row.get("level_reason") or ""),
         "current_elite": bool(current_elite),
+        "current_score_candidate": bool(current_elite),
+        "current_valid_l6": bool(current_valid_l6),
         "verified_l6": bool(verified_l6),
         "sources": str(row.get("sources") or ""),
         "total_estimated_pnl_usdc": float(row.get("total_estimated_pnl_usdc") or 0),
@@ -842,6 +911,12 @@ def _normalize_wallet_row(
         "activity_count": int(row.get("activity_count") or 0),
         "distinct_markets": int(row.get("distinct_markets") or 0),
         "research_score": float(row.get("research_score") or 0),
+        "diagnostic_score": float(row.get("diagnostic_score") or 0),
+        "forward_selection_score": (
+            float(row["forward_selection_score"])
+            if row.get("forward_selection_score") is not None
+            else None
+        ),
         "strategy_tags": _json_list(row.pop("strategy_tags_json", "[]")),
         "risk_flags": risk_flags,
         "rank_in_cohort": int(row.get("rank_in_cohort") or 0),
@@ -1060,7 +1135,7 @@ def _render_dashboard(settings: RobotSettings) -> str:
         + '<span class="section-meta">24 小时完成量</span></section>'
         + _queue_board(queues)
         + '<section class="section-head split"><div><h2>高等级钱包</h2>'
-        + f'<p>L3-L4 历史优选、当前评分候选与独立复核钱包；当前评分候选 {_fmt_int(data.get("current_elite_wallet_count"))} 个，当前验证 L6 {_fmt_int(data.get("verified_l6_wallet_count"))} 个。</p></div>'
+        + f'<p>L3-L4 历史优选、当前评分候选与独立复核钱包；当前评分候选 {_fmt_int(data.get("current_elite_wallet_count"))} 个，当前有效 L6 {_fmt_int(data.get("current_valid_l6_wallet_count"))} 个。</p></div>'
         + f'<a href="/wallets?level=l3">查看目录</a></section>'
         + _wallet_table(high_rows)
         + '<section class="grid two-col">'
@@ -1290,7 +1365,7 @@ def _wallet_table(rows: list[dict[str, Any]]) -> str:
         if level_value == "l5":
             level_note = "当前评分候选" if row.get("current_elite") else "历史 L5，当前未入选"
         elif level_value == "l6":
-            if row.get("verified_l6"):
+            if row.get("current_valid_l6"):
                 level_note = "当前独立复核通过"
             elif row.get("current_elite"):
                 level_note = "历史 L6，当前仍为评分候选"
@@ -1364,7 +1439,7 @@ def _detail_panel(title: str, rows: list[tuple[str, Any]]) -> str:
 
 
 def _l6_status_label(level: dict[str, Any], validation: dict[str, Any]) -> str:
-    if bool(level.get("verified_l6")):
+    if bool(level.get("current_valid_l6")):
         return "已通过"
     decision = str(validation.get("decision") or "")
     if decision == "warning":
@@ -1491,6 +1566,9 @@ def _reason_label(value: Any) -> str:
         "relative_rank_capacity_limited": "已达相对排名区间但本轮名额已满",
         "verified_trade": "有效成交初筛",
         "trusted_source": "可信来源初筛",
+        "trusted_candidate_provenance": "可信候选来源初筛",
+        "observed_resource_gate": "重复成交初筛通过",
+        "sample_passed_resource_gate_v3": "快速样本通过",
         "sample_volume_at_least_100_usdc": "样本金额通过",
         "legacy_candidate_backfill": "历史候选回填",
         "legacy_sighting_backfill": "历史来源回填",

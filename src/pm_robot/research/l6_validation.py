@@ -16,7 +16,7 @@ from pm_robot.research.evidence_rows import (
 from pm_robot.research.pnl_estimates import estimate_wallet_pnl
 
 
-L6_VALIDATION_POLICY_VERSION = "l6_independent_v4"
+L6_VALIDATION_POLICY_VERSION = "l6_independent_v5"
 
 
 class L6ValidationDecision(str, Enum):
@@ -154,7 +154,11 @@ def evaluate_l6_validation(
     window_activity = [
         row for row in activity_rows if coverage_start <= _timestamp(row) <= coverage_end
     ]
-    activity_metrics, anomaly_flags = _activity_anomalies(window_activity)
+    activity_metrics, anomaly_flags = _activity_anomalies(
+        window_activity,
+        now=coverage_end,
+        recent_start=recent_start,
+    )
     timestamp_coverage = len(timestamped_closed) / len(closed_rows) if closed_rows else 0.0
 
     hard_failures: list[str] = []
@@ -263,7 +267,14 @@ def evaluate_l6_validation(
     )
 
 
-def _activity_anomalies(rows: list[dict[str, Any]]) -> tuple[dict[str, Any], list[str]]:
+def _activity_anomalies(
+    rows: list[dict[str, Any]],
+    *,
+    now: int,
+    recent_start: int,
+) -> tuple[dict[str, Any], list[str]]:
+    """Summarize activity shape for L6 evidence without changing wallet levels."""
+
     trades = [row for row in rows if _activity_type(row) == "TRADE"]
     gross_volume = sum(max(0.0, _trade_usdc(row)) for row in trades)
     signed_cashflow = sum(
@@ -278,6 +289,18 @@ def _activity_anomalies(rows: list[dict[str, Any]]) -> tuple[dict[str, Any], lis
     gaps = [right - left for left, right in zip(timestamps, timestamps[1:]) if right >= left]
     median_gap = median(gaps) if gaps else None
     gap_cv = _coefficient_of_variation(gaps)
+    recent_timestamps = [timestamp for timestamp in timestamps if timestamp >= recent_start]
+    last_trade_at = timestamps[-1] if timestamps else None
+    signal_timestamps: dict[tuple[str, str, str], list[int]] = {}
+    for row in trades:
+        timestamp = _timestamp(row)
+        if timestamp <= 0:
+            continue
+        signal_timestamps.setdefault(_activity_signal_key(row), []).append(timestamp)
+    max_same_signal_trades_10_seconds = max(
+        (_max_events_in_window(values, window_seconds=10) for values in signal_timestamps.values()),
+        default=0,
+    )
     flags: list[str] = []
     if len(trades) >= 100 and churn_ratio > 50.0:
         flags.append("high_turnover_low_net_flow")
@@ -296,6 +319,11 @@ def _activity_anomalies(rows: list[dict[str, Any]]) -> tuple[dict[str, Any], lis
             "special_activity_share": round(special_share, 6),
             "median_trade_gap_seconds": median_gap,
             "trade_gap_cv": round(gap_cv, 6) if gap_cv is not None else None,
+            "last_trade_at": last_trade_at,
+            "last_trade_age_seconds": max(0, now - last_trade_at) if last_trade_at else None,
+            "recent_trade_count": len(recent_timestamps),
+            "recent_active_days": len({timestamp // 86_400 for timestamp in recent_timestamps}),
+            "max_same_signal_trades_10_seconds": max_same_signal_trades_10_seconds,
         },
         flags,
     )
@@ -350,6 +378,19 @@ def _coefficient_of_variation(values: list[int]) -> float | None:
     return math.sqrt(variance) / mean
 
 
+def _max_events_in_window(timestamps: list[int], *, window_seconds: int) -> int:
+    """Return the largest inclusive event count in one bounded time window."""
+
+    ordered = sorted(timestamp for timestamp in timestamps if timestamp > 0)
+    left = 0
+    maximum = 0
+    for right, timestamp in enumerate(ordered):
+        while timestamp - ordered[left] > window_seconds:
+            left += 1
+        maximum = max(maximum, right - left + 1)
+    return maximum
+
+
 def _dict_rows(rows: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
     return [dict(row) for row in rows if isinstance(row, dict)]
 
@@ -379,6 +420,18 @@ def _market(row: dict[str, Any]) -> str:
         if value:
             return value
     return ""
+
+
+def _activity_signal_key(row: dict[str, Any]) -> tuple[str, str, str]:
+    """Match the PolyHermes aggregation scope for one leader activity row."""
+
+    outcome = ""
+    for key in ("asset", "tokenId", "token_id", "outcomeIndex", "outcome_index", "outcome"):
+        value = str(row.get(key) or "").strip().lower()
+        if value:
+            outcome = value
+            break
+    return (_market(row).lower(), outcome, _side(row))
 
 
 def _activity_type(row: dict[str, Any]) -> str:

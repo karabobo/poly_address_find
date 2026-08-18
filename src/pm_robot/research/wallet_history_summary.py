@@ -11,7 +11,7 @@ from pm_robot.research.evidence_rows import dedupe_activity_rows
 from pm_robot.wallet_levels import HistoryDepth
 
 
-METHODOLOGY_VERSION = "wallet_history_summary_v4"
+METHODOLOGY_VERSION = "wallet_history_summary_v5"
 _COMPLETE_PNL_COVERAGE = frozenset({"complete"})
 
 
@@ -33,7 +33,10 @@ class WalletHistorySummary:
     strategy_tags: tuple[str, ...]
     risk_flags: tuple[str, ...]
     research_score: float
+    diagnostic_score: float
+    forward_selection_score: float
     score_components: dict[str, float]
+    forward_score_components: dict[str, float]
 
 
 def summarize_wallet_history(
@@ -107,7 +110,7 @@ def summarize_wallet_history(
         official_all_pnl_usdc=official_all_pnl_usdc,
         official_profit_intensity=official_profit_intensity,
     )
-    research_score = sum(
+    diagnostic_score = sum(
         score_components[name] * weight
         for name, weight in (
             ("pnl", 0.20),
@@ -118,6 +121,29 @@ def summarize_wallet_history(
             ("persistence", 0.15),
             ("concentration", 0.10),
             ("evidence_quality", 0.05),
+        )
+    )
+    forward_score_components = _forward_score_components(
+        activity_count=len(trades),
+        distinct_markets=distinct_markets,
+        total_volume=total_volume,
+        top_share=top_share,
+        timestamps=timestamps,
+        buy_count=buy_count,
+        sell_count=sell_count,
+        fast_share=fast_share,
+        non_fast_count=non_fast_count,
+    )
+    forward_selection_score = sum(
+        forward_score_components[name] * weight
+        for name, weight in (
+            ("breadth", 0.22),
+            ("activity", 0.20),
+            ("volume", 0.18),
+            ("persistence", 0.16),
+            ("concentration", 0.12),
+            ("two_sided", 0.06),
+            ("non_fast_coverage", 0.06),
         )
     )
     return WalletHistorySummary(
@@ -136,8 +162,13 @@ def summarize_wallet_history(
         latest_timestamp=timestamps[-1] if timestamps else None,
         strategy_tags=tuple(strategy_tags),
         risk_flags=tuple(risk_flags),
-        research_score=round(_clip(research_score, 0.0, 100.0), 6),
+        research_score=round(_clip(diagnostic_score, 0.0, 100.0), 6),
+        diagnostic_score=round(_clip(diagnostic_score, 0.0, 100.0), 6),
+        forward_selection_score=round(_clip(forward_selection_score, 0.0, 100.0), 6),
         score_components={key: round(value, 6) for key, value in score_components.items()},
+        forward_score_components={
+            key: round(value, 6) for key, value in forward_score_components.items()
+        },
     )
 
 
@@ -204,6 +235,50 @@ def _score_components(
             official_profit_intensity=official_profit_intensity,
             pnl_coverage=coverage,
         ),
+    }
+
+
+def _forward_score_components(
+    *,
+    activity_count: int,
+    distinct_markets: int,
+    total_volume: float,
+    top_share: float,
+    timestamps: list[int],
+    buy_count: int,
+    sell_count: int,
+    fast_share: float,
+    non_fast_count: int,
+) -> dict[str, float]:
+    """Behavior-only score safe for resource selection.
+
+    This deliberately excludes official PnL, open PnL, ROI, validation output,
+    and any L6-after-the-fact metrics. Inputs are known at the current history
+    evidence depth.
+    """
+
+    breadth = math.log1p(max(0, distinct_markets)) / math.log(21.0) * 100.0
+    activity = math.log1p(max(0, activity_count)) / math.log(1_001.0) * 100.0
+    volume = math.log1p(max(0.0, total_volume)) / math.log(100_001.0) * 100.0
+    span_days = (timestamps[-1] - timestamps[0]) / 86_400 if len(timestamps) >= 2 else 0.0
+    persistence = math.log1p(max(0.0, span_days)) / math.log(366.0) * 100.0
+    two_sided = 100.0 if buy_count > 0 and sell_count > 0 else 35.0 if activity_count else 0.0
+    non_fast_coverage = (
+        100.0
+        if activity_count <= 0
+        else (non_fast_count / activity_count) * 100.0
+    )
+    # Fast markets are allowed, but a forward resource score should prefer
+    # coverage that is easier to validate beyond speed-only micro markets.
+    non_fast_coverage = max(non_fast_coverage, (1.0 - fast_share) * 100.0)
+    return {
+        "breadth": _clip(breadth, 0.0, 100.0),
+        "activity": _clip(activity, 0.0, 100.0),
+        "volume": _clip(volume, 0.0, 100.0),
+        "persistence": _clip(persistence, 0.0, 100.0),
+        "concentration": _clip((1.0 - top_share) * 100.0, 0.0, 100.0),
+        "two_sided": _clip(two_sided, 0.0, 100.0),
+        "non_fast_coverage": _clip(non_fast_coverage, 0.0, 100.0),
     }
 
 

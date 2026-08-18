@@ -7,6 +7,7 @@ from pm_robot.storage.wallet_levels import (
     advance_wallet_level,
     ensure_wallet_level,
     get_wallet_level,
+    reclassify_wallet_level,
     set_wallet_hard_risk_block,
 )
 from pm_robot.wallet_levels import WalletLevel
@@ -130,3 +131,52 @@ def test_existing_l5_can_advance_once_to_l6_without_rewriting_prior_events():
         ("l4", "l5"),
         ("l5", "l6"),
     ]
+
+
+def test_explicit_quality_reclassification_lowers_level_and_writes_audit_event():
+    conn = _conn()
+    ensure_wallet_level(conn, WALLET, reason="seed", now=100)
+    for target in (
+        WalletLevel.L1,
+        WalletLevel.L2,
+        WalletLevel.L3,
+        WalletLevel.L4,
+        WalletLevel.L5,
+        WalletLevel.L6,
+    ):
+        advance_wallet_level(conn, WALLET, to_level=target, reason="seed", now=101)
+
+    decision = reclassify_wallet_level(
+        conn,
+        WALLET,
+        to_level=WalletLevel.L2,
+        reason="l6_current_evidence_stale",
+        policy_version="l6_current_reconciliation_v1",
+        facts={"current_valid_l6": False},
+        now=200,
+    )
+
+    assert decision.level is WalletLevel.L2
+    assert get_wallet_level(conn, WALLET).level is WalletLevel.L2
+    event = conn.execute(
+        "SELECT * FROM wallet_level_events WHERE wallet = ? ORDER BY event_id DESC LIMIT 1",
+        (WALLET,),
+    ).fetchone()
+    assert event["from_level"] == "l6"
+    assert event["to_level"] == "l2"
+    assert event["reason"] == "l6_current_evidence_stale"
+
+
+def test_quality_reclassification_cannot_be_used_to_promote():
+    conn = _conn()
+    ensure_wallet_level(conn, WALLET, reason="seed", now=100)
+
+    with pytest.raises(ValueError, match="cannot promote"):
+        reclassify_wallet_level(
+            conn,
+            WALLET,
+            to_level=WalletLevel.L1,
+            reason="invalid",
+            policy_version="test",
+            now=200,
+        )

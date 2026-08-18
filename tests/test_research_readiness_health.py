@@ -2,7 +2,11 @@ from pm_robot.config import RobotSettings
 import json
 from concurrent.futures import ThreadPoolExecutor
 
-from pm_robot.ops import _write_json_atomically, health_check
+from pm_robot.ops import (
+    _high_confidence_l6_readiness,
+    _write_json_atomically,
+    health_check,
+)
 from pm_robot.storage.api_rate_limit import RateLimitScope, SharedApiRateLimiter
 from pm_robot.orchestration.wallet_level_selection import SELECTION_POLICY_VERSION
 from pm_robot.research.wallet_history_summary import METHODOLOGY_VERSION
@@ -89,6 +93,29 @@ def test_health_reads_dedicated_rate_limit_database(tmp_path):
     assert result["upstream_request_budget"]["scope_count"] == 1
 
 
+def test_health_fails_when_the_dedicated_rate_limit_coordinator_is_unavailable(tmp_path):
+    db_path = tmp_path / "robot.sqlite"
+    conn = connect(db_path)
+    try:
+        run_migrations(conn)
+    finally:
+        conn.close()
+
+    result = health_check(
+        _settings(
+            tmp_path,
+            db_path,
+            rate_limit_db_path=tmp_path / "missing-rate-limits.sqlite",
+        )
+    )
+
+    assert result["ok"] is False
+    assert result["upstream_request_budget"]["available"] is False
+    assert result["checks"]["upstream_request_budget"] == (
+        "coordination database is not initialized"
+    )
+
+
 def test_health_pipeline_omits_retired_runtime_events(tmp_path):
     db_path = tmp_path / "robot.sqlite"
     conn = connect(db_path)
@@ -118,6 +145,28 @@ def test_health_pipeline_omits_retired_runtime_events(tmp_path):
         "loop_discovery_leaderboard",
         "loop_wallet_level_control",
     }
+
+
+def test_health_keeps_healthy_heartbeat_progress_out_of_error(tmp_path):
+    db_path = tmp_path / "robot.sqlite"
+    conn = connect(db_path)
+    try:
+        run_migrations(conn)
+        conn.execute(
+            """
+            INSERT INTO runtime_heartbeats(name, started_at, finished_at, status, error)
+            VALUES ('loop_rtds_discovery', 100, 101, 'ok', 'messages=12 trades=12')
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    result = health_check(_settings(tmp_path, db_path))
+
+    heartbeat = result["pipeline"]["loop_rtds_discovery"]
+    assert heartbeat["error"] == ""
+    assert heartbeat["detail"] == "messages=12 trades=12"
 
 
 def test_health_uses_loop_specific_heartbeat_freshness_windows(tmp_path, monkeypatch):
@@ -277,10 +326,12 @@ def test_health_only_exposes_l5_with_recent_deep_evidence_as_current_elite(
             INSERT INTO wallet_history_summaries(
                 wallet, artifact_id, history_depth, activity_count,
                 distinct_markets, total_volume_usdc, strategy_tags_json,
-                risk_flags_json, research_score, score_components_json,
-                methodology_version, computed_at, updated_at
+                risk_flags_json, research_score, diagnostic_score,
+                forward_selection_score, score_components_json,
+                forward_score_components_json, methodology_version,
+                computed_at, updated_at
             ) VALUES (?, 'artifact-fresh', 'deep', 200, 10, 5000,
-                      '[]', '[]', 80, '{}', ?, ?, ?)
+                      '[]', '[]', 80, 80, 80, '{}', '{}', ?, ?, ?)
             """,
             (wallet, METHODOLOGY_VERSION, now - 1_000, now - 1_000),
         )
@@ -289,10 +340,11 @@ def test_health_only_exposes_l5_with_recent_deep_evidence_as_current_elite(
             INSERT INTO wallet_level_selections(
                 wallet, target_level, evidence_artifact_id, policy_version,
                 selected, rank_in_cohort, cohort_size, source_bucket,
-                strategy_bucket, reason, decided_at, updated_at
+                strategy_bucket, reason, decided_at, updated_at,
+                forward_selection_score, score_status
             ) VALUES (?, 'l5', 'artifact-fresh', ?,
                       1, 1, 20, 'stream', 'general',
-                      'relative_rank_selected', ?, ?)
+                      'relative_rank_selected', ?, ?, 80, 'valid')
             """,
             (wallet, SELECTION_POLICY_VERSION, now - 900, now - 900),
         )
@@ -305,3 +357,144 @@ def test_health_only_exposes_l5_with_recent_deep_evidence_as_current_elite(
 
     assert readiness["metrics"]["fresh_elite_wallets"] == 1
     assert readiness["elite_wallets_available"] is True
+
+
+def test_current_high_confidence_l6_readiness_reflects_runtime_requirements(tmp_path):
+    db_path = tmp_path / "robot.sqlite"
+    now = 2_000_000
+    conn = connect(db_path)
+    try:
+        run_migrations(conn)
+        conn.execute(
+            """
+            INSERT INTO runtime_heartbeats(name, started_at, finished_at, status, error)
+            VALUES ('loop_discovery_leaderboard', 100, 100, 'ok', '')
+            """
+        )
+        conn.commit()
+
+        readiness = _high_confidence_l6_readiness(
+            conn,
+            required_runtime_heartbeats=("loop_discovery_leaderboard",),
+            runtime_heartbeat_max_age_seconds=3600,
+            runtime_heartbeat_max_age_overrides=(),
+            now=now,
+        )
+    finally:
+        conn.close()
+
+    assert readiness["runtime_readiness"]["ready"] is False
+    assert readiness["research_readiness"]["ready"] is True
+    assert readiness["planner_ready"] is True
+
+
+def test_current_high_confidence_l6_readiness_ignores_lower_level_planner_churn(
+    tmp_path,
+):
+    db_path = tmp_path / "robot.sqlite"
+    conn = connect(db_path)
+    try:
+        run_migrations(conn)
+        conn.executemany(
+            "INSERT INTO wallet_levels(wallet, level) VALUES (?, ?)",
+            (("0x" + "1" * 40, "l2"), ("0x" + "2" * 40, "l6")),
+        )
+        conn.execute(
+            """
+            INSERT INTO wallet_history_planner_state(wallet, level)
+            VALUES (?, 'l6')
+            """,
+            ("0x" + "2" * 40,),
+        )
+        conn.execute(
+            "DELETE FROM wallet_history_planner_dirty WHERE wallet = ?",
+            ("0x" + "2" * 40,),
+        )
+        conn.commit()
+
+        readiness = _high_confidence_l6_readiness(
+            conn,
+            required_runtime_heartbeats=(),
+            runtime_heartbeat_max_age_seconds=3600,
+            runtime_heartbeat_max_age_overrides=(),
+            now=2_000_000,
+        )
+    finally:
+        conn.close()
+
+    assert readiness["planner_ready"] is True
+
+
+def test_current_high_confidence_l6_readiness_requires_l6_planner_state(tmp_path):
+    db_path = tmp_path / "robot.sqlite"
+    conn = connect(db_path)
+    try:
+        run_migrations(conn)
+        conn.execute(
+            "INSERT INTO wallet_levels(wallet, level) VALUES (?, 'l6')",
+            ("0x" + "3" * 40,),
+        )
+        conn.execute("DELETE FROM wallet_history_planner_dirty")
+        conn.commit()
+
+        readiness = _high_confidence_l6_readiness(
+            conn,
+            required_runtime_heartbeats=(),
+            runtime_heartbeat_max_age_seconds=3600,
+            runtime_heartbeat_max_age_overrides=(),
+            now=2_000_000,
+        )
+    finally:
+        conn.close()
+
+    assert readiness["planner_ready"] is False
+
+
+def test_current_high_confidence_l6_readiness_blocks_terminal_l6_evidence_work(tmp_path):
+    db_path = tmp_path / "robot.sqlite"
+    wallet = "0x" + "4" * 40
+    conn = connect(db_path)
+    try:
+        run_migrations(conn)
+        conn.execute(
+            "INSERT INTO wallet_levels(wallet, level) VALUES (?, 'l6')",
+            (wallet,),
+        )
+        conn.execute(
+            "INSERT INTO wallet_history_planner_state(wallet, level) VALUES (?, 'l6')",
+            (wallet,),
+        )
+        conn.execute("DELETE FROM wallet_history_planner_dirty WHERE wallet = ?", (wallet,))
+        conn.execute(
+            """
+            INSERT INTO pipeline_jobs(
+                job_type, wallet, job_action, job_scope, priority, shard, status,
+                attempts, max_attempts, next_attempt_at, last_error, created_at, updated_at
+            ) VALUES (
+                'wallet_l6_validate', ?, 'validate_l6:test', 'l6', 10, 0,
+                'terminal_failed', 3, 3, 0, 'corrupt local validation artifact', 100, 100
+            )
+            """,
+            (wallet,),
+        )
+        conn.commit()
+
+        readiness = _high_confidence_l6_readiness(
+            conn,
+            required_runtime_heartbeats=(),
+            runtime_heartbeat_max_age_seconds=3_600,
+            runtime_heartbeat_max_age_overrides=(),
+            now=2_000_000,
+        )
+    finally:
+        conn.close()
+
+    assert readiness["planner_ready"] is False
+    assert readiness["planner_blockers"] == [
+        {
+            "wallet": wallet,
+            "job_type": "wallet_l6_validate",
+            "status": "terminal_failed",
+            "reason": "corrupt local validation artifact",
+        }
+    ]

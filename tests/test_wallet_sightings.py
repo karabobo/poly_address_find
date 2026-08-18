@@ -7,6 +7,7 @@ from pm_robot.orchestration.wallet_sightings import (
     record_wallet_sighting,
 )
 from pm_robot.storage.db import connect, run_migrations
+from pm_robot.storage.repository import upsert_candidate
 from pm_robot.storage.wallet_levels import get_wallet_level
 from pm_robot.wallet_levels import WalletLevel
 
@@ -69,7 +70,28 @@ def test_sighting_stays_l0_when_current_ingress_budget_is_full(tmp_path):
         conn.close()
 
 
-def test_small_verified_trade_stays_l0_without_candidate_or_jobs(tmp_path):
+def test_sighting_normalizes_timestamped_discovery_status(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    wallet = "0x" + "d" * 40
+    try:
+        run_migrations(conn)
+        candidate = CandidateAddress(
+            address=wallet,
+            sources="rtds",
+            status="rtds_activity_discovered:1700000000",
+        )
+
+        record_wallet_sighting(conn, candidate, allow_l1=False, now=2_000)
+        conn.commit()
+
+        assert conn.execute(
+            "SELECT status FROM observed_wallets WHERE wallet = ?", (wallet,)
+        ).fetchone()[0] == "rtds_activity_discovered"
+    finally:
+        conn.close()
+
+
+def test_one_material_verified_trade_stays_l0_without_candidate_or_jobs(tmp_path):
     conn = connect(tmp_path / "robot.sqlite")
     wallet = "0x" + "2" * 40
     try:
@@ -78,7 +100,7 @@ def test_small_verified_trade_stays_l0_without_candidate_or_jobs(tmp_path):
         result = record_wallet_sighting(
             conn,
             _candidate(wallet),
-            recent_trades=[_trade("0xtrade", 5)],
+            recent_trades=[_trade("0xtrade", 100)],
             verified_trade=True,
             now=2_000,
         )
@@ -158,7 +180,10 @@ def test_deferred_admission_prioritizes_larger_qualified_sample(tmp_path):
             record_wallet_sighting(
                 conn,
                 _candidate(wallets[name]),
-                recent_trades=[_trade(f"0x{name}", volume)],
+                recent_trades=[
+                    _trade(f"0x{name}-a", volume * 0.4),
+                    _trade(f"0x{name}-b", volume * 0.6),
+                ],
                 verified_trade=True,
                 allow_l1=False,
                 now=now,
@@ -217,7 +242,7 @@ def test_cumulative_verified_trade_sample_promotes_to_l1_without_history_jobs(tm
             "recent_trade_count": 2,
             "recent_usdc_total": 100.0,
             "promoted_at": 2_100,
-            "promotion_reason": "observed_sample_volume_at_least_100_usdc",
+            "promotion_reason": "observed_resource_gate",
         }
         assert conn.execute(
             "SELECT 1 FROM candidate_wallets WHERE address = ?", (wallet,)
@@ -248,6 +273,44 @@ def test_trusted_source_can_enter_l1_without_trade_history(tmp_path):
         assert conn.execute(
             "SELECT recent_trade_count FROM observed_wallets WHERE wallet = ?", (wallet,)
         ).fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+def test_existing_candidate_row_alone_does_not_promote_l0_to_l1(tmp_path):
+    conn = connect(tmp_path / "robot.sqlite")
+    wallet = "0x" + "6" * 40
+    try:
+        run_migrations(conn)
+        upsert_candidate(
+            conn,
+            CandidateAddress(
+                address=wallet,
+                sources="polymarket_trades_global",
+                labels="source_seed",
+            ),
+            now=1_000,
+        )
+        conn.commit()
+
+        result = record_wallet_sighting(
+            conn,
+            _candidate(wallet, source="polymarket_trades_global"),
+            recent_trades=[_trade("0xtrade", 25)],
+            verified_trade=True,
+            now=2_000,
+        )
+        conn.commit()
+
+        assert result.level is WalletLevel.L0
+        assert result.reason == ""
+        assert result.candidate_updated is True
+        assert get_wallet_level(conn, wallet).level is WalletLevel.L0
+        observed = conn.execute(
+            "SELECT promoted_at, promotion_reason FROM observed_wallets WHERE wallet = ?",
+            (wallet,),
+        ).fetchone()
+        assert dict(observed) == {"promoted_at": None, "promotion_reason": ""}
     finally:
         conn.close()
 

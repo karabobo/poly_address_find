@@ -15,7 +15,7 @@ from urllib.parse import quote
 from pm_robot.config import RobotSettings
 from pm_robot.pipeline_terms import ACTIVE_PIPELINE_JOB_TYPES
 from pm_robot.research.current_elite import (
-    current_elite_wallet_count,
+    current_score_candidate_wallet_count,
     current_high_confidence_l6_snapshot,
     current_high_confidence_l6_wallet_count,
     current_verified_l6_wallet_count,
@@ -39,6 +39,12 @@ from pm_robot.wallet_levels import RECENT_SAMPLE_VOLUME_GATE_USDC
 DAY_SECONDS = 86_400
 WAL_CHECKPOINT_MODES = ("none", "passive", "truncate")
 DEFAULT_FAILED_JOB_COOLDOWN_SECONDS = 21_600
+DEFAULT_WAL_TRUNCATE_THRESHOLD_MB = 512
+DEFAULT_WAL_TRUNCATE_ALLOWED_HOURS = "0-6"
+DEFAULT_WAL_CHECKPOINT_TIMEOUT_MS = 250
+DEFAULT_PIPELINE_QUEUE_STALL_SECONDS = 3_600
+MAINTENANCE_DEFER_JOB_TYPES = ("wallet_recent_screen", "wallet_history_collect")
+L5_L6_EVIDENCE_JOB_TYPES = ("wallet_history_collect", "wallet_l6_validate")
 ACTIVE_RESEARCH_RUNTIME_EVENTS = (
     "loop_discovery_activity",
     "loop_discovery_leaderboard",
@@ -65,6 +71,7 @@ REQUIRED_RESEARCH_TABLES = {
     "wallet_features",
     "wallet_history_summaries",
     "wallet_level_events",
+    "wallet_level_review_state",
     "wallet_levels",
     "wallet_pnl_summaries",
     "wallet_screen_summaries",
@@ -82,6 +89,8 @@ def health_check(settings: RobotSettings) -> dict[str, Any]:
         "ok": True,
         "checked_at": int(time.time()),
         "service_scope": "wallet_discovery_research",
+        "research_only": True,
+        "not_for_trading": True,
         "db_path": str(settings.db_path),
         "archive_dir": str(settings.archive_dir),
         "checks": {},
@@ -112,6 +121,7 @@ def health_check(settings: RobotSettings) -> dict[str, Any]:
                 result["checks"]["runtime_heartbeats"] = runtime_readiness["reason"]
             else:
                 result["checks"]["runtime_heartbeats"] = "ok"
+            result["pipeline_queue_health"] = _pipeline_queue_health(conn)
             result["research_readiness"] = _research_readiness(conn)
             if not result["research_readiness"]["ready"]:
                 result["ok"] = False
@@ -134,6 +144,15 @@ def health_check(settings: RobotSettings) -> dict[str, Any]:
                 result["upstream_request_budget"] = api_rate_limit_summary(conn)
                 result["upstream_request_budget"]["storage"] = "main"
                 result["upstream_request_budget"]["available"] = True
+            if not result.get("upstream_request_budget", {}).get("available", False):
+                result["ok"] = False
+                result["checks"]["upstream_request_budget"] = str(
+                    result["upstream_request_budget"].get(
+                        "coordination_error", "unavailable"
+                    )
+                )
+            else:
+                result["checks"]["upstream_request_budget"] = "ok"
             result["storage"] = storage_report(settings, conn=conn)
         finally:
             conn.close()
@@ -176,15 +195,20 @@ def _pipeline_freshness(conn: sqlite3.Connection) -> dict[str, Any]:
         """,
         (*ACTIVE_RESEARCH_RUNTIME_EVENTS, *ACTIVE_RESEARCH_RUNTIME_EVENTS),
     ).fetchall()
-    return {
-        str(row["name"]): {
-            "status": str(row["status"] or ""),
+    pipeline: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        status = str(row["status"] or "")
+        recorded_error = str(row["error"] or "")
+        pipeline[str(row["name"])] = {
+            "status": status,
             "started_at": int(row["started_at"] or 0),
             "finished_at": int(row["finished_at"] or 0),
-            "error": str(row["error"] or ""),
+            # Older healthy loops stored progress counters in the error column.
+            # Preserve that diagnostic context without presenting it as a failure.
+            "error": recorded_error if status != "ok" else "",
+            "detail": recorded_error if status == "ok" else "",
         }
-        for row in rows
-    }
+    return pipeline
 
 
 def _runtime_heartbeat_readiness(
@@ -296,6 +320,9 @@ def _research_readiness(conn: sqlite3.Connection) -> dict[str, Any]:
         for name, count in ingress_invariants.items()
         if count > 0
     ]
+    fresh_score_candidate_wallets = current_score_candidate_wallet_count(
+        conn, now=int(time.time())
+    )
     metrics = {
         "observed_wallets": _scalar(conn, "SELECT COUNT(*) FROM observed_wallets"),
         "candidate_wallets": _scalar(conn, "SELECT COUNT(*) FROM candidate_wallets"),
@@ -312,7 +339,8 @@ def _research_readiness(conn: sqlite3.Connection) -> dict[str, Any]:
             conn,
             "SELECT COUNT(*) FROM wallet_levels WHERE hard_risk_block = 1",
         ),
-        "fresh_elite_wallets": current_elite_wallet_count(conn, now=int(time.time())),
+        "fresh_score_candidate_wallets": fresh_score_candidate_wallets,
+        "fresh_elite_wallets": fresh_score_candidate_wallets,
         "verified_l6_wallets": current_verified_l6_wallet_count(conn, now=int(time.time())),
         "high_confidence_l6_wallets": current_high_confidence_l6_wallet_count(
             conn,
@@ -321,12 +349,87 @@ def _research_readiness(conn: sqlite3.Connection) -> dict[str, Any]:
         "ingress_invariants": ingress_invariants,
         "levels": {f"l{level}": levels.get(f"l{level}", 0) for level in range(7)},
         "jobs": jobs,
+        "queue_health": _pipeline_queue_health(conn),
     }
     return {
         "ready": not blockers,
         "blockers": blockers,
         "metrics": metrics,
-        "elite_wallets_available": metrics["fresh_elite_wallets"] > 0,
+        "elite_wallets_available": metrics["fresh_score_candidate_wallets"] > 0,
+    }
+
+
+def _wallet_history_planner_l5_l6_full_dirty(conn: sqlite3.Connection) -> bool:
+    """Return True when any L5/L6 wallet still has pending full-dirty planner work."""
+
+    return (
+        conn.execute(
+            """
+            SELECT 1
+            FROM wallet_history_planner_dirty AS dirty
+            JOIN wallet_levels AS levels
+              ON levels.wallet = dirty.wallet
+            WHERE levels.level IN ('l5', 'l6')
+            LIMIT 1
+            """
+        ).fetchone()
+        is not None
+    )
+
+
+def _wallet_history_planner_l5_l6_state_complete(
+    conn: sqlite3.Connection,
+) -> bool:
+    """Return True when every L5/L6 wallet has current planner state."""
+
+    return (
+        conn.execute(
+            """
+            SELECT 1
+            FROM wallet_levels AS levels
+            LEFT JOIN wallet_history_planner_state AS state
+              ON state.wallet = levels.wallet
+            WHERE levels.level IN ('l5', 'l6')
+              AND state.wallet IS NULL
+            LIMIT 1
+            """
+        ).fetchone()
+        is None
+    )
+
+
+def _high_confidence_l6_readiness(
+    conn: sqlite3.Connection,
+    *,
+    required_runtime_heartbeats: tuple[str, ...],
+    runtime_heartbeat_max_age_seconds: int,
+    runtime_heartbeat_max_age_overrides: tuple[tuple[str, int], ...],
+    now: int,
+) -> dict[str, Any]:
+    """Evaluate planner/runtime/research readiness once for current-high-confidence export."""
+
+    pipeline = _pipeline_freshness(conn)
+    runtime_readiness = _runtime_heartbeat_readiness(
+        pipeline,
+        required=required_runtime_heartbeats,
+        max_age_seconds=runtime_heartbeat_max_age_seconds,
+        max_age_overrides=dict(runtime_heartbeat_max_age_overrides),
+        now=now,
+    )
+    research_readiness = _research_readiness(conn)
+    # L2-L4 churn must not starve the L6 handoff. Only L5/L6 planner state can
+    # change the exported candidate set, so readiness is scoped to those levels.
+    planner_blockers = _l5_l6_evidence_blockers(conn)
+    planner_ready = bool(
+        _wallet_history_planner_l5_l6_state_complete(conn)
+        and not _wallet_history_planner_l5_l6_full_dirty(conn)
+        and not planner_blockers
+    )
+    return {
+        "runtime_readiness": runtime_readiness,
+        "research_readiness": research_readiness,
+        "planner_ready": planner_ready,
+        "planner_blockers": planner_blockers,
     }
 
 
@@ -346,7 +449,19 @@ def write_high_confidence_l6_snapshot(
 
     conn = connect_readonly(settings.db_path)
     try:
-        data = current_high_confidence_l6_snapshot(conn)
+        now = int(time.time())
+        readiness = _high_confidence_l6_readiness(
+            conn,
+            required_runtime_heartbeats=settings.required_runtime_heartbeats,
+            runtime_heartbeat_max_age_seconds=settings.runtime_heartbeat_max_age_seconds,
+            runtime_heartbeat_max_age_overrides=settings.runtime_heartbeat_max_age_overrides,
+            now=now,
+        )
+        data = current_high_confidence_l6_snapshot(
+            conn,
+            now=now,
+            readiness=readiness,
+        )
     finally:
         conn.close()
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -497,6 +612,23 @@ def status(settings: RobotSettings) -> dict[str, Any]:
     return data
 
 
+def maintenance_preflight(settings: RobotSettings, *, now: int | None = None) -> dict[str, Any]:
+    """Minimal NAS maintenance guard: read only active screen/history queue state."""
+
+    checked_at = int(time.time()) if now is None else int(now)
+    conn = connect_readonly(settings.db_path)
+    try:
+        active = _maintenance_preflight_active_queue_count(conn, now=checked_at)
+    finally:
+        conn.close()
+    return {
+        "ok": True,
+        "checked_at": checked_at,
+        "wallet_history_screen_active": active,
+        "defer_maintenance": active > 0,
+    }
+
+
 def maintenance(
     settings: RobotSettings,
     *,
@@ -507,6 +639,9 @@ def maintenance(
     dry_run: bool = False,
     vacuum: bool = False,
     wal_checkpoint: str = "none",
+    wal_truncate_threshold_mb: int = DEFAULT_WAL_TRUNCATE_THRESHOLD_MB,
+    wal_truncate_allowed_hours: str = DEFAULT_WAL_TRUNCATE_ALLOWED_HOURS,
+    wal_checkpoint_timeout_ms: int = DEFAULT_WAL_CHECKPOINT_TIMEOUT_MS,
     skip_cleanup: bool = False,
     cleanup_batch_limit: int = 10_000,
     reset_stale_jobs: bool = False,
@@ -572,7 +707,14 @@ def maintenance(
                 conn.execute("PRAGMA optimize")
             if vacuum:
                 conn.execute("VACUUM")
-        checkpoint = _wal_checkpoint(conn, mode=checkpoint_mode, dry_run=dry_run)
+        checkpoint = _wal_checkpoint(
+            conn,
+            mode=checkpoint_mode,
+            dry_run=dry_run,
+            truncate_threshold_mb=wal_truncate_threshold_mb,
+            truncate_allowed_hours=wal_truncate_allowed_hours,
+            checkpoint_timeout_ms=wal_checkpoint_timeout_ms,
+        )
     finally:
         conn.close()
     backup_cleanup = cleanup_backups(settings.backup_dir, keep=keep_backups, dry_run=dry_run)
@@ -806,6 +948,7 @@ def _recover_stale_pipeline_jobs(
                     ELSE 0
                 END,
                 last_error = CASE
+                    WHEN COALESCE(last_error, '') != '' THEN last_error
                     WHEN attempts >= max_attempts THEN 'attempt_budget_exhausted_by_maintenance'
                     ELSE 'expired_lease_requeued_by_maintenance'
                 END,
@@ -989,6 +1132,7 @@ def storage_report(
             report["parquet_artifacts"] = int(row["artifact_count"] or 0)
             report["parquet_active_artifacts"] = int(row["active_count"] or 0)
             report["parquet_catalog_size_mb"] = round(int(row["catalog_bytes"] or 0) / 1_048_576, 2)
+            report["parquet_storage_source"] = "catalog"
     finally:
         if own_conn and catalog_conn is not None:
             catalog_conn.close()
@@ -1017,18 +1161,300 @@ def cleanup_backups(backup_dir: Path, *, keep: int, dry_run: bool = False) -> di
     }
 
 
+def _pipeline_queue_health(
+    conn: sqlite3.Connection,
+    *,
+    now: int | None = None,
+    stall_seconds: int = DEFAULT_PIPELINE_QUEUE_STALL_SECONDS,
+) -> dict[str, Any]:
+    """Report queue faults without mistaking an active backlog for a stall."""
+
+    now = int(time.time()) if now is None else int(now)
+    bounded_stall_seconds = max(60, int(stall_seconds))
+    stalled_before = now - bounded_stall_seconds
+    placeholders = ", ".join("?" for _ in ACTIVE_PIPELINE_JOB_TYPES)
+    defer_placeholders = ", ".join("?" for _ in MAINTENANCE_DEFER_JOB_TYPES)
+    queued = _scalar(
+        conn,
+        f"""
+        SELECT COUNT(*) FROM pipeline_jobs
+        WHERE job_type IN ({placeholders})
+          AND status = 'queued'
+        """,
+        ACTIVE_PIPELINE_JOB_TYPES,
+    )
+    running = _scalar(
+        conn,
+        f"""
+        SELECT COUNT(*) FROM pipeline_jobs
+        WHERE job_type IN ({placeholders})
+          AND status = 'running'
+        """,
+        ACTIVE_PIPELINE_JOB_TYPES,
+    )
+    active = _scalar(
+        conn,
+        f"""
+        SELECT COUNT(*) FROM pipeline_jobs
+        WHERE job_type IN ({placeholders})
+          AND (
+              (status = 'queued' AND attempts < max_attempts)
+              OR (status = 'running' AND lease_until > ?)
+          )
+        """,
+        (*ACTIVE_PIPELINE_JOB_TYPES, now),
+    )
+    wallet_history_screen_active = _scalar(
+        conn,
+        f"""
+        SELECT COUNT(*) FROM pipeline_jobs
+        WHERE job_type IN ({defer_placeholders})
+          AND (
+              (status = 'queued' AND attempts < max_attempts)
+              OR (status = 'running' AND lease_until > ?)
+          )
+        """,
+        (*MAINTENANCE_DEFER_JOB_TYPES, now),
+    )
+    expired_running = _scalar(
+        conn,
+        f"""
+        SELECT COUNT(*) FROM pipeline_jobs
+        WHERE job_type IN ({placeholders})
+          AND status = 'running' AND lease_until <= ?
+        """,
+        (*ACTIVE_PIPELINE_JOB_TYPES, now),
+    )
+    queued_exhausted = _scalar(
+        conn,
+        f"""
+        SELECT COUNT(*) FROM pipeline_jobs
+        WHERE job_type IN ({placeholders})
+          AND status = 'queued' AND attempts >= max_attempts
+        """,
+        ACTIVE_PIPELINE_JOB_TYPES,
+    )
+    failed_missing_error = _scalar(
+        conn,
+        f"""
+        SELECT COUNT(*) FROM pipeline_jobs
+        WHERE job_type IN ({placeholders})
+          AND status = 'failed' AND COALESCE(last_error, '') = ''
+        """,
+        ACTIVE_PIPELINE_JOB_TYPES,
+    )
+    failed_rows = conn.execute(
+        f"""
+        SELECT job_type, COUNT(*) AS count, MIN(NULLIF(last_error, '')) AS error_sample
+        FROM pipeline_jobs
+        WHERE job_type IN ({placeholders}) AND status = 'failed'
+        GROUP BY job_type
+        ORDER BY count DESC, job_type
+        """,
+        ACTIVE_PIPELINE_JOB_TYPES,
+    ).fetchall()
+    progress_rows = conn.execute(
+        f"""
+        SELECT
+            job_type,
+            SUM(
+                CASE
+                    WHEN status = 'queued'
+                     AND attempts < max_attempts
+                     AND next_attempt_at <= ?
+                     AND updated_at <= ?
+                    THEN 1 ELSE 0
+                END
+            ) AS due_queued,
+            MIN(
+                CASE
+                    WHEN status = 'queued'
+                     AND attempts < max_attempts
+                     AND next_attempt_at <= ?
+                     AND updated_at <= ?
+                    THEN updated_at
+                END
+            ) AS oldest_due_updated_at,
+            SUM(
+                CASE
+                    WHEN status = 'running' AND lease_until > ? THEN 1 ELSE 0
+                END
+            ) AS fresh_running,
+            MAX(CASE WHEN status = 'done' THEN completed_at ELSE 0 END) AS last_completed_at
+        FROM pipeline_jobs
+        WHERE job_type IN ({placeholders})
+        GROUP BY job_type
+        ORDER BY job_type
+        """,
+        (
+            now,
+            stalled_before,
+            now,
+            stalled_before,
+            now,
+            *ACTIVE_PIPELINE_JOB_TYPES,
+        ),
+    ).fetchall()
+    stalled_by_job_type = [
+        {
+            "job_type": str(row["job_type"]),
+            "due_queued": int(row["due_queued"] or 0),
+            "oldest_due_updated_at": int(row["oldest_due_updated_at"] or 0),
+            "last_completed_at": int(row["last_completed_at"] or 0),
+        }
+        for row in progress_rows
+        if int(row["due_queued"] or 0) > 0
+        and int(row["fresh_running"] or 0) == 0
+        and int(row["last_completed_at"] or 0) <= stalled_before
+    ]
+    return {
+        "queued": queued,
+        "running": running,
+        "active": active,
+        "wallet_history_screen_active": wallet_history_screen_active,
+        "expired_running": expired_running,
+        "queued_exhausted": queued_exhausted,
+        "failed_missing_error": failed_missing_error,
+        "stall_after_seconds": bounded_stall_seconds,
+        "stalled_by_job_type": stalled_by_job_type,
+        "failed_by_job_type": [
+            {
+                "job_type": str(row["job_type"]),
+                "count": int(row["count"] or 0),
+                "error_sample": str(row["error_sample"] or ""),
+            }
+            for row in failed_rows
+        ],
+    }
+
+
+def _l5_l6_evidence_blockers(conn: sqlite3.Connection) -> list[dict[str, str]]:
+    """Return unresolved terminal evidence failures that make an L5/L6 handoff unsafe."""
+
+    placeholders = ", ".join("?" for _ in L5_L6_EVIDENCE_JOB_TYPES)
+    rows = conn.execute(
+        f"""
+        SELECT
+            job.wallet,
+            job.job_type,
+            job.status,
+            COALESCE(NULLIF(job.terminal_reason, ''), NULLIF(job.last_error, ''), 'unclassified')
+                AS reason
+        FROM pipeline_jobs AS job
+        JOIN wallet_levels AS levels
+          ON levels.wallet = job.wallet
+        WHERE levels.level IN ('l5', 'l6')
+          AND levels.hard_risk_block = 0
+          AND job.job_type IN ({placeholders})
+          AND (
+                job.status = 'terminal_failed'
+             OR (job.status = 'failed' AND job.attempts >= job.max_attempts)
+          )
+          AND NOT EXISTS (
+              SELECT 1
+              FROM pipeline_jobs AS recovered
+              WHERE recovered.wallet = job.wallet
+                AND recovered.job_type = job.job_type
+                AND recovered.status = 'done'
+                AND recovered.completed_at > job.updated_at
+          )
+        ORDER BY job.wallet, job.job_type, job.updated_at DESC, job.job_id DESC
+        """,
+        L5_L6_EVIDENCE_JOB_TYPES,
+    ).fetchall()
+    return [
+        {
+            "wallet": str(row["wallet"]),
+            "job_type": str(row["job_type"]),
+            "status": str(row["status"]),
+            "reason": str(row["reason"]),
+        }
+        for row in rows
+    ]
+
+
+def _maintenance_preflight_active_queue_query(now: int) -> tuple[str, tuple[Any, ...]]:
+    placeholders = ", ".join("?" for _ in MAINTENANCE_DEFER_JOB_TYPES)
+    sql = f"""
+        SELECT COALESCE(SUM(active_count), 0) AS active_count
+        FROM (
+            SELECT COUNT(*) AS active_count
+            FROM pipeline_jobs INDEXED BY idx_pipeline_jobs_type_claim
+            WHERE job_type IN ({placeholders})
+              AND status = 'queued'
+              AND attempts < max_attempts
+            UNION ALL
+            SELECT COUNT(*) AS active_count
+            FROM pipeline_jobs INDEXED BY idx_pipeline_jobs_type_claim
+            WHERE job_type IN ({placeholders})
+              AND status = 'running'
+              AND lease_until > ?
+        )
+    """
+    return sql, (*MAINTENANCE_DEFER_JOB_TYPES, *MAINTENANCE_DEFER_JOB_TYPES, int(now))
+
+
+def _maintenance_preflight_active_queue_count(
+    conn: sqlite3.Connection,
+    *,
+    now: int,
+) -> int:
+    sql, params = _maintenance_preflight_active_queue_query(now)
+    return int(conn.execute(sql, params).fetchone()[0] or 0)
+
+
 def _wal_checkpoint(
     conn: sqlite3.Connection,
     *,
     mode: str,
     dry_run: bool,
+    truncate_threshold_mb: int = DEFAULT_WAL_TRUNCATE_THRESHOLD_MB,
+    truncate_allowed_hours: str = DEFAULT_WAL_TRUNCATE_ALLOWED_HOURS,
+    checkpoint_timeout_ms: int = DEFAULT_WAL_CHECKPOINT_TIMEOUT_MS,
 ) -> dict[str, Any]:
     if mode == "none":
         return {"mode": mode, "executed": False, "skipped_reason": "not_requested"}
     if dry_run:
         return {"mode": mode, "executed": False, "skipped_reason": "dry_run"}
+    if mode == "passive":
+        return _execute_wal_checkpoint(conn, mode="passive", timeout_ms=5000)
+    probe = _execute_wal_checkpoint(conn, mode="passive", timeout_ms=checkpoint_timeout_ms)
+    probe["probe_mode"] = "passive"
+    if probe.get("skipped_reason"):
+        return {**probe, "requested_mode": mode, "executed": False}
+    db_path = _main_database_path(conn)
+    wal_path = db_path.with_name(f"{db_path.name}-wal")
+    wal_size_mb = round((_path_size(wal_path) if wal_path.exists() else 0) / 1_048_576, 2)
+    probe["wal_size_mb"] = wal_size_mb
+    threshold = max(0, int(truncate_threshold_mb))
+    if int(probe.get("busy", 0)) != 0:
+        return {**probe, "requested_mode": mode, "executed": False, "skipped_reason": "busy_readers"}
+    if wal_size_mb <= threshold:
+        return {**probe, "requested_mode": mode, "executed": False, "skipped_reason": "below_threshold"}
+    current_hour = int(time.localtime().tm_hour)
+    allowed_hours = _parse_allowed_hours(truncate_allowed_hours)
+    if current_hour not in allowed_hours:
+        return {
+            **probe,
+            "requested_mode": mode,
+            "executed": False,
+            "skipped_reason": "outside_allowed_hours",
+            "current_hour": current_hour,
+            "allowed_hours": sorted(allowed_hours),
+        }
+    result = _execute_wal_checkpoint(conn, mode="truncate", timeout_ms=checkpoint_timeout_ms)
+    result.update({"wal_size_mb": wal_size_mb, "probe": probe})
+    return result
+
+
+def _execute_wal_checkpoint(
+    conn: sqlite3.Connection,
+    *,
+    mode: str,
+    timeout_ms: int,
+) -> dict[str, Any]:
     try:
-        conn.execute("PRAGMA busy_timeout = 5000")
+        conn.execute(f"PRAGMA busy_timeout = {max(1, int(timeout_ms))}")
         row = conn.execute(f"PRAGMA wal_checkpoint({mode.upper()})").fetchone()
     except sqlite3.OperationalError as exc:
         if not is_sqlite_locked_error(exc):
@@ -1047,6 +1473,31 @@ def _wal_checkpoint(
         "log_frames": int(row[1]),
         "checkpointed_frames": int(row[2]),
     }
+
+
+def _main_database_path(conn: sqlite3.Connection) -> Path:
+    row = conn.execute("PRAGMA database_list").fetchone()
+    return Path(str(row[2]))
+
+
+def _parse_allowed_hours(value: str) -> set[int]:
+    hours: set[int] = set()
+    for part in str(value or "").split(","):
+        item = part.strip()
+        if not item:
+            continue
+        if "-" in item:
+            start_text, end_text = item.split("-", 1)
+            start = int(start_text)
+            end = int(end_text)
+            if start <= end:
+                hours.update(range(start, end + 1))
+            else:
+                hours.update(range(start, 24))
+                hours.update(range(0, end + 1))
+        else:
+            hours.add(int(item))
+    return {hour for hour in hours if 0 <= hour <= 23} or set(range(24))
 
 
 def _table_names(conn: sqlite3.Connection) -> set[str]:

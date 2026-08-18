@@ -156,3 +156,32 @@ def test_declared_profit_anchors_avoid_small_pnl_saturation():
 
     assert 50 < small.score_components["pnl"] < 80
     assert large.score_components["pnl"] > small.score_components["pnl"]
+
+
+def test_official_pnl_changes_diagnostic_but_not_forward_selection_score():
+    rows = [_row(index, market=f"market-{index % 6}", usdc=75) for index in range(80)]
+
+    negative = summarize_wallet_history(
+        rows,
+        history_depth=HistoryDepth.DEEP,
+        estimated_pnl_usdc=None,
+        cost_roi_estimate=None,
+        official_all_pnl_usdc=-100_000,
+        official_profit_intensity=-0.1,
+        now=10_000,
+    )
+    positive = summarize_wallet_history(
+        rows,
+        history_depth=HistoryDepth.DEEP,
+        estimated_pnl_usdc=None,
+        cost_roi_estimate=None,
+        official_all_pnl_usdc=1_000_000,
+        official_profit_intensity=0.2,
+        now=10_000,
+    )
+
+    assert positive.research_score > negative.research_score
+    assert positive.diagnostic_score == positive.research_score
+    assert negative.forward_selection_score == pytest.approx(
+        positive.forward_selection_score
+    )

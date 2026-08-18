@@ -84,8 +84,12 @@ task_compose() {
 }
 
 validate_proxy_config() {
-  local primary_host secondary_host key_path known_hosts_path remote_port local_port
+  local primary_enabled secondary_enabled primary_host secondary_host key_path known_hosts_path remote_port local_port
   local primary_tunnel_port secondary_tunnel_port
+  primary_enabled="${PM_ROBOT_PROXY_PRIMARY_ENABLED:-$(env_file_value PM_ROBOT_PROXY_PRIMARY_ENABLED)}"
+  secondary_enabled="${PM_ROBOT_PROXY_SECONDARY_ENABLED:-$(env_file_value PM_ROBOT_PROXY_SECONDARY_ENABLED)}"
+  primary_enabled="${primary_enabled:-0}"
+  secondary_enabled="${secondary_enabled:-1}"
   primary_host="${PM_ROBOT_PROXY_PRIMARY_VPS_HOST:-$(env_file_value PM_ROBOT_PROXY_PRIMARY_VPS_HOST)}"
   secondary_host="${PM_ROBOT_PROXY_SECONDARY_VPS_HOST:-$(env_file_value PM_ROBOT_PROXY_SECONDARY_VPS_HOST)}"
   key_path="${PM_ROBOT_VPS_KEY_PATH:-$(env_file_value PM_ROBOT_VPS_KEY_PATH)}"
@@ -94,12 +98,16 @@ validate_proxy_config() {
   local_port="${PM_ROBOT_PROXY_LOCAL_PORT:-$(env_file_value PM_ROBOT_PROXY_LOCAL_PORT)}"
   primary_tunnel_port="${PM_ROBOT_PROXY_PRIMARY_TUNNEL_PORT:-$(env_file_value PM_ROBOT_PROXY_PRIMARY_TUNNEL_PORT)}"
   secondary_tunnel_port="${PM_ROBOT_PROXY_SECONDARY_TUNNEL_PORT:-$(env_file_value PM_ROBOT_PROXY_SECONDARY_TUNNEL_PORT)}"
-  if [[ -z "$primary_host" ]]; then
+  if [[ "$primary_enabled" != "0" && -z "$primary_host" ]]; then
     echo "PM_ROBOT_PROXY_PRIMARY_VPS_HOST is required before starting proxy-dependent services." >&2
     exit 2
   fi
-  if [[ -z "$secondary_host" ]]; then
+  if [[ "$secondary_enabled" != "0" && -z "$secondary_host" ]]; then
     echo "PM_ROBOT_PROXY_SECONDARY_VPS_HOST is required before starting proxy-dependent services." >&2
+    exit 2
+  fi
+  if [[ "$primary_enabled" == "0" && "$secondary_enabled" == "0" ]]; then
+    echo "At least one VPS proxy tunnel must be enabled before starting proxy-dependent services." >&2
     exit 2
   fi
   if [[ -z "$key_path" ]]; then

@@ -12,7 +12,7 @@ import math
 import sqlite3
 import time
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Mapping
 
 from pm_robot.clients.polymarket_public import PublicPolymarketClient
 from pm_robot.pipeline_terms import PipelineJobType
@@ -32,18 +32,49 @@ from pm_robot.storage.wallet_levels import advance_wallet_level, get_wallet_leve
 from pm_robot.wallet_levels import (
     HistoryDepth,
     RECENT_SAMPLE_TRADE_LIMIT,
-    RECENT_SAMPLE_VOLUME_GATE_USDC,
+    RECENT_SCREEN_MIN_MARKET_COUNT,
+    RECENT_SCREEN_MIN_SINGLE_TRADE_USDC,
+    RECENT_SCREEN_MIN_TRADE_COUNT,
+    RECENT_SCREEN_MIN_VOLUME_USDC,
     WalletLevel,
 )
 
 
 JOB_TYPE = PipelineJobType.WALLET_RECENT_SCREEN.value
-SCREEN_POLICY_VERSION = "v2"
+SCREEN_POLICY_VERSION = "v3"
 JOB_ACTION = f"screen_recent:{SCREEN_POLICY_VERSION}"
 JOB_SCOPE = HistoryDepth.SAMPLE.value
 SAMPLE_TRADE_LIMIT = RECENT_SAMPLE_TRADE_LIMIT
-SAMPLE_VOLUME_GATE_USDC = RECENT_SAMPLE_VOLUME_GATE_USDC
+SAMPLE_MIN_TRADE_COUNT = RECENT_SCREEN_MIN_TRADE_COUNT
+SAMPLE_MIN_MARKET_COUNT = RECENT_SCREEN_MIN_MARKET_COUNT
+SAMPLE_MIN_VOLUME_USDC = RECENT_SCREEN_MIN_VOLUME_USDC
+SAMPLE_MIN_SINGLE_TRADE_USDC = RECENT_SCREEN_MIN_SINGLE_TRADE_USDC
 DEFAULT_RESCREEN_AFTER_SECONDS = 7 * 86_400
+DEFAULT_PRIORITY_AGING_SECONDS = 3_600
+SOURCE_BUCKETS = ("curated", "leaderboard", "polydata", "stream")
+
+_SOURCE_BUCKET_PREDICATES = {
+    "leaderboard": "LOWER(COALESCE(observed.sources, '')) LIKE '%leaderboard%'",
+    "curated": """
+        LOWER(COALESCE(observed.sources, '')) NOT LIKE '%leaderboard%'
+        AND (
+            LOWER(COALESCE(observed.sources, '')) LIKE '%manual%'
+            OR LOWER(COALESCE(observed.sources, '')) LIKE '%bitget%'
+        )
+    """,
+    "polydata": """
+        LOWER(COALESCE(observed.sources, '')) NOT LIKE '%leaderboard%'
+        AND LOWER(COALESCE(observed.sources, '')) NOT LIKE '%manual%'
+        AND LOWER(COALESCE(observed.sources, '')) NOT LIKE '%bitget%'
+        AND LOWER(COALESCE(observed.sources, '')) LIKE '%polydata%'
+    """,
+    "stream": """
+        LOWER(COALESCE(observed.sources, '')) NOT LIKE '%leaderboard%'
+        AND LOWER(COALESCE(observed.sources, '')) NOT LIKE '%manual%'
+        AND LOWER(COALESCE(observed.sources, '')) NOT LIKE '%bitget%'
+        AND LOWER(COALESCE(observed.sources, '')) NOT LIKE '%polydata%'
+    """,
+}
 
 
 @dataclass(frozen=True)
@@ -110,47 +141,12 @@ def plan_wallet_screen_jobs(
             status="ok",
         )
 
-    rows = conn.execute(
-        """
-        SELECT
-            levels.wallet,
-            levels.last_seen_at,
-            COALESCE(observed.sources, '') AS sources,
-            COALESCE(observed.recent_usdc_total, 0) AS observed_usdc,
-            COALESCE(observed.recent_trade_count, 0) AS observed_trades,
-            COALESCE(screen.updated_at, 0) AS screen_updated_at
-        FROM wallet_levels AS levels
-        LEFT JOIN observed_wallets AS observed ON observed.wallet = levels.wallet
-        LEFT JOIN wallet_screen_summaries AS screen ON screen.wallet = levels.wallet
-        WHERE levels.level = 'l1'
-          AND levels.hard_risk_block = 0
-          AND NOT EXISTS (
-                SELECT 1
-                FROM pipeline_jobs AS active_job
-                WHERE active_job.job_type = ?
-                  AND active_job.wallet = levels.wallet
-                  AND (
-                        active_job.status = 'running'
-                     OR (active_job.status = 'queued' AND active_job.attempts < active_job.max_attempts)
-                  )
-          )
-          AND (
-                screen.wallet IS NULL
-             OR screen.screen_complete = 0
-             OR (
-                    screen.screen_qualified = 0
-                AND screen.updated_at <= ?
-                AND levels.last_seen_at > screen.updated_at
-             )
-          )
-        ORDER BY levels.last_seen_at DESC, levels.wallet ASC
-        """,
-        (
-            JOB_TYPE,
-            ts - max(0, int(rescreen_after_seconds)),
-        ),
-    ).fetchall()
-    targets = _fair_targets([dict(row) for row in rows], limit=slots)
+    rows = _candidate_rows_by_source_bucket(
+        conn,
+        limit=slots,
+        rescreen_cutoff=ts - max(0, int(rescreen_after_seconds)),
+    )
+    targets = _fair_targets(rows, limit=slots)
     enqueued = 0
     for target in targets:
         wallet = str(target["wallet"])
@@ -217,6 +213,7 @@ def run_wallet_screen_worker(
             shard=shard_index,
             worker_id=worker_id,
             lease_seconds=lease_seconds,
+            priority_aging_seconds=DEFAULT_PRIORITY_AGING_SECONDS,
         )
         if job is None:
             break
@@ -243,15 +240,7 @@ def run_wallet_screen_worker(
             )
             now = int(time.time())
             sample = _summarize_trades(trades)
-            qualified = (
-                sample["trade_count"] > 0
-                and sample["volume_usdc"] >= SAMPLE_VOLUME_GATE_USDC
-            )
-            screen_reason = (
-                "sample_volume_at_least_100_usdc"
-                if qualified
-                else "sample_volume_below_100_usdc"
-            )
+            qualified, screen_reason = recent_screen_qualification(sample)
             _persist_screen(
                 conn,
                 wallet=wallet,
@@ -265,12 +254,13 @@ def run_wallet_screen_worker(
                     conn,
                     wallet,
                     to_level=WalletLevel.L2,
-                    reason="recent_sample_volume",
+                    reason="sample_passed_resource_gate_v3",
                     policy_version=SCREEN_POLICY_VERSION,
                     facts={
                         "sample_trade_count": sample["trade_count"],
                         "sample_volume_usdc": sample["volume_usdc"],
                         "sample_market_count": sample["market_count"],
+                        "sample_max_trade_usdc": sample["max_trade_usdc"],
                     },
                     now=now,
                 )
@@ -283,6 +273,8 @@ def run_wallet_screen_worker(
                     "qualified": qualified,
                     "sample_trade_count": sample["trade_count"],
                     "sample_volume_usdc": sample["volume_usdc"],
+                    "sample_market_count": sample["market_count"],
+                    "sample_max_trade_usdc": sample["max_trade_usdc"],
                     "level": get_wallet_level(conn, wallet).level.value,
                 },
                 now=now,
@@ -372,6 +364,13 @@ def _persist_screen(
                     "method": "recent_trades",
                     "limit": SAMPLE_TRADE_LIMIT,
                     "policy_version": SCREEN_POLICY_VERSION,
+                    "thresholds": {
+                        "min_trade_count": SAMPLE_MIN_TRADE_COUNT,
+                        "min_market_count": SAMPLE_MIN_MARKET_COUNT,
+                        "min_volume_usdc": SAMPLE_MIN_VOLUME_USDC,
+                        "min_single_trade_usdc": SAMPLE_MIN_SINGLE_TRADE_USDC,
+                    },
+                    "sample_max_trade_usdc": sample["max_trade_usdc"],
                 }
             ),
             now,
@@ -392,8 +391,47 @@ def _summarize_trades(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "trade_count": len(trades),
         "volume_usdc": sum(volumes),
         "market_count": len(markets),
+        "max_trade_usdc": max(volumes, default=0.0),
         "latest_trade_at": max((_int(row.get("timestamp")) for row in trades), default=0),
     }
+
+
+def recent_screen_qualification(sample: Mapping[str, Any]) -> tuple[bool, str]:
+    """Return the compact L1 resource gate; it does not judge profitability."""
+
+    if _int(sample.get("trade_count")) < SAMPLE_MIN_TRADE_COUNT:
+        return False, "sample_trade_count_below_3"
+    if _int(sample.get("market_count")) < SAMPLE_MIN_MARKET_COUNT:
+        return False, "sample_market_count_below_2"
+    if _float(sample.get("volume_usdc")) < SAMPLE_MIN_VOLUME_USDC:
+        return False, f"sample_volume_below_{int(SAMPLE_MIN_VOLUME_USDC)}_usdc"
+    if _float(sample.get("max_trade_usdc")) < SAMPLE_MIN_SINGLE_TRADE_USDC:
+        return False, (
+            f"sample_no_trade_at_least_{int(SAMPLE_MIN_SINGLE_TRADE_USDC)}_usdc"
+        )
+    return True, "sample_passed_resource_gate_v3"
+
+
+def current_screen_is_history_eligible(screen: Mapping[str, Any]) -> bool:
+    """Accept only a complete v3 compact screen before L2 can spend history budget."""
+
+    if not bool(screen.get("screen_complete")) or not bool(screen.get("screen_qualified")):
+        return False
+    try:
+        snapshot = json.loads(str(screen.get("source_snapshot_json") or "{}"))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return False
+    if snapshot.get("policy_version") != SCREEN_POLICY_VERSION:
+        return False
+    qualified, _ = recent_screen_qualification(
+        {
+            "trade_count": screen.get("sample_trade_count", 0),
+            "market_count": screen.get("sample_market_count", 0),
+            "volume_usdc": screen.get("sample_volume_usdc", 0.0),
+            "max_trade_usdc": snapshot.get("sample_max_trade_usdc", 0.0),
+        }
+    )
+    return qualified
 
 
 def _trade_usdc(row: dict[str, Any]) -> float:
@@ -421,6 +459,69 @@ def _fair_targets(rows: list[dict[str, Any]], *, limit: int) -> list[dict[str, A
                 next_names.append(name)
         names = next_names
     return selected
+
+
+def _candidate_rows_by_source_bucket(
+    conn: sqlite3.Connection,
+    *,
+    limit: int,
+    rescreen_cutoff: int,
+) -> list[dict[str, Any]]:
+    if limit <= 0:
+        return []
+    rows: list[dict[str, Any]] = []
+    for bucket in SOURCE_BUCKETS:
+        rows.extend(
+            dict(row)
+            for row in conn.execute(
+                _candidate_bucket_sql(bucket),
+                (int(rescreen_cutoff), int(limit)),
+            ).fetchall()
+        )
+    return rows
+
+
+def _candidate_bucket_sql(bucket: str) -> str:
+    try:
+        source_predicate = _SOURCE_BUCKET_PREDICATES[bucket]
+    except KeyError as exc:
+        raise ValueError(f"unknown wallet screen source bucket: {bucket}") from exc
+    return f"""
+        SELECT
+            levels.wallet,
+            levels.last_seen_at,
+            COALESCE(observed.sources, '') AS sources,
+            COALESCE(observed.recent_usdc_total, 0) AS observed_usdc,
+            COALESCE(observed.recent_trade_count, 0) AS observed_trades,
+            COALESCE(screen.updated_at, 0) AS screen_updated_at
+        FROM wallet_levels AS levels INDEXED BY idx_wallet_levels_l1_screen_plan
+        LEFT JOIN observed_wallets AS observed ON observed.wallet = levels.wallet
+        LEFT JOIN wallet_screen_summaries AS screen ON screen.wallet = levels.wallet
+        LEFT JOIN pipeline_jobs AS active_job
+          INDEXED BY idx_pipeline_jobs_wallet_screen_active_lookup
+          ON active_job.wallet = levels.wallet
+         AND active_job.job_type = 'wallet_recent_screen'
+         AND active_job.status IN ('running', 'queued')
+         AND (
+                active_job.status = 'running'
+             OR active_job.attempts < active_job.max_attempts
+         )
+        WHERE levels.level = 'l1'
+          AND levels.hard_risk_block = 0
+          AND active_job.job_id IS NULL
+          AND ({source_predicate})
+          AND (
+                screen.wallet IS NULL
+             OR screen.screen_complete = 0
+             OR (
+                    screen.screen_qualified = 0
+                AND screen.updated_at <= ?
+                AND levels.last_seen_at > screen.updated_at
+             )
+          )
+        ORDER BY levels.last_seen_at DESC, levels.wallet ASC
+        LIMIT ?
+    """
 
 
 def _source_bucket(sources: str) -> str:

@@ -23,7 +23,10 @@ from pm_robot.orchestration.retry_policy import (
 )
 from pm_robot.orchestration.wallet_level_selection import SELECTION_POLICY_VERSION
 from pm_robot.pipeline_terms import PipelineJobType
-from pm_robot.research.current_elite import CURRENT_ELITE_EVIDENCE_MAX_AGE_SECONDS
+from pm_robot.research.current_elite import (
+    CURRENT_ELITE_EVIDENCE_MAX_AGE_SECONDS,
+    l6_promotion_quality_failures,
+)
 from pm_robot.research.l6_validation import (
     L6_VALIDATION_POLICY_VERSION,
     L6ValidationDecision,
@@ -43,7 +46,11 @@ from pm_robot.storage.repository import (
     enqueue_pipeline_job,
     retry_pipeline_job,
 )
-from pm_robot.storage.wallet_levels import advance_wallet_level, get_wallet_level
+from pm_robot.storage.wallet_levels import (
+    advance_wallet_level,
+    get_wallet_level,
+    reclassify_wallet_level,
+)
 from pm_robot.wallet_levels import WalletLevel
 
 
@@ -127,6 +134,8 @@ def plan_l6_validation_jobs(
          AND selection.evidence_artifact_id = summary.artifact_id
          AND selection.policy_version = ?
          AND selection.selected = 1
+         AND selection.score_status = 'valid'
+         AND selection.forward_selection_score IS NOT NULL
         LEFT JOIN wallet_l6_validations AS latest
           ON latest.validation_id = (
               SELECT prior.validation_id
@@ -154,9 +163,11 @@ def plan_l6_validation_jobs(
                       active_job.status = 'running'
                    OR (active_job.status = 'queued' AND active_job.attempts < active_job.max_attempts)
                 )
-          )
+        )
         ORDER BY
-            CASE levels.level WHEN 'l5' THEN 0 ELSE 1 END,
+            -- Revalidate existing L6 evidence before new L5 promotions. This keeps
+            -- the execution handoff current when an L6 policy version advances.
+            CASE levels.level WHEN 'l6' THEN 0 ELSE 1 END,
             summary.research_score DESC,
             levels.wallet ASC
         LIMIT ?
@@ -198,6 +209,7 @@ def plan_l6_validation_jobs(
                 now=ts,
             )
         )
+        conn.commit()
     return L6ValidationPlanSummary(
         targets_seen=len(rows),
         jobs_enqueued=enqueued,
@@ -316,9 +328,19 @@ def run_l6_validation_worker(
                 artifact=raw_artifact,
                 now=now,
             )
+            promotion_failures: tuple[str, ...] = ()
             if result.decision is L6ValidationDecision.PASS:
                 passed += 1
-                if level.level is WalletLevel.L5:
+                promotion_failures = l6_promotion_quality_failures(
+                    conn,
+                    wallet=wallet,
+                    evidence_artifact_id=evidence_artifact_id,
+                    validation_id=raw_artifact.artifact_id,
+                    now=now,
+                    validation_policy_version=result.policy_version,
+                    selection_policy_version=selection_policy_version,
+                )
+                if level.level is WalletLevel.L5 and not promotion_failures:
                     decision = advance_wallet_level(
                         conn,
                         wallet,
@@ -343,6 +365,22 @@ def run_l6_validation_worker(
                 warned += 1
             else:
                 validation_failed += 1
+            if level.level is WalletLevel.L6 and (
+                result.decision is not L6ValidationDecision.PASS or promotion_failures
+            ):
+                reclassify_wallet_level(
+                    conn,
+                    wallet,
+                    to_level=WalletLevel.L5,
+                    reason="l6_refresh_not_currently_valid",
+                    policy_version=result.policy_version,
+                    facts={
+                        "validation_id": raw_artifact.artifact_id,
+                        "decision": result.decision.value,
+                        "quality_failures": list(promotion_failures),
+                    },
+                    now=now,
+                )
             if not complete_pipeline_job(
                 conn,
                 job_id=int(job["job_id"]),
@@ -351,7 +389,12 @@ def run_l6_validation_worker(
                     "validation_id": raw_artifact.artifact_id,
                     "decision": result.decision.value,
                     "reason": result.reason,
-                    "promoted_l6": bool(level.level is WalletLevel.L5 and result.decision is L6ValidationDecision.PASS),
+                    "promotion_quality_failures": list(promotion_failures),
+                    "promoted_l6": bool(
+                        level.level is WalletLevel.L5
+                        and result.decision is L6ValidationDecision.PASS
+                        and not promotion_failures
+                    ),
                 },
                 now=now,
             ):
@@ -633,6 +676,8 @@ def _evidence_is_current(
              AND selection.evidence_artifact_id = summary.artifact_id
              AND selection.policy_version = ?
              AND selection.selected = 1
+             AND selection.score_status = 'valid'
+             AND selection.forward_selection_score IS NOT NULL
             WHERE summary.wallet = ?
               AND summary.artifact_id = ?
               AND summary.history_depth = 'deep'

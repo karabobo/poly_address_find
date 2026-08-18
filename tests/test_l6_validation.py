@@ -65,6 +65,34 @@ def test_l6_validation_passes_sustained_realized_profit_without_hard_anomaly():
     assert result.official_profit_intensity == pytest.approx(0.01)
 
 
+def test_l6_validation_records_recent_execution_shape_per_signal():
+    activity = _activity_rows()
+    activity.extend(
+        {
+            "timestamp": NOW - 120 + index,
+            "type": "TRADE",
+            "side": "BUY",
+            "conditionId": "burst-market",
+            "asset": "burst-token",
+            "usdcSize": 20,
+            "transactionHash": f"0xburst{index:059x}",
+        }
+        for index in range(4)
+    )
+
+    result = evaluate_l6_validation(
+        current_positions=[],
+        closed_positions=_closed_rows(),
+        activity=activity,
+        leaderboard_rows=_leaderboard_rows(),
+        now=NOW,
+    )
+
+    assert result.evidence_metrics["last_trade_age_seconds"] == 117
+    assert result.evidence_metrics["recent_active_days"] >= 1
+    assert result.evidence_metrics["max_same_signal_trades_10_seconds"] == 4
+
+
 def test_l6_validation_dedupes_semantic_evidence_with_extra_metadata():
     closed = _closed_rows()
     activity = _activity_rows()

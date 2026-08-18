@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from pm_robot.clients.http import HttpClientError
 from pm_robot.clients.polymarket_public import (
     MAX_CLOSED_POSITIONS_LIMIT,
     PublicPolymarketClient,
@@ -22,6 +23,7 @@ from pm_robot.orchestration.retry_policy import (
     is_upstream_scheduling_error,
     upstream_aware_retry_at,
 )
+from pm_robot.orchestration.wallet_screening import current_screen_is_history_eligible
 from pm_robot.research.wallet_history_summary import (
     METHODOLOGY_VERSION,
     WalletHistorySummary,
@@ -30,6 +32,7 @@ from pm_robot.research.wallet_history_summary import (
 from pm_robot.research.pnl_estimates import PnlEstimate, estimate_wallet_pnl
 from pm_robot.storage.db import is_sqlite_locked_error
 from pm_robot.storage.repository import (
+    PIPELINE_TERMINAL_FAILED_STATUS,
     claim_pipeline_job,
     complete_pipeline_job,
     enqueue_pipeline_job,
@@ -41,6 +44,15 @@ from pm_robot.storage.wallet_history_store import (
     discard_uncommitted_wallet_history_artifact,
     load_active_wallet_history_artifact,
     persist_wallet_history_artifact,
+)
+from pm_robot.storage.wallet_history_planner_state import (
+    apply_wallet_history_planner_sightings,
+    load_wallet_history_planner_level_rows,
+    replace_wallet_history_planner_state_rows,
+    select_wallet_history_planner_refresh_wallets,
+    select_wallet_history_planner_sightings,
+    wallet_history_planner_bootstrap_complete,
+    wallet_history_planner_dirty_backlog_empty,
 )
 from pm_robot.storage.wallet_levels import get_wallet_level
 from pm_robot.wallet_levels import HistoryDepth, WalletLevel
@@ -61,9 +73,29 @@ DEEP_CLOSED_POSITION_LIMIT = 200
 DEFAULT_LIGHT_REFRESH_SECONDS = 30 * 86_400
 DEFAULT_DEEP_REFRESH_SECONDS = 7 * 86_400
 DEFAULT_PRIORITY_AGING_SECONDS = 3_600
+L2_DEEP_MIN_ACTIVITY_COUNT = 25
+L2_DEEP_MIN_MARKET_COUNT = 2
+L2_DEEP_MIN_VOLUME_USDC = 500.0
+L2_TRUSTED_SLOW_ACTIVITY_COUNT = 10
+L2_TRUSTED_SLOW_MARKET_COUNT = 1
+L2_TRUSTED_SLOW_VOLUME_USDC = 100.0
+L2_TRUSTED_SLOW_MAX_PER_ROUND = 2
 REUSE_ONLY_REFRESH_REASONS = frozenset(
     {"methodology_upgrade", "pnl_evidence_refresh"}
 )
+_PLAN_REFRESH_LANES = (
+    "required_depth",
+    "methodology_upgrade",
+    "new_activity_after_refresh_window",
+    "pnl_evidence_refresh",
+)
+_PLAN_TARGET_DEPTHS = ("deep", "light")
+_PLAN_LEVEL_BATCH_SIZE = 500
+_PLAN_SIGHTING_BATCH_SIZE = 5_000
+
+
+class WalletHistoryTerminalDataQualityError(RuntimeError):
+    """Non-transient local history data corruption that retry budget cannot repair."""
 
 
 @dataclass(frozen=True)
@@ -134,6 +166,17 @@ def plan_wallet_history_jobs(
     if max_active_jobs > 0:
         slots = min(slots, max(0, int(max_active_jobs) - active_jobs))
     if slots == 0:
+        # Queue pressure blocks new network work, not state-only sighting coalescing.
+        _refresh_wallet_history_planner_sightings(
+            conn,
+            limit=max(_PLAN_SIGHTING_BATCH_SIZE, max(1, int(limit)) * 8),
+            light_refresh_seconds=light_refresh_seconds,
+            deep_refresh_seconds=deep_refresh_seconds,
+            now=ts,
+        )
+        commit = getattr(conn, "commit", None)
+        if commit is not None:
+            commit()
         return WalletHistoryPlanSummary(
             targets_seen=0,
             jobs_enqueued=0,
@@ -142,214 +185,18 @@ def plan_wallet_history_jobs(
             throttled=max_active_jobs > 0 and active_jobs >= max_active_jobs,
             status="ok",
         )
-    candidate_pool_per_depth = max(slots * 4, slots)
-    rows = conn.execute(
-        """
-        WITH evidence AS (
-            SELECT
-                levels.wallet,
-                levels.level,
-                levels.last_seen_at,
-                COALESCE(observed.sources, '') AS sources,
-                COALESCE(summary.history_depth, '') AS current_depth,
-                COALESCE(summary.methodology_version, '') AS current_methodology_version,
-                COALESCE(summary.research_score, 0) AS research_score,
-                COALESCE(summary.updated_at, 0) AS summary_updated_at,
-                COALESCE(pnl.methodology_version, '') AS current_pnl_methodology_version,
-                COALESCE(pnl.captured_at, 0) AS pnl_captured_at,
-                COALESCE(screen.sample_trade_count, 0) AS sample_trade_count,
-                COALESCE(screen.sample_volume_usdc, 0) AS sample_volume_usdc,
-                COALESCE(screen.sample_market_count, 0) AS sample_market_count,
-                CASE
-                    WHEN levels.level IN ('l3', 'l4', 'l5', 'l6') THEN 'deep'
-                    ELSE 'light'
-                END AS target_depth,
-                CASE
-                    WHEN summary.wallet IS NOT NULL
-                         AND COALESCE(summary.methodology_version, '') != ? THEN 1
-                    ELSE 0
-                END AS methodology_stale,
-                CASE
-                    WHEN levels.level IN ('l4', 'l5', 'l6')
-                         AND COALESCE(summary.methodology_version, '') = ?
-                         AND (
-                                pnl.wallet IS NULL
-                             OR COALESCE(pnl.methodology_version, '') != ?
-                             OR (
-                                    pnl.official_all_pnl_usdc IS NULL
-                                AND COALESCE(pnl.captured_at, 0) <= ?
-                             )
-                         ) THEN 1
-                    ELSE 0
-                END AS pnl_refresh_needed,
-                CASE
-                    WHEN levels.level = 'l2'
-                         AND summary.history_depth = 'light'
-                         AND summary.updated_at <= ?
-                         AND levels.last_seen_at > summary.updated_at THEN 1
-                    WHEN levels.level IN ('l3', 'l4', 'l5', 'l6')
-                         AND summary.history_depth = 'deep'
-                         AND summary.updated_at <= ?
-                         AND levels.last_seen_at > summary.updated_at THEN 1
-                    ELSE 0
-                END AS activity_refresh_needed
-            FROM wallet_levels AS levels
-            LEFT JOIN observed_wallets AS observed ON observed.wallet = levels.wallet
-            LEFT JOIN wallet_screen_summaries AS screen ON screen.wallet = levels.wallet
-            LEFT JOIN wallet_history_summaries AS summary ON summary.wallet = levels.wallet
-            LEFT JOIN wallet_pnl_summaries AS pnl ON pnl.wallet = levels.wallet
-            WHERE levels.hard_risk_block = 0
-              AND NOT EXISTS (
-                    SELECT 1
-                    FROM pipeline_jobs AS active_job
-                    WHERE active_job.job_type = ?
-                      AND active_job.wallet = levels.wallet
-                      AND (
-                            active_job.status = 'running'
-                         OR (active_job.status = 'queued' AND active_job.attempts < active_job.max_attempts)
-                      )
-              )
-              AND NOT EXISTS (
-                    SELECT 1
-                    FROM pipeline_jobs AS deferred_failure
-                    WHERE deferred_failure.job_type = ?
-                      AND deferred_failure.wallet = levels.wallet
-                      AND deferred_failure.status = 'failed'
-                      AND deferred_failure.next_attempt_at > ?
-                      AND deferred_failure.job_scope = CASE
-                            WHEN levels.level IN ('l3', 'l4', 'l5', 'l6') THEN 'deep'
-                            ELSE 'light'
-                      END
-                      AND deferred_failure.job_action IN (
-                            (
-                                CASE
-                                    WHEN levels.level IN ('l3', 'l4', 'l5', 'l6') THEN ?
-                                    ELSE ?
-                                END
-                            ) || ':refresh:' || COALESCE(summary.updated_at, 0),
-                            (
-                                CASE
-                                    WHEN levels.level IN ('l3', 'l4', 'l5', 'l6') THEN ?
-                                    ELSE ?
-                                END
-                            ) || ':pnl:' || COALESCE(
-                                NULLIF(pnl.captured_at, 0),
-                                summary.updated_at,
-                                0
-                            )
-                      )
-              )
-              AND (
-                    (levels.level = 'l2' AND summary.wallet IS NULL)
-                 OR (
-                        levels.level = 'l2'
-                    AND summary.history_depth = 'light'
-                    AND (
-                            COALESCE(summary.methodology_version, '') != ?
-                         OR (
-                                summary.updated_at <= ?
-                            AND levels.last_seen_at > summary.updated_at
-                         )
-                    )
-                 )
-                 OR (
-                        levels.level IN ('l3', 'l4', 'l5', 'l6')
-                    AND (
-                            summary.wallet IS NULL
-                         OR COALESCE(summary.history_depth, '') != 'deep'
-                         OR COALESCE(summary.methodology_version, '') != ?
-                         OR (
-                                summary.updated_at <= ?
-                            AND levels.last_seen_at > summary.updated_at
-                         )
-                    )
-                 )
-                 OR (
-                        levels.level IN ('l4', 'l5', 'l6')
-                    AND COALESCE(summary.methodology_version, '') = ?
-                    AND (
-                           pnl.wallet IS NULL
-                        OR COALESCE(pnl.methodology_version, '') != ?
-                        OR (
-                               pnl.official_all_pnl_usdc IS NULL
-                           AND COALESCE(pnl.captured_at, 0) <= ?
-                        )
-                    )
-                 )
-              )
-        ), eligible AS (
-            SELECT
-                evidence.*,
-                CASE
-                    WHEN current_depth != target_depth THEN 'required_depth'
-                    WHEN methodology_stale = 1 THEN 'methodology_upgrade'
-                    WHEN activity_refresh_needed = 1 THEN 'new_activity_after_refresh_window'
-                    WHEN pnl_refresh_needed = 1 THEN 'pnl_evidence_refresh'
-                    ELSE 'new_activity_after_refresh_window'
-                END AS refresh_lane,
-                CASE
-                    WHEN methodology_stale = 1 AND level = 'l6' THEN 0
-                    WHEN methodology_stale = 1 AND level = 'l5' THEN 1
-                    WHEN methodology_stale = 1 AND level = 'l4' THEN 2
-                    WHEN methodology_stale = 1 AND level = 'l3' THEN 3
-                    WHEN pnl_refresh_needed = 1 AND level = 'l6' THEN 4
-                    WHEN pnl_refresh_needed = 1 AND level = 'l5' THEN 5
-                    WHEN pnl_refresh_needed = 1 AND level = 'l4' THEN 6
-                    WHEN level IN ('l3', 'l4', 'l5', 'l6') AND current_depth != 'deep' THEN 7
-                    WHEN methodology_stale = 1 THEN 8
-                    WHEN level IN ('l3', 'l4', 'l5', 'l6') THEN 9
-                    WHEN current_depth = '' THEN 10
-                    ELSE 11
-                END AS urgency
-            FROM evidence
-        ), ranked AS (
-            SELECT
-                eligible.*,
-                ROW_NUMBER() OVER (
-                    PARTITION BY target_depth, refresh_lane
-                    ORDER BY urgency, research_score DESC,
-                             sample_market_count DESC, sample_volume_usdc DESC,
-                             sample_trade_count DESC, last_seen_at DESC, wallet ASC
-                ) AS lane_rank
-            FROM eligible
-        )
-        SELECT
-            wallet, level, last_seen_at, sources, current_depth,
-            current_methodology_version, methodology_stale,
-            current_pnl_methodology_version, pnl_captured_at, pnl_refresh_needed,
-            activity_refresh_needed,
-            research_score, summary_updated_at, target_depth, urgency,
-            sample_trade_count, sample_volume_usdc, sample_market_count
-        FROM ranked
-        WHERE lane_rank <= ?
-        ORDER BY lane_rank, target_depth, refresh_lane, urgency,
-                 research_score DESC, wallet ASC
-        """,
-        (
-            METHODOLOGY_VERSION,
-            METHODOLOGY_VERSION,
-            PNL_METHODOLOGY_VERSION,
-            ts - PNL_INCOMPLETE_REFRESH_SECONDS,
-            ts - max(0, int(light_refresh_seconds)),
-            ts - max(0, int(deep_refresh_seconds)),
-            JOB_TYPE,
-            JOB_TYPE,
-            ts,
-            DEEP_ACTION,
-            LIGHT_ACTION,
-            DEEP_ACTION,
-            LIGHT_ACTION,
-            METHODOLOGY_VERSION,
-            ts - max(0, int(light_refresh_seconds)),
-            METHODOLOGY_VERSION,
-            ts - max(0, int(deep_refresh_seconds)),
-            METHODOLOGY_VERSION,
-            PNL_METHODOLOGY_VERSION,
-            ts - PNL_INCOMPLETE_REFRESH_SECONDS,
-            candidate_pool_per_depth,
-        ),
-    ).fetchall()
-    targets = _fair_targets([dict(row) for row in rows], limit=len(rows))
+    candidate_pool_per_lane = max(slots * 4, slots)
+    rows = _select_wallet_history_plan_candidates(
+        conn,
+        lane_limit=candidate_pool_per_lane,
+        light_refresh_seconds=light_refresh_seconds,
+        deep_refresh_seconds=deep_refresh_seconds,
+        now=ts,
+    )
+    warming_up = not rows and not _wallet_history_planner_ready_for_selection(conn)
+    targets = _limit_l2_trusted_slow_targets(
+        _fair_targets([dict(row) for row in rows], limit=len(rows))
+    )
     enqueued = 0
     targets_seen = 0
     for target in targets:
@@ -393,19 +240,1002 @@ def plan_wallet_history_jobs(
                     "target_rows": _target_rows(depth),
                     "planned_at": ts,
                 },
-                max_attempts=(
-                    1 if refresh_reason in REUSE_ONLY_REFRESH_REASONS else 3
-                ),
+                max_attempts=3,
                 now=ts,
             )
         )
+    if enqueued:
+        conn.commit()
     return WalletHistoryPlanSummary(
         targets_seen=targets_seen,
         jobs_enqueued=enqueued,
         active_jobs=active_jobs,
         max_active_jobs=max(0, int(max_active_jobs)),
         throttled=False,
-        status="ok",
+        status="warming_up" if warming_up else "ok",
+    )
+
+
+def _wallet_history_plan_candidate_params(
+    *,
+    light_refresh_seconds: int = DEFAULT_LIGHT_REFRESH_SECONDS,
+    deep_refresh_seconds: int,
+    now: int,
+) -> tuple[Any, ...]:
+    del light_refresh_seconds, deep_refresh_seconds, now
+    return ()
+
+
+def _wallet_history_plan_candidate_scan_sql() -> str:
+    return (
+        "SELECT wallet, level, last_seen_at, current_depth, "
+        "current_methodology_version, methodology_stale, "
+        "current_pnl_methodology_version, pnl_captured_at, "
+        "pnl_refresh_needed, activity_refresh_needed, research_score, "
+        "summary_updated_at, target_depth, refresh_lane, urgency, "
+        "sample_trade_count, sample_volume_usdc, sample_market_count "
+        "FROM wallet_history_planner_state "
+        "WHERE is_eligible = 1"
+    )
+
+
+def _select_wallet_history_plan_candidates(
+    conn: sqlite3.Connection,
+    *,
+    lane_limit: int,
+    light_refresh_seconds: int = DEFAULT_LIGHT_REFRESH_SECONDS,
+    deep_refresh_seconds: int,
+    now: int,
+) -> list[dict[str, Any]]:
+    """Fetch bounded planner candidates per lane without SQLite temp sorting."""
+
+    bounded_limit = max(0, int(lane_limit))
+    if bounded_limit == 0:
+        return []
+    sighting_limit = max(_PLAN_SIGHTING_BATCH_SIZE, bounded_limit * 8)
+    _refresh_wallet_history_planner_sightings(
+        conn,
+        limit=sighting_limit,
+        light_refresh_seconds=light_refresh_seconds,
+        deep_refresh_seconds=deep_refresh_seconds,
+        now=now,
+    )
+    _refresh_wallet_history_planner_state(
+        conn,
+        limit=max(
+            _PLAN_LEVEL_BATCH_SIZE,
+            bounded_limit * len(_PLAN_TARGET_DEPTHS) * len(_PLAN_REFRESH_LANES),
+        ),
+        light_refresh_seconds=light_refresh_seconds,
+        deep_refresh_seconds=deep_refresh_seconds,
+        now=now,
+    )
+    _refresh_wallet_history_planner_sightings(
+        conn,
+        limit=sighting_limit,
+        light_refresh_seconds=light_refresh_seconds,
+        deep_refresh_seconds=deep_refresh_seconds,
+        now=now,
+    )
+    commit = getattr(conn, "commit", None)
+    if commit is not None:
+        commit()
+    if not _wallet_history_planner_ready_for_selection(conn):
+        return []
+    rows = _select_wallet_history_plan_state_lanes(conn, lane_limit=bounded_limit)
+    _attach_wallet_history_plan_sources(conn, rows)
+
+    return _rank_wallet_history_plan_candidates(rows)
+
+
+def _wallet_history_planner_ready_for_selection(conn: sqlite3.Connection) -> bool:
+    return (
+        wallet_history_planner_bootstrap_complete(conn)
+        and wallet_history_planner_dirty_backlog_empty(conn)
+    )
+
+
+def _refresh_wallet_history_planner_sightings(
+    conn: sqlite3.Connection,
+    *,
+    limit: int,
+    light_refresh_seconds: int,
+    deep_refresh_seconds: int,
+    now: int,
+) -> int:
+    """Coalesce activity timestamps without touching evidence side tables."""
+
+    claims = select_wallet_history_planner_sightings(conn, limit=limit)
+    if not claims:
+        return 0
+    updates: list[tuple[int, int, str]] = []
+    for claim in claims:
+        target_depth = (
+            HistoryDepth.DEEP.value
+            if claim.level in {"l3", "l4", "l5", "l6"}
+            else HistoryDepth.LIGHT.value
+        )
+        next_refresh_at = int(claim.next_refresh_at)
+        if (
+            claim.current_depth == target_depth
+            and claim.last_seen_at > claim.summary_updated_at
+        ):
+            refresh_seconds = (
+                deep_refresh_seconds
+                if target_depth == HistoryDepth.DEEP.value
+                else light_refresh_seconds
+            )
+            activity_due_at = claim.summary_updated_at + max(
+                0, int(refresh_seconds)
+            )
+            if activity_due_at > 0:
+                next_refresh_at = _earliest_positive_timestamp(
+                    next_refresh_at,
+                    activity_due_at,
+                )
+        updates.append(
+            (claim.last_seen_at, next_refresh_at, claim.wallet)
+        )
+    apply_wallet_history_planner_sightings(
+        conn,
+        updates=updates,
+        claims=claims,
+    )
+    return len(claims)
+
+
+def _earliest_positive_timestamp(current: int, candidate: int) -> int:
+    positive = [value for value in (int(current), int(candidate)) if value > 0]
+    return min(positive) if positive else 0
+
+
+def _refresh_wallet_history_planner_state(
+    conn: sqlite3.Connection,
+    *,
+    limit: int,
+    light_refresh_seconds: int,
+    deep_refresh_seconds: int,
+    now: int,
+) -> int:
+    claims = select_wallet_history_planner_refresh_wallets(
+        conn,
+        limit=limit,
+        now=now,
+    )
+    if not claims:
+        return 0
+    wallets = [claim.wallet for claim in claims]
+    light_refresh_before = int(now) - max(0, int(light_refresh_seconds))
+    deep_refresh_before = int(now) - max(0, int(deep_refresh_seconds))
+    pnl_refresh_before = int(now) - PNL_INCOMPLETE_REFRESH_SECONDS
+    state_rows: list[dict[str, Any]] = []
+    relevant_levels = {"l2", "l3", "l4", "l5", "l6"}
+    for chunk in _wallet_history_plan_wallet_chunks(
+        wallets,
+        limit=min(_PLAN_LEVEL_BATCH_SIZE, _sqlite_variable_limit(conn)),
+    ):
+        level_rows = load_wallet_history_planner_level_rows(conn, wallets=chunk)
+        level_rows = [
+            row
+            for row in level_rows
+            if str(row["level"] or "") in relevant_levels
+        ]
+        level_wallets = [str(row["wallet"]) for row in level_rows]
+        snapshots = _load_wallet_history_plan_snapshots(
+            conn,
+            wallets=level_wallets,
+            now=now,
+        )
+        state_rows.extend(
+            _wallet_history_planner_state_row(
+                row,
+                snapshots=snapshots,
+                light_refresh_before=light_refresh_before,
+                deep_refresh_before=deep_refresh_before,
+                pnl_refresh_before=pnl_refresh_before,
+                light_refresh_seconds=light_refresh_seconds,
+                deep_refresh_seconds=deep_refresh_seconds,
+                now=now,
+                refreshed_at=now,
+            )
+            for row in level_rows
+        )
+    replace_wallet_history_planner_state_rows(
+        conn,
+        claims=claims,
+        rows=state_rows,
+    )
+    return len(wallets)
+
+
+def _wallet_history_planner_state_row(
+    level_row: Any,
+    *,
+    snapshots: dict[str, Any],
+    light_refresh_before: int,
+    deep_refresh_before: int,
+    pnl_refresh_before: int,
+    light_refresh_seconds: int,
+    deep_refresh_seconds: int,
+    now: int,
+    refreshed_at: int,
+) -> dict[str, Any]:
+    wallet = str(level_row["wallet"])
+    level = str(level_row["level"] or "")
+    hard_risk_block = int(level_row["hard_risk_block"] or 0)
+    last_seen_at = int(level_row["last_seen_at"] or 0)
+    target_depth = (
+        HistoryDepth.DEEP.value
+        if level in {"l3", "l4", "l5", "l6"}
+        else HistoryDepth.LIGHT.value
+    )
+    summary = snapshots["summary"].get(wallet)
+    screen = snapshots["screen"].get(wallet, {})
+    pnl = snapshots["pnl"].get(wallet)
+    current_depth = str(summary["current_depth"]) if summary is not None else ""
+    current_methodology_version = (
+        str(summary["current_methodology_version"]) if summary is not None else ""
+    )
+    research_score = float(summary["research_score"]) if summary is not None else 0.0
+    summary_updated_at = (
+        int(summary["summary_updated_at"]) if summary is not None else 0
+    )
+    current_pnl_methodology_version = (
+        str(pnl["current_pnl_methodology_version"]) if pnl is not None else ""
+    )
+    pnl_captured_at = int(pnl["pnl_captured_at"]) if pnl is not None else 0
+    methodology_stale = int(
+        summary is not None and current_methodology_version != METHODOLOGY_VERSION
+    )
+    pnl_refresh_needed = int(
+        level in {"l4", "l5", "l6"}
+        and current_methodology_version == METHODOLOGY_VERSION
+        and (
+            pnl is None
+            or current_pnl_methodology_version != PNL_METHODOLOGY_VERSION
+            or (
+                pnl["official_all_pnl_usdc"] is None
+                and pnl_captured_at <= pnl_refresh_before
+            )
+        )
+    )
+    activity_refresh_needed = int(
+        (
+            level == "l2"
+            and current_depth == "light"
+            and summary_updated_at <= light_refresh_before
+            and last_seen_at > summary_updated_at
+        )
+        or (
+            level in {"l3", "l4", "l5", "l6"}
+            and current_depth == "deep"
+            and summary_updated_at <= deep_refresh_before
+            and last_seen_at > summary_updated_at
+        )
+    )
+    refresh_lane = _wallet_history_plan_refresh_lane(
+        current_depth=current_depth,
+        target_depth=target_depth,
+        methodology_stale=methodology_stale,
+        activity_refresh_needed=activity_refresh_needed,
+        pnl_refresh_needed=pnl_refresh_needed,
+    )
+    urgency = _wallet_history_plan_urgency(
+        level=level,
+        current_depth=current_depth,
+        methodology_stale=methodology_stale,
+        pnl_refresh_needed=pnl_refresh_needed,
+    )
+    eligible = int(
+        hard_risk_block == 0
+        and level in {"l2", "l3", "l4", "l5", "l6"}
+        and _wallet_history_plan_candidate_from_snapshots(
+            level_row,
+            snapshots=snapshots,
+            light_refresh_before=light_refresh_before,
+            deep_refresh_before=deep_refresh_before,
+            pnl_refresh_before=pnl_refresh_before,
+        )
+        is not None
+    )
+    return {
+        "wallet": wallet,
+        "level": level,
+        "hard_risk_block": hard_risk_block,
+        "last_seen_at": last_seen_at,
+        "current_depth": current_depth,
+        "current_methodology_version": current_methodology_version,
+        "methodology_stale": methodology_stale,
+        "current_pnl_methodology_version": current_pnl_methodology_version,
+        "pnl_captured_at": pnl_captured_at,
+        "pnl_refresh_needed": pnl_refresh_needed,
+        "activity_refresh_needed": activity_refresh_needed,
+        "research_score": research_score,
+        "summary_updated_at": summary_updated_at,
+        "sample_trade_count": int(screen.get("sample_trade_count", 0) or 0),
+        "sample_volume_usdc": float(screen.get("sample_volume_usdc", 0.0) or 0.0),
+        "sample_market_count": int(screen.get("sample_market_count", 0) or 0),
+        "target_depth": target_depth,
+        "refresh_lane": refresh_lane if eligible else "",
+        "urgency": urgency,
+        "is_eligible": eligible,
+        "next_refresh_at": _wallet_history_plan_next_refresh_at(
+            snapshots["jobs"]["deferred_actions"],
+            wallet=wallet,
+            level=level,
+            target_depth=target_depth,
+            current_depth=current_depth,
+            current_methodology_version=current_methodology_version,
+            current_pnl_methodology_version=current_pnl_methodology_version,
+            pnl_official_all_pnl_usdc=(
+                pnl["official_all_pnl_usdc"] if pnl is not None else None
+            ),
+            summary_updated_at=summary_updated_at,
+            pnl_captured_at=pnl_captured_at,
+            last_seen_at=last_seen_at,
+            light_refresh_seconds=light_refresh_seconds,
+            deep_refresh_seconds=deep_refresh_seconds,
+            now=now,
+        ),
+        "refreshed_at": int(refreshed_at),
+    }
+
+
+def _select_wallet_history_plan_state_lanes(
+    conn: sqlite3.Connection,
+    *,
+    lane_limit: int,
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for target_depth in _PLAN_TARGET_DEPTHS:
+        for refresh_lane in _PLAN_REFRESH_LANES:
+            rows.extend(
+                dict(row)
+                for row in conn.execute(
+                    _wallet_history_plan_lane_sql(),
+                    (target_depth, refresh_lane, max(0, int(lane_limit))),
+                )
+            )
+    return rows
+
+
+def _wallet_history_plan_lane_sql() -> str:
+    return (
+        "SELECT wallet, level, last_seen_at, current_depth, "
+        "current_methodology_version, methodology_stale, "
+        "current_pnl_methodology_version, pnl_captured_at, "
+        "pnl_refresh_needed, activity_refresh_needed, research_score, "
+        "summary_updated_at, target_depth, refresh_lane, urgency, "
+        "sample_trade_count, sample_volume_usdc, sample_market_count "
+        "FROM wallet_history_planner_state "
+        "WHERE target_depth = ? AND refresh_lane = ? AND is_eligible = 1 "
+        "ORDER BY urgency ASC, research_score DESC, sample_market_count DESC, "
+        "sample_volume_usdc DESC, sample_trade_count DESC, last_seen_at DESC, "
+        "wallet ASC "
+        "LIMIT ?"
+    )
+
+
+def _iter_wallet_history_plan_candidate_batches(
+    conn: sqlite3.Connection,
+    level_rows: Any,
+    *,
+    light_refresh_seconds: int,
+    deep_refresh_seconds: int,
+    now: int,
+) -> Any:
+    batch_limit = min(_PLAN_LEVEL_BATCH_SIZE, _sqlite_variable_limit(conn))
+    batch: list[Any] = []
+    for row in level_rows:
+        batch.append(row)
+        if len(batch) >= batch_limit:
+            yield from _iter_wallet_history_plan_candidates(
+                batch,
+                snapshots=_load_wallet_history_plan_snapshots(
+                    conn,
+                    wallets=[str(item["wallet"]) for item in batch],
+                    now=now,
+                ),
+                light_refresh_seconds=light_refresh_seconds,
+                deep_refresh_seconds=deep_refresh_seconds,
+                now=now,
+            )
+            batch = []
+    if batch:
+        yield from _iter_wallet_history_plan_candidates(
+            batch,
+            snapshots=_load_wallet_history_plan_snapshots(
+                conn,
+                wallets=[str(item["wallet"]) for item in batch],
+                now=now,
+            ),
+            light_refresh_seconds=light_refresh_seconds,
+            deep_refresh_seconds=deep_refresh_seconds,
+            now=now,
+        )
+
+
+def _load_wallet_history_plan_snapshots(
+    conn: sqlite3.Connection,
+    *,
+    wallets: list[str],
+    now: int,
+) -> dict[str, Any]:
+    return {
+        "screen": _wallet_history_plan_screen_snapshot(conn, wallets=wallets),
+        "summary": _wallet_history_plan_summary_snapshot(conn, wallets=wallets),
+        "pnl": _wallet_history_plan_pnl_snapshot(conn, wallets=wallets),
+        "jobs": _wallet_history_plan_job_snapshot(conn, wallets=wallets, now=now),
+    }
+
+
+def _wallet_history_plan_wallet_filter(wallets: list[str]) -> tuple[str, tuple[str, ...]]:
+    placeholders = ", ".join("?" for _ in wallets)
+    return placeholders, tuple(wallets)
+
+
+def _wallet_history_plan_screen_snapshot(
+    conn: sqlite3.Connection,
+    *,
+    wallets: list[str],
+) -> dict[str, dict[str, Any]]:
+    if not wallets:
+        return {}
+    placeholders, params = _wallet_history_plan_wallet_filter(wallets)
+    return {
+        str(row["wallet"]): {
+            "sample_trade_count": int(row["sample_trade_count"] or 0),
+            "sample_volume_usdc": float(row["sample_volume_usdc"] or 0.0),
+            "sample_market_count": int(row["sample_market_count"] or 0),
+            "screen_complete": int(row["screen_complete"] or 0),
+            "screen_qualified": int(row["screen_qualified"] or 0),
+            "source_snapshot_json": str(row["source_snapshot_json"] or "{}"),
+        }
+        for row in conn.execute(
+            """
+            SELECT wallet,
+                   COALESCE(sample_trade_count, 0) AS sample_trade_count,
+                   COALESCE(sample_volume_usdc, 0) AS sample_volume_usdc,
+                   COALESCE(sample_market_count, 0) AS sample_market_count,
+                   COALESCE(screen_complete, 0) AS screen_complete,
+                   COALESCE(screen_qualified, 0) AS screen_qualified,
+                   COALESCE(source_snapshot_json, '{{}}') AS source_snapshot_json
+            FROM wallet_screen_summaries
+            WHERE wallet IN ({placeholders})
+            """
+            .format(placeholders=placeholders),
+            params,
+        )
+    }
+
+
+def _wallet_history_plan_summary_snapshot(
+    conn: sqlite3.Connection,
+    *,
+    wallets: list[str],
+) -> dict[str, dict[str, Any]]:
+    if not wallets:
+        return {}
+    placeholders, params = _wallet_history_plan_wallet_filter(wallets)
+    return {
+        str(row["wallet"]): {
+            "current_depth": str(row["history_depth"] or ""),
+            "current_methodology_version": str(row["methodology_version"] or ""),
+            "research_score": float(row["research_score"] or 0.0),
+            "summary_updated_at": int(row["updated_at"] or 0),
+        }
+        for row in conn.execute(
+            """
+            SELECT wallet, history_depth, methodology_version,
+                   COALESCE(research_score, 0) AS research_score,
+                   COALESCE(updated_at, 0) AS updated_at
+            FROM wallet_history_summaries
+            WHERE wallet IN ({placeholders})
+            """
+            .format(placeholders=placeholders),
+            params,
+        )
+    }
+
+
+def _wallet_history_plan_pnl_snapshot(
+    conn: sqlite3.Connection,
+    *,
+    wallets: list[str],
+) -> dict[str, dict[str, Any]]:
+    if not wallets:
+        return {}
+    placeholders, params = _wallet_history_plan_wallet_filter(wallets)
+    return {
+        str(row["wallet"]): {
+            "current_pnl_methodology_version": str(row["methodology_version"] or ""),
+            "pnl_captured_at": int(row["captured_at"] or 0),
+            "official_all_pnl_usdc": row["official_all_pnl_usdc"],
+        }
+        for row in conn.execute(
+            """
+            SELECT wallet, methodology_version, COALESCE(captured_at, 0) AS captured_at,
+                   official_all_pnl_usdc
+            FROM wallet_pnl_summaries
+            WHERE wallet IN ({placeholders})
+            """
+            .format(placeholders=placeholders),
+            params,
+        )
+    }
+
+
+def _wallet_history_plan_job_snapshot(
+    conn: sqlite3.Connection,
+    *,
+    wallets: list[str],
+    now: int,
+) -> dict[str, Any]:
+    active_wallets: set[str] = set()
+    terminal_scopes: set[tuple[str, str]] = set()
+    deferred_actions: dict[tuple[str, str, str], int] = {}
+    if not wallets:
+        return {
+            "active_wallets": active_wallets,
+            "terminal_scopes": terminal_scopes,
+            "deferred_actions": deferred_actions,
+        }
+    for chunk in _wallet_history_plan_wallet_chunks(
+        wallets,
+        limit=max(1, _sqlite_variable_limit(conn) - 3),
+    ):
+        placeholders, wallet_params = _wallet_history_plan_wallet_filter(chunk)
+        for row in conn.execute(
+            f"""
+            SELECT wallet, job_scope, job_action, status, attempts, max_attempts,
+                   next_attempt_at
+            FROM pipeline_jobs
+            WHERE job_type = ?
+              AND wallet IN ({placeholders})
+              AND (
+                    status IN ('running', 'queued', ?)
+                 OR (status = 'failed' AND next_attempt_at > ?)
+              )
+            """,
+            (JOB_TYPE, *wallet_params, PIPELINE_TERMINAL_FAILED_STATUS, int(now)),
+        ):
+            status = str(row["status"] or "")
+            wallet = str(row["wallet"])
+            if status == "running" or (
+                status == "queued"
+                and int(row["attempts"] or 0) < int(row["max_attempts"] or 0)
+            ):
+                active_wallets.add(wallet)
+            elif status == PIPELINE_TERMINAL_FAILED_STATUS:
+                terminal_scopes.add((wallet, str(row["job_scope"] or "")))
+            elif status == "failed":
+                deferred_actions[
+                    (
+                        wallet,
+                        str(row["job_scope"] or ""),
+                        str(row["job_action"] or ""),
+                    )
+                ] = int(row["next_attempt_at"] or 0)
+
+    return {
+        "active_wallets": active_wallets,
+        "terminal_scopes": terminal_scopes,
+        "deferred_actions": deferred_actions,
+    }
+
+
+def _iter_wallet_history_plan_candidates(
+    level_rows: Any,
+    *,
+    snapshots: dict[str, Any],
+    light_refresh_seconds: int,
+    deep_refresh_seconds: int,
+    now: int,
+) -> Any:
+    light_refresh_before = int(now) - max(0, int(light_refresh_seconds))
+    deep_refresh_before = int(now) - max(0, int(deep_refresh_seconds))
+    pnl_refresh_before = int(now) - PNL_INCOMPLETE_REFRESH_SECONDS
+    for row in level_rows:
+        candidate = _wallet_history_plan_candidate_from_snapshots(
+            row,
+            snapshots=snapshots,
+            light_refresh_before=light_refresh_before,
+            deep_refresh_before=deep_refresh_before,
+            pnl_refresh_before=pnl_refresh_before,
+        )
+        if candidate is not None:
+            yield candidate
+
+
+def _wallet_history_plan_candidate_from_snapshots(
+    level_row: Any,
+    *,
+    snapshots: dict[str, Any],
+    light_refresh_before: int,
+    deep_refresh_before: int,
+    pnl_refresh_before: int,
+) -> dict[str, Any] | None:
+    wallet = str(level_row["wallet"])
+    level = str(level_row["level"] or "")
+    last_seen_at = int(level_row["last_seen_at"] or 0)
+    target_depth = (
+        HistoryDepth.DEEP.value
+        if level in {"l3", "l4", "l5", "l6"}
+        else HistoryDepth.LIGHT.value
+    )
+    jobs = snapshots["jobs"]
+    if wallet in jobs["active_wallets"]:
+        return None
+    if (wallet, target_depth) in jobs["terminal_scopes"]:
+        return None
+
+    summary = snapshots["summary"].get(wallet)
+    screen = snapshots["screen"].get(wallet, {})
+    if level == "l2" and not current_screen_is_history_eligible(screen):
+        return None
+    pnl = snapshots["pnl"].get(wallet)
+    current_depth = str(summary["current_depth"]) if summary is not None else ""
+    current_methodology_version = (
+        str(summary["current_methodology_version"]) if summary is not None else ""
+    )
+    research_score = (
+        float(summary["research_score"]) if summary is not None else 0.0
+    )
+    summary_updated_at = (
+        int(summary["summary_updated_at"]) if summary is not None else 0
+    )
+    current_pnl_methodology_version = (
+        str(pnl["current_pnl_methodology_version"]) if pnl is not None else ""
+    )
+    pnl_captured_at = int(pnl["pnl_captured_at"]) if pnl is not None else 0
+    methodology_stale = int(
+        summary is not None and current_methodology_version != METHODOLOGY_VERSION
+    )
+    pnl_refresh_needed = int(
+        level in {"l4", "l5", "l6"}
+        and current_methodology_version == METHODOLOGY_VERSION
+        and (
+            pnl is None
+            or current_pnl_methodology_version != PNL_METHODOLOGY_VERSION
+            or (
+                pnl["official_all_pnl_usdc"] is None
+                and pnl_captured_at <= pnl_refresh_before
+            )
+        )
+    )
+    activity_refresh_needed = int(
+        (
+            level == "l2"
+            and current_depth == "light"
+            and summary_updated_at <= light_refresh_before
+            and last_seen_at > summary_updated_at
+        )
+        or (
+            level in {"l3", "l4", "l5", "l6"}
+            and current_depth == "deep"
+            and summary_updated_at <= deep_refresh_before
+            and last_seen_at > summary_updated_at
+        )
+    )
+
+    if _wallet_history_plan_deferred_failure_blocks(
+        jobs["deferred_actions"],
+        wallet=wallet,
+        target_depth=target_depth,
+        summary_updated_at=summary_updated_at,
+        pnl_captured_at=pnl_captured_at,
+    ):
+        return None
+    if not _wallet_history_plan_candidate_is_eligible(
+        level=level,
+        summary_exists=summary is not None,
+        current_depth=current_depth,
+        current_methodology_version=current_methodology_version,
+        methodology_stale=methodology_stale,
+        activity_refresh_needed=activity_refresh_needed,
+        pnl_refresh_needed=pnl_refresh_needed,
+    ):
+        return None
+
+    refresh_lane = _wallet_history_plan_refresh_lane(
+        current_depth=current_depth,
+        target_depth=target_depth,
+        methodology_stale=methodology_stale,
+        activity_refresh_needed=activity_refresh_needed,
+        pnl_refresh_needed=pnl_refresh_needed,
+    )
+    return {
+        "wallet": wallet,
+        "level": level,
+        "last_seen_at": last_seen_at,
+        "current_depth": current_depth,
+        "current_methodology_version": current_methodology_version,
+        "methodology_stale": methodology_stale,
+        "current_pnl_methodology_version": current_pnl_methodology_version,
+        "pnl_captured_at": pnl_captured_at,
+        "pnl_refresh_needed": pnl_refresh_needed,
+        "activity_refresh_needed": activity_refresh_needed,
+        "research_score": research_score,
+        "summary_updated_at": summary_updated_at,
+        "target_depth": target_depth,
+        "refresh_lane": refresh_lane,
+        "urgency": _wallet_history_plan_urgency(
+            level=level,
+            current_depth=current_depth,
+            methodology_stale=methodology_stale,
+            pnl_refresh_needed=pnl_refresh_needed,
+        ),
+        "sample_trade_count": int(screen.get("sample_trade_count", 0) or 0),
+        "sample_volume_usdc": float(screen.get("sample_volume_usdc", 0.0) or 0.0),
+        "sample_market_count": int(screen.get("sample_market_count", 0) or 0),
+    }
+
+
+def _wallet_history_plan_deferred_failure_blocks(
+    deferred_actions: dict[tuple[str, str, str], int],
+    *,
+    wallet: str,
+    target_depth: str,
+    summary_updated_at: int,
+    pnl_captured_at: int,
+) -> bool:
+    base_action = (
+        DEEP_ACTION if target_depth == HistoryDepth.DEEP.value else LIGHT_ACTION
+    )
+    pnl_marker = pnl_captured_at if pnl_captured_at else summary_updated_at
+    blocked_actions = {
+        f"{base_action}:refresh:{summary_updated_at}",
+        f"{base_action}:pnl:{pnl_marker}",
+    }
+    return any(
+        (wallet, target_depth, action) in deferred_actions for action in blocked_actions
+    )
+
+
+def _wallet_history_plan_next_refresh_at(
+    deferred_actions: dict[tuple[str, str, str], int],
+    *,
+    wallet: str,
+    level: str,
+    target_depth: str,
+    current_depth: str,
+    current_methodology_version: str,
+    current_pnl_methodology_version: str,
+    pnl_official_all_pnl_usdc: Any,
+    summary_updated_at: int,
+    pnl_captured_at: int,
+    last_seen_at: int,
+    light_refresh_seconds: int,
+    deep_refresh_seconds: int,
+    now: int,
+) -> int:
+    future_times: list[int] = []
+    base_action = (
+        DEEP_ACTION if target_depth == HistoryDepth.DEEP.value else LIGHT_ACTION
+    )
+    pnl_marker = pnl_captured_at if pnl_captured_at else summary_updated_at
+    for action in (
+        f"{base_action}:refresh:{summary_updated_at}",
+        f"{base_action}:pnl:{pnl_marker}",
+    ):
+        unblock_at = int(deferred_actions.get((wallet, target_depth, action), 0))
+        if unblock_at > int(now):
+            future_times.append(unblock_at)
+
+    if last_seen_at > summary_updated_at and current_depth == target_depth:
+        if level == "l2" and target_depth == HistoryDepth.LIGHT.value:
+            due_at = summary_updated_at + max(0, int(light_refresh_seconds))
+            if due_at > int(now):
+                future_times.append(due_at)
+        elif level in {"l3", "l4", "l5", "l6"} and target_depth == HistoryDepth.DEEP.value:
+            due_at = summary_updated_at + max(0, int(deep_refresh_seconds))
+            if due_at > int(now):
+                future_times.append(due_at)
+
+    if (
+        level in {"l4", "l5", "l6"}
+        and current_methodology_version == METHODOLOGY_VERSION
+        and current_pnl_methodology_version == PNL_METHODOLOGY_VERSION
+        and pnl_official_all_pnl_usdc is None
+        and pnl_captured_at > 0
+    ):
+        due_at = pnl_captured_at + PNL_INCOMPLETE_REFRESH_SECONDS
+        if due_at > int(now):
+            future_times.append(due_at)
+    return min(future_times) if future_times else 0
+
+
+def _wallet_history_plan_candidate_is_eligible(
+    *,
+    level: str,
+    summary_exists: bool,
+    current_depth: str,
+    current_methodology_version: str,
+    methodology_stale: int,
+    activity_refresh_needed: int,
+    pnl_refresh_needed: int,
+) -> bool:
+    if level == "l2" and not summary_exists:
+        return True
+    if level == "l2" and current_depth == "light":
+        return bool(methodology_stale or activity_refresh_needed)
+    if level in {"l3", "l4", "l5", "l6"} and (
+        not summary_exists
+        or current_depth != "deep"
+        or current_methodology_version != METHODOLOGY_VERSION
+        or activity_refresh_needed
+    ):
+        return True
+    return bool(
+        level in {"l4", "l5", "l6"}
+        and current_methodology_version == METHODOLOGY_VERSION
+        and pnl_refresh_needed
+    )
+
+
+def _wallet_history_plan_refresh_lane(
+    *,
+    current_depth: str,
+    target_depth: str,
+    methodology_stale: int,
+    activity_refresh_needed: int,
+    pnl_refresh_needed: int,
+) -> str:
+    if current_depth != target_depth:
+        return "required_depth"
+    if methodology_stale:
+        return "methodology_upgrade"
+    if activity_refresh_needed:
+        return "new_activity_after_refresh_window"
+    if pnl_refresh_needed:
+        return "pnl_evidence_refresh"
+    return "new_activity_after_refresh_window"
+
+
+def _wallet_history_plan_urgency(
+    *,
+    level: str,
+    current_depth: str,
+    methodology_stale: int,
+    pnl_refresh_needed: int,
+) -> int:
+    if methodology_stale and level == "l6":
+        return 0
+    if methodology_stale and level == "l5":
+        return 1
+    if methodology_stale and level == "l4":
+        return 2
+    if methodology_stale and level == "l3":
+        return 3
+    if pnl_refresh_needed and level == "l6":
+        return 4
+    if pnl_refresh_needed and level == "l5":
+        return 5
+    if pnl_refresh_needed and level == "l4":
+        return 6
+    if level in {"l3", "l4", "l5", "l6"} and current_depth != "deep":
+        return 7
+    if methodology_stale:
+        return 8
+    if level in {"l3", "l4", "l5", "l6"}:
+        return 9
+    if current_depth == "":
+        return 10
+    return 11
+
+
+def _bounded_wallet_history_plan_lanes(
+    rows: Any,
+    *,
+    lane_limit: int,
+) -> list[dict[str, Any]]:
+    lanes: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    trim_threshold = max(1, int(lane_limit)) * 2
+    for row in rows:
+        item = dict(row)
+        lane_key = (str(item["target_depth"]), str(item["refresh_lane"]))
+        lane = lanes.setdefault(lane_key, [])
+        lane.append(item)
+        if len(lane) > trim_threshold:
+            lane.sort(key=_wallet_history_plan_lane_sort_key)
+            del lane[lane_limit:]
+
+    bounded: list[dict[str, Any]] = []
+    for lane in lanes.values():
+        lane.sort(key=_wallet_history_plan_lane_sort_key)
+        bounded.extend(lane[:lane_limit])
+    return bounded
+
+
+def _attach_wallet_history_plan_sources(
+    conn: sqlite3.Connection,
+    rows: list[dict[str, Any]],
+) -> None:
+    """Attach observed wallet sources after bounded planner candidate selection."""
+
+    if not rows:
+        return
+    wallets = list(dict.fromkeys(str(row["wallet"]) for row in rows))
+    sources_by_wallet: dict[str, str] = {}
+    for chunk in _wallet_history_plan_wallet_chunks(
+        wallets,
+        limit=_sqlite_variable_limit(conn),
+    ):
+        placeholders = ", ".join("?" for _ in chunk)
+        for row in conn.execute(
+            "SELECT wallet, COALESCE(sources, '') AS sources "
+            f"FROM observed_wallets WHERE wallet IN ({placeholders})",
+            tuple(chunk),
+        ):
+            sources_by_wallet[str(row["wallet"])] = str(row["sources"] or "")
+    for row in rows:
+        row["sources"] = sources_by_wallet.get(str(row["wallet"]), "")
+
+
+def _sqlite_variable_limit(conn: sqlite3.Connection) -> int:
+    getlimit = getattr(conn, "getlimit", None)
+    if getlimit is None:
+        return 999
+    try:
+        limit = int(getlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER))
+    except (AttributeError, TypeError, ValueError, sqlite3.Error):
+        return 999
+    return max(1, limit)
+
+
+def _wallet_history_plan_wallet_chunks(
+    wallets: list[str],
+    *,
+    limit: int,
+) -> list[list[str]]:
+    chunk_size = max(1, int(limit))
+    return [
+        wallets[index : index + chunk_size]
+        for index in range(0, len(wallets), chunk_size)
+    ]
+
+
+def _rank_wallet_history_plan_candidates(
+    rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Assign the same per-lane ranks the old window query produced."""
+
+    lanes: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for row in rows:
+        lane_key = (str(row["target_depth"]), str(row["refresh_lane"]))
+        lanes.setdefault(lane_key, []).append(row)
+
+    ranked: list[dict[str, Any]] = []
+    for lane_key in sorted(lanes):
+        for lane_rank, row in enumerate(
+            sorted(lanes[lane_key], key=_wallet_history_plan_lane_sort_key),
+            start=1,
+        ):
+            item = dict(row)
+            item["lane_rank"] = lane_rank
+            ranked.append(item)
+    ranked.sort(
+        key=lambda row: (
+            int(row["lane_rank"]),
+            str(row["target_depth"]),
+            str(row["refresh_lane"]),
+            int(row["urgency"]),
+            -float(row["research_score"] or 0),
+            str(row["wallet"]),
+        )
+    )
+    return ranked
+
+
+def _wallet_history_plan_lane_sort_key(row: dict[str, Any]) -> tuple[Any, ...]:
+    return (
+        int(row["urgency"]),
+        -float(row["research_score"] or 0.0),
+        -int(row["sample_market_count"] or 0),
+        -float(row["sample_volume_usdc"] or 0.0),
+        -int(row["sample_trade_count"] or 0),
+        -int(row["last_seen_at"] or 0),
+        str(row["wallet"]),
     )
 
 
@@ -484,6 +1314,24 @@ def run_wallet_history_worker(
                 conn.commit()
                 succeeded += 1
                 continue
+            if depth is HistoryDepth.LIGHT:
+                # A queued L2 job may predate a stricter screen policy. Recheck
+                # before any upstream request so stale jobs cannot spend budget.
+                screen = _wallet_history_plan_screen_snapshot(conn, wallets=[wallet]).get(wallet, {})
+                if not current_screen_is_history_eligible(screen):
+                    complete_pipeline_job(
+                        conn,
+                        job_id=int(job["job_id"]),
+                        worker_id=worker_id,
+                        output_data={
+                            "status": "skipped_stale_l2_screen",
+                            "level": level.level.value,
+                            "history_depth": depth.value,
+                        },
+                    )
+                    conn.commit()
+                    succeeded += 1
+                    continue
             job_input = _json_dict(job.get("input_json"))
             refresh_reason = str(job_input.get("refresh_reason") or "")
             history_rows: list[dict[str, Any]] = []
@@ -562,6 +1410,7 @@ def run_wallet_history_worker(
                     "artifact_id": artifact.artifact_id,
                     "row_count": artifact.row_count,
                     "research_score": summary.research_score,
+                    "forward_selection_score": summary.forward_selection_score,
                     "artifact_reused": artifact_reused,
                     "artifact_repaired": artifact_repaired,
                 },
@@ -583,6 +1432,7 @@ def run_wallet_history_worker(
                     artifact=artifact,
                 )
             scheduler_deferred = is_upstream_scheduling_error(exc)
+            terminal_error = _is_terminal_history_error(exc)
             if scheduler_deferred:
                 deferred += 1
             else:
@@ -600,6 +1450,9 @@ def run_wallet_history_worker(
                     attempts=int(job["attempts"] or 1),
                 ),
                 count_attempt=not scheduler_deferred,
+                fail_permanently=terminal_error,
+                terminal_reason="wallet_history_data_quality" if terminal_error else "",
+                terminal_policy_version=HISTORY_POLICY_VERSION if terminal_error else "",
                 now=now,
             )
             conn.commit()
@@ -617,6 +1470,26 @@ def run_wallet_history_worker(
         status="partial" if failed or deferred else "ok",
         error=error,
     )
+
+
+def _is_terminal_history_error(exc: BaseException) -> bool:
+    """Classify local data-quality failures that retrying cannot repair."""
+
+    if isinstance(exc, WalletHistoryTerminalDataQualityError):
+        return True
+    if isinstance(exc, HttpClientError):
+        return False
+    if is_sqlite_locked_error(exc):
+        return False
+    if isinstance(exc, sqlite3.OperationalError):
+        return False
+    text = str(exc).lower()
+    terminal_fragments = (
+        "incompatible history data",
+        "artifact depth",
+        "cannot replace deep history with light history",
+    )
+    return any(fragment in text for fragment in terminal_fragments)
 
 
 def _fetch_history(
@@ -897,9 +1770,10 @@ def _persist_history_summary(
             total_volume_usdc, buy_count, sell_count, median_gap_sec,
             trades_per_day, market_volume_top_share, oldest_timestamp,
             latest_timestamp, strategy_tags_json, risk_flags_json,
-            research_score, score_components_json, methodology_version,
-            computed_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            research_score, diagnostic_score, forward_selection_score,
+            score_components_json, forward_score_components_json,
+            methodology_version, computed_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(wallet) DO UPDATE SET
             artifact_id = excluded.artifact_id,
             history_depth = excluded.history_depth,
@@ -918,7 +1792,10 @@ def _persist_history_summary(
             strategy_tags_json = excluded.strategy_tags_json,
             risk_flags_json = excluded.risk_flags_json,
             research_score = excluded.research_score,
+            diagnostic_score = excluded.diagnostic_score,
+            forward_selection_score = excluded.forward_selection_score,
             score_components_json = excluded.score_components_json,
+            forward_score_components_json = excluded.forward_score_components_json,
             methodology_version = excluded.methodology_version,
             computed_at = excluded.computed_at,
             updated_at = excluded.updated_at
@@ -942,7 +1819,10 @@ def _persist_history_summary(
             json.dumps(summary.strategy_tags),
             json.dumps(summary.risk_flags),
             summary.research_score,
+            summary.diagnostic_score,
+            summary.forward_selection_score,
             json.dumps(summary.score_components, sort_keys=True),
+            json.dumps(summary.forward_score_components, sort_keys=True),
             METHODOLOGY_VERSION,
             now,
             now,
@@ -978,7 +1858,10 @@ def _update_wallet_feature(
         "strategy_tags": list(summary.strategy_tags),
         "risk_flags": list(summary.risk_flags),
         "research_score": summary.research_score,
+        "diagnostic_score": summary.diagnostic_score,
+        "forward_selection_score": summary.forward_selection_score,
         "score_components": summary.score_components,
+        "forward_score_components": summary.forward_score_components,
         "updated_at": now,
     }
     sell_pct = (
@@ -1050,10 +1933,45 @@ def _fair_targets(rows: list[dict[str, Any]], *, limit: int) -> list[dict[str, A
     return selected
 
 
+def _limit_l2_trusted_slow_targets(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    selected: list[dict[str, Any]] = []
+    slow_count = 0
+    slow_sources: set[str] = set()
+    for row in rows:
+        if not _is_l2_trusted_slow_target(row):
+            selected.append(row)
+            continue
+        source_bucket = _source_bucket(str(row.get("sources") or ""))
+        if slow_count >= L2_TRUSTED_SLOW_MAX_PER_ROUND:
+            continue
+        if source_bucket in slow_sources:
+            continue
+        slow_count += 1
+        slow_sources.add(source_bucket)
+        selected.append(row)
+    return selected
+
+
+def _is_l2_trusted_slow_target(row: dict[str, Any]) -> bool:
+    if str(row.get("level") or "") != WalletLevel.L2.value:
+        return False
+    source_bucket = _source_bucket(str(row.get("sources") or ""))
+    if source_bucket == "stream":
+        return False
+    return (
+        int(row.get("sample_trade_count") or 0) < L2_DEEP_MIN_ACTIVITY_COUNT
+        or int(row.get("sample_market_count") or 0) < L2_DEEP_MIN_MARKET_COUNT
+        or float(row.get("sample_volume_usdc") or 0.0) < L2_DEEP_MIN_VOLUME_USDC
+    )
+
+
 def _round_robin_history_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     buckets: dict[str, list[dict[str, Any]]] = {}
     for row in rows:
-        key = f"{_target_depth(row)}:{_source_bucket(str(row.get('sources') or ''))}"
+        key = (
+            f"{_target_depth(row)}:{str(row.get('level') or '')}:"
+            f"{_source_bucket(str(row.get('sources') or ''))}"
+        )
         buckets.setdefault(key, []).append(row)
     selected: list[dict[str, Any]] = []
     names = sorted(buckets)

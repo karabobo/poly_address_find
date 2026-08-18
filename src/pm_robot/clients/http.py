@@ -115,8 +115,10 @@ class RateLimitedHttpClient:
         url = f"{base_url}{path}{query}"
         attempt = 0
         last_error: HttpClientError | None = None
+        request_started = time.monotonic()
+        final_status_code: int | None = None
+        final_error_type = ""
         while attempt <= self.max_retries:
-            started = time.monotonic()
             status_code: int | None = None
             error_type = ""
             try:
@@ -128,7 +130,8 @@ class RateLimitedHttpClient:
                 if _looks_like_html(text):
                     raise HttpClientError("non-json/html response", status_code=status_code, error_type="cloudflare_or_html")
                 data = json.loads(text)
-                self._log(base_url, path, status_code, started, attempt, "", True)
+                # Request telemetry is one row per logical request, not per retry.
+                self._log(base_url, path, status_code, request_started, attempt, "", True)
                 return data
             except HTTPError as exc:
                 status_code = int(exc.code)
@@ -167,7 +170,8 @@ class RateLimitedHttpClient:
                 error_type = exc.error_type
                 last_error = exc
 
-            self._log(base_url, path, status_code, started, attempt, error_type, False)
+            final_status_code = status_code
+            final_error_type = error_type
             if attempt >= self.max_retries or not _retryable(error_type, status_code):
                 break
             if status_code == 429 and last_error is not None:
@@ -179,6 +183,15 @@ class RateLimitedHttpClient:
                 time.sleep(min(8.0, 2.0**attempt))
             self._wait_for_slot(base_url, path)
             attempt += 1
+        self._log(
+            base_url,
+            path,
+            final_status_code,
+            request_started,
+            attempt,
+            final_error_type,
+            False,
+        )
         raise last_error or HttpClientError("request failed")
 
     def _wait_for_slot(self, base_url: str, path: str) -> None:

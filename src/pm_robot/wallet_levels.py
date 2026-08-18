@@ -12,6 +12,11 @@ from enum import Enum
 
 RECENT_SAMPLE_TRADE_LIMIT = 10
 RECENT_SAMPLE_VOLUME_GATE_USDC = 100.0
+RECENT_OBSERVED_MIN_TRADE_COUNT = 2
+RECENT_SCREEN_MIN_TRADE_COUNT = 3
+RECENT_SCREEN_MIN_MARKET_COUNT = 2
+RECENT_SCREEN_MIN_VOLUME_USDC = 300.0
+RECENT_SCREEN_MIN_SINGLE_TRADE_USDC = 100.0
 
 
 class WalletLevel(str, Enum):
@@ -57,8 +62,11 @@ class LevelFacts:
     verified_trade: bool = False
     trusted_source: bool = False
     screen_complete: bool = False
+    observed_trade_count: int = 0
     sample_trade_count: int = 0
     sample_volume_usdc: float = 0.0
+    sample_market_count: int = 0
+    sample_max_trade_usdc: float = 0.0
     light_history_complete: bool = False
     deep_history_complete: bool = False
     selected_for_l3: bool = False
@@ -88,20 +96,23 @@ def decide_wallet_level(facts: LevelFacts) -> LevelDecision:
             return LevelDecision(WalletLevel.L1, "trusted_source")
         if (
             facts.verified_trade
+            and facts.observed_trade_count >= RECENT_OBSERVED_MIN_TRADE_COUNT
             and facts.sample_volume_usdc >= RECENT_SAMPLE_VOLUME_GATE_USDC
         ):
-            return LevelDecision(WalletLevel.L1, "observed_sample_volume")
+            return LevelDecision(WalletLevel.L1, "observed_sample_resource_gate")
         return LevelDecision(current, "awaiting_resource_admission")
 
     if current is WalletLevel.L1:
         if not facts.screen_complete:
             return LevelDecision(current, "awaiting_recent_screen")
         if (
-            facts.sample_trade_count > 0
-            and facts.sample_volume_usdc >= RECENT_SAMPLE_VOLUME_GATE_USDC
+            facts.sample_trade_count >= RECENT_SCREEN_MIN_TRADE_COUNT
+            and facts.sample_market_count >= RECENT_SCREEN_MIN_MARKET_COUNT
+            and facts.sample_volume_usdc >= RECENT_SCREEN_MIN_VOLUME_USDC
+            and facts.sample_max_trade_usdc >= RECENT_SCREEN_MIN_SINGLE_TRADE_USDC
         ):
-            return LevelDecision(WalletLevel.L2, "recent_sample_volume")
-        return LevelDecision(current, "recent_sample_below_resource_gate")
+            return LevelDecision(WalletLevel.L2, "recent_screen_resource_gate")
+        return LevelDecision(current, "recent_screen_below_resource_gate")
 
     if current is WalletLevel.L2:
         if facts.light_history_complete and facts.selected_for_l3:

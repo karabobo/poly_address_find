@@ -427,6 +427,7 @@ def api_rate_limit_summary_from_path(
     db_path: Path,
     *,
     now: float | None = None,
+    timeout_seconds: float = 5.0,
 ) -> dict[str, object]:
     """Read the dedicated coordination database without touching the main wallet DB."""
 
@@ -438,8 +439,9 @@ def api_rate_limit_summary_from_path(
     conn: sqlite3.Connection | None = None
     try:
         uri = f"file:{path.resolve().as_posix()}?mode=ro"
-        conn = sqlite3.connect(uri, uri=True, timeout=0.5)
-        conn.execute("PRAGMA busy_timeout = 500")
+        timeout = max(0.1, float(timeout_seconds))
+        conn = sqlite3.connect(uri, uri=True, timeout=timeout)
+        conn.execute(f"PRAGMA busy_timeout = {int(timeout * 1_000)}")
         conn.row_factory = sqlite3.Row
         summary = api_rate_limit_summary(conn, now=now)
         summary["available"] = True

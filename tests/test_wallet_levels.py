@@ -29,7 +29,7 @@ def test_history_depth_does_not_reuse_wallet_level_names():
     )
 
 
-def test_l0_to_l1_admits_trusted_sources_or_one_hundred_usdc_sample():
+def test_l0_to_l1_requires_two_verified_events_or_a_trusted_source():
     small_trade = decide_wallet_level(
         LevelFacts(
             current_level=WalletLevel.L0,
@@ -41,6 +41,7 @@ def test_l0_to_l1_admits_trusted_sources_or_one_hundred_usdc_sample():
         LevelFacts(
             current_level=WalletLevel.L0,
             verified_trade=True,
+            observed_trade_count=2,
             sample_volume_usdc=100,
         )
     )
@@ -58,18 +59,22 @@ def test_unverified_l0_sighting_does_not_schedule_history():
     assert next_collection_action(facts) is CollectionAction.NONE
 
 
-def test_l1_screen_uses_up_to_ten_recent_trades_and_one_hundred_usdc():
+def test_l1_screen_requires_repeated_material_activity_across_markets():
     qualified = LevelFacts(
         current_level=WalletLevel.L1,
         screen_complete=True,
         sample_trade_count=7,
-        sample_volume_usdc=125.0,
+        sample_market_count=2,
+        sample_volume_usdc=300.0,
+        sample_max_trade_usdc=100.0,
     )
     thin = LevelFacts(
         current_level=WalletLevel.L1,
         screen_complete=True,
         sample_trade_count=10,
-        sample_volume_usdc=99.99,
+        sample_market_count=2,
+        sample_volume_usdc=299.99,
+        sample_max_trade_usdc=100.0,
     )
 
     assert decide_wallet_level(qualified).level is WalletLevel.L2
@@ -121,6 +126,7 @@ def test_level_reconciliation_never_skips_or_automatically_demotes():
     flashy_l0 = LevelFacts(
         current_level=WalletLevel.L0,
         verified_trade=True,
+        observed_trade_count=2,
         screen_complete=True,
         sample_trade_count=10,
         sample_volume_usdc=1_000_000.0,
